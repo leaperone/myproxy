@@ -1,6 +1,7 @@
 use std::fs;
 use std::fs::File;
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,7 +28,13 @@ impl Default for Supervisor {
 
 impl Supervisor {
     pub fn connect(&self, strategy: &Strategy) -> Result<()> {
-        log::info("supervisor", format!("connect mixed-port {}", strategy.mixed_port));
+        log::info(
+            "supervisor",
+            format!(
+                "connect mixed-port {} tun={}",
+                strategy.mixed_port, strategy.tun
+            ),
+        );
         self.disconnect()?;
         let catalog = catalog::refresh(strategy)?;
         compile::compile(strategy, &catalog)?;
@@ -50,6 +57,9 @@ impl Supervisor {
             log::error("supervisor", "runtime YAML failed mihomo -t");
             bail!("runtime YAML failed mihomo -t");
         }
+        if strategy.tun {
+            ensure_tun_privileges(&bin)?;
+        }
 
         let log_file = File::create(paths::mihomo_log_path()?).context("mihomo.log")?;
         let mut child = Command::new(&bin)
@@ -63,7 +73,8 @@ impl Supervisor {
         fs::write(paths::pid_path()?, child.id().to_string())?;
 
         let addr = format!("127.0.0.1:{}", strategy.mixed_port);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let wait_secs = if strategy.tun { 8 } else { 3 };
+        let deadline = Instant::now() + Duration::from_secs(wait_secs);
         loop {
             if let Ok(Some(status)) = child.try_wait() {
                 log::error("supervisor", format!("mihomo exited immediately: {status}"));
@@ -92,7 +103,13 @@ impl Supervisor {
             std::thread::sleep(Duration::from_millis(50));
         }
         *self.child.lock().expect("supervisor lock") = Some(child);
-        log::info("supervisor", format!("listening {addr}"));
+        log::info(
+            "supervisor",
+            format!(
+                "listening {addr}{}",
+                if strategy.tun { " tun" } else { "" }
+            ),
+        );
         Ok(())
     }
 
@@ -137,4 +154,60 @@ impl Supervisor {
         }
         false
     }
+}
+
+fn ensure_tun_privileges(bin: &Path) -> Result<()> {
+    if mihomo_has_tun_privs(bin) {
+        log::info("supervisor", "mihomo already setuid root");
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        bail!("TUN needs a setuid-root mihomo binary at {}", bin.display());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let quoted = sh_single_quote(bin);
+        let shell = format!("chown root:admin {quoted} && chmod 4755 {quoted}");
+        log::info("supervisor", "asking for administrator to setuid mihomo");
+        let status = Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "do shell script {} with administrator privileges",
+                applescript_string(&shell)
+            ))
+            .status()
+            .context("osascript")?;
+        if !status.success() || !mihomo_has_tun_privs(bin) {
+            bail!(
+                "TUN needs an administrator password once to mark {} setuid root",
+                bin.display()
+            );
+        }
+        log::info("supervisor", "mihomo is setuid root");
+        Ok(())
+    }
+}
+
+fn mihomo_has_tun_privs(bin: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(bin)
+            .map(|meta| meta.uid() == 0 && meta.mode() & 0o4000 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bin;
+        false
+    }
+}
+
+fn sh_single_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }

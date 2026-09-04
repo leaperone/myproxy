@@ -31,16 +31,24 @@ enum RuleDraftKind {
     Exact,
     Suffix,
     Keyword,
+    Cidr,
 }
 
 impl RuleDraftKind {
-    const ALL: [Self; 4] = [Self::App, Self::Exact, Self::Suffix, Self::Keyword];
+    const ALL: [Self; 5] = [
+        Self::App,
+        Self::Exact,
+        Self::Suffix,
+        Self::Keyword,
+        Self::Cidr,
+    ];
 
     fn from_matcher(matcher: &Matcher) -> Self {
         match matcher.kind.as_str() {
             "app" => Self::App,
             "keyword" => Self::Keyword,
             "domain" => Self::Exact,
+            "cidr" => Self::Cidr,
             _ => Self::Suffix,
         }
     }
@@ -51,6 +59,7 @@ impl RuleDraftKind {
             Self::Exact => "域名",
             Self::Suffix => "后缀",
             Self::Keyword => "关键字",
+            Self::Cidr => "网段",
         }
     }
 
@@ -60,6 +69,7 @@ impl RuleDraftKind {
             Self::Exact => "apple.com",
             Self::Suffix => "apple.com，匹配其子域",
             Self::Keyword => "关键字，例如 google",
+            Self::Cidr => "149.154.160.0/20",
         }
     }
 
@@ -69,6 +79,7 @@ impl RuleDraftKind {
             Self::Exact => Matcher::domain(match_value),
             Self::Suffix => Matcher::suffix(match_value),
             Self::Keyword => Matcher::keyword(match_value),
+            Self::Cidr => Matcher::cidr(match_value),
         }
     }
 }
@@ -650,7 +661,7 @@ impl RuleSetEditor {
             return false;
         }
         if next.matchers.is_empty() {
-            self.notice = "至少加一条进程或域名。".into();
+            self.notice = "至少加一条匹配。".into();
             cx.notify();
             return false;
         }
@@ -1297,10 +1308,11 @@ impl AppView {
                 }) {
                     Ok(_) => {
                         this.status = format!(
-                            "已编译 {} 个节点，排除 {}。Mixed {}。",
+                            "已编译 {} 个节点，排除 {}。Mixed {}{}。",
                             this.catalog.nodes.len(),
                             this.catalog.excluded.len(),
-                            this.strategy.mixed_port
+                            this.strategy.mixed_port,
+                            if this.strategy.tun { " + TUN" } else { "" }
                         );
                     }
                     Err(err) => {
@@ -1337,8 +1349,9 @@ impl AppView {
                             this.connected = true;
                             this.catalog = Catalog::load().unwrap_or_default();
                             this.status = format!(
-                                "已连接 127.0.0.1:{} （HTTP + SOCKS5）",
-                                this.strategy.mixed_port
+                                "已连接 127.0.0.1:{} （HTTP + SOCKS5{}）",
+                                this.strategy.mixed_port,
+                                if this.strategy.tun { " + TUN" } else { "" }
                             );
                         }
                         Err(err) => {
@@ -2099,7 +2112,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                "Mixed 一口同时提供 HTTP 代理与 SOCKS5。排除器用正则。",
+                "Mixed 一口同时提供 HTTP 代理与 SOCKS5。TUN 可接管系统流量。排除器用正则。",
             ))
             .child(panel(
                 theme,
@@ -2109,28 +2122,34 @@ impl AppView {
             .child(panel(
                 theme,
                 "入口",
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_sm().child("127.0.0.1"))
-                    .child(div().w(px(100.)).child(Input::new(&self.port_input)))
-                    .child({
-                        let entity = entity.clone();
-                        Button::new("save-port").label("保存端口").on_click(
-                            move |_, _, app| {
-                                entity.update(app, |this, cx| {
-                                    if let Ok(port) = this.port_input.read(cx).value().parse::<u16>()
-                                    {
-                                        this.strategy.mixed_port = port;
-                                        this.persist();
-                                    } else {
-                                        this.status = "端口无效。".into();
-                                    }
-                                    cx.notify();
-                                });
-                            },
-                        )
-                    }),
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_sm().child("127.0.0.1"))
+                            .child(div().w(px(100.)).child(Input::new(&self.port_input)))
+                            .child({
+                                let entity = entity.clone();
+                                Button::new("save-port").label("保存端口").on_click(
+                                    move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            if let Ok(port) =
+                                                this.port_input.read(cx).value().parse::<u16>()
+                                            {
+                                                this.strategy.mixed_port = port;
+                                                this.persist();
+                                            } else {
+                                                this.status = "端口无效。".into();
+                                            }
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                            }),
+                    )
+                    .child(self.tun_row(cx, theme)),
             ))
             .child(self.updates_panel(cx, theme))
             .child(panel(
@@ -2155,6 +2174,42 @@ impl AppView {
             ))
             .child(self.startup_panel(cx, theme))
             .child(self.developer_panel(cx, theme))
+    }
+
+    fn tun_row(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let on = self.strategy.tun;
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(div().text_sm().child("系统接管 (TUN)"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("让 Telegram 等不走 Mixed 的流量进核心。首次连接会要一次管理员密码。改完需重新连接。"),
+                    ),
+            )
+            .child({
+                let mut toggle = Button::new("tun-toggle").small();
+                toggle = if on {
+                    toggle.danger().label("关闭")
+                } else {
+                    toggle.primary().label("开启")
+                };
+                toggle.on_click(move |_, _, app| {
+                    entity.update(app, |this, cx| {
+                        this.strategy.tun = !this.strategy.tun;
+                        this.persist();
+                        cx.notify();
+                    });
+                })
+            })
     }
 
     fn startup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {

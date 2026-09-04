@@ -24,6 +24,9 @@ enum Commands {
     Port {
         port: u16,
     },
+    Tun {
+        state: String,
+    },
     Filter {
         #[arg(long)]
         set: Option<String>,
@@ -95,6 +98,8 @@ enum RuleCmd {
         suffix: String,
         #[arg(long, default_value = "")]
         keyword: String,
+        #[arg(long, default_value = "")]
+        cidr: String,
         #[arg(long)]
         via: String,
     },
@@ -107,7 +112,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Capabilities => {
             println!(
-                "status apply connect disconnect port filter subscription group rule log"
+                "status apply connect disconnect port tun filter subscription group rule log"
             );
         }
         Commands::Log => {
@@ -125,8 +130,9 @@ fn main() -> Result<()> {
             let strategy = Strategy::load()?;
             let catalog = catalog::Catalog::load()?;
             println!(
-                "mixed-port {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
+                "mixed-port {}  tun {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
                 strategy.mixed_port,
+                if strategy.tun { "on" } else { "off" },
                 strategy.subscriptions.len(),
                 catalog.nodes.len(),
                 catalog.excluded.len(),
@@ -151,7 +157,11 @@ fn main() -> Result<()> {
             myproxy::log::debug("ctl", "connect");
             let strategy = Strategy::load()?;
             Supervisor::default().connect(&strategy)?;
-            println!("connected mixed-port {}", strategy.mixed_port);
+            println!(
+                "connected mixed-port {}{}",
+                strategy.mixed_port,
+                if strategy.tun { " tun" } else { "" }
+            );
         }
         Commands::Disconnect => {
             myproxy::log::debug("ctl", "disconnect");
@@ -163,6 +173,17 @@ fn main() -> Result<()> {
             strategy.mixed_port = port;
             strategy.save()?;
             println!("mixed-port {port}");
+        }
+        Commands::Tun { state } => {
+            let on = match state.as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                _ => bail!("tun on|off"),
+            };
+            let mut strategy = Strategy::load()?;
+            strategy.tun = on;
+            strategy.save()?;
+            println!("tun {}", if on { "on" } else { "off" });
         }
         Commands::Filter { set } => {
             let mut strategy = Strategy::load()?;
@@ -313,15 +334,23 @@ fn main() -> Result<()> {
                 domain,
                 suffix,
                 keyword,
+                cidr,
                 via,
             } => {
-                if app.is_empty() && domain.is_empty() && suffix.is_empty() && keyword.is_empty() {
-                    bail!("need --app, --domain, --suffix, or --keyword");
+                if app.is_empty()
+                    && domain.is_empty()
+                    && suffix.is_empty()
+                    && keyword.is_empty()
+                    && cidr.is_empty()
+                {
+                    bail!("need --app, --domain, --suffix, --keyword, or --cidr");
                 }
                 let matcher = if !app.is_empty() {
                     Matcher::app(app)
                 } else if !keyword.is_empty() {
                     Matcher::keyword(keyword)
+                } else if !cidr.is_empty() {
+                    Matcher::cidr(cidr)
                 } else if !domain.is_empty() {
                     Matcher::domain(domain)
                 } else {
