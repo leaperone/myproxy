@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
-use gpui_kit::component::dialog::DialogButtonProps;
+use gpui_kit::component::dialog::{Cancel, Confirm, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
@@ -959,7 +959,8 @@ impl AppView {
         let parent = cx.entity();
         let editor = cx.new(|cx| GroupEditor::new(parent.clone(), existing, window, cx));
         let editing = id.is_some();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, _| {
+            let ok_label = if editing { "保存" } else { "添加" };
             dialog
                 .title(if editing {
                     "编辑节点组"
@@ -967,12 +968,10 @@ impl AppView {
                     "添加节点组"
                 })
                 .width(px(720.))
+                .max_h(window.viewport_size().height - px(96.))
                 .overlay_closable(true)
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text(if editing { "保存" } else { "添加" })
-                        .cancel_text("取消")
-                        .show_cancel(true)
                         .on_ok({
                             let editor = editor.clone();
                             move |_, window, cx| editor.update(cx, |ed, cx| ed.commit(window, cx))
@@ -988,6 +987,25 @@ impl AppView {
                                 true
                             }
                         }),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("group-dialog-cancel").label("取消").on_click(
+                                |_, window, cx| window.dispatch_action(Box::new(Cancel), cx),
+                            ),
+                        )
+                        .child(
+                            Button::new("group-dialog-ok")
+                                .primary()
+                                .label(ok_label)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(Confirm { secondary: false }),
+                                        cx,
+                                    )
+                                }),
+                        ),
                 )
                 .on_close({
                     let parent = parent.clone();
