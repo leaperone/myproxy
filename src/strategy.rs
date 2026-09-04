@@ -11,7 +11,7 @@ use crate::paths;
 pub const DEFAULT_EXCLUDE: &str =
     r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
 
-pub const STRATEGY_SCHEMA: u32 = 4;
+pub const STRATEGY_SCHEMA: u32 = 5;
 
 pub const TELEGRAM_GROUP: &str = "Telegram";
 
@@ -263,7 +263,7 @@ impl Strategy {
         if self.schema < 3 {
             self.fold_legacy_rules();
         }
-        if self.schema < 4 {
+        if self.schema < 5 {
             self.ensure_telegram_routing();
         }
         self.schema = STRATEGY_SCHEMA;
