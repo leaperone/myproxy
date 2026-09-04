@@ -8,6 +8,7 @@ GPUI controller for a bundled mihomo core. Strategy document is the source of tr
 scripts/fetch-mihomo.sh   # Apple Silicon mihomo
 scripts/dev.sh            # local window + push debug binaries to macbook-air
 MYPROXY_PAGE=rules scripts/dev.sh   # open 规则 page
+MYPROXY_PAGE=connections scripts/dev.sh  # open 连接 page
 scripts/install-macbook-air.sh      # release .app → macbook-air, mixed-port 7891
 scripts/dev-air.sh                  # Air only: rebuild on save and relaunch
 ```

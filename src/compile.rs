@@ -7,6 +7,12 @@ use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
 
+pub const CONTROLLER_SECRET: &str = "myproxy-local";
+
+pub fn controller_port(mixed_port: u16) -> u16 {
+    mixed_port.saturating_add(107)
+}
+
 pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     let mut root = serde_yaml::Mapping::new();
     root.insert("mixed-port".into(), strategy.mixed_port.into());
@@ -18,9 +24,9 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     root.insert("ipv6".into(), true.into());
     root.insert(
         "external-controller".into(),
-        format!("127.0.0.1:{}", strategy.mixed_port.saturating_add(107)).into(),
+        format!("127.0.0.1:{}", controller_port(strategy.mixed_port)).into(),
     );
-    root.insert("secret".into(), "myproxy-local".into());
+    root.insert("secret".into(), CONTROLLER_SECRET.into());
 
     let proxies: Vec<serde_yaml::Value> = catalog.nodes.iter().map(|n| n.raw.clone()).collect();
     root.insert("proxies".into(), serde_yaml::Value::Sequence(proxies));
@@ -29,7 +35,10 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     for group in &strategy.groups {
         let mut members = catalog::resolve_group_members(group, catalog);
         if members.is_empty() {
-            log::warn("compile", format!("group {} empty, using DIRECT", group.name));
+            log::warn(
+                "compile",
+                format!("group {} empty, using DIRECT", group.name),
+            );
             members.push("DIRECT".into());
         }
         let mut item = serde_yaml::Mapping::new();
@@ -84,10 +93,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
             }
         }
     }
-    rules.push(format!(
-        "MATCH,{}",
-        default_group(strategy)
-    ));
+    rules.push(format!("MATCH,{}", default_group(strategy)));
     let compiled = rules.len();
     let rules: Vec<serde_yaml::Value> = rules.into_iter().map(serde_yaml::Value::String).collect();
     root.insert("rules".into(), serde_yaml::Value::Sequence(rules));
