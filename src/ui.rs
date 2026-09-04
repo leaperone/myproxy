@@ -1174,6 +1174,9 @@ impl AppView {
 
         let supervisor = Arc::new(Supervisor::default());
         let connected = supervisor.is_running();
+        if connected {
+            supervisor.adopt_running(strategy.tun);
+        }
         let entity = cx.entity();
         let appearance_observer = window.observe_window_appearance(move |window, cx| {
             entity.update(cx, |this, cx| {
@@ -1367,11 +1370,15 @@ impl AppView {
                         this.catalog = cat;
                         this.mark_applied();
                         this.status = format!(
-                            "已编译 {} 个节点，排除 {}。Mixed {}{}。",
+                            "已编译 {} 个节点，排除 {}。{}Mixed {}。",
                             this.catalog.nodes.len(),
                             this.catalog.excluded.len(),
-                            this.strategy.mixed_port,
-                            if this.strategy.tun { " + TUN" } else { "" }
+                            if this.strategy.tun {
+                                "系统接管 · "
+                            } else {
+                                ""
+                            },
+                            this.strategy.mixed_port
                         );
                     }
                     Err(err) => {
@@ -1409,9 +1416,13 @@ impl AppView {
                             this.catalog = Catalog::load().unwrap_or_default();
                             this.mark_applied();
                             this.status = format!(
-                                "已连接 127.0.0.1:{} （HTTP + SOCKS5{}）",
-                                this.strategy.mixed_port,
-                                if this.strategy.tun { " + TUN" } else { "" }
+                                "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
+                                if this.strategy.tun {
+                                    "系统接管 · "
+                                } else {
+                                    ""
+                                },
+                                this.strategy.mixed_port
                             );
                         }
                         Err(err) => {
@@ -1791,7 +1802,11 @@ impl AppView {
             .child(page_title(
                 theme,
                 "总览",
-                "策略文档是权威源。连接会启动捆绑的 mihomo。",
+                if self.strategy.tun {
+                    "系统接管是默认入口。应用无需填代理。Mixed 仍可给显式 HTTP/SOCKS 用。"
+                } else {
+                    "未打开系统接管时，只有填了 Mixed 的应用会进规则。"
+                },
             ))
             .child(
                 h_flex()
@@ -1824,13 +1839,21 @@ impl AppView {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(if connected {
-                                        format!(
-                                            "127.0.0.1:{} · HTTP + SOCKS5{}",
-                                            self.strategy.mixed_port,
-                                            if self.strategy.tun { " + TUN" } else { "" }
-                                        )
+                                        if self.strategy.tun {
+                                            format!(
+                                                "系统接管中 · 应用无需填代理 · Mixed 127.0.0.1:{} 仍可用",
+                                                self.strategy.mixed_port
+                                            )
+                                        } else {
+                                            format!(
+                                                "仅 Mixed 127.0.0.1:{} · 未填代理的应用不会进规则",
+                                                self.strategy.mixed_port
+                                            )
+                                        }
+                                    } else if self.strategy.tun {
+                                        "下次连接将系统接管。首次会要管理员密码。".into()
                                     } else {
-                                        "启动捆绑的 mihomo。".into()
+                                        "启动捆绑的 mihomo。要拦截未填代理的应用，先打开设置里的系统接管。".into()
                                     }),
                             ),
                     )
@@ -1849,6 +1872,11 @@ impl AppView {
                         theme,
                         "Status",
                         if connected { "已连接" } else { "空闲" },
+                    ))
+                    .child(metric(
+                        theme,
+                        "系统接管",
+                        if self.strategy.tun { "开" } else { "关" },
                     ))
                     .child(metric(
                         theme,
@@ -1901,7 +1929,11 @@ impl AppView {
             .child(page_title(
                 theme,
                 "连接",
-                "当前经过 Mixed 端口的流量。应用规则只在流量进入该端口后才会命中。",
+                if self.strategy.tun {
+                    "系统接管打开后，未填代理的应用也会出现在这里。Mixed 仍显示显式代理连接。"
+                } else {
+                    "当前只看到走进 Mixed 的连接。要拦截未填代理的应用，先打开设置里的系统接管。"
+                },
             ))
             .child(
                 h_flex()
@@ -2219,8 +2251,9 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                "Mixed 一口同时提供 HTTP 代理与 SOCKS5。TUN 可接管系统流量。排除器用正则。",
+                "打开系统接管后应用不必填代理。Mixed 一口仍提供 HTTP + SOCKS5。",
             ))
+            .child(self.tun_panel(cx, theme))
             .child(panel(
                 theme,
                 "外观",
@@ -2228,9 +2261,15 @@ impl AppView {
             ))
             .child(panel(
                 theme,
-                "入口",
+                "显式代理（Mixed）",
                 v_flex()
                     .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("主动指定 HTTP/SOCKS 的客户端仍用这个端口。系统接管打开后，未填代理的应用也会进核心。"),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
@@ -2255,8 +2294,7 @@ impl AppView {
                                     },
                                 )
                             }),
-                    )
-                    .child(self.tun_row(cx, theme)),
+                    ),
             ))
             .child(self.updates_panel(cx, theme))
             .child(panel(
@@ -2283,40 +2321,79 @@ impl AppView {
             .child(self.developer_panel(cx, theme))
     }
 
-    fn tun_row(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+    fn set_tun(&mut self, on: bool) {
+        self.strategy.tun = on;
+        if self.connected {
+            if self.persist_and_apply() {
+                self.connected = self.supervisor.is_running();
+                self.status = if on {
+                    "已开启系统接管。应用无需再填代理。".into()
+                } else {
+                    "已关闭系统接管。未填代理的应用不再进核心。".into()
+                };
+            } else {
+                self.connected = self.supervisor.is_running();
+            }
+        } else if self.persist() {
+            self.status = if on {
+                "已记录。下次连接将系统接管；首次会要管理员密码。".into()
+            } else {
+                "已关闭系统接管。".into()
+            };
+        }
+    }
+
+    fn tun_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
         let on = self.strategy.tun;
-        h_flex()
-            .w_full()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .child(
-                v_flex()
-                    .gap(px(2.))
-                    .child(div().text_sm().child("系统接管 (TUN)"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("让 Telegram 等不走 Mixed 的流量进核心。首次连接会要一次管理员密码。改完需重新连接。"),
-                    ),
-            )
-            .child({
-                let mut toggle = Button::new("tun-toggle").small();
-                toggle = if on {
-                    toggle.danger().label("关闭")
-                } else {
-                    toggle.primary().label("开启")
-                };
-                toggle.on_click(move |_, _, app| {
-                    entity.update(app, |this, cx| {
-                        this.strategy.tun = !this.strategy.tun;
-                        this.persist();
-                        cx.notify();
-                    });
-                })
-            })
+        panel(
+            theme,
+            "系统接管",
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(div().text_sm().child("拦截本机流量再按规则分流"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("无需在 Telegram、T3、Grok、自动更新里填写 HTTP/SOCKS。进程 / 域名 / 节点组规则在流量进核心后生效。"),
+                                ),
+                        )
+                        .child({
+                            let mut toggle = Button::new("tun-toggle").small();
+                            toggle = if on {
+                                toggle.danger().label("关闭")
+                            } else {
+                                toggle.primary().label("开启")
+                            };
+                            toggle.on_click(move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    this.set_tun(!this.strategy.tun);
+                                    cx.notify();
+                                });
+                            })
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if on {
+                            "已打开。连接后走 mihomo TUN（自动路由 + 进程识别）。首次或更新核心后会要一次管理员密码，给 mihomo 加 setuid，不是 Network Extension。Mixed 端口仍留给显式代理。"
+                        } else {
+                            "默认关闭。打开并连接后才会接管；未填代理的应用现在不会进规则。"
+                        }),
+                ),
+        )
     }
 
     fn startup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {

@@ -78,7 +78,7 @@ pub struct Strategy {
     /// When true, myproxy writes debug traces to `myproxy.log` and the Settings page.
     #[serde(default)]
     pub developer_mode: bool,
-    /// When true, compile a mihomo TUN inbound so apps that ignore Mixed enter the core.
+    /// When true, compile mihomo TUN so apps need not point HTTP/SOCKS at Mixed.
     #[serde(default)]
     pub tun: bool,
     /// Register a macOS login item when running from a bundled `.app`.
