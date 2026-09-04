@@ -9,7 +9,7 @@ use gpui_kit::component::sidebar::{
     Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, IconName, Selectable, Sizable, StyledExt, Theme, TitleBar,
+    h_flex, v_flex, ActiveTheme, IconName, Root, Selectable, Sizable, StyledExt, Theme, TitleBar,
     WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -931,20 +931,27 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        v_flex()
+        div()
             .size_full()
-            .bg(theme.background)
-            .child(self.title_bar(cx, &theme))
             .child(
-                h_flex()
-                    .id("shell")
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(self.sidebar(cx, &theme))
-                    .child(self.page_view(cx, &theme)),
+                v_flex()
+                    .size_full()
+                    .bg(theme.background)
+                    .child(self.title_bar(cx, &theme))
+                    .child(
+                        h_flex()
+                            .id("shell")
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(self.sidebar(cx, &theme))
+                            .child(self.page_view(cx, &theme)),
+                    ),
             )
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 
