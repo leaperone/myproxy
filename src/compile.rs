@@ -88,6 +88,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
         "MATCH,{}",
         default_group(strategy)
     ));
+    let compiled = rules.len();
     let rules: Vec<serde_yaml::Value> = rules.into_iter().map(serde_yaml::Value::String).collect();
     root.insert("rules".into(), serde_yaml::Value::Sequence(rules));
 
@@ -101,7 +102,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
             catalog.nodes.len(),
             strategy.groups.len(),
             strategy.rule_sets.len(),
-            rules.len()
+            compiled
         ),
     );
     Ok(yaml)

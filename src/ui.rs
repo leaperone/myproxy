@@ -739,13 +739,17 @@ impl Render for RuleSetEditor {
                             .label(via_label(&via))
                             .icon(IconName::ChevronDown)
                             .min_w(px(160.))
-                            .dropdown_menu(move |menu, _, _| {
-                                via_menu(menu, &choices, &via, move |app, value| {
-                                    entity.update(app, |this, cx| {
-                                        this.via = value;
-                                        cx.notify();
-                                    });
-                                })
+                            .dropdown_menu({
+                                let entity = entity.clone();
+                                move |menu, _, _| {
+                                    let entity = entity.clone();
+                                    via_menu(menu, &choices, &via, move |app, value| {
+                                        entity.update(app, |this, cx| {
+                                            this.via = value;
+                                            cx.notify();
+                                        });
+                                    })
+                                }
                             })
                     }),
             )
@@ -2358,9 +2362,9 @@ fn render_rule_set_card(
                         let via_current = via.clone();
                         let choices = via_choices.clone();
                         move |menu, _, _| {
+                            let entity = entity.clone();
+                            let id = id.clone();
                             via_menu(menu, &choices, &via_current, move |app, value| {
-                                let entity = entity.clone();
-                                let id = id.clone();
                                 entity.update(app, |this, cx| {
                                     this.set_selected_rule_via(&id, &value);
                                     cx.notify();
