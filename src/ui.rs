@@ -1011,6 +1011,7 @@ fn initial_page() -> Page {
 pub struct AppView {
     page: Page,
     strategy: Strategy,
+    applied: Strategy,
     catalog: Catalog,
     status: String,
     connected: bool,
@@ -1184,7 +1185,7 @@ impl AppView {
         });
         Self {
             page: initial_page(),
-            status: "策略已加载。用 CLI 或本页编辑，然后点「更新配置」或「连接」。".into(),
+            status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
             connected,
             supervisor,
             url_input: cx.new(|cx| {
@@ -1202,7 +1203,8 @@ impl AppView {
             port_input: cx.new(|cx| {
                 InputState::new(window, cx).default_value(strategy.mixed_port.to_string())
             }),
-            strategy,
+            strategy: strategy.clone(),
+            applied: strategy,
             catalog,
             appearance,
             _appearance_observer: appearance_observer,
@@ -1268,6 +1270,7 @@ impl AppView {
         match self.supervisor.apply(&self.strategy) {
             Ok(cat) => {
                 self.catalog = cat;
+                self.mark_applied();
                 true
             }
             Err(err) => {
@@ -1276,6 +1279,14 @@ impl AppView {
                 false
             }
         }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.strategy != self.applied
+    }
+
+    fn mark_applied(&mut self) {
+        self.applied = self.strategy.clone();
     }
 
     fn clear_traffic(&mut self) -> bool {
@@ -1354,6 +1365,7 @@ impl AppView {
                 match this.supervisor.apply(&this.strategy) {
                     Ok(cat) => {
                         this.catalog = cat;
+                        this.mark_applied();
                         this.status = format!(
                             "已编译 {} 个节点，排除 {}。Mixed {}{}。",
                             this.catalog.nodes.len(),
@@ -1395,6 +1407,7 @@ impl AppView {
                         Ok(()) => {
                             this.connected = true;
                             this.catalog = Catalog::load().unwrap_or_default();
+                            this.mark_applied();
                             this.status = format!(
                                 "已连接 127.0.0.1:{} （HTTP + SOCKS5{}）",
                                 this.strategy.mixed_port,
@@ -1647,12 +1660,6 @@ impl Render for AppView {
 impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
-        let mut toggle = Button::new("toggle-core").small();
-        toggle = if connected {
-            toggle.danger().label("断开")
-        } else {
-            toggle.primary().label("连接")
-        };
         TitleBar::new().child(
             h_flex()
                 .id("title-contents")
@@ -1676,19 +1683,16 @@ impl AppView {
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child(if connected {
-                                    format!("已连接 · mixed {}", self.strategy.mixed_port)
-                                } else {
-                                    "未连接".into()
-                                }),
+                                .child(if connected { "已连接" } else { "未连接" }),
                         )
-                        .child(
-                            Button::new("apply")
-                                .small()
-                                .label("更新配置")
-                                .on_click(self.on_apply(cx)),
-                        )
-                        .child(toggle.on_click(self.on_connect(cx))),
+                        .when(self.is_dirty(), |this| {
+                            this.child(
+                                Button::new("apply")
+                                    .small()
+                                    .label("应用")
+                                    .on_click(self.on_apply(cx)),
+                            )
+                        }),
                 ),
         )
     }
@@ -1764,7 +1768,7 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(match page {
-                        Page::Overview => self.overview(theme).into_any_element(),
+                        Page::Overview => self.overview(cx, theme).into_any_element(),
                         Page::Subscriptions => self.subscriptions(cx, theme).into_any_element(),
                         Page::Groups => self.groups(cx, theme).into_any_element(),
                         Page::Settings => self.settings(cx, theme).into_any_element(),
@@ -1774,7 +1778,14 @@ impl AppView {
             })
     }
 
-    fn overview(&self, theme: &Theme) -> impl IntoElement {
+    fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let connected = self.connected;
+        let mut connect = Button::new("hero-connect").large();
+        connect = if connected {
+            connect.danger().label("断开")
+        } else {
+            connect.primary().label("连接")
+        };
         v_flex()
             .gap_4()
             .child(page_title(
@@ -1784,11 +1795,60 @@ impl AppView {
             ))
             .child(
                 h_flex()
+                    .w_full()
+                    .p_5()
+                    .gap_4()
+                    .items_center()
+                    .justify_between()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.group_box)
+                    .child(
+                        v_flex()
+                            .gap(px(4.))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(status_dot(theme, connected))
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_semibold()
+                                            .child(if connected { "已连接" } else { "未连接" }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if connected {
+                                        format!(
+                                            "127.0.0.1:{} · HTTP + SOCKS5{}",
+                                            self.strategy.mixed_port,
+                                            if self.strategy.tun { " + TUN" } else { "" }
+                                        )
+                                    } else {
+                                        "启动捆绑的 mihomo。".into()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        connect
+                            .h(px(48.))
+                            .px_8()
+                            .min_w(px(132.))
+                            .on_click(self.on_connect(cx)),
+                    ),
+            )
+            .child(
+                h_flex()
                     .gap_3()
                     .child(metric(
                         theme,
                         "Status",
-                        if self.connected { "已连接" } else { "空闲" },
+                        if connected { "已连接" } else { "空闲" },
                     ))
                     .child(metric(
                         theme,
