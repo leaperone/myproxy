@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
       - name: Fetch bundled mihomo
         run: scripts/fetch-mihomo.sh
       - name: Build

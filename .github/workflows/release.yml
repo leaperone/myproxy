@@ -21,6 +21,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
       - name: Resolve version
         id: ver
         env:
