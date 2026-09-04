@@ -6,7 +6,7 @@ Strategy JSON under `~/Library/Application Support/myproxy/` is authoritative. G
 
 ```sh
 scripts/fetch-mihomo.sh
-scripts/dev.sh                 # local watchexec restart
+scripts/dev.sh                 # local watchexec restart + push debug binaries to macbook-air
 scripts/install-macbook-air.sh # release .app on macbook-air, mixed-port 7891
 scripts/dev-air.sh             # compile here, copy binaries, relaunch Air
 cargo run --bin myproxyctl -- capabilities

@@ -5,10 +5,15 @@ cd "$(dirname "$0")/.."
 host="${SSH_HOST:-macbook-air}"
 if [[ "${RELEASE:-}" == "1" ]]; then
   profile=release
-  cargo build --release --bins
 else
   profile=debug
-  cargo build --bins
+fi
+if [[ "${SKIP_BUILD:-}" != "1" ]]; then
+  if [[ "$profile" == "release" ]]; then
+    cargo build --release --bins
+  else
+    cargo build --bins
+  fi
 fi
 remote_app='~/Applications/myproxy.app'
 remote_macos="$remote_app/Contents/MacOS"

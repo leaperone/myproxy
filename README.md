@@ -6,10 +6,10 @@ GPUI controller for a bundled mihomo core. Strategy document is the source of tr
 
 ```sh
 scripts/fetch-mihomo.sh   # Apple Silicon mihomo
-scripts/dev.sh            # local window; restart on .rs/.toml save (needs watchexec)
+scripts/dev.sh            # local window + push debug binaries to macbook-air
 MYPROXY_PAGE=rules scripts/dev.sh   # open 规则 page
 scripts/install-macbook-air.sh      # release .app → macbook-air, mixed-port 7891
-scripts/dev-air.sh                  # rebuild on save and relaunch the Air app
+scripts/dev-air.sh                  # Air only: rebuild on save and relaunch
 ```
 
 Rust 1.98+ (`rust-toolchain.toml`). GPUI has no in-process hot patch; the Air box cannot build GPUI, so `dev-air.sh` compiles here and copies `myproxy` / `myproxyctl` into `~/Applications/myproxy.app`. Air `strategy.json` is not overwritten.
