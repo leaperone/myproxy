@@ -14,6 +14,8 @@ scripts/dev-air.sh                  # rebuild on save and relaunch the Air app
 
 Rust 1.98+ (`rust-toolchain.toml`). GPUI has no in-process hot patch; the Air box cannot build GPUI, so `dev-air.sh` compiles here and copies `myproxy` / `myproxyctl` into `~/Applications/myproxy.app`. Air `strategy.json` is not overwritten.
 
+On macOS the app keeps a menu-bar extra: left-click opens the window, right-click shows 打开窗口 / 连接 / 断开 / 更新配置 / 退出.
+
 ## CLI (agents)
 
 ```sh
