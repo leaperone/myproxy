@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use myproxy::catalog;
-use myproxy::compile;
 use myproxy::paths;
 use myproxy::strategy::{self, Matcher, Strategy};
 use myproxy::supervisor::Supervisor;
@@ -146,8 +145,7 @@ fn main() -> Result<()> {
         Commands::Apply => {
             myproxy::log::debug("ctl", "apply");
             let strategy = Strategy::load()?;
-            let catalog = catalog::refresh(&strategy)?;
-            compile::compile(&strategy, &catalog)?;
+            let catalog = Supervisor::default().apply(&strategy)?;
             println!(
                 "applied {} nodes, {} excluded → {}",
                 catalog.nodes.len(),

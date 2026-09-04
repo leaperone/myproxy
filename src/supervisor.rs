@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::catalog;
+use crate::catalog::{self, Catalog};
 use crate::compile;
+use crate::controller;
 use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
@@ -111,6 +112,16 @@ impl Supervisor {
             ),
         );
         Ok(())
+    }
+
+    pub fn apply(&self, strategy: &Strategy) -> Result<Catalog> {
+        log::debug("supervisor", "apply");
+        let catalog = catalog::refresh(strategy)?;
+        compile::compile(strategy, &catalog)?;
+        if self.is_running() {
+            controller::reload(strategy.mixed_port)?;
+        }
+        Ok(catalog)
     }
 
     pub fn disconnect(&self) -> Result<()> {
