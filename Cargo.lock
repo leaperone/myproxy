@@ -4583,6 +4583,7 @@ dependencies = [
  "dirs 6.0.0",
  "gpui-kit",
  "libc",
+ "objc",
  "regex",
  "serde",
  "serde_json",

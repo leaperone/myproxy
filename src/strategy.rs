@@ -11,7 +11,7 @@ use crate::paths;
 pub const DEFAULT_EXCLUDE: &str =
     r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
 
-pub const STRATEGY_SCHEMA: u32 = 3;
+pub const STRATEGY_SCHEMA: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Strategy {
@@ -22,6 +22,18 @@ pub struct Strategy {
     /// When true, myproxy writes debug traces to `myproxy.log` and the Settings page.
     #[serde(default)]
     pub developer_mode: bool,
+    /// Register a macOS login item when running from a bundled `.app`.
+    #[serde(default)]
+    pub launch_at_login: bool,
+    /// Do not show the main window on process start.
+    #[serde(default)]
+    pub silent_launch: bool,
+    /// Do not construct the main window until the tray asks; hide the Dock icon.
+    #[serde(default)]
+    pub lite_mode: bool,
+    /// Call `Supervisor::connect` during process start.
+    #[serde(default)]
+    pub connect_on_launch: bool,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
@@ -107,6 +119,10 @@ impl Default for Strategy {
             mixed_port: 17890,
             exclude_filter: DEFAULT_EXCLUDE.into(),
             developer_mode: false,
+            launch_at_login: false,
+            silent_launch: false,
+            lite_mode: false,
+            connect_on_launch: false,
             subscriptions: Vec::new(),
             groups: vec![Group::all_nodes("PROXY".into(), "select".into())],
             rule_sets: Vec::new(),

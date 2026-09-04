@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod compile;
 pub mod controller;
 pub mod log;
+pub mod login_item;
 pub mod paths;
 pub mod strategy;
 pub mod supervisor;
