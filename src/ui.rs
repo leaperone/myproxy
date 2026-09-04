@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
@@ -9,11 +10,12 @@ use gpui_kit::component::sidebar::{
 };
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme, IconName, Selectable, Sizable, StyledExt, Theme, TitleBar,
+    WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::strategy::{parse_list, Group, Rule, Strategy};
+use myproxy::strategy::{join_list, parse_list, Group, Rule, Strategy};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,451 @@ fn normalize_suffix(raw: &str) -> String {
 struct ViaChoice {
     value: String,
     label: String,
+}
+
+const REGION_PRESETS: &[(&str, &[&str])] = &[
+    ("JP", &["jp", "日", "tokyo", "东京"]),
+    ("US", &["us", "美"]),
+    ("HK", &["hk", "港"]),
+    ("TW", &["tw", "台"]),
+];
+
+struct GroupEditor {
+    parent: Entity<AppView>,
+    edit_id: Option<String>,
+    notice: String,
+    all_nodes: bool,
+    kind: String,
+    name: Entity<InputState>,
+    sources: Entity<InputState>,
+    contains: Entity<InputState>,
+    excludes: Entity<InputState>,
+    include: Vec<String>,
+    blocked: Vec<String>,
+}
+
+impl GroupEditor {
+    fn new(
+        parent: Entity<AppView>,
+        existing: Option<Group>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let edit_id = existing.as_ref().map(|g| g.id.clone());
+        let all_nodes = existing.as_ref().map(|g| g.all_nodes).unwrap_or(false);
+        let kind = existing
+            .as_ref()
+            .map(|g| {
+                if g.kind == "url-test" {
+                    "url-test"
+                } else {
+                    "select"
+                }
+            })
+            .unwrap_or("select")
+            .to_string();
+        let include = existing
+            .as_ref()
+            .map(|g| g.include.clone())
+            .unwrap_or_default();
+        let blocked = existing
+            .as_ref()
+            .map(|g| g.exclude.clone())
+            .unwrap_or_default();
+        let name = existing
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        let sources = existing
+            .as_ref()
+            .map(|g| join_list(&g.sources))
+            .unwrap_or_default();
+        let contains = existing
+            .as_ref()
+            .map(|g| join_list(&g.name_contains))
+            .unwrap_or_default();
+        let excludes = existing
+            .as_ref()
+            .map(|g| join_list(&g.name_excludes))
+            .unwrap_or_default();
+        Self {
+            parent,
+            edit_id,
+            notice: String::new(),
+            all_nodes,
+            kind,
+            name: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("组名")
+                    .default_value(name)
+            }),
+            sources: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("来源：空=任意订阅")
+                    .default_value(sources)
+            }),
+            contains: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("名称含：jp, tokyo, 日 或 JP*")
+                    .default_value(contains)
+            }),
+            excludes: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("名称不含：IEPL, x0.1")
+                    .default_value(excludes)
+            }),
+            include,
+            blocked,
+        }
+    }
+
+    fn set_list_value(
+        input: &Entity<InputState>,
+        parts: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = join_list(parts);
+        input.update(cx, |i, cx| {
+            i.set_value(text, window, cx);
+        });
+    }
+
+    fn draft(&self, cx: &App) -> Group {
+        Group {
+            id: self.edit_id.clone().unwrap_or_default(),
+            name: self.name.read(cx).value().trim().to_string(),
+            kind: self.kind.clone(),
+            all_nodes: self.all_nodes,
+            sources: parse_list(&self.sources.read(cx).value()),
+            name_contains: parse_list(&self.contains.read(cx).value()),
+            name_excludes: parse_list(&self.excludes.read(cx).value()),
+            include: self.include.clone(),
+            exclude: self.blocked.clone(),
+            filter: String::new(),
+        }
+    }
+
+    fn commit(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut next = self.draft(cx);
+        if next.name.is_empty() {
+            self.notice = "需要组名。".into();
+            cx.notify();
+            return false;
+        }
+        if !next.all_nodes
+            && next.sources.is_empty()
+            && next.name_contains.is_empty()
+            && next.include.is_empty()
+        {
+            self.notice = "条件组需要来源、名称含或钉住；否则打开「全部」。".into();
+            cx.notify();
+            return false;
+        }
+        let edit_id = self.edit_id.clone();
+        let result = self.parent.update(cx, |parent, cx| {
+            if let Some(id) = &edit_id {
+                if !parent.strategy.update_group(id, next) {
+                    return Err("保存失败：节点组已不存在。".to_string());
+                }
+            } else {
+                next.id = uuid::Uuid::new_v4().to_string();
+                parent.strategy.add_group(next);
+            }
+            if parent.persist() {
+                parent.group_modal_open = false;
+                parent.group_edit_id = None;
+                parent.status = if edit_id.is_some() {
+                    "已保存节点组。".into()
+                } else {
+                    "已添加节点组。".into()
+                };
+                cx.notify();
+                Ok(())
+            } else {
+                Err(parent.status.clone())
+            }
+        });
+        match result {
+            Ok(()) => true,
+            Err(msg) => {
+                self.notice = msg;
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn toggle_source(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let mut sources = parse_list(&self.sources.read(cx).value());
+        if sources.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            sources.retain(|s| !s.eq_ignore_ascii_case(name));
+        } else {
+            sources.push(name.to_string());
+        }
+        Self::set_list_value(&self.sources, &sources, window, cx);
+    }
+
+    fn remove_token(
+        input: &Entity<InputState>,
+        token: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut parts = parse_list(&input.read(cx).value());
+        parts.retain(|p| p != token);
+        Self::set_list_value(input, &parts, window, cx);
+    }
+
+    fn append_contains(&mut self, tokens: &[&str], window: &mut Window, cx: &mut Context<Self>) {
+        let mut parts = parse_list(&self.contains.read(cx).value());
+        for token in tokens {
+            if !parts.iter().any(|p| p.eq_ignore_ascii_case(token)) {
+                parts.push((*token).to_string());
+            }
+        }
+        self.all_nodes = false;
+        Self::set_list_value(&self.contains, &parts, window, cx);
+    }
+
+    fn pin_member(&mut self, name: &str) {
+        self.blocked.retain(|n| n != name);
+        if !self.include.iter().any(|n| n == name) {
+            self.include.push(name.to_string());
+        }
+        self.notice = format!("已钉住 {name}。保存后生效。");
+    }
+
+    fn block_member(&mut self, name: &str) {
+        self.include.retain(|n| n != name);
+        if !self.blocked.iter().any(|n| n == name) {
+            self.blocked.push(name.to_string());
+        }
+        self.notice = format!("已排除 {name}。保存后生效。");
+    }
+
+    fn unpin_member(&mut self, name: &str) {
+        self.include.retain(|n| n != name);
+        self.notice = format!("取消钉住 {name}。");
+    }
+
+    fn unblock_member(&mut self, name: &str) {
+        self.blocked.retain(|n| n != name);
+        self.notice = format!("取消排除 {name}。");
+    }
+}
+
+impl Render for GroupEditor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let parent = self.parent.read(cx);
+        let theme = cx.theme().clone();
+        let draft = self.draft(cx);
+        let members = catalog::resolve_group_members(&draft, &parent.catalog);
+        let contains = parse_list(&self.contains.read(cx).value());
+        let excludes = parse_list(&self.excludes.read(cx).value());
+        let sources = parse_list(&self.sources.read(cx).value());
+        let muted_fg = theme.muted_foreground;
+        let border = theme.border;
+        let radius = theme.radius;
+        let group_box = theme.group_box;
+        let subscriptions = parent.strategy.subscriptions.clone();
+
+        v_flex()
+            .gap_3()
+            .when(!self.notice.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child(self.notice.clone()),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(px(160.)).child(Input::new(&self.name)))
+                    .child({
+                        let entity = entity.clone();
+                        let mut group = ButtonGroup::new("group-mode")
+                            .compact()
+                            .outline()
+                            .small();
+                        group = group
+                            .child(
+                                Button::new("group-mode-match")
+                                    .small()
+                                    .label("条件")
+                                    .selected(!self.all_nodes),
+                            )
+                            .child(
+                                Button::new("group-mode-all")
+                                    .small()
+                                    .label("全部")
+                                    .selected(self.all_nodes),
+                            );
+                        group.on_click(move |ixs, _, app| {
+                            let Some(&ix) = ixs.first() else {
+                                return;
+                            };
+                            entity.update(app, |this, cx| {
+                                this.all_nodes = ix == 1;
+                                cx.notify();
+                            });
+                        })
+                    })
+                    .child({
+                        let entity = entity.clone();
+                        let mut group = ButtonGroup::new("group-kind")
+                            .compact()
+                            .outline()
+                            .small();
+                        group = group
+                            .child(
+                                Button::new("group-kind-select")
+                                    .small()
+                                    .label("select")
+                                    .selected(self.kind != "url-test"),
+                            )
+                            .child(
+                                Button::new("group-kind-url")
+                                    .small()
+                                    .label("url-test")
+                                    .selected(self.kind == "url-test"),
+                            );
+                        group.on_click(move |ixs, _, app| {
+                            let Some(&ix) = ixs.first() else {
+                                return;
+                            };
+                            entity.update(app, |this, cx| {
+                                this.kind = if ix == 1 {
+                                    "url-test".into()
+                                } else {
+                                    "select".into()
+                                };
+                                cx.notify();
+                            });
+                        })
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .flex_wrap()
+                    .child(div().text_xs().text_color(muted_fg).child("来源"))
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("src-any")
+                            .small()
+                            .label("任意")
+                            .selected(sources.is_empty())
+                            .on_click(move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    GroupEditor::set_list_value(&this.sources, &[], window, cx);
+                                    cx.notify();
+                                });
+                            })
+                    })
+                    .children(subscriptions.iter().map(|sub| {
+                        let entity = entity.clone();
+                        let name = sub.name.clone();
+                        let selected = sources.iter().any(|s| s.eq_ignore_ascii_case(&name));
+                        Button::new(SharedString::from(format!("src-{name}")))
+                            .small()
+                            .label(name.clone())
+                            .selected(selected)
+                            .on_click(move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    this.toggle_source(&name, window, cx);
+                                    cx.notify();
+                                });
+                            })
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().child(Input::new(&self.contains)))
+                    .children(REGION_PRESETS.iter().map(|(label, tokens)| {
+                        let entity = entity.clone();
+                        let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+                        Button::new(SharedString::from(format!("region-{label}")))
+                            .small()
+                            .label(*label)
+                            .on_click(move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+                                    this.append_contains(&refs, window, cx);
+                                    cx.notify();
+                                });
+                            })
+                    })),
+            )
+            .when(!contains.is_empty(), |this| {
+                this.child(chip_row(
+                    entity.clone(),
+                    "contains",
+                    ChipField::Contains,
+                    &contains,
+                ))
+            })
+            .child(Input::new(&self.excludes))
+            .when(!excludes.is_empty(), |this| {
+                this.child(chip_row(
+                    entity.clone(),
+                    "excludes",
+                    ChipField::Excludes,
+                    &excludes,
+                ))
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(format!("预览 · {} 个节点 · {}", members.len(), draft.policy_label())),
+            )
+            .child(
+                v_flex()
+                    .id("group-preview")
+                    .max_h(px(240.))
+                    .overflow_y_scroll()
+                    .rounded(radius)
+                    .border_1()
+                    .border_color(border)
+                    .bg(group_box)
+                    .when(members.is_empty() && self.blocked.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .p_3()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(if parent.catalog.nodes.is_empty() {
+                                    "目录是空的。先到订阅页 Apply。".to_string()
+                                } else {
+                                    "没有成员。放宽条件，或钉住节点。".to_string()
+                                }),
+                        )
+                    })
+                    .children(members.iter().map(|name| {
+                        render_member_row(
+                            entity.clone(),
+                            &theme,
+                            name,
+                            self.include.iter().any(|n| n == name),
+                            false,
+                        )
+                    }))
+                    .children(
+                        self.blocked
+                            .iter()
+                            .filter(|name| !members.iter().any(|m| m == *name))
+                            .map(|name| render_member_row(entity.clone(), &theme, name, false, true)),
+                    ),
+            )
+    }
 }
 
 fn default_via(strategy: &Strategy) -> String {
@@ -159,9 +606,8 @@ pub struct AppView {
     rule_edit_id: Option<String>,
     url_input: Entity<InputState>,
     name_input: Entity<InputState>,
-    group_name: Entity<InputState>,
-    group_sources: Entity<InputState>,
-    group_contains: Entity<InputState>,
+    group_modal_open: bool,
+    group_edit_id: Option<String>,
     rule_match: Entity<InputState>,
     rule_via: String,
     rule_query: Entity<InputState>,
@@ -179,8 +625,10 @@ impl AppView {
                 .await;
             if this
                 .update(cx, |this, cx| {
-                    if let Ok(strategy) = Strategy::load() {
-                        this.strategy = strategy;
+                    if !this.group_modal_open && this.rule_edit_id.is_none() {
+                        if let Ok(strategy) = Strategy::load() {
+                            this.strategy = strategy;
+                        }
                     }
                     if let Ok(catalog) = Catalog::load() {
                         this.catalog = catalog;
@@ -206,13 +654,8 @@ impl AppView {
                 InputState::new(window, cx).placeholder("https://…/clash.yaml")
             }),
             name_input: cx.new(|cx| InputState::new(window, cx).placeholder("订阅名")),
-            group_name: cx.new(|cx| InputState::new(window, cx).placeholder("组名")),
-            group_sources: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("来源：Kitty, Mojie（空=任意订阅）")
-            }),
-            group_contains: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("名称含：jp, tokyo, 日")
-            }),
+            group_modal_open: false,
+            group_edit_id: None,
             rule_draft_kind: RuleDraftKind::Suffix,
             rule_edit_id: None,
             rule_match: cx.new(|cx| {
@@ -389,6 +832,62 @@ impl AppView {
                 self.status = "已添加规则。".into();
             }
         }
+    }
+
+    fn open_group_dialog(&mut self, id: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        window.close_all_dialogs(cx);
+        let existing = id.and_then(|id| self.strategy.groups.iter().find(|g| g.id == id).cloned());
+        if id.is_some() && existing.is_none() {
+            self.status = "找不到这个节点组。".into();
+            return;
+        }
+        self.group_modal_open = true;
+        self.group_edit_id = existing.as_ref().map(|g| g.id.clone());
+        let parent = cx.entity();
+        let editor = cx.new(|cx| GroupEditor::new(parent.clone(), existing, window, cx));
+        let editing = id.is_some();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(if editing {
+                    "编辑节点组"
+                } else {
+                    "添加节点组"
+                })
+                .width(px(720.))
+                .overlay_closable(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(if editing { "保存" } else { "添加" })
+                        .cancel_text("取消")
+                        .show_cancel(true)
+                        .on_ok({
+                            let editor = editor.clone();
+                            move |_, window, cx| editor.update(cx, |ed, cx| ed.commit(window, cx))
+                        })
+                        .on_cancel({
+                            let parent = parent.clone();
+                            move |_, _, cx| {
+                                parent.update(cx, |this, cx| {
+                                    this.group_modal_open = false;
+                                    this.group_edit_id = None;
+                                    cx.notify();
+                                });
+                                true
+                            }
+                        }),
+                )
+                .on_close({
+                    let parent = parent.clone();
+                    move |_, _, cx| {
+                        parent.update(cx, |this, cx| {
+                            this.group_modal_open = false;
+                            this.group_edit_id = None;
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(editor.clone())
+        });
     }
 
     fn set_selected_rule_via(&mut self, id: &str, via: &str) {
@@ -707,131 +1206,35 @@ impl AppView {
 
     fn groups(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
+        let accent = theme.accent;
         v_flex()
             .gap_4()
             .child(page_title(
                 theme,
                 "节点组",
-                "条件组：来源 ∩ 名称包含（多条为或）∪ 钉住 − 排除。空条件不会再变成「全部节点」。PROXY 用「全部」。",
+                "点卡片打开编辑窗。来源 ∩ 名称含（或，支持 * ?）∪ 钉住 − 排除。名称不含只打自动命中。",
             ))
             .child(
-                v_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().w(px(140.)).child(Input::new(&self.group_name)))
-                            .child(div().flex_1().child(Input::new(&self.group_sources))),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().flex_1().child(Input::new(&self.group_contains)))
-                            .child({
-                                let entity = entity.clone();
-                                Button::new("add-group").primary().label("添加条件组").on_click(
-                                    move |_, window, app| {
-                                        entity.update(app, |this, cx| {
-                                            let name = this.group_name.read(cx).value().to_string();
-                                            let sources =
-                                                parse_list(&this.group_sources.read(cx).value());
-                                            let contains =
-                                                parse_list(&this.group_contains.read(cx).value());
-                                            if name.trim().is_empty() {
-                                                this.status = "需要组名。".into();
-                                            } else if sources.is_empty() && contains.is_empty() {
-                                                this.status =
-                                                    "条件组需要来源或名称包含；否则请用「添加全部」。"
-                                                        .into();
-                                            } else {
-                                                this.strategy.add_group(Group::matching(
-                                                    name.trim().into(),
-                                                    "select".into(),
-                                                    sources,
-                                                    contains,
-                                                ));
-                                                this.persist();
-                                                this.group_name.update(cx, |i, cx| {
-                                                    i.set_value("", window, cx)
-                                                });
-                                            }
-                                            cx.notify();
-                                        });
-                                    },
-                                )
-                            })
-                            .child({
-                                let entity = entity.clone();
-                                Button::new("add-group-all").label("添加全部").on_click(
-                                    move |_, window, app| {
-                                        entity.update(app, |this, cx| {
-                                            let name = this.group_name.read(cx).value().to_string();
-                                            let sources =
-                                                parse_list(&this.group_sources.read(cx).value());
-                                            if name.trim().is_empty() {
-                                                this.status = "需要组名。".into();
-                                            } else {
-                                                let mut group = Group::all_nodes(
-                                                    name.trim().into(),
-                                                    "select".into(),
-                                                );
-                                                group.sources = sources;
-                                                this.strategy.add_group(group);
-                                                this.persist();
-                                                this.group_name.update(cx, |i, cx| {
-                                                    i.set_value("", window, cx)
-                                                });
-                                            }
-                                            cx.notify();
-                                        });
-                                    },
-                                )
-                            }),
-                    ),
+                h_flex().child({
+                    let entity = entity.clone();
+                    Button::new("add-group")
+                        .primary()
+                        .label("添加节点组")
+                        .on_click(move |_, window, app| {
+                            entity.update(app, |this, cx| {
+                                this.open_group_dialog(None, window, cx);
+                                cx.notify();
+                            });
+                        })
+                }),
             )
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
             })
             .children(self.strategy.groups.iter().map(|group| {
-                let members = catalog::resolve_group_members(group, &self.catalog);
-                let preview = members.iter().take(6).cloned().collect::<Vec<_>>().join(" · ");
-                let id = group.id.clone();
-                let entity = entity.clone();
-                panel(
-                    theme,
-                    &format!("{}  ·  {}  ·  {} 个节点", group.name, group.kind, members.len()),
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(group.policy_label()),
-                        )
-                        .child(
-                            div().text_xs().child(if preview.is_empty() {
-                                "没有成员。条件为空就不会自动进组；先 Apply 订阅或钉住节点。"
-                                    .into()
-                            } else {
-                                preview
-                            }),
-                        )
-                        .child(
-                            h_flex().justify_end().child(
-                                Button::new(SharedString::from(format!("del-group-{id}")))
-                                    .small()
-                                    .danger()
-                                    .label("删除")
-                                    .on_click(move |_, _, app| {
-                                        entity.update(app, |this, cx| {
-                                            this.strategy.remove_group(&id);
-                                            this.persist();
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                        ),
-                )
+                let count = catalog::resolve_group_members(group, &self.catalog).len();
+                let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
+                render_group_card(entity.clone(), theme, group, count, selected, accent)
             }))
     }
 
@@ -1146,6 +1549,208 @@ impl AppView {
                     }),
             ))
     }
+}
+
+#[derive(Clone, Copy)]
+enum ChipField {
+    Contains,
+    Excludes,
+}
+
+fn chip_row(
+    entity: Entity<GroupEditor>,
+    prefix: &str,
+    field: ChipField,
+    tokens: &[String],
+) -> impl IntoElement {
+    h_flex().gap_1().flex_wrap().children(tokens.iter().map(|token| {
+        let entity = entity.clone();
+        let token = token.clone();
+        let id = SharedString::from(format!("{prefix}-{token}"));
+        Button::new(id)
+            .small()
+            .label(format!("{token} ×"))
+            .on_click(move |_, window, app| {
+                entity.update(app, |this, cx| {
+                    match field {
+                        ChipField::Contains => {
+                            GroupEditor::remove_token(&this.contains, &token, window, cx);
+                        }
+                        ChipField::Excludes => {
+                            GroupEditor::remove_token(&this.excludes, &token, window, cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+    }))
+}
+
+fn render_member_row(
+    entity: Entity<GroupEditor>,
+    theme: &Theme,
+    name: &str,
+    pinned: bool,
+    blocked: bool,
+) -> impl IntoElement {
+    let name_owned = name.to_string();
+    let muted_fg = theme.muted_foreground;
+    let accent = theme.accent;
+    h_flex()
+        .id(SharedString::from(format!("member-{name}")))
+        .w_full()
+        .px_3()
+        .py_1()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_xs()
+                .when(blocked, |this| this.text_color(muted_fg))
+                .child(name.to_string()),
+        )
+        .when(pinned, |this| this.child(pill(theme, "钉住", accent)))
+        .when(blocked, |this| this.child(pill(theme, "排除", theme.warning)))
+        .when(pinned, |this| {
+            let entity = entity.clone();
+            let name = name_owned.clone();
+            this.child(
+                Button::new(SharedString::from(format!("unpin-{name}")))
+                    .small()
+                    .label("取消钉住")
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.unpin_member(&name);
+                            cx.notify();
+                        });
+                    }),
+            )
+        })
+        .when(blocked && !pinned, |this| {
+            let entity = entity.clone();
+            let name = name_owned.clone();
+            this.child(
+                Button::new(SharedString::from(format!("unblock-{name}")))
+                    .small()
+                    .label("取消排除")
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.unblock_member(&name);
+                            cx.notify();
+                        });
+                    }),
+            )
+        })
+        .when(!pinned && !blocked, |this| {
+            let pin_entity = entity.clone();
+            let pin_name = name_owned.clone();
+            let block_entity = entity.clone();
+            let block_name = name_owned.clone();
+            this.child(
+                Button::new(SharedString::from(format!("pin-{pin_name}")))
+                    .small()
+                    .label("钉住")
+                    .on_click(move |_, _, app| {
+                        pin_entity.update(app, |this, cx| {
+                            this.pin_member(&pin_name);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("block-{block_name}")))
+                    .small()
+                    .label("排除")
+                    .on_click(move |_, _, app| {
+                        block_entity.update(app, |this, cx| {
+                            this.block_member(&block_name);
+                            cx.notify();
+                        });
+                    }),
+            )
+        })
+}
+
+fn render_group_card(
+    entity: Entity<AppView>,
+    theme: &Theme,
+    group: &Group,
+    count: usize,
+    selected: bool,
+    accent: Hsla,
+) -> impl IntoElement {
+    let id = group.id.clone();
+    let del_id = group.id.clone();
+    let muted = theme.muted;
+    let muted_fg = theme.muted_foreground;
+    v_flex()
+        .id(SharedString::from(format!("group-card-{id}")))
+        .p_4()
+        .gap_2()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.group_box)
+        .cursor_pointer()
+        .when(selected, |this| this.bg(accent.opacity(0.14)))
+        .hover(move |style| style.bg(muted))
+        .on_click({
+            let entity = entity.clone();
+            let id = id.clone();
+            move |_, window, app| {
+                entity.update(app, |this, cx| {
+                    this.open_group_dialog(Some(&id), window, cx);
+                    cx.notify();
+                });
+            }
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child(format!("{}  ·  {}  ·  {} 个节点", group.name, group.kind, count)),
+                )
+                .child({
+                    let entity = entity.clone();
+                    Button::new(SharedString::from(format!("del-group-{del_id}")))
+                        .small()
+                        .danger()
+                        .label("删除")
+                        .on_click(move |_, window, app| {
+                            app.stop_propagation();
+                            let close_modal = entity
+                                .read(app)
+                                .group_edit_id
+                                .as_deref()
+                                == Some(del_id.as_str());
+                            entity.update(app, |this, cx| {
+                                if close_modal {
+                                    this.group_modal_open = false;
+                                    this.group_edit_id = None;
+                                }
+                                this.strategy.remove_group(&del_id);
+                                this.persist();
+                                cx.notify();
+                            });
+                            if close_modal {
+                                window.close_dialog(app);
+                            }
+                        })
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted_fg)
+                .child(group.policy_label()),
+        )
 }
 
 fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {

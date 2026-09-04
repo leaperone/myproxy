@@ -45,9 +45,12 @@ pub struct Group {
     /// Subscription display names. Empty means any subscription.
     #[serde(default)]
     pub sources: Vec<String>,
-    /// Case-insensitive substrings, OR'd. Ignored when `all_nodes` is true.
+    /// Case-insensitive substrings or `*` `?` wildcards, OR'd. Ignored when `all_nodes` is true.
     #[serde(default)]
     pub name_contains: Vec<String>,
+    /// Case-insensitive patterns, OR'd. Drops automatic matches only; pins stay.
+    #[serde(default)]
+    pub name_excludes: Vec<String>,
     #[serde(default)]
     pub include: Vec<String>,
     #[serde(default)]
@@ -163,6 +166,15 @@ impl Strategy {
         self.rules.last().expect("just pushed")
     }
 
+    pub fn update_group(&mut self, id: &str, mut next: Group) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
+            return false;
+        };
+        next.id = group.id.clone();
+        *group = next;
+        true
+    }
+
     pub fn update_rule(&mut self, id: &str, mut next: Rule) -> bool {
         let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) else {
             return false;
@@ -213,6 +225,7 @@ impl Group {
             all_nodes: true,
             sources: Vec::new(),
             name_contains: Vec::new(),
+            name_excludes: Vec::new(),
             include: Vec::new(),
             exclude: Vec::new(),
             filter: String::new(),
@@ -232,6 +245,7 @@ impl Group {
             all_nodes: false,
             sources,
             name_contains,
+            name_excludes: Vec::new(),
             include: Vec::new(),
             exclude: Vec::new(),
             filter: String::new(),
@@ -239,29 +253,34 @@ impl Group {
     }
 
     pub fn policy_label(&self) -> String {
+        let mut parts = Vec::new();
         if self.all_nodes {
             if self.sources.is_empty() {
-                "全部已导入节点".into()
+                parts.push("全部已导入节点".into());
             } else {
-                format!("全部 · {}", self.sources.join(" / "))
+                parts.push(format!("全部 · {}", self.sources.join(" / ")));
             }
         } else {
-            let mut parts = Vec::new();
             if !self.sources.is_empty() {
                 parts.push(format!("来源 {}", self.sources.join(" / ")));
             }
             if !self.name_contains.is_empty() {
                 parts.push(format!("名称含 {}", self.name_contains.join(" / ")));
             }
-            if !self.include.is_empty() {
-                parts.push(format!("钉住 {}", self.include.len()));
-            }
             if parts.is_empty() {
-                "无自动匹配（仅钉住）".into()
-            } else {
-                parts.join(" · ")
+                parts.push("无自动匹配（仅钉住）".into());
             }
         }
+        if !self.name_excludes.is_empty() {
+            parts.push(format!("名称不含 {}", self.name_excludes.join(" / ")));
+        }
+        if !self.include.is_empty() {
+            parts.push(format!("钉住 {}", self.include.len()));
+        }
+        if !self.exclude.is_empty() {
+            parts.push(format!("排除 {}", self.exclude.len()));
+        }
+        parts.join(" · ")
     }
 
     fn migrate_legacy(&mut self) {
@@ -285,6 +304,10 @@ pub fn parse_list(raw: &str) -> Vec<String> {
         .map(|part| part.trim().to_string())
         .filter(|part| !part.is_empty())
         .collect()
+}
+
+pub fn join_list(parts: &[String]) -> String {
+    parts.join(", ")
 }
 
 fn split_legacy_filter(raw: &str) -> Vec<String> {

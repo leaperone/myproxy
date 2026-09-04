@@ -182,17 +182,64 @@ fn group_accepts(group: &crate::strategy::Group, node: &Node) -> bool {
     if !source_matches(group, node) {
         return false;
     }
+    if group
+        .name_excludes
+        .iter()
+        .any(|pattern| name_matches_pattern(&node.name, pattern))
+    {
+        return false;
+    }
     if group.all_nodes {
         return true;
     }
     if group.name_contains.is_empty() {
         return false;
     }
-    let haystack = node.name.to_lowercase();
-    group.name_contains.iter().any(|pattern| {
-        let needle = pattern.trim().to_lowercase();
-        !needle.is_empty() && haystack.contains(&needle)
-    })
+    group
+        .name_contains
+        .iter()
+        .any(|pattern| name_matches_pattern(&node.name, pattern))
+}
+
+fn name_matches_pattern(text: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let text = text.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return text.contains(&pattern);
+    }
+    wildcard_match(
+        &pattern.chars().collect::<Vec<_>>(),
+        &text.chars().collect::<Vec<_>>(),
+    )
+}
+
+fn wildcard_match(pattern: &[char], value: &[char]) -> bool {
+    let (mut p, mut v) = (0usize, 0usize);
+    let (mut star, mut star_v) = (None, 0usize);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            star_v = v;
+        } else if let Some(s) = star {
+            p = s + 1;
+            star_v += 1;
+            v = star_v;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn source_matches(group: &crate::strategy::Group, node: &Node) -> bool {

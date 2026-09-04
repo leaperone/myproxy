@@ -61,6 +61,8 @@ enum GroupCmd {
         source: Vec<String>,
         #[arg(long = "contains")]
         contains: Vec<String>,
+        #[arg(long = "not-contains")]
+        not_contains: Vec<String>,
     },
     Set {
         name: String,
@@ -70,6 +72,8 @@ enum GroupCmd {
         source: Vec<String>,
         #[arg(long = "contains")]
         contains: Vec<String>,
+        #[arg(long = "not-contains")]
+        not_contains: Vec<String>,
     },
     Remove { name: String },
     Include { group: String, node: String },
@@ -193,13 +197,17 @@ fn main() -> Result<()> {
                 all,
                 source,
                 contains,
+                not_contains,
             } => {
                 let mut strategy = Strategy::load()?;
-                let group = if all {
-                    strategy::Group::all_nodes(name.clone(), kind)
+                let mut group = if all {
+                    let mut group = strategy::Group::all_nodes(name.clone(), kind);
+                    group.sources = source;
+                    group
                 } else {
                     strategy::Group::matching(name.clone(), kind, source, contains)
                 };
+                group.name_excludes = not_contains;
                 strategy.add_group(group);
                 strategy.save()?;
                 println!("added group {name}");
@@ -209,6 +217,7 @@ fn main() -> Result<()> {
                 all,
                 source,
                 contains,
+                not_contains,
             } => {
                 let mut strategy = Strategy::load()?;
                 {
@@ -224,6 +233,9 @@ fn main() -> Result<()> {
                     if !contains.is_empty() {
                         some.name_contains = contains;
                         some.all_nodes = false;
+                    }
+                    if !not_contains.is_empty() {
+                        some.name_excludes = not_contains;
                     }
                 }
                 strategy.save()?;
