@@ -6,11 +6,13 @@ GPUI controller for a bundled mihomo core. Strategy document is the source of tr
 
 ```sh
 scripts/fetch-mihomo.sh   # Apple Silicon mihomo
-scripts/dev.sh            # restart on .rs/.toml save (needs watchexec)
+scripts/dev.sh            # local window; restart on .rs/.toml save (needs watchexec)
 MYPROXY_PAGE=rules scripts/dev.sh   # open 规则 page
+scripts/install-macbook-air.sh      # release .app → macbook-air, mixed-port 7891
+scripts/dev-air.sh                  # rebuild on save and relaunch the Air app
 ```
 
-Rust 1.98+ (`rust-toolchain.toml`). GPUI has no in-process hot patch; `dev.sh` kills and relaunches the window.
+Rust 1.98+ (`rust-toolchain.toml`). GPUI has no in-process hot patch; the Air box cannot build GPUI, so `dev-air.sh` compiles here and copies `myproxy` / `myproxyctl` into `~/Applications/myproxy.app`. Air `strategy.json` is not overwritten.
 
 ## CLI (agents)
 
@@ -28,4 +30,4 @@ cargo run --bin myproxyctl -- apply
 cargo run --bin myproxyctl -- connect
 ```
 
-Mixed port is HTTP proxy and SOCKS5 on the same loopback port (default **17890**, so it does not collide with Clash/MClash on 7890).
+Mixed port is HTTP proxy and SOCKS5 on the same loopback port (local default **17890**; Air install uses **7891**).

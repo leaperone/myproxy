@@ -349,11 +349,11 @@ impl Rule {
 
     pub fn kind_label(&self) -> &'static str {
         if !self.app.is_empty() {
-            "应用"
+            "进程"
         } else if !self.keyword.is_empty() {
             "关键字"
         } else if !self.domain.is_empty() {
-            "精确"
+            "域名"
         } else if !self.suffix.is_empty() {
             "后缀"
         } else {

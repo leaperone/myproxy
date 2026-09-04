@@ -41,8 +41,8 @@ impl RuleDraftKind {
 
     fn label(self) -> &'static str {
         match self {
-            Self::App => "应用",
-            Self::Exact => "精确",
+            Self::App => "进程",
+            Self::Exact => "域名",
             Self::Suffix => "后缀",
             Self::Keyword => "关键字",
         }
@@ -440,7 +440,7 @@ impl AppView {
                         .child(
                             Button::new("apply")
                                 .small()
-                                .label("应用")
+                                .label("更新配置")
                                 .on_click(self.on_apply(cx)),
                         )
                         .child(toggle.on_click(self.on_connect(cx))),
