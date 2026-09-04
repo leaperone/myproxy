@@ -18,6 +18,7 @@ use crate::strategy::Strategy;
 pub struct Supervisor {
     child: Mutex<Option<Child>>,
     running_tun: Mutex<bool>,
+    running_se: Mutex<bool>,
 }
 
 impl Default for Supervisor {
@@ -25,14 +26,16 @@ impl Default for Supervisor {
         Self {
             child: Mutex::new(None),
             running_tun: Mutex::new(false),
+            running_se: Mutex::new(false),
         }
     }
 }
 
 impl Supervisor {
-    pub fn adopt_running(&self, tun: bool) {
+    pub fn adopt_running(&self, tun: bool, system_extension: bool) {
         if self.is_running() {
             *self.running_tun.lock().expect("supervisor lock") = tun;
+            *self.running_se.lock().expect("supervisor lock") = system_extension;
         }
     }
 
@@ -40,8 +43,8 @@ impl Supervisor {
         log::info(
             "supervisor",
             format!(
-                "connect mixed-port {} tun={}",
-                strategy.mixed_port, strategy.tun
+                "connect mixed-port {} tun={} se={}",
+                strategy.mixed_port, strategy.tun, strategy.system_extension
             ),
         );
         self.disconnect()?;
@@ -66,7 +69,7 @@ impl Supervisor {
             log::error("supervisor", "runtime YAML failed mihomo -t");
             bail!("runtime YAML failed mihomo -t");
         }
-        if strategy.tun {
+        if strategy.tun && !strategy.system_extension {
             ensure_tun_privileges(&bin)?;
         }
 
@@ -82,7 +85,11 @@ impl Supervisor {
         fs::write(paths::pid_path()?, child.id().to_string())?;
 
         let addr = format!("127.0.0.1:{}", strategy.mixed_port);
-        let wait_secs = if strategy.tun { 8 } else { 3 };
+        let wait_secs = if strategy.tun && !strategy.system_extension {
+            8
+        } else {
+            3
+        };
         let deadline = Instant::now() + Duration::from_secs(wait_secs);
         loop {
             if let Ok(Some(status)) = child.try_wait() {
@@ -113,10 +120,22 @@ impl Supervisor {
         }
         *self.child.lock().expect("supervisor lock") = Some(child);
         *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
+        *self.running_se.lock().expect("supervisor lock") = strategy.system_extension;
         log::info(
             "supervisor",
-            format!("listening {addr}{}", if strategy.tun { " tun" } else { "" }),
+            format!(
+                "listening {addr}{}{}",
+                if strategy.tun && !strategy.system_extension {
+                    " tun"
+                } else {
+                    ""
+                },
+                if strategy.system_extension { " se" } else { "" }
+            ),
         );
+        if strategy.system_extension {
+            crate::network_extension::enable_async(strategy);
+        }
         Ok(())
     }
 
@@ -126,20 +145,28 @@ impl Supervisor {
         compile::compile(strategy, &catalog)?;
         if self.is_running() {
             let was_tun = *self.running_tun.lock().expect("supervisor lock");
-            if was_tun != strategy.tun {
+            let was_se = *self.running_se.lock().expect("supervisor lock");
+            if was_tun != strategy.tun || was_se != strategy.system_extension {
                 log::info(
                     "supervisor",
-                    format!("tun {was_tun} → {}, reconnect", strategy.tun),
+                    format!(
+                        "intercept tun {was_tun}→{} se {was_se}→{}, reconnect",
+                        strategy.tun, strategy.system_extension
+                    ),
                 );
                 self.connect(strategy)?;
             } else {
                 controller::reload(strategy.mixed_port)?;
+                if strategy.system_extension {
+                    crate::network_extension::enable_async(strategy);
+                }
             }
         }
         Ok(catalog)
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        crate::network_extension::disable_async();
         let mut stopped = false;
         if let Some(mut child) = self.child.lock().expect("supervisor lock").take() {
             let _ = child.kill();
@@ -158,6 +185,7 @@ impl Supervisor {
             }
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
+        *self.running_se.lock().expect("supervisor lock") = false;
         if stopped {
             log::info("supervisor", "disconnect");
         }

@@ -1,0 +1,1 @@
+"NSSystemExtensionUsageDescription" = "myproxy 使用网络系统扩展拦截本机出站连接，并按你的进程与分流规则送进核心。";

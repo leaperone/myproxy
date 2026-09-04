@@ -21,6 +21,8 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      MYPROXY_HOST_DEVID_PROFILE: ${{ secrets.MYPROXY_HOST_DEVID_PROFILE }}
+      MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE: ${{ secrets.MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +107,18 @@ jobs:
             echo "MYPROXY_KEYCHAIN_PATH=${keychain_path}"
             echo "MYPROXY_CERTIFICATE_PATH=${certificate_path}"
           } >> "${GITHUB_ENV}"
+      - name: Decode Network Extension profiles
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/myproxy-profiles"
+          if [[ -n "${MYPROXY_HOST_DEVID_PROFILE:-}" && -n "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE:-}" ]]; then
+            printf '%s' "${MYPROXY_HOST_DEVID_PROFILE}" | base64 --decode > "${RUNNER_TEMP}/myproxy-profiles/host.provisionprofile"
+            printf '%s' "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE}" | base64 --decode > "${RUNNER_TEMP}/myproxy-profiles/network-extension.provisionprofile"
+            echo "MYPROXY_HOST_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-profiles/host.provisionprofile" >> "${GITHUB_ENV}"
+            echo "MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-profiles/network-extension.provisionprofile" >> "${GITHUB_ENV}"
+          else
+            echo "MYPROXY_*_DEVID_PROFILE secrets are unset; the packaged system extension will not activate until they are provided."
+          fi
       - name: Package Sparkle zip and appcast
         env:
           VERSION: ${{ steps.ver.outputs.version }}

@@ -81,6 +81,9 @@ pub struct Strategy {
     /// When true, compile mihomo TUN so apps need not point HTTP/SOCKS at Mixed.
     #[serde(default)]
     pub tun: bool,
+    /// When true, activate MClash-style System Extension intercept (NETransparentProxyProvider).
+    #[serde(default)]
+    pub system_extension: bool,
     /// Register a macOS login item when running from a bundled `.app`.
     #[serde(default)]
     pub launch_at_login: bool,
@@ -179,6 +182,7 @@ impl Default for Strategy {
             exclude_filter: DEFAULT_EXCLUDE.into(),
             developer_mode: false,
             tun: false,
+            system_extension: false,
             launch_at_login: false,
             silent_launch: false,
             lite_mode: false,
