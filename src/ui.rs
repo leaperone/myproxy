@@ -18,6 +18,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
+use myproxy::controller::{self, TrafficSnapshot};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::Supervisor;
@@ -946,6 +947,7 @@ fn via_menu(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overview,
+    Connections,
     Subscriptions,
     Groups,
     Rules,
@@ -954,6 +956,7 @@ enum Page {
 
 fn initial_page() -> Page {
     match std::env::var("MYPROXY_PAGE").unwrap_or_default().as_str() {
+        "connections" | "traffic" | "conn" => Page::Connections,
         "subscriptions" | "subs" => Page::Subscriptions,
         "groups" => Page::Groups,
         "rules" => Page::Rules,
@@ -980,6 +983,12 @@ pub struct AppView {
     port_input: Entity<InputState>,
     appearance: Appearance,
     _appearance_observer: Subscription,
+    traffic: TrafficSnapshot,
+    traffic_up: u64,
+    traffic_down: u64,
+    traffic_has_rate: bool,
+    traffic_error: Option<String>,
+    traffic_prev: Option<(Instant, u64, u64)>,
 }
 
 impl AppView {
@@ -1010,9 +1019,52 @@ impl AppView {
             let mut strategy_stamp = strategy_path.as_deref().and_then(file_stamp);
             let mut catalog_stamp = catalog_path.as_deref().and_then(file_stamp);
             loop {
+                let wait_ms = this
+                    .update(cx, |this, _| {
+                        if this.page == Page::Connections {
+                            1000
+                        } else {
+                            1500
+                        }
+                    })
+                    .unwrap_or(1500);
                 cx.background_executor()
-                    .timer(Duration::from_millis(1500))
+                    .timer(Duration::from_millis(wait_ms))
                     .await;
+
+                let fetch_port = this
+                    .update(cx, |this, cx| {
+                        if !this.connected {
+                            if this.clear_traffic() {
+                                cx.notify();
+                            }
+                            None
+                        } else if this.page == Page::Connections {
+                            Some(this.strategy.mixed_port)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(port) = fetch_port {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            controller::fetch(port).map_err(|err| err.to_string())
+                        })
+                        .await;
+                    if this
+                        .update(cx, |this, cx| {
+                            this.apply_traffic(result);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
                 if this
                     .update(cx, |this, cx| {
                         let started = Instant::now();
@@ -1020,6 +1072,9 @@ impl AppView {
                         let connected = this.supervisor.is_running();
                         if connected != this.connected {
                             this.connected = connected;
+                            if !connected {
+                                this.clear_traffic();
+                            }
                             dirty = true;
                         }
                         let editing = this.group_modal_open || this.rule_modal_open;
@@ -1108,6 +1163,12 @@ impl AppView {
             catalog,
             appearance,
             _appearance_observer: appearance_observer,
+            traffic: TrafficSnapshot::default(),
+            traffic_up: 0,
+            traffic_down: 0,
+            traffic_has_rate: false,
+            traffic_error: None,
+            traffic_prev: None,
         }
     }
 
@@ -1153,6 +1214,48 @@ impl AppView {
                 log::error("ui", format!("save strategy failed: {err:#}"));
                 self.status = format!("保存失败: {err:#}");
                 false
+            }
+        }
+    }
+
+    fn clear_traffic(&mut self) -> bool {
+        let dirty = !self.traffic.connections.is_empty()
+            || self.traffic_has_rate
+            || self.traffic_error.is_some()
+            || self.traffic.upload_total != 0
+            || self.traffic.download_total != 0;
+        self.traffic = TrafficSnapshot::default();
+        self.traffic_up = 0;
+        self.traffic_down = 0;
+        self.traffic_has_rate = false;
+        self.traffic_error = None;
+        self.traffic_prev = None;
+        dirty
+    }
+
+    fn apply_traffic(&mut self, result: Result<TrafficSnapshot, String>) {
+        match result {
+            Ok(snap) => {
+                let now = Instant::now();
+                if let Some((prev_at, prev_up, prev_down)) = self.traffic_prev {
+                    let dt = now.duration_since(prev_at).as_secs_f64();
+                    if dt >= 0.2 {
+                        self.traffic_up =
+                            ((snap.upload_total.saturating_sub(prev_up)) as f64 / dt) as u64;
+                        self.traffic_down =
+                            ((snap.download_total.saturating_sub(prev_down)) as f64 / dt) as u64;
+                        self.traffic_has_rate = true;
+                        self.traffic_prev = Some((now, snap.upload_total, snap.download_total));
+                    }
+                } else {
+                    self.traffic_prev = Some((now, snap.upload_total, snap.download_total));
+                }
+                self.traffic = snap;
+                self.traffic_error = None;
+            }
+            Err(err) => {
+                log::debug("ui", format!("connections poll failed: {err}"));
+                self.traffic_error = Some("暂时读不到核心连接。".into());
             }
         }
     }
@@ -1550,6 +1653,7 @@ impl AppView {
                 SidebarGroup::new("会话").child(
                     SidebarMenu::new()
                         .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
+                        .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
                         .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
                         .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
                         .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
@@ -1593,6 +1697,7 @@ impl AppView {
             )
             .child(match self.page {
                 Page::Rules => self.rules(cx, theme).into_any_element(),
+                Page::Connections => self.connections(cx, theme).into_any_element(),
                 page => div()
                     .id("page-scroll")
                     .flex_1()
@@ -1603,7 +1708,7 @@ impl AppView {
                         Page::Subscriptions => self.subscriptions(cx, theme).into_any_element(),
                         Page::Groups => self.groups(cx, theme).into_any_element(),
                         Page::Settings => self.settings(cx, theme).into_any_element(),
-                        Page::Rules => unreachable!(),
+                        Page::Rules | Page::Connections => unreachable!(),
                     })
                     .into_any_element(),
             })
@@ -1645,6 +1750,136 @@ impl AppView {
                         &self.strategy.rule_sets.len().to_string(),
                     )),
             )
+    }
+
+    fn connections(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let connected = self.connected;
+        let muted_fg = theme.muted_foreground;
+        let up = if connected && self.traffic_has_rate {
+            controller::format_rate(self.traffic_up)
+        } else {
+            "—".into()
+        };
+        let down = if connected && self.traffic_has_rate {
+            controller::format_rate(self.traffic_down)
+        } else {
+            "—".into()
+        };
+        let count = if connected {
+            self.traffic.connections.len().to_string()
+        } else {
+            "—".into()
+        };
+        let mixed = format!("127.0.0.1:{}", self.strategy.mixed_port);
+        v_flex()
+            .id("connections-page")
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .gap_4()
+            .child(page_title(
+                theme,
+                "连接",
+                "当前经过 Mixed 端口的流量。应用规则只在流量进入该端口后才会命中。",
+            ))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(metric(
+                        theme,
+                        "状态",
+                        if connected { "已连接" } else { "未连接" },
+                    ))
+                    .child(metric(theme, "Mixed 端口", &mixed))
+                    .child(metric(theme, "上传", &up))
+                    .child(metric(theme, "下载", &down))
+                    .child(metric(theme, "连接数", &count)),
+            )
+            .when(
+                self.traffic_error.is_some()
+                    || (connected && !self.traffic.connections.is_empty()),
+                |this| {
+                    this.child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(self.traffic_error.clone().unwrap_or_default()),
+                            )
+                            .when(connected && !self.traffic.connections.is_empty(), |this| {
+                                this.child({
+                                    let entity = entity.clone();
+                                    Button::new("close-all-connections")
+                                        .small()
+                                        .danger()
+                                        .label("关闭全部")
+                                        .on_click(move |_, _, app| {
+                                            entity.update(app, |this, cx| {
+                                                let port = this.strategy.mixed_port;
+                                                this.traffic.connections.clear();
+                                                this.status = "已关闭全部连接。".into();
+                                                cx.background_executor()
+                                                    .spawn(async move {
+                                                        if let Err(err) =
+                                                            controller::close_all(port)
+                                                        {
+                                                            log::debug(
+                                                                "ui",
+                                                                format!("close all failed: {err:#}"),
+                                                            );
+                                                        }
+                                                    })
+                                                    .detach();
+                                                cx.notify();
+                                            });
+                                        })
+                                })
+                            }),
+                    )
+                },
+            )
+            .when(!connected, |this| {
+                this.child(empty_hint(
+                    theme,
+                    "核心未连接。点右上角「连接」后，这里会显示经过 Mixed 端口的连接。",
+                ))
+            })
+            .when(
+                connected && self.traffic.connections.is_empty() && self.traffic_error.is_none(),
+                |this| {
+                    this.child(empty_hint(
+                        theme,
+                        "暂时没有连接。只有进入 Mixed 端口的流量会出现在这里。",
+                    ))
+                },
+            )
+            .when(
+                connected && self.traffic.connections.is_empty() && self.traffic_error.is_some(),
+                |this| {
+                    this.child(empty_hint(
+                        theme,
+                        "核心已连接，但还读不到连接列表。等 Mixed 端口起来后再看。",
+                    ))
+                },
+            )
+            .when(connected && !self.traffic.connections.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .id("connection-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .gap_1()
+                        .child(connection_header_row(theme))
+                        .children(self.traffic.connections.iter().map(|conn| {
+                            render_connection_row(entity.clone(), theme, conn)
+                        })),
+                )
+            })
     }
 
     fn subscriptions(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -2305,6 +2540,118 @@ fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
         .text_sm()
         .text_color(theme.muted_foreground)
         .child(text.to_string())
+}
+
+fn connection_header_row(theme: &Theme) -> impl IntoElement {
+    let muted_fg = theme.muted_foreground;
+    h_flex()
+        .w_full()
+        .items_center()
+        .px_3()
+        .py_1()
+        .gap_2()
+        .child(connection_col(px(108.), "进程", muted_fg, None))
+        .child(connection_col_flex("目标", muted_fg, None))
+        .child(connection_col(px(52.), "协议", muted_fg, None))
+        .child(connection_col(px(168.), "走向", muted_fg, None))
+        .child(connection_col(px(72.), "上传", muted_fg, None))
+        .child(connection_col(px(72.), "下载", muted_fg, None))
+        .child(connection_col(px(80.), "时长", muted_fg, None))
+        .child(div().w(px(56.)))
+}
+
+fn connection_col(
+    width: Pixels,
+    text: impl Into<String>,
+    color: Hsla,
+    mono: Option<SharedString>,
+) -> impl IntoElement {
+    div()
+        .w(width)
+        .min_w(width)
+        .text_xs()
+        .text_color(color)
+        .when_some(mono, |this, family| this.font_family(family))
+        .child(text.into())
+}
+
+fn connection_col_flex(
+    text: impl Into<String>,
+    color: Hsla,
+    mono: Option<SharedString>,
+) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(96.))
+        .text_xs()
+        .text_color(color)
+        .when_some(mono, |this, family| this.font_family(family))
+        .child(text.into())
+}
+
+fn render_connection_row(
+    entity: Entity<AppView>,
+    theme: &Theme,
+    conn: &controller::LiveConnection,
+) -> impl IntoElement {
+    let id = conn.id.clone();
+    let muted = theme.muted;
+    let muted_fg = theme.muted_foreground;
+    let fg = theme.foreground;
+    let mono = theme.mono_font_family.clone();
+    let up = controller::format_bytes(conn.upload);
+    let down = controller::format_bytes(conn.download);
+    h_flex()
+        .id(SharedString::from(format!("conn-{id}")))
+        .w_full()
+        .items_center()
+        .px_3()
+        .py_2()
+        .gap_2()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.group_box)
+        .hover(move |style| style.bg(muted))
+        .child(connection_col(px(108.), conn.process.clone(), fg, None))
+        .child(connection_col_flex(
+            conn.destination.clone(),
+            muted_fg,
+            Some(mono.clone()),
+        ))
+        .child(connection_col(px(52.), conn.network.clone(), muted_fg, None))
+        .child(connection_col(px(168.), conn.chain.clone(), fg, None))
+        .child(connection_col(px(72.), up, muted_fg, Some(mono.clone())))
+        .child(connection_col(px(72.), down, muted_fg, Some(mono)))
+        .child(connection_col(
+            px(80.),
+            conn.duration.clone(),
+            muted_fg,
+            None,
+        ))
+        .child({
+            let entity = entity.clone();
+            Button::new(SharedString::from(format!("close-conn-{id}")))
+                .small()
+                .danger()
+                .label("关闭")
+                .on_click(move |_, _, app| {
+                    let id = id.clone();
+                    entity.update(app, |this, cx| {
+                        this.traffic.connections.retain(|conn| conn.id != id);
+                        let port = this.strategy.mixed_port;
+                        let close_id = id.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                if let Err(err) = controller::close_one(port, &close_id) {
+                                    log::debug("ui", format!("close connection failed: {err:#}"));
+                                }
+                            })
+                            .detach();
+                        cx.notify();
+                    });
+                })
+        })
 }
 
 fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {

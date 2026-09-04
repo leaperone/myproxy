@@ -2,7 +2,7 @@
 
 macOS menu-bar controller ([GPUI](https://github.com/zed-industries/zed)) for a bundled [mihomo](https://github.com/MetaCubeX/mihomo) core.
 
-Strategy JSON under `~/Library/Application Support/myproxy/` is the source of truth: subscriptions, node groups, rules, and Mixed port (HTTP + SOCKS5 on one loopback port). The UI is Chinese: **节点组**, **规则**, **设置**.
+Strategy JSON under `~/Library/Application Support/myproxy/` is the source of truth: subscriptions, node groups, rules, and Mixed port (HTTP + SOCKS5 on one loopback port). The UI is Chinese: **连接**, **节点组**, **规则**, **设置**.
 
 ## Install
 
@@ -24,6 +24,7 @@ Check from **设置 → 检查更新** or the menu-bar extra. v0.0.1 is a full i
 scripts/fetch-mihomo.sh
 scripts/fetch-sparkle.sh          # Sparkle.framework + generate_appcast
 cargo run --bin myproxy           # debug UI, no Sparkle
+MYPROXY_PAGE=connections cargo run --bin myproxy
 scripts/package-macos-app.sh      # release .app with Sparkle
 scripts/release-macos.sh          # zip + appcast into dist/
 cargo run --bin myproxyctl -- capabilities
