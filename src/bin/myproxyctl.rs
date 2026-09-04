@@ -145,7 +145,9 @@ fn main() -> Result<()> {
         Commands::Apply => {
             myproxy::log::debug("ctl", "apply");
             let strategy = Strategy::load()?;
-            let catalog = Supervisor::default().apply(&strategy)?;
+            let supervisor = Supervisor::default();
+            supervisor.adopt_running(strategy.tun);
+            let catalog = supervisor.apply(&strategy)?;
             println!(
                 "applied {} nodes, {} excluded → {}",
                 catalog.nodes.len(),

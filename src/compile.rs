@@ -29,28 +29,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     root.insert("secret".into(), CONTROLLER_SECRET.into());
 
     if strategy.tun {
-        let mut tun = serde_yaml::Mapping::new();
-        tun.insert("enable".into(), true.into());
-        tun.insert("stack".into(), "system".into());
-        tun.insert("auto-route".into(), true.into());
-        tun.insert("auto-detect-interface".into(), true.into());
-        let hijack: Vec<serde_yaml::Value> = ["any:53", "tcp://any:53"]
-            .into_iter()
-            .map(|s| serde_yaml::Value::String(s.into()))
-            .collect();
-        tun.insert("dns-hijack".into(), serde_yaml::Value::Sequence(hijack));
-        root.insert("tun".into(), serde_yaml::Value::Mapping(tun));
-
-        let mut dns = serde_yaml::Mapping::new();
-        dns.insert("enable".into(), true.into());
-        dns.insert("ipv6".into(), true.into());
-        dns.insert("enhanced-mode".into(), "redir-host".into());
-        let nameservers: Vec<serde_yaml::Value> = ["1.1.1.1", "8.8.8.8"]
-            .into_iter()
-            .map(|s| serde_yaml::Value::String(s.into()))
-            .collect();
-        dns.insert("nameserver".into(), serde_yaml::Value::Sequence(nameservers));
-        root.insert("dns".into(), serde_yaml::Value::Mapping(dns));
+        insert_tun_intercept(&mut root);
     }
 
     let proxies: Vec<serde_yaml::Value> = catalog.nodes.iter().map(|n| n.raw.clone()).collect();
@@ -150,6 +129,81 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
         ),
     );
     Ok(yaml)
+}
+
+fn yaml_strings(items: &[&str]) -> serde_yaml::Value {
+    serde_yaml::Value::Sequence(
+        items
+            .iter()
+            .map(|s| serde_yaml::Value::String((*s).into()))
+            .collect(),
+    )
+}
+
+fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
+    let mut tun = serde_yaml::Mapping::new();
+    tun.insert("enable".into(), true.into());
+    tun.insert("stack".into(), "system".into());
+    tun.insert("auto-route".into(), true.into());
+    tun.insert("strict-route".into(), true.into());
+    tun.insert("auto-detect-interface".into(), true.into());
+    tun.insert(
+        "dns-hijack".into(),
+        yaml_strings(&["any:53", "tcp://any:53"]),
+    );
+    root.insert("tun".into(), serde_yaml::Value::Mapping(tun));
+
+    let mut dns = serde_yaml::Mapping::new();
+    dns.insert("enable".into(), true.into());
+    dns.insert("listen".into(), "127.0.0.1:1053".into());
+    dns.insert("ipv6".into(), true.into());
+    dns.insert("enhanced-mode".into(), "fake-ip".into());
+    dns.insert("fake-ip-range".into(), "198.18.0.1/16".into());
+    dns.insert(
+        "fake-ip-filter".into(),
+        yaml_strings(&["*.lan", "*.local", "localhost"]),
+    );
+    dns.insert(
+        "default-nameserver".into(),
+        yaml_strings(&["8.8.8.8", "1.1.1.1"]),
+    );
+    dns.insert("nameserver".into(), yaml_strings(&["1.1.1.1", "8.8.8.8"]));
+    dns.insert(
+        "proxy-server-nameserver".into(),
+        yaml_strings(&["8.8.8.8", "1.1.1.1"]),
+    );
+    root.insert("dns".into(), serde_yaml::Value::Mapping(dns));
+
+    let mut http = serde_yaml::Mapping::new();
+    http.insert(
+        "ports".into(),
+        serde_yaml::Value::Sequence(vec![
+            80.into(),
+            serde_yaml::Value::String("8080-8880".into()),
+        ]),
+    );
+    let mut tls = serde_yaml::Mapping::new();
+    tls.insert(
+        "ports".into(),
+        serde_yaml::Value::Sequence(vec![443.into(), 8443.into()]),
+    );
+    let mut quic = serde_yaml::Mapping::new();
+    quic.insert(
+        "ports".into(),
+        serde_yaml::Value::Sequence(vec![443.into(), 8443.into()]),
+    );
+    let mut sniff = serde_yaml::Mapping::new();
+    sniff.insert("HTTP".into(), serde_yaml::Value::Mapping(http));
+    sniff.insert("TLS".into(), serde_yaml::Value::Mapping(tls));
+    sniff.insert("QUIC".into(), serde_yaml::Value::Mapping(quic));
+
+    let mut sniffer = serde_yaml::Mapping::new();
+    sniffer.insert("enable".into(), true.into());
+    sniffer.insert("override-destination".into(), true.into());
+    sniffer.insert("force-dns-mapping".into(), true.into());
+    sniffer.insert("parse-pure-ip".into(), true.into());
+    sniffer.insert("sniff".into(), serde_yaml::Value::Mapping(sniff));
+    root.insert("sniffer".into(), serde_yaml::Value::Mapping(sniffer));
 }
 
 fn via_target(via: &str, strategy: &Strategy) -> String {

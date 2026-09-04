@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::catalog::{self, Catalog};
 use crate::compile;
@@ -17,17 +17,25 @@ use crate::strategy::Strategy;
 
 pub struct Supervisor {
     child: Mutex<Option<Child>>,
+    running_tun: Mutex<bool>,
 }
 
 impl Default for Supervisor {
     fn default() -> Self {
         Self {
             child: Mutex::new(None),
+            running_tun: Mutex::new(false),
         }
     }
 }
 
 impl Supervisor {
+    pub fn adopt_running(&self, tun: bool) {
+        if self.is_running() {
+            *self.running_tun.lock().expect("supervisor lock") = tun;
+        }
+    }
+
     pub fn connect(&self, strategy: &Strategy) -> Result<()> {
         log::info(
             "supervisor",
@@ -104,12 +112,10 @@ impl Supervisor {
             std::thread::sleep(Duration::from_millis(50));
         }
         *self.child.lock().expect("supervisor lock") = Some(child);
+        *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
         log::info(
             "supervisor",
-            format!(
-                "listening {addr}{}",
-                if strategy.tun { " tun" } else { "" }
-            ),
+            format!("listening {addr}{}", if strategy.tun { " tun" } else { "" }),
         );
         Ok(())
     }
@@ -119,7 +125,16 @@ impl Supervisor {
         let catalog = catalog::refresh(strategy)?;
         compile::compile(strategy, &catalog)?;
         if self.is_running() {
-            controller::reload(strategy.mixed_port)?;
+            let was_tun = *self.running_tun.lock().expect("supervisor lock");
+            if was_tun != strategy.tun {
+                log::info(
+                    "supervisor",
+                    format!("tun {was_tun} → {}, reconnect", strategy.tun),
+                );
+                self.connect(strategy)?;
+            } else {
+                controller::reload(strategy.mixed_port)?;
+            }
         }
         Ok(catalog)
     }
@@ -134,12 +149,15 @@ impl Supervisor {
         if let Ok(path) = paths::pid_path() {
             if let Ok(pid) = fs::read_to_string(&path) {
                 if let Ok(pid) = pid.trim().parse::<i32>() {
-                    unsafe { libc::kill(pid, libc::SIGTERM); }
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
                     stopped = true;
                 }
                 let _ = fs::remove_file(path);
             }
         }
+        *self.running_tun.lock().expect("supervisor lock") = false;
         if stopped {
             log::info("supervisor", "disconnect");
         }
