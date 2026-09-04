@@ -21,11 +21,11 @@ impl Global for TrayKeepAlive {}
 pub fn install(cx: &mut App) {
     match build_tray() {
         Ok(tray) => cx.set_global(TrayKeepAlive { _tray: tray }),
-        Err(err) => eprintln!("menu bar icon failed: {err:#}"),
+        Err(err) => myproxy::log::warn(format!("menu bar icon failed: {err:#}")),
     }
     cx.spawn(async move |cx| loop {
         cx.background_executor()
-            .timer(Duration::from_millis(80))
+            .timer(Duration::from_millis(250))
             .await;
         let mut clicks = Vec::new();
         let mut menus = Vec::new();
@@ -103,16 +103,16 @@ fn connect() {
     match Strategy::load() {
         Ok(strategy) => {
             if let Err(err) = Supervisor::default().connect(&strategy) {
-                eprintln!("connect failed: {err:#}");
+                myproxy::log::warn(format!("tray connect failed: {err:#}"));
             }
         }
-        Err(err) => eprintln!("load strategy failed: {err:#}"),
+        Err(err) => myproxy::log::warn(format!("tray load strategy failed: {err:#}")),
     }
 }
 
 fn disconnect() {
     if let Err(err) = Supervisor::default().disconnect() {
-        eprintln!("disconnect failed: {err:#}");
+        myproxy::log::warn(format!("tray disconnect failed: {err:#}"));
     }
 }
 
@@ -121,7 +121,7 @@ fn apply() {
         catalog::refresh(&strategy).and_then(|catalog| compile::compile(&strategy, &catalog))
     }) {
         Ok(_) => {}
-        Err(err) => eprintln!("apply failed: {err:#}"),
+        Err(err) => myproxy::log::warn(format!("tray apply failed: {err:#}")),
     }
 }
 

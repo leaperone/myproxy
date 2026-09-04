@@ -172,6 +172,24 @@ pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) 
     names
 }
 
+pub fn count_group_members(group: &crate::strategy::Group, catalog: &Catalog) -> usize {
+    let mut count = catalog
+        .nodes
+        .iter()
+        .filter(|node| group_accepts(group, node))
+        .count();
+    for extra in &group.include {
+        let already = catalog
+            .nodes
+            .iter()
+            .any(|node| &node.name == extra && group_accepts(group, node));
+        if !already {
+            count += 1;
+        }
+    }
+    count
+}
+
 fn group_accepts(group: &crate::strategy::Group, node: &Node) -> bool {
     if group.exclude.iter().any(|n| n == &node.name) {
         return false;

@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod compile;
+pub mod log;
 pub mod paths;
 pub mod strategy;
 pub mod supervisor;

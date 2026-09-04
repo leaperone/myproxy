@@ -16,6 +16,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Capabilities,
+    Log,
     Status,
     Apply,
     Connect,
@@ -103,8 +104,19 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Capabilities => {
             println!(
-                "status apply connect disconnect port filter subscription group rule"
+                "status apply connect disconnect port filter subscription group rule log"
             );
+        }
+        Commands::Log => {
+            let path = paths::app_log_path()?;
+            if !path.exists() {
+                println!("no log yet: {}", path.display());
+                return Ok(());
+            }
+            let text = std::fs::read_to_string(&path)?;
+            for line in text.lines().rev().take(80).collect::<Vec<_>>().into_iter().rev() {
+                println!("{line}");
+            }
         }
         Commands::Status => {
             let strategy = Strategy::load()?;

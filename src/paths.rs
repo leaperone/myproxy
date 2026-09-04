@@ -31,6 +31,10 @@ pub fn mihomo_log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mihomo.log"))
 }
 
+pub fn app_log_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("myproxy.log"))
+}
+
 pub fn bundled_mihomo() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
     let next_to_exe = exe.parent().map(|p| p.join("mihomo")).unwrap_or_default();

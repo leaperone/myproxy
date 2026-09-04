@@ -1,5 +1,6 @@
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -15,6 +16,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
+use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Rule, Strategy};
 use myproxy::supervisor::Supervisor;
 
@@ -147,32 +149,39 @@ impl GroupEditor {
             .as_ref()
             .map(|g| join_list(&g.name_excludes))
             .unwrap_or_default();
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("组名")
+                .default_value(name)
+        });
+        let sources = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("来源：空=任意订阅")
+                .default_value(sources)
+        });
+        let contains = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("名称含：jp, tokyo, 日 或 JP*")
+                .default_value(contains)
+        });
+        let excludes = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("名称不含：IEPL, x0.1")
+                .default_value(excludes)
+        });
+        cx.observe(&sources, |_, _, cx| cx.notify()).detach();
+        cx.observe(&contains, |_, _, cx| cx.notify()).detach();
+        cx.observe(&excludes, |_, _, cx| cx.notify()).detach();
         Self {
             parent,
             edit_id,
             notice: String::new(),
             all_nodes,
             kind,
-            name: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("组名")
-                    .default_value(name)
-            }),
-            sources: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("来源：空=任意订阅")
-                    .default_value(sources)
-            }),
-            contains: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("名称含：jp, tokyo, 日 或 JP*")
-                    .default_value(contains)
-            }),
-            excludes: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("名称不含：IEPL, x0.1")
-                    .default_value(excludes)
-            }),
+            name,
+            sources,
+            contains,
+            excludes,
             include,
             blocked,
         }
@@ -320,7 +329,17 @@ impl Render for GroupEditor {
         let parent = self.parent.read(cx);
         let theme = cx.theme().clone();
         let draft = self.draft(cx);
+        let started = Instant::now();
         let members = catalog::resolve_group_members(&draft, &parent.catalog);
+        let resolve_ms = started.elapsed().as_millis();
+        if resolve_ms >= 8 {
+            log::debug(format!(
+                "group preview resolve {} members in {resolve_ms}ms",
+                members.len()
+            ));
+        }
+        const PREVIEW_LIMIT: usize = 80;
+        let extra = members.len().saturating_sub(PREVIEW_LIMIT);
         let contains = parse_list(&self.contains.read(cx).value());
         let excludes = parse_list(&self.excludes.read(cx).value());
         let sources = parse_list(&self.sources.read(cx).value());
@@ -508,7 +527,7 @@ impl Render for GroupEditor {
                                 }),
                         )
                     })
-                    .children(members.iter().map(|name| {
+                    .children(members.iter().take(PREVIEW_LIMIT).map(|name| {
                         render_member_row(
                             entity.clone(),
                             &theme,
@@ -517,6 +536,16 @@ impl Render for GroupEditor {
                             false,
                         )
                     }))
+                    .when(extra > 0, |this| {
+                        this.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(format!("其余 {extra} 个未列出。收紧条件或排除后再看。")),
+                        )
+                    })
                     .children(
                         self.blocked
                             .iter()
@@ -619,26 +648,75 @@ impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let strategy = Strategy::load().unwrap_or_default();
         let catalog = Catalog::load().unwrap_or_default();
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(1200))
-                .await;
-            if this
-                .update(cx, |this, cx| {
-                    if !this.group_modal_open && this.rule_edit_id.is_none() {
-                        if let Ok(strategy) = Strategy::load() {
-                            this.strategy = strategy;
+        log::set_developer(strategy.developer_mode);
+        log::info(format!(
+            "window ready nodes={} groups={} rules={}",
+            catalog.nodes.len(),
+            strategy.groups.len(),
+            strategy.rules.len()
+        ));
+        let strategy_path = myproxy::paths::strategy_path().ok();
+        let catalog_path = myproxy::paths::catalog_path().ok();
+        cx.spawn(async move |this, cx| {
+            let mut strategy_stamp = strategy_path.as_deref().and_then(file_stamp);
+            let mut catalog_stamp = catalog_path.as_deref().and_then(file_stamp);
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1500))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let started = Instant::now();
+                        let mut dirty = false;
+                        let connected = this.supervisor.is_running();
+                        if connected != this.connected {
+                            this.connected = connected;
+                            dirty = true;
                         }
-                    }
-                    if let Ok(catalog) = Catalog::load() {
-                        this.catalog = catalog;
-                    }
-                    this.connected = this.supervisor.is_running();
-                    cx.notify();
-                })
-                .is_err()
-            {
-                break;
+                        let editing = this.group_modal_open || this.rule_edit_id.is_some();
+                        if !editing {
+                            if let Some(path) = strategy_path.as_deref() {
+                                let stamp = file_stamp(path);
+                                if stamp != strategy_stamp {
+                                    strategy_stamp = stamp;
+                                    if let Ok(strategy) = Strategy::load() {
+                                        log::set_developer(strategy.developer_mode);
+                                        this.strategy = strategy;
+                                        dirty = true;
+                                        log::debug("reload strategy.json");
+                                    }
+                                }
+                            }
+                            if let Some(path) = catalog_path.as_deref() {
+                                let stamp = file_stamp(path);
+                                if stamp != catalog_stamp {
+                                    catalog_stamp = stamp;
+                                    if let Ok(catalog) = Catalog::load() {
+                                        log::debug(format!(
+                                            "reload catalog.json nodes={}",
+                                            catalog.nodes.len()
+                                        ));
+                                        this.catalog = catalog;
+                                        dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                        if this.page == Page::Settings && log::developer() {
+                            dirty = true;
+                        }
+                        if dirty {
+                            cx.notify();
+                        }
+                        let ms = started.elapsed().as_millis();
+                        if ms >= 8 {
+                            log::debug(format!("poll {ms}ms dirty={dirty}"));
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -681,6 +759,7 @@ impl AppView {
                 true
             }
             Err(err) => {
+                log::warn(format!("save strategy failed: {err:#}"));
                 self.status = format!("保存失败: {err:#}");
                 false
             }
@@ -723,6 +802,11 @@ impl AppView {
                     myproxy::compile::compile(&this.strategy, &cat)
                 }) {
                     Ok(_) => {
+                        log::info(format!(
+                            "apply ok nodes={} excluded={}",
+                            this.catalog.nodes.len(),
+                            this.catalog.excluded.len()
+                        ));
                         this.status = format!(
                             "已编译 {} 个节点，排除 {}。Mixed {}。",
                             this.catalog.nodes.len(),
@@ -730,7 +814,10 @@ impl AppView {
                             this.strategy.mixed_port
                         );
                     }
-                    Err(err) => this.status = format!("Apply 失败: {err:#}"),
+                    Err(err) => {
+                        log::warn(format!("apply failed: {err:#}"));
+                        this.status = format!("Apply 失败: {err:#}");
+                    }
                 }
                 cx.notify();
             });
@@ -749,20 +836,31 @@ impl AppView {
                         Ok(()) => {
                             this.connected = false;
                             this.status = "已断开。".into();
+                            log::info("disconnected");
                         }
-                        Err(err) => this.status = format!("{err:#}"),
+                        Err(err) => {
+                            log::warn(format!("disconnect failed: {err:#}"));
+                            this.status = format!("{err:#}");
+                        }
                     }
                 } else {
                     match this.supervisor.connect(&this.strategy) {
                         Ok(()) => {
                             this.connected = true;
                             this.catalog = Catalog::load().unwrap_or_default();
+                            log::info(format!(
+                                "connected mixed {}",
+                                this.strategy.mixed_port
+                            ));
                             this.status = format!(
                                 "已连接 127.0.0.1:{} （HTTP + SOCKS5）",
                                 this.strategy.mixed_port
                             );
                         }
-                        Err(err) => this.status = format!("{err:#}"),
+                        Err(err) => {
+                            log::warn(format!("connect failed: {err:#}"));
+                            this.status = format!("{err:#}");
+                        }
                     }
                 }
                 cx.notify();
@@ -843,6 +941,13 @@ impl AppView {
         }
         self.group_modal_open = true;
         self.group_edit_id = existing.as_ref().map(|g| g.id.clone());
+        log::debug(format!(
+            "open group dialog {}",
+            existing
+                .as_ref()
+                .map(|g| g.name.as_str())
+                .unwrap_or("(new)")
+        ));
         let parent = cx.entity();
         let editor = cx.new(|cx| GroupEditor::new(parent.clone(), existing, window, cx));
         let editing = id.is_some();
@@ -1239,7 +1344,7 @@ impl AppView {
                 this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
             })
             .children(self.strategy.groups.iter().map(|group| {
-                let count = catalog::resolve_group_members(group, &self.catalog).len();
+                let count = catalog::count_group_members(group, &self.catalog);
                 let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
                 render_group_card(entity.clone(), theme, group, count, selected, accent)
             }))
@@ -1555,6 +1660,91 @@ impl AppView {
                         )
                     }),
             ))
+            .child(self.developer_panel(cx, theme))
+    }
+
+    fn developer_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let on = self.strategy.developer_mode || log::env_forced();
+        let log_path = log::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(无法创建日志文件)".into());
+        panel(
+            theme,
+            "开发者",
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("记录操作与慢路径，方便回顾卡顿。MYPROXY_DEV=1 也会打开。"),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child({
+                            let entity = entity.clone();
+                            let mut toggle = Button::new("dev-mode").small();
+                            toggle = if on {
+                                toggle.danger().label("关闭开发者模式")
+                            } else {
+                                toggle.primary().label("开启开发者模式")
+                            };
+                            toggle.on_click(move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    this.strategy.developer_mode = !this.strategy.developer_mode;
+                                    log::set_developer(this.strategy.developer_mode);
+                                    this.persist();
+                                    cx.notify();
+                                });
+                            })
+                        })
+                        .when(on, |this| {
+                            this.child({
+                                Button::new("reveal-log")
+                                    .small()
+                                    .label("在 Finder 中显示")
+                                    .on_click(move |_, _, _| {
+                                        if let Some(path) = log::path() {
+                                            let _ = std::process::Command::new("open")
+                                                .arg("-R")
+                                                .arg(path)
+                                                .spawn();
+                                        }
+                                    })
+                            })
+                        }),
+                )
+                .when(on, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_color(theme.muted_foreground)
+                            .child(log_path),
+                    )
+                    .child(
+                        v_flex()
+                            .id("dev-log")
+                            .max_h(px(240.))
+                            .overflow_y_scroll()
+                            .p_3()
+                            .gap_1()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.group_box)
+                            .children(log::recent(80).into_iter().map(|line| {
+                                div()
+                                    .text_xs()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .child(line)
+                            })),
+                    )
+                }),
+        )
     }
 }
 
@@ -1758,6 +1948,10 @@ fn render_group_card(
                 .text_color(muted_fg)
                 .child(group.policy_label()),
         )
+}
+
+fn file_stamp(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {

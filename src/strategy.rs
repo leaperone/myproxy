@@ -18,6 +18,9 @@ pub struct Strategy {
     pub schema: u32,
     pub mixed_port: u16,
     pub exclude_filter: String,
+    /// When true, myproxy writes debug traces to `myproxy.log` and the Settings page.
+    #[serde(default)]
+    pub developer_mode: bool,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
@@ -84,6 +87,7 @@ impl Default for Strategy {
             schema: STRATEGY_SCHEMA,
             mixed_port: 17890,
             exclude_filter: DEFAULT_EXCLUDE.into(),
+            developer_mode: false,
             subscriptions: Vec::new(),
             groups: vec![Group::all_nodes("PROXY".into(), "select".into())],
             rules: Vec::new(),
