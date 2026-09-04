@@ -155,26 +155,10 @@ fn proxies_from_yaml(text: &str) -> Result<Vec<serde_yaml::Value>> {
 }
 
 pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) -> Vec<String> {
-    let filter = if group.filter.trim().is_empty() {
-        None
-    } else {
-        Regex::new(&group.filter).ok()
-    };
     let mut names: Vec<String> = catalog
         .nodes
         .iter()
-        .filter(|node| {
-            if group.exclude.iter().any(|n| n == &node.name) {
-                return false;
-            }
-            if group.include.iter().any(|n| n == &node.name) {
-                return true;
-            }
-            match &filter {
-                None => true,
-                Some(re) => re.is_match(&node.name),
-            }
-        })
+        .filter(|node| group_accepts(group, node))
         .map(|n| n.name.clone())
         .collect();
 
@@ -186,4 +170,36 @@ pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) 
     names.sort();
     names.dedup();
     names
+}
+
+fn group_accepts(group: &crate::strategy::Group, node: &Node) -> bool {
+    if group.exclude.iter().any(|n| n == &node.name) {
+        return false;
+    }
+    if group.include.iter().any(|n| n == &node.name) {
+        return true;
+    }
+    if !source_matches(group, node) {
+        return false;
+    }
+    if group.all_nodes {
+        return true;
+    }
+    if group.name_contains.is_empty() {
+        return false;
+    }
+    let haystack = node.name.to_lowercase();
+    group.name_contains.iter().any(|pattern| {
+        let needle = pattern.trim().to_lowercase();
+        !needle.is_empty() && haystack.contains(&needle)
+    })
+}
+
+fn source_matches(group: &crate::strategy::Group, node: &Node) -> bool {
+    if group.sources.is_empty() {
+        return true;
+    }
+    group.sources.iter().any(|source| {
+        source.eq_ignore_ascii_case(&node.subscription) || source == &node.subscription
+    })
 }

@@ -12,7 +12,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::strategy::{Rule, Strategy};
+use myproxy::strategy::{parse_list, Group, Rule, Strategy};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,8 @@ pub struct AppView {
     url_input: Entity<InputState>,
     name_input: Entity<InputState>,
     group_name: Entity<InputState>,
-    group_filter: Entity<InputState>,
+    group_sources: Entity<InputState>,
+    group_contains: Entity<InputState>,
     rule_match: Entity<InputState>,
     rule_via: Entity<InputState>,
     filter_input: Entity<InputState>,
@@ -89,8 +90,11 @@ impl AppView {
             }),
             name_input: cx.new(|cx| InputState::new(window, cx).placeholder("订阅名")),
             group_name: cx.new(|cx| InputState::new(window, cx).placeholder("组名")),
-            group_filter: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("(?i)日|jp|tokyo")
+            group_sources: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("来源：Kitty, Mojie（空=任意订阅）")
+            }),
+            group_contains: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("名称含：jp, tokyo, 日")
             }),
             rule_match: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("Arc 或 *.apple.com")
@@ -477,36 +481,82 @@ impl AppView {
             .child(page_title(
                 theme,
                 "节点组",
-                "成员 = 筛选 ∪ 显式包含 − 排除。应用后写入 mihomo。",
+                "条件组：来源 ∩ 名称包含（多条为或）∪ 钉住 − 排除。空条件不会再变成「全部节点」。PROXY 用「全部」。",
             ))
             .child(
-                h_flex()
+                v_flex()
                     .gap_2()
-                    .child(div().w(px(140.)).child(Input::new(&self.group_name)))
-                    .child(div().flex_1().child(Input::new(&self.group_filter)))
-                    .child({
-                        let entity = entity.clone();
-                        Button::new("add-group").primary().label("添加组").on_click(
-                            move |_, window, app| {
-                                entity.update(app, |this, cx| {
-                                    let name = this.group_name.read(cx).value().to_string();
-                                    let filter = this.group_filter.read(cx).value().to_string();
-                                    if name.trim().is_empty() {
-                                        this.status = "需要组名。".into();
-                                    } else {
-                                        this.strategy.add_group(
-                                            name.trim().into(),
-                                            "select".into(),
-                                            filter,
-                                        );
-                                        this.persist();
-                                        this.group_name.update(cx, |i, cx| i.set_value("", window, cx));
-                                    }
-                                    cx.notify();
-                                });
-                            },
-                        )
-                    }),
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().w(px(140.)).child(Input::new(&self.group_name)))
+                            .child(div().flex_1().child(Input::new(&self.group_sources))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Input::new(&self.group_contains)))
+                            .child({
+                                let entity = entity.clone();
+                                Button::new("add-group").primary().label("添加条件组").on_click(
+                                    move |_, window, app| {
+                                        entity.update(app, |this, cx| {
+                                            let name = this.group_name.read(cx).value().to_string();
+                                            let sources =
+                                                parse_list(&this.group_sources.read(cx).value());
+                                            let contains =
+                                                parse_list(&this.group_contains.read(cx).value());
+                                            if name.trim().is_empty() {
+                                                this.status = "需要组名。".into();
+                                            } else if sources.is_empty() && contains.is_empty() {
+                                                this.status =
+                                                    "条件组需要来源或名称包含；否则请用「添加全部」。"
+                                                        .into();
+                                            } else {
+                                                this.strategy.add_group(Group::matching(
+                                                    name.trim().into(),
+                                                    "select".into(),
+                                                    sources,
+                                                    contains,
+                                                ));
+                                                this.persist();
+                                                this.group_name.update(cx, |i, cx| {
+                                                    i.set_value("", window, cx)
+                                                });
+                                            }
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                            })
+                            .child({
+                                let entity = entity.clone();
+                                Button::new("add-group-all").label("添加全部").on_click(
+                                    move |_, window, app| {
+                                        entity.update(app, |this, cx| {
+                                            let name = this.group_name.read(cx).value().to_string();
+                                            let sources =
+                                                parse_list(&this.group_sources.read(cx).value());
+                                            if name.trim().is_empty() {
+                                                this.status = "需要组名。".into();
+                                            } else {
+                                                let mut group = Group::all_nodes(
+                                                    name.trim().into(),
+                                                    "select".into(),
+                                                );
+                                                group.sources = sources;
+                                                this.strategy.add_group(group);
+                                                this.persist();
+                                                this.group_name.update(cx, |i, cx| {
+                                                    i.set_value("", window, cx)
+                                                });
+                                            }
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                            }),
+                    ),
             )
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
@@ -514,29 +564,41 @@ impl AppView {
             .children(self.strategy.groups.iter().map(|group| {
                 let members = catalog::resolve_group_members(group, &self.catalog);
                 let preview = members.iter().take(6).cloned().collect::<Vec<_>>().join(" · ");
+                let id = group.id.clone();
+                let entity = entity.clone();
                 panel(
                     theme,
-                    &format!("{}  ·  {}  ·  {} nodes", group.name, group.kind, members.len()),
+                    &format!("{}  ·  {}  ·  {} 个节点", group.name, group.kind, members.len()),
                     v_flex()
                         .gap_1()
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child(if group.filter.is_empty() {
-                                    "filter: (all kept nodes)".into()
-                                } else {
-                                    format!("filter: {}", group.filter)
-                                }),
+                                .child(group.policy_label()),
                         )
                         .child(
-                            div()
-                                .text_xs()
-                                .child(if preview.is_empty() {
-                                    "no members yet — Apply a subscription first".into()
-                                } else {
-                                    preview
-                                }),
+                            div().text_xs().child(if preview.is_empty() {
+                                "没有成员。条件为空就不会自动进组；先 Apply 订阅或钉住节点。"
+                                    .into()
+                            } else {
+                                preview
+                            }),
+                        )
+                        .child(
+                            h_flex().justify_end().child(
+                                Button::new(SharedString::from(format!("del-group-{id}")))
+                                    .small()
+                                    .danger()
+                                    .label("删除")
+                                    .on_click(move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            this.strategy.remove_group(&id);
+                                            this.persist();
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
                         ),
                 )
             }))

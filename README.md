@@ -18,7 +18,10 @@ Rust 1.98+ (`rust-toolchain.toml`). GPUI has no in-process hot patch; `dev.sh` k
 cargo run --bin myproxyctl -- capabilities
 cargo run --bin myproxyctl -- subscription add 'https://…' --name Neko
 cargo run --bin myproxyctl -- filter --set '(?i)(流量|剩余|到期|官网)'
-cargo run --bin myproxyctl -- group add Japan --filter '(?i)日|jp'
+cargo run --bin myproxyctl -- group add Japan --contains jp --contains tokyo --contains 日
+cargo run --bin myproxyctl -- group add KittyJP --source Kitty --contains 日 --contains jp
+cargo run --bin myproxyctl -- group add PROXY --all
+cargo run --bin myproxyctl -- group include Japan 'Kitty · JP-01'
 cargo run --bin myproxyctl -- rule add --domain chatgpt.com --via PROXY
 cargo run --bin myproxyctl -- rule add --app Arc --via Japan
 cargo run --bin myproxyctl -- apply

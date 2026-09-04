@@ -10,8 +10,12 @@ use crate::paths;
 pub const DEFAULT_EXCLUDE: &str =
     r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
 
+pub const STRATEGY_SCHEMA: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Strategy {
+    #[serde(default)]
+    pub schema: u32,
     pub mixed_port: u16,
     pub exclude_filter: String,
     #[serde(default)]
@@ -35,12 +39,22 @@ pub struct Group {
     pub name: String,
     #[serde(default = "default_select")]
     pub kind: String,
+    /// When true, every kept catalog node in `sources` (or all sources) is a member.
     #[serde(default)]
-    pub filter: String,
+    pub all_nodes: bool,
+    /// Subscription display names. Empty means any subscription.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Case-insensitive substrings, OR'd. Ignored when `all_nodes` is true.
+    #[serde(default)]
+    pub name_contains: Vec<String>,
     #[serde(default)]
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Legacy single regex. Read on migrate, never written back.
+    #[serde(default, skip_serializing)]
+    pub filter: String,
 }
 
 fn default_select() -> String {
@@ -62,17 +76,11 @@ pub struct Rule {
 impl Default for Strategy {
     fn default() -> Self {
         Self {
+            schema: STRATEGY_SCHEMA,
             mixed_port: 17890,
             exclude_filter: DEFAULT_EXCLUDE.into(),
             subscriptions: Vec::new(),
-            groups: vec![Group {
-                id: Uuid::new_v4().to_string(),
-                name: "PROXY".into(),
-                kind: "select".into(),
-                filter: String::new(),
-                include: Vec::new(),
-                exclude: Vec::new(),
-            }],
+            groups: vec![Group::all_nodes("PROXY".into(), "select".into())],
             rules: Vec::new(),
         }
     }
@@ -88,7 +96,11 @@ impl Strategy {
         }
         let data = fs::read_to_string(&path)
             .with_context(|| format!("read {}", path.display()))?;
-        serde_json::from_str(&data).context("parse strategy.json")
+        let mut strategy: Self = serde_json::from_str(&data).context("parse strategy.json")?;
+        if strategy.migrate_groups() {
+            let _ = strategy.save();
+        }
+        Ok(strategy)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -116,16 +128,20 @@ impl Strategy {
         self.subscriptions.len() != before
     }
 
-    pub fn add_group(&mut self, name: String, kind: String, filter: String) -> &Group {
-        self.groups.push(Group {
-            id: Uuid::new_v4().to_string(),
-            name,
-            kind,
-            filter,
-            include: Vec::new(),
-            exclude: Vec::new(),
-        });
+    pub fn add_group(&mut self, group: Group) -> &Group {
+        self.groups.push(group);
         self.groups.last().expect("just pushed")
+    }
+
+    fn migrate_groups(&mut self) -> bool {
+        if self.schema >= STRATEGY_SCHEMA {
+            return false;
+        }
+        for group in &mut self.groups {
+            group.migrate_legacy();
+        }
+        self.schema = STRATEGY_SCHEMA;
+        true
     }
 
     pub fn group_mut(&mut self, name: &str) -> Option<&mut Group> {
@@ -150,6 +166,104 @@ impl Strategy {
         self.rules.retain(|r| r.id != id);
         self.rules.len() != before
     }
+}
+
+impl Group {
+    pub fn all_nodes(name: String, kind: String) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            kind,
+            all_nodes: true,
+            sources: Vec::new(),
+            name_contains: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            filter: String::new(),
+        }
+    }
+
+    pub fn matching(
+        name: String,
+        kind: String,
+        sources: Vec<String>,
+        name_contains: Vec<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            kind,
+            all_nodes: false,
+            sources,
+            name_contains,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            filter: String::new(),
+        }
+    }
+
+    pub fn policy_label(&self) -> String {
+        if self.all_nodes {
+            if self.sources.is_empty() {
+                "全部已导入节点".into()
+            } else {
+                format!("全部 · {}", self.sources.join(" / "))
+            }
+        } else {
+            let mut parts = Vec::new();
+            if !self.sources.is_empty() {
+                parts.push(format!("来源 {}", self.sources.join(" / ")));
+            }
+            if !self.name_contains.is_empty() {
+                parts.push(format!("名称含 {}", self.name_contains.join(" / ")));
+            }
+            if !self.include.is_empty() {
+                parts.push(format!("钉住 {}", self.include.len()));
+            }
+            if parts.is_empty() {
+                "无自动匹配（仅钉住）".into()
+            } else {
+                parts.join(" · ")
+            }
+        }
+    }
+
+    fn migrate_legacy(&mut self) {
+        if !self.filter.trim().is_empty() {
+            self.all_nodes = false;
+            if self.name_contains.is_empty() {
+                self.name_contains = split_legacy_filter(&self.filter);
+            }
+        } else if self.name_contains.is_empty()
+            && self.sources.is_empty()
+            && self.include.is_empty()
+        {
+            self.all_nodes = true;
+        }
+        self.filter.clear();
+    }
+}
+
+pub fn parse_list(raw: &str) -> Vec<String> {
+    raw.split([',', '，', '/', '|'])
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn split_legacy_filter(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim().trim_start_matches("(?i)").trim_start_matches("(?-i)");
+    trimmed
+        .split('|')
+        .map(|part| {
+            part.trim()
+                .trim_start_matches("(?i)")
+                .trim_matches(|c: char| c == '(' || c == ')')
+                .trim()
+                .to_string()
+        })
+        .filter(|part| !part.is_empty() && part != "?i")
+        .collect()
 }
 
 impl Rule {
@@ -198,5 +312,7 @@ impl Rule {
 
 pub fn load_from(path: &Path) -> Result<Strategy> {
     let data = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&data)?)
+    let mut strategy: Strategy = serde_json::from_str(&data)?;
+    strategy.migrate_groups();
+    Ok(strategy)
 }

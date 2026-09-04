@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use myproxy::catalog;
 use myproxy::compile;
 use myproxy::paths;
-use myproxy::strategy::{Rule, Strategy};
+use myproxy::strategy::{self, Rule, Strategy};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Parser)]
@@ -55,8 +55,21 @@ enum GroupCmd {
         name: String,
         #[arg(long, default_value = "select")]
         kind: String,
-        #[arg(long, default_value = "")]
-        filter: String,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        source: Vec<String>,
+        #[arg(long = "contains")]
+        contains: Vec<String>,
+    },
+    Set {
+        name: String,
+        #[arg(long)]
+        all: Option<bool>,
+        #[arg(long)]
+        source: Vec<String>,
+        #[arg(long = "contains")]
+        contains: Vec<String>,
     },
     Remove { name: String },
     Include { group: String, node: String },
@@ -164,19 +177,55 @@ fn main() -> Result<()> {
                 for group in &strategy.groups {
                     let members = catalog::resolve_group_members(group, &catalog);
                     println!(
-                        "{}\t{}\tfilter={}\tmembers={}",
+                        "{}\t{}\t{}\tmembers={}",
                         group.name,
                         group.kind,
-                        group.filter,
+                        group.policy_label(),
                         members.len()
                     );
                 }
             }
-            GroupCmd::Add { name, kind, filter } => {
+            GroupCmd::Add {
+                name,
+                kind,
+                all,
+                source,
+                contains,
+            } => {
                 let mut strategy = Strategy::load()?;
-                strategy.add_group(name.clone(), kind, filter);
+                let group = if all {
+                    strategy::Group::all_nodes(name.clone(), kind)
+                } else {
+                    strategy::Group::matching(name.clone(), kind, source, contains)
+                };
+                strategy.add_group(group);
                 strategy.save()?;
                 println!("added group {name}");
+            }
+            GroupCmd::Set {
+                name,
+                all,
+                source,
+                contains,
+            } => {
+                let mut strategy = Strategy::load()?;
+                {
+                    let some = strategy
+                        .group_mut(&name)
+                        .ok_or_else(|| anyhow::anyhow!("no group"))?;
+                    if let Some(all) = all {
+                        some.all_nodes = all;
+                    }
+                    if !source.is_empty() {
+                        some.sources = source;
+                    }
+                    if !contains.is_empty() {
+                        some.name_contains = contains;
+                        some.all_nodes = false;
+                    }
+                }
+                strategy.save()?;
+                println!("updated group {name}");
             }
             GroupCmd::Remove { name } => {
                 let mut strategy = Strategy::load()?;
