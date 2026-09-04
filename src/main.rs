@@ -1,3 +1,4 @@
+mod appearance;
 mod ui;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -13,6 +14,7 @@ fn main() {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        appearance::apply_saved(None, cx);
         #[cfg(target_os = "macos")]
         tray::install(cx);
         cx.spawn(async move |cx| {

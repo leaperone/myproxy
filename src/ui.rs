@@ -2,7 +2,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
+use gpui_kit::component::button::{
+    Button, ButtonGroup, ButtonVariants as _, Toggle, ToggleGroup, ToggleVariants as _,
+};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
@@ -19,6 +21,8 @@ use myproxy::catalog::{self, Catalog};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Rule, Strategy};
 use myproxy::supervisor::Supervisor;
+
+use crate::appearance::Appearance;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuleDraftKind {
@@ -645,10 +649,14 @@ pub struct AppView {
     rule_query: Entity<InputState>,
     filter_input: Entity<InputState>,
     port_input: Entity<InputState>,
+    appearance: Appearance,
+    _appearance_observer: Subscription,
 }
 
 impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let appearance = Appearance::load();
+        appearance.apply(Some(window), cx);
         let strategy = match Strategy::load() {
             Ok(strategy) => strategy,
             Err(err) => {
@@ -738,6 +746,15 @@ impl AppView {
 
         let supervisor = Arc::new(Supervisor::default());
         let connected = supervisor.is_running();
+        let entity = cx.entity();
+        let appearance_observer = window.observe_window_appearance(move |window, cx| {
+            entity.update(cx, |this, cx| {
+                if this.appearance == Appearance::System {
+                    Theme::sync_system_appearance(Some(window), cx);
+                    cx.notify();
+                }
+            });
+        });
         Self {
             page: initial_page(),
             status: "策略已加载。用 CLI 或本页编辑，然后点「更新配置」或「连接」。".into(),
@@ -764,6 +781,40 @@ impl AppView {
             }),
             strategy,
             catalog,
+            appearance,
+            _appearance_observer: appearance_observer,
+        }
+    }
+
+    fn set_appearance(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&Vec<bool>, &mut Window, &mut App) + 'static {
+        let entity = cx.entity();
+        move |checks, window, app| {
+            entity.update(app, |this, cx| {
+                let current = [
+                    this.appearance == Appearance::Light,
+                    this.appearance == Appearance::Dark,
+                    this.appearance == Appearance::System,
+                ];
+                let appearance = if checks.first() != Some(&current[0]) {
+                    Appearance::Light
+                } else if checks.get(1) != Some(&current[1]) {
+                    Appearance::Dark
+                } else if checks.get(2) != Some(&current[2]) {
+                    Appearance::System
+                } else {
+                    return;
+                };
+                if this.appearance == appearance {
+                    return;
+                }
+                this.appearance = appearance;
+                this.appearance.save();
+                this.appearance.apply(Some(window), cx);
+                cx.notify();
+            });
         }
     }
 
@@ -1624,6 +1675,11 @@ impl AppView {
             ))
             .child(panel(
                 theme,
+                "外观",
+                v_flex().gap_3().child(self.appearance_row(cx, theme)),
+            ))
+            .child(panel(
+                theme,
                 "入口",
                 h_flex()
                     .gap_2()
@@ -1669,6 +1725,47 @@ impl AppView {
                     }),
             ))
             .child(self.developer_panel(cx, theme))
+    }
+
+    fn appearance_row(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(div().text_sm().child("主题"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("浅色、深色，或跟随系统"),
+                    ),
+            )
+            .child(
+                ToggleGroup::new("appearance-mode")
+                    .outline()
+                    .segmented()
+                    .small()
+                    .child(
+                        Toggle::new("appearance-light")
+                            .label("浅色")
+                            .checked(self.appearance == Appearance::Light),
+                    )
+                    .child(
+                        Toggle::new("appearance-dark")
+                            .label("深色")
+                            .checked(self.appearance == Appearance::Dark),
+                    )
+                    .child(
+                        Toggle::new("appearance-system")
+                            .label("系统")
+                            .checked(self.appearance == Appearance::System),
+                    )
+                    .on_click(self.set_appearance(cx)),
+            )
     }
 
     fn developer_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
