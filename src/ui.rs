@@ -1,40 +1,73 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, TitleBar,
+    h_flex, v_flex, ActiveTheme, IconName, Sizable, StyledExt, Theme, TitleBar,
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use myproxy::catalog::{self, Catalog};
+use myproxy::strategy::{Rule, Strategy};
+use myproxy::supervisor::Supervisor;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overview,
     Subscriptions,
     Groups,
-    Routing,
-    Connections,
+    Rules,
     Settings,
+}
+
+fn initial_page() -> Page {
+    match std::env::var("MYPROXY_PAGE").unwrap_or_default().as_str() {
+        "subscriptions" | "subs" => Page::Subscriptions,
+        "groups" => Page::Groups,
+        "rules" => Page::Rules,
+        "settings" => Page::Settings,
+        _ => Page::Overview,
+    }
 }
 
 pub struct AppView {
     page: Page,
+    strategy: Strategy,
+    catalog: Catalog,
+    status: String,
     connected: bool,
-    down_bps: f64,
-    up_bps: f64,
+    supervisor: Arc<Supervisor>,
+    url_input: Entity<InputState>,
+    name_input: Entity<InputState>,
+    group_name: Entity<InputState>,
+    group_filter: Entity<InputState>,
+    rule_match: Entity<InputState>,
+    rule_via: Entity<InputState>,
+    filter_input: Entity<InputState>,
+    port_input: Entity<InputState>,
 }
 
 impl AppView {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let strategy = Strategy::load().unwrap_or_default();
+        let catalog = Catalog::load().unwrap_or_default();
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(900))
+                .timer(Duration::from_millis(1200))
                 .await;
             if this
                 .update(cx, |this, cx| {
-                    this.tick_traffic();
+                    if let Ok(strategy) = Strategy::load() {
+                        this.strategy = strategy;
+                    }
+                    if let Ok(catalog) = Catalog::load() {
+                        this.catalog = catalog;
+                    }
+                    this.connected = this.supervisor.is_running();
                     cx.notify();
                 })
                 .is_err()
@@ -44,26 +77,41 @@ impl AppView {
         })
         .detach();
 
+        let supervisor = Arc::new(Supervisor::default());
+        let connected = supervisor.is_running();
         Self {
-            page: Page::Overview,
-            connected: true,
-            down_bps: 2_400_000.0,
-            up_bps: 180_000.0,
+            page: initial_page(),
+            status: "策略已加载。用 CLI 或本页编辑，然后点「应用」或「连接」。".into(),
+            connected,
+            supervisor,
+            url_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("https://…/clash.yaml")
+            }),
+            name_input: cx.new(|cx| InputState::new(window, cx).placeholder("订阅名")),
+            group_name: cx.new(|cx| InputState::new(window, cx).placeholder("组名")),
+            group_filter: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("(?i)日|jp|tokyo")
+            }),
+            rule_match: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Arc 或 *.apple.com")
+            }),
+            rule_via: cx.new(|cx| InputState::new(window, cx).default_value("PROXY")),
+            filter_input: cx.new(|cx| {
+                InputState::new(window, cx).default_value(strategy.exclude_filter.clone())
+            }),
+            port_input: cx.new(|cx| {
+                InputState::new(window, cx).default_value(strategy.mixed_port.to_string())
+            }),
+            strategy,
+            catalog,
         }
     }
 
-    fn tick_traffic(&mut self) {
-        if !self.connected {
-            self.down_bps *= 0.35;
-            self.up_bps *= 0.35;
-            return;
+    fn persist(&mut self) {
+        match self.strategy.save() {
+            Ok(()) => self.status = "已保存策略。".into(),
+            Err(err) => self.status = format!("保存失败: {err:#}"),
         }
-        let jitter = |base: f64| {
-            let n = rand::random::<f64>() * 0.28 - 0.12;
-            (base * (1.0 + n)).max(12_000.0)
-        };
-        self.down_bps = jitter(2_350_000.0);
-        self.up_bps = jitter(175_000.0);
     }
 
     fn select_page(
@@ -75,23 +123,6 @@ impl AppView {
         move |_, _, app| {
             entity.update(app, |this, cx| {
                 this.page = page;
-                cx.notify();
-            });
-        }
-    }
-
-    fn toggle_connected(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
-        let entity = cx.entity();
-        move |_, _, app| {
-            entity.update(app, |this, cx| {
-                this.connected = !this.connected;
-                if !this.connected {
-                    this.down_bps = 0.0;
-                    this.up_bps = 0.0;
-                }
                 cx.notify();
             });
         }
@@ -109,12 +140,67 @@ impl AppView {
             .active(self.page == page)
             .on_click(self.select_page(cx, page))
     }
+
+    fn on_apply(&self, cx: &mut Context<Self>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity();
+        move |_, _, app| {
+            entity.update(app, |this, cx| {
+                match catalog::refresh(&this.strategy).and_then(|cat| {
+                    this.catalog = cat.clone();
+                    myproxy::compile::compile(&this.strategy, &cat)
+                }) {
+                    Ok(_) => {
+                        this.status = format!(
+                            "已编译 {} 个节点，排除 {}。Mixed {}。",
+                            this.catalog.nodes.len(),
+                            this.catalog.excluded.len(),
+                            this.strategy.mixed_port
+                        );
+                    }
+                    Err(err) => this.status = format!("Apply 失败: {err:#}"),
+                }
+                cx.notify();
+            });
+        }
+    }
+
+    fn on_connect(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity();
+        move |_, _, app| {
+            entity.update(app, |this, cx| {
+                if this.connected {
+                    match this.supervisor.disconnect() {
+                        Ok(()) => {
+                            this.connected = false;
+                            this.status = "已断开。".into();
+                        }
+                        Err(err) => this.status = format!("{err:#}"),
+                    }
+                } else {
+                    match this.supervisor.connect(&this.strategy) {
+                        Ok(()) => {
+                            this.connected = true;
+                            this.catalog = Catalog::load().unwrap_or_default();
+                            this.status = format!(
+                                "已连接 127.0.0.1:{} （HTTP + SOCKS5）",
+                                this.strategy.mixed_port
+                            );
+                        }
+                        Err(err) => this.status = format!("{err:#}"),
+                    }
+                }
+                cx.notify();
+            });
+        }
+    }
 }
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-
         v_flex()
             .size_full()
             .bg(theme.background)
@@ -135,11 +221,10 @@ impl AppView {
         let connected = self.connected;
         let mut toggle = Button::new("toggle-core").small();
         toggle = if connected {
-            toggle.danger().label("Disconnect")
+            toggle.danger().label("断开")
         } else {
-            toggle.primary().label("Connect")
+            toggle.primary().label("连接")
         };
-
         TitleBar::new().child(
             h_flex()
                 .id("title-contents")
@@ -149,27 +234,33 @@ impl AppView {
                 .pr_3()
                 .child(
                     h_flex()
-                        .items_center()
                         .gap_2()
+                        .items_center()
                         .child(div().text_sm().font_semibold().child("myproxy"))
-                        .child(pill(theme, "DEMO", theme.warning)),
+                        .child(pill(theme, "DEV", theme.warning)),
                 )
                 .child(
                     h_flex()
-                        .items_center()
                         .gap_2()
+                        .items_center()
                         .child(status_dot(theme, connected))
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child(if connected {
-                                    "Connected · mixed 7890"
+                                    format!("已连接 · mixed {}", self.strategy.mixed_port)
                                 } else {
-                                    "Disconnected"
+                                    "未连接".into()
                                 }),
                         )
-                        .child(toggle.on_click(self.toggle_connected(cx))),
+                        .child(
+                            Button::new("apply")
+                                .small()
+                                .label("应用")
+                                .on_click(self.on_apply(cx)),
+                        )
+                        .child(toggle.on_click(self.on_connect(cx))),
                 ),
         )
     }
@@ -181,270 +272,443 @@ impl AppView {
                 SidebarHeader::new().child(
                     v_flex()
                         .gap(px(2.))
-                        .child(div().text_sm().font_semibold().child("Control"))
+                        .child(div().text_sm().font_semibold().child("控制"))
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("mihomo · mock session"),
+                                .child("strategy.json"),
                         ),
                 ),
             )
             .child(
-                SidebarGroup::new("Session").child(
+                SidebarGroup::new("会话").child(
                     SidebarMenu::new()
-                        .child(self.nav_item(
-                            cx,
-                            Page::Overview,
-                            "Overview",
-                            IconName::LayoutDashboard,
-                        ))
-                        .child(self.nav_item(
-                            cx,
-                            Page::Subscriptions,
-                            "Subscriptions",
-                            IconName::Inbox,
-                        ))
-                        .child(self.nav_item(cx, Page::Groups, "Node Groups", IconName::Folder))
-                        .child(self.nav_item(cx, Page::Routing, "App Routing", IconName::Map)),
+                        .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
+                        .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
+                        .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
+                        .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
                 ),
             )
             .child(
-                SidebarGroup::new("Monitor").child(
+                SidebarGroup::new("系统").child(
                     SidebarMenu::new()
-                        .child(self.nav_item(
-                            cx,
-                            Page::Connections,
-                            "Connections",
-                            IconName::Network,
-                        ))
-                        .child(self.nav_item(cx, Page::Settings, "Settings", IconName::Settings)),
+                        .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
                 ),
             )
             .footer(
                 SidebarFooter::new().child(
-                    v_flex()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("Exclude filter"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_family(theme.mono_font_family.clone())
-                                .child("流量|剩余|到期|官网"),
-                        ),
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "{} nodes · {} excluded",
+                            self.catalog.nodes.len(),
+                            self.catalog.excluded.len()
+                        )),
                 ),
             )
     }
 
-    fn page_view(&self, _cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+    fn page_view(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         v_flex()
             .id("page")
             .flex_1()
             .h_full()
             .overflow_hidden()
             .p_6()
-            .gap_5()
+            .gap_4()
             .bg(theme.background)
-            .child(match self.page {
-                Page::Overview => self.overview(theme).into_any_element(),
-                Page::Subscriptions => self.subscriptions(theme).into_any_element(),
-                Page::Groups => self.groups(theme).into_any_element(),
-                Page::Routing => self.routing(theme).into_any_element(),
-                Page::Connections => self.connections(theme).into_any_element(),
-                Page::Settings => self.settings(theme).into_any_element(),
-            })
+            .child(
+                div()
+                    .id("status")
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(self.status.clone()),
+            )
+            .child(
+                div()
+                    .id("page-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(match self.page {
+                        Page::Overview => self.overview(theme).into_any_element(),
+                        Page::Subscriptions => self.subscriptions(cx, theme).into_any_element(),
+                        Page::Groups => self.groups(cx, theme).into_any_element(),
+                        Page::Rules => self.rules(cx, theme).into_any_element(),
+                        Page::Settings => self.settings(cx, theme).into_any_element(),
+                    }),
+            )
     }
 
     fn overview(&self, theme: &Theme) -> impl IntoElement {
         v_flex()
-            .gap_5()
+            .gap_4()
             .child(page_title(
                 theme,
-                "Overview",
-                "Mock session. Connect toggles numbers only.",
+                "总览",
+                "策略文档是权威源。连接会启动捆绑的 mihomo。",
             ))
             .child(
                 h_flex()
                     .gap_3()
-                    .child(metric_card(
+                    .child(metric(
                         theme,
                         "Status",
-                        if self.connected {
-                            "Connected"
-                        } else {
-                            "Idle"
-                        },
-                        if self.connected {
-                            "mihomo · loopback"
-                        } else {
-                            "core not started"
-                        },
+                        if self.connected { "已连接" } else { "空闲" },
                     ))
-                    .child(metric_card(
-                        theme,
-                        "Download",
-                        &format_bps(self.down_bps),
-                        "live mock",
-                    ))
-                    .child(metric_card(
-                        theme,
-                        "Upload",
-                        &format_bps(self.up_bps),
-                        "live mock",
-                    ))
-                    .child(metric_card(
+                    .child(metric(
                         theme,
                         "Mixed port",
-                        "127.0.0.1:7890",
-                        "HTTP + SOCKS5",
+                        &format!("127.0.0.1:{}", self.strategy.mixed_port),
+                    ))
+                    .child(metric(
+                        theme,
+                        "Nodes",
+                        &format!(
+                            "{} kept / {} excluded",
+                            self.catalog.nodes.len(),
+                            self.catalog.excluded.len()
+                        ),
+                    ))
+                    .child(metric(
+                        theme,
+                        "Rules",
+                        &self.strategy.rules.len().to_string(),
                     )),
             )
+    }
+
+    fn subscriptions(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        v_flex()
+            .gap_4()
+            .child(page_title(
+                theme,
+                "订阅",
+                "多个机场 URL。排除过滤器在导入时丢掉流量/余额/官网一类节点。",
+            ))
             .child(
                 h_flex()
-                    .gap_3()
-                    .items_start()
-                    .child(panel(
-                        theme,
-                        "Subscriptions",
-                        v_flex()
-                            .gap_2()
-                            .child(row_line(theme, "NekoNet", "48 kept · 3 excluded"))
-                            .child(row_line(theme, "Sakura", "22 kept · 1 excluded")),
-                    ))
-                    .child(panel(
-                        theme,
-                        "Active groups",
-                        v_flex()
-                            .gap_2()
-                            .child(row_line(theme, "PROXY", "select · 64 nodes"))
-                            .child(row_line(theme, "AUTO", "url-test · 64 nodes"))
-                            .child(row_line(theme, "Japan", "filter 日|JP · 12 nodes")),
-                    )),
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(px(160.)).child(Input::new(&self.name_input)))
+                    .child(div().flex_1().child(Input::new(&self.url_input)))
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("add-sub").primary().label("添加").on_click(
+                            move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    let name = this.name_input.read(cx).value().to_string();
+                                    let url = this.url_input.read(cx).value().to_string();
+                                    if url.trim().is_empty() {
+                                        this.status = "需要订阅 URL。".into();
+                                    } else {
+                                        let name = if name.trim().is_empty() {
+                                            "sub".into()
+                                        } else {
+                                            name
+                                        };
+                                        this.strategy.add_subscription(name, url.trim().into());
+                                        this.persist();
+                                        this.name_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                        });
+                                        this.url_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                        });
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    }),
             )
+            .when(self.strategy.subscriptions.is_empty(), |this| {
+                this.child(empty_hint(
+                    theme,
+                    "还没有订阅。填 URL 后点添加，或用 myproxyctl subscription add。",
+                ))
+            })
+            .children(self.strategy.subscriptions.iter().map(|sub| {
+                let id = sub.id.clone();
+                let entity = entity.clone();
+                panel(
+                    theme,
+                    &sub.name,
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(theme.muted_foreground)
+                                .child(sub.url.clone()),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("del-{id}")))
+                                .small()
+                                .danger()
+                                .label("删除")
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.strategy.remove_subscription(&id);
+                                        this.persist();
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+            }))
+            .children(self.catalog.excluded.iter().take(8).map(|ex| {
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("excluded {} ({}) — {}", ex.name, ex.subscription, ex.reason))
+            }))
     }
 
-    fn subscriptions(&self, theme: &Theme) -> impl IntoElement {
+    fn groups(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
         v_flex()
-            .gap_5()
+            .gap_4()
             .child(page_title(
                 theme,
-                "Subscriptions",
-                "Two airport links. Nodes matching the exclude filter never enter groups.",
+                "节点组",
+                "成员 = 筛选 ∪ 显式包含 − 排除。应用后写入 mihomo。",
             ))
-            .child(sub_card(
-                theme,
-                "NekoNet",
-                "https://example.invalid/neko",
-                51,
-                48,
-                "剩余流量 128GB · 套餐到期 2099-01-01 · 官网",
-            ))
-            .child(sub_card(
-                theme,
-                "Sakura",
-                "https://example.invalid/sakura",
-                23,
-                22,
-                "流量重置日",
-            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().w(px(140.)).child(Input::new(&self.group_name)))
+                    .child(div().flex_1().child(Input::new(&self.group_filter)))
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("add-group").primary().label("添加组").on_click(
+                            move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    let name = this.group_name.read(cx).value().to_string();
+                                    let filter = this.group_filter.read(cx).value().to_string();
+                                    if name.trim().is_empty() {
+                                        this.status = "需要组名。".into();
+                                    } else {
+                                        this.strategy.add_group(
+                                            name.trim().into(),
+                                            "select".into(),
+                                            filter,
+                                        );
+                                        this.persist();
+                                        this.group_name.update(cx, |i, cx| i.set_value("", window, cx));
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    }),
+            )
+            .when(self.strategy.groups.is_empty(), |this| {
+                this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
+            })
+            .children(self.strategy.groups.iter().map(|group| {
+                let members = catalog::resolve_group_members(group, &self.catalog);
+                let preview = members.iter().take(6).cloned().collect::<Vec<_>>().join(" · ");
+                panel(
+                    theme,
+                    &format!("{}  ·  {}  ·  {} nodes", group.name, group.kind, members.len()),
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(if group.filter.is_empty() {
+                                    "filter: (all kept nodes)".into()
+                                } else {
+                                    format!("filter: {}", group.filter)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .child(if preview.is_empty() {
+                                    "no members yet — Apply a subscription first".into()
+                                } else {
+                                    preview
+                                }),
+                        ),
+                )
+            }))
     }
 
-    fn groups(&self, theme: &Theme) -> impl IntoElement {
+    fn rules(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
         v_flex()
-            .gap_5()
+            .gap_4()
             .child(page_title(
                 theme,
-                "Node Groups",
-                "Membership is filter ∪ explicit − exclude. Compiled to mihomo later.",
+                "规则",
+                "按应用或域名选择节点 / 节点组 / Direct / Reject。自上而下第一条命中。应用规则编译为进程名，需流量进入 Mixed 口。",
             ))
-            .child(group_card(
-                theme,
-                "PROXY",
-                "select",
-                "All kept nodes from both subscriptions",
-                &["NekoNet · 东京 01", "NekoNet · 新加坡 03", "Sakura · 大阪 IEPL"],
-            ))
-            .child(group_card(
-                theme,
-                "Japan",
-                "select · filter (?i)日|jp|tokyo|osaka",
-                "12 nodes after filter",
-                &["NekoNet · 东京 01", "NekoNet · 东京 02", "Sakura · 大阪 IEPL"],
-            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(Input::new(&self.rule_match)))
+                    .child(div().w(px(140.)).child(Input::new(&self.rule_via)))
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("add-rule-app").label("作应用").on_click(
+                            move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    let m = this.rule_match.read(cx).value().to_string();
+                                    let via = this.rule_via.read(cx).value().to_string();
+                                    if m.trim().is_empty() {
+                                        this.status = "填写应用名，例如 Arc。".into();
+                                    } else {
+                                        this.strategy.add_rule(Rule::new_app(m.trim().into(), via));
+                                        this.persist();
+                                        this.rule_match.update(cx, |i, cx| i.set_value("", window, cx));
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    })
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("add-rule-domain").primary().label("作域名").on_click(
+                            move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    let m = this.rule_match.read(cx).value().to_string();
+                                    let via = this.rule_via.read(cx).value().to_string();
+                                    if m.trim().is_empty() {
+                                        this.status = "填写域名或 *.suffix。".into();
+                                    } else if m.contains('*') || m.starts_with('.') {
+                                        this.strategy.add_rule(Rule::new_suffix(
+                                            m.trim().trim_start_matches("*.").into(),
+                                            via,
+                                        ));
+                                        this.persist();
+                                        this.rule_match.update(cx, |i, cx| i.set_value("", window, cx));
+                                    } else {
+                                        this.strategy.add_rule(Rule::new_domain(m.trim().into(), via));
+                                        this.persist();
+                                        this.rule_match.update(cx, |i, cx| i.set_value("", window, cx));
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    }),
+            )
+            .when(self.strategy.rules.is_empty(), |this| {
+                this.child(empty_hint(
+                    theme,
+                    "还没有规则。未匹配的流量走 PROXY（或第一组）。应用规则目前是进程名，不是系统级拦截。",
+                ))
+            })
+            .children(self.strategy.rules.iter().map(|rule| {
+                let id = rule.id.clone();
+                let entity = entity.clone();
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .p_3()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.group_box)
+                    .child(div().text_sm().child(rule.match_label()))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(pill(theme, &rule.via, theme.accent))
+                            .child(
+                                Button::new(SharedString::from(format!("del-rule-{id}")))
+                                    .small()
+                                    .danger()
+                                    .label("删除")
+                                    .on_click(move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            this.strategy.remove_rule(&id);
+                                            this.persist();
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+            }))
     }
 
-    fn routing(&self, theme: &Theme) -> impl IntoElement {
+    fn settings(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
         v_flex()
-            .gap_5()
+            .gap_4()
             .child(page_title(
                 theme,
-                "App Routing",
-                "Apps need a Network Extension. Domains compile to mihomo rules. Demo list only.",
+                "设置",
+                "Mixed 一口同时提供 HTTP 代理与 SOCKS5。排除器用正则。",
             ))
             .child(panel(
                 theme,
-                "Rules · first match wins",
+                "入口",
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().child("127.0.0.1"))
+                    .child(div().w(px(100.)).child(Input::new(&self.port_input)))
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("save-port").label("保存端口").on_click(
+                            move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    if let Ok(port) = this.port_input.read(cx).value().parse::<u16>()
+                                    {
+                                        this.strategy.mixed_port = port;
+                                        this.persist();
+                                    } else {
+                                        this.status = "端口无效。".into();
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    }),
+            ))
+            .child(panel(
+                theme,
+                "排除过滤器",
                 v_flex()
                     .gap_2()
-                    .child(rule_line(theme, "Arc.app", "Japan"))
-                    .child(rule_line(theme, "Cursor", "PROXY"))
-                    .child(rule_line(theme, "*.apple.com", "Direct"))
-                    .child(rule_line(theme, "chatgpt.com", "PROXY"))
-                    .child(rule_line(theme, "Unmatched apps", "Direct")),
+                    .child(Input::new(&self.filter_input))
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("save-filter").primary().label("保存过滤器").on_click(
+                            move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    this.strategy.exclude_filter =
+                                        this.filter_input.read(cx).value().to_string();
+                                    this.persist();
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    }),
             ))
     }
+}
 
-    fn connections(&self, theme: &Theme) -> impl IntoElement {
-        v_flex()
-            .gap_5()
-            .child(page_title(
-                theme,
-                "Connections",
-                "Fake live table. Real data comes from the mihomo stream later.",
-            ))
-            .child(panel(
-                theme,
-                "Active",
-                v_flex()
-                    .gap_2()
-                    .child(conn_line(theme, "Cursor", "api2.cursor.sh", "PROXY"))
-                    .child(conn_line(theme, "Arc", "www.google.com", "Japan"))
-                    .child(conn_line(theme, "Music", "amp-api.music.apple.com", "Direct"))
-                    .child(conn_line(theme, "ChatGPT", "chatgpt.com", "PROXY")),
-            ))
-    }
-
-    fn settings(&self, theme: &Theme) -> impl IntoElement {
-        v_flex()
-            .gap_5()
-            .child(page_title(
-                theme,
-                "Settings",
-                "These values will be written into the strategy document.",
-            ))
-            .child(panel(
-                theme,
-                "Inbound",
-                v_flex()
-                    .gap_2()
-                    .child(row_line(theme, "Mixed port", "7890 · HTTP + SOCKS5"))
-                    .child(row_line(theme, "Bind", "127.0.0.1"))
-                    .child(row_line(theme, "System proxy", "off in this demo")),
-            ))
-            .child(panel(
-                theme,
-                "Core",
-                v_flex()
-                    .gap_2()
-                    .child(row_line(theme, "Engine", "mihomo Alpha · not bundled yet"))
-                    .child(row_line(theme, "Controller", "loopback + ephemeral secret")),
-            ))
-    }
+fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
+    div()
+        .p_4()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .text_sm()
+        .text_color(theme.muted_foreground)
+        .child(text.to_string())
 }
 
 fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
@@ -459,7 +723,7 @@ fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
         )
 }
 
-fn metric_card(theme: &Theme, label: &str, value: &str, hint: &str) -> impl IntoElement {
+fn metric(theme: &Theme, label: &str, value: &str) -> impl IntoElement {
     v_flex()
         .flex_1()
         .p_4()
@@ -474,153 +738,19 @@ fn metric_card(theme: &Theme, label: &str, value: &str, hint: &str) -> impl Into
                 .text_color(theme.muted_foreground)
                 .child(label.to_string()),
         )
-        .child(div().text_lg().font_semibold().child(value.to_string()))
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(hint.to_string()),
-        )
+        .child(div().text_sm().font_semibold().child(value.to_string()))
 }
 
 fn panel(theme: &Theme, title: &str, body: impl IntoElement) -> impl IntoElement {
     v_flex()
-        .flex_1()
         .p_4()
-        .gap_3()
+        .gap_2()
         .rounded(theme.radius)
         .border_1()
         .border_color(theme.border)
         .bg(theme.group_box)
         .child(div().text_sm().font_semibold().child(title.to_string()))
         .child(body)
-}
-
-fn row_line(theme: &Theme, left: &str, right: &str) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .justify_between()
-        .child(div().text_sm().child(left.to_string()))
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(right.to_string()),
-        )
-}
-
-fn sub_card(
-    theme: &Theme,
-    name: &str,
-    url: &str,
-    fetched: u32,
-    kept: u32,
-    excluded: &str,
-) -> impl IntoElement {
-    v_flex()
-        .p_4()
-        .gap_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
-        .child(
-            h_flex()
-                .justify_between()
-                .child(div().text_sm().font_semibold().child(name.to_string()))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{kept} / {fetched} nodes")),
-                ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .font_family(theme.mono_font_family.clone())
-                .text_color(theme.muted_foreground)
-                .child(url.to_string()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(format!("excluded: {excluded}")),
-        )
-}
-
-fn group_card(
-    theme: &Theme,
-    name: &str,
-    kind: &str,
-    summary: &str,
-    members: &[&str],
-) -> impl IntoElement {
-    v_flex()
-        .p_4()
-        .gap_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(div().text_sm().font_semibold().child(name.to_string()))
-                .child(pill(theme, kind, theme.accent)),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(summary.to_string()),
-        )
-        .children(members.iter().map(|member| {
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(Icon::new(IconName::HardDrive).small())
-                .child(div().text_sm().child((*member).to_string()))
-        }))
-}
-
-fn rule_line(theme: &Theme, source: &str, target: &str) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .justify_between()
-        .child(div().text_sm().child(source.to_string()))
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    Icon::new(IconName::ArrowRight)
-                        .small()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(div().text_sm().font_semibold().child(target.to_string())),
-        )
-}
-
-fn conn_line(theme: &Theme, app: &str, dest: &str, via: &str) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_3()
-        .child(div().w(px(88.)).text_sm().child(app.to_string()))
-        .child(
-            div()
-                .flex_1()
-                .text_xs()
-                .font_family(theme.mono_font_family.clone())
-                .text_color(theme.muted_foreground)
-                .child(dest.to_string()),
-        )
-        .child(pill(theme, via, theme.accent))
 }
 
 fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
@@ -635,20 +765,12 @@ fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
 }
 
 fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
-    let color = if on {
-        theme.success
-    } else {
-        theme.muted_foreground
-    };
-    div().size_2().rounded_full().bg(color)
-}
-
-fn format_bps(bps: f64) -> String {
-    if bps < 1_000.0 {
-        format!("{bps:.0} B/s")
-    } else if bps < 1_000_000.0 {
-        format!("{:.1} KB/s", bps / 1_000.0)
-    } else {
-        format!("{:.2} MB/s", bps / 1_000_000.0)
-    }
+    div()
+        .size_2()
+        .rounded_full()
+        .bg(if on {
+            theme.success
+        } else {
+            theme.muted_foreground
+        })
 }

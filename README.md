@@ -1,9 +1,28 @@
 # myproxy
 
-GPUI controller for a bundled mihomo core. The current tree is a **visual demo**: navigation and mock data only. It does not start mihomo.
+GPUI controller for a bundled mihomo core. Strategy document is the source of truth: subscriptions, exclude filter, groups, mixed-port, and **规则**.
+
+## Dev
 
 ```sh
-cargo run
+scripts/fetch-mihomo.sh   # Apple Silicon mihomo
+scripts/dev.sh            # restart on .rs/.toml save (needs watchexec)
+MYPROXY_PAGE=rules scripts/dev.sh   # open 规则 page
 ```
 
-macOS, Rust 1.98+ (`rust-toolchain.toml` pins it). GPUI Kit needs `cold_path` from that compiler.
+Rust 1.98+ (`rust-toolchain.toml`). GPUI has no in-process hot patch; `dev.sh` kills and relaunches the window.
+
+## CLI (agents)
+
+```sh
+cargo run --bin myproxyctl -- capabilities
+cargo run --bin myproxyctl -- subscription add 'https://…' --name Neko
+cargo run --bin myproxyctl -- filter --set '(?i)(流量|剩余|到期|官网)'
+cargo run --bin myproxyctl -- group add Japan --filter '(?i)日|jp'
+cargo run --bin myproxyctl -- rule add --domain chatgpt.com --via PROXY
+cargo run --bin myproxyctl -- rule add --app Arc --via Japan
+cargo run --bin myproxyctl -- apply
+cargo run --bin myproxyctl -- connect
+```
+
+Mixed port is HTTP proxy and SOCKS5 on the same loopback port (default **17890**, so it does not collide with Clash/MClash on 7890).

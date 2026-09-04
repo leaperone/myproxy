@@ -1,17 +1,14 @@
 mod ui;
 
-use gpui_kit::component::TitleBar;
-use gpui_kit::component::Root;
+use gpui_kit::component::{Root, TitleBar};
 use gpui_kit::*;
 
 use ui::AppView;
 
 fn main() {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
-
     app.run(move |cx| {
         gpui_kit::init(cx);
-
         cx.spawn(async move |cx| {
             cx.open_window(
                 WindowOptions {

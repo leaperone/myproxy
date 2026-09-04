@@ -1,0 +1,25 @@
+proxies:
+  - name: JP-Tokyo-01
+    type: ss
+    server: 127.0.0.1
+    port: 8388
+    cipher: aes-128-gcm
+    password: demo
+  - name: US-Silicon-01
+    type: ss
+    server: 127.0.0.1
+    port: 8389
+    cipher: aes-128-gcm
+    password: demo
+  - name: 剩余流量 128GB
+    type: ss
+    server: 127.0.0.1
+    port: 8390
+    cipher: aes-128-gcm
+    password: demo
+  - name: 套餐到期 2099-01-01
+    type: ss
+    server: 127.0.0.1
+    port: 8391
+    cipher: aes-128-gcm
+    password: demo
