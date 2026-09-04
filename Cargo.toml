@@ -1,0 +1,10 @@
+[package]
+name = "myproxy"
+version = "0.1.0"
+edition = "2021"
+description = "GPUI controller for a bundled mihomo core"
+publish = false
+
+[dependencies]
+gpui-kit = "0.6"
+rand = "0.9"
