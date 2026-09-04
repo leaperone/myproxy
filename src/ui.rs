@@ -1,19 +1,78 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, IconName, Sizable, StyledExt, Theme, TitleBar,
+    h_flex, v_flex, ActiveTheme, IconName, Selectable, Sizable, StyledExt, Theme, TitleBar,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
 use myproxy::strategy::{parse_list, Group, Rule, Strategy};
 use myproxy::supervisor::Supervisor;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleDraftKind {
+    App,
+    Exact,
+    Suffix,
+    Keyword,
+}
+
+impl RuleDraftKind {
+    const ALL: [Self; 4] = [Self::App, Self::Exact, Self::Suffix, Self::Keyword];
+
+    fn from_rule(rule: &Rule) -> Self {
+        if !rule.app.is_empty() {
+            Self::App
+        } else if !rule.keyword.is_empty() {
+            Self::Keyword
+        } else if !rule.domain.is_empty() {
+            Self::Exact
+        } else {
+            Self::Suffix
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::App => "应用",
+            Self::Exact => "精确",
+            Self::Suffix => "后缀",
+            Self::Keyword => "关键字",
+        }
+    }
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            Self::App => "进程名，例如 Arc",
+            Self::Exact => "apple.com",
+            Self::Suffix => "apple.com，匹配其子域",
+            Self::Keyword => "关键字，例如 google",
+        }
+    }
+
+    fn into_rule(self, match_value: String, via: String) -> Rule {
+        match self {
+            Self::App => Rule::new_app(match_value, via),
+            Self::Exact => Rule::new_domain(match_value, via),
+            Self::Suffix => Rule::new_suffix(normalize_suffix(&match_value), via),
+            Self::Keyword => Rule::new_keyword(match_value, via),
+        }
+    }
+}
+
+fn normalize_suffix(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .to_string()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -41,6 +100,8 @@ pub struct AppView {
     status: String,
     connected: bool,
     supervisor: Arc<Supervisor>,
+    rule_draft_kind: RuleDraftKind,
+    rule_edit_id: Option<String>,
     url_input: Entity<InputState>,
     name_input: Entity<InputState>,
     group_name: Entity<InputState>,
@@ -48,6 +109,7 @@ pub struct AppView {
     group_contains: Entity<InputState>,
     rule_match: Entity<InputState>,
     rule_via: Entity<InputState>,
+    rule_query: Entity<InputState>,
     filter_input: Entity<InputState>,
     port_input: Entity<InputState>,
 }
@@ -96,10 +158,13 @@ impl AppView {
             group_contains: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("名称含：jp, tokyo, 日")
             }),
+            rule_draft_kind: RuleDraftKind::Suffix,
+            rule_edit_id: None,
             rule_match: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Arc 或 *.apple.com")
+                InputState::new(window, cx).placeholder(RuleDraftKind::Suffix.placeholder())
             }),
             rule_via: cx.new(|cx| InputState::new(window, cx).default_value("PROXY")),
+            rule_query: cx.new(|cx| InputState::new(window, cx).placeholder("筛选规则…")),
             filter_input: cx.new(|cx| {
                 InputState::new(window, cx).default_value(strategy.exclude_filter.clone())
             }),
@@ -111,10 +176,16 @@ impl AppView {
         }
     }
 
-    fn persist(&mut self) {
+    fn persist(&mut self) -> bool {
         match self.strategy.save() {
-            Ok(()) => self.status = "已保存策略。".into(),
-            Err(err) => self.status = format!("保存失败: {err:#}"),
+            Ok(()) => {
+                self.status = "已保存策略。".into();
+                true
+            }
+            Err(err) => {
+                self.status = format!("保存失败: {err:#}");
+                false
+            }
         }
     }
 
@@ -198,6 +269,114 @@ impl AppView {
                 }
                 cx.notify();
             });
+        }
+    }
+
+    fn set_rule_kind(&mut self, kind: RuleDraftKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.rule_draft_kind = kind;
+        self.rule_match.update(cx, |input, cx| {
+            input.set_placeholder(kind.placeholder(), window, cx);
+        });
+    }
+
+    fn begin_edit_rule(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rule) = self.strategy.rules.iter().find(|r| r.id == id).cloned() else {
+            self.status = "找不到这条规则。".into();
+            return;
+        };
+        self.rule_edit_id = Some(id.to_string());
+        self.set_rule_kind(RuleDraftKind::from_rule(&rule), window, cx);
+        let match_value = rule.match_value().to_string();
+        let via = rule.via.clone();
+        self.rule_match.update(cx, |input, cx| {
+            input.set_value(match_value, window, cx);
+        });
+        self.rule_via.update(cx, |input, cx| {
+            input.set_value(via, window, cx);
+        });
+        self.status = format!("正在编辑 {} → {}", rule.match_label(), rule.via);
+    }
+
+    fn cancel_edit_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rule_edit_id = None;
+        self.rule_match.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.set_placeholder(self.rule_draft_kind.placeholder(), window, cx);
+        });
+        self.rule_via.update(cx, |input, cx| {
+            input.set_value("PROXY", window, cx);
+        });
+        self.status = "已取消编辑。".into();
+    }
+
+    fn commit_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let match_value = self.rule_match.read(cx).value().trim().to_string();
+        let via = self.rule_via.read(cx).value().trim().to_string();
+        if match_value.is_empty() {
+            self.status = format!("填写{}。", self.rule_draft_kind.placeholder());
+            return;
+        }
+        if via.is_empty() {
+            self.status = "填写走向，例如 PROXY、DIRECT、REJECT。".into();
+            return;
+        }
+        let next = self.rule_draft_kind.into_rule(match_value, via);
+        if let Some(id) = self.rule_edit_id.clone() {
+            if !self.strategy.update_rule(&id, next) {
+                self.status = "保存失败：规则已不存在。".into();
+                return;
+            }
+            if self.persist() {
+                self.cancel_edit_rule(window, cx);
+                self.status = "已保存规则。".into();
+            }
+        } else {
+            self.strategy.add_rule(next);
+            if self.persist() {
+                self.rule_match.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                self.status = "已添加规则。".into();
+            }
+        }
+    }
+
+    fn set_selected_rule_via(&mut self, id: &str, via: &str) {
+        if !self.strategy.set_rule_via(id, via.to_string()) {
+            self.status = "改走向失败。".into();
+            return;
+        }
+        if self.persist() {
+            self.status = format!("已改为 {via}。");
+        }
+    }
+
+    fn move_selected_rule(&mut self, id: &str, delta: i32) {
+        if !self.strategy.move_rule(id, delta) {
+            return;
+        }
+        if self.persist() {
+            self.status = if delta < 0 {
+                "已上移，优先级提高。".into()
+            } else {
+                "已下移，优先级降低。".into()
+            };
+        }
+    }
+
+    fn remove_selected_rule(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let editing = self.rule_edit_id.as_deref() == Some(id);
+        if !self.strategy.remove_rule(id) {
+            return;
+        }
+        if self.persist() {
+            if editing {
+                self.rule_edit_id = None;
+                self.rule_match.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+            }
+            self.status = "已删除规则。".into();
         }
     }
 }
@@ -330,20 +509,22 @@ impl AppView {
                     .text_color(theme.muted_foreground)
                     .child(self.status.clone()),
             )
-            .child(
-                div()
+            .child(match self.page {
+                Page::Rules => self.rules(cx, theme).into_any_element(),
+                page => div()
                     .id("page-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(match self.page {
+                    .child(match page {
                         Page::Overview => self.overview(theme).into_any_element(),
                         Page::Subscriptions => self.subscriptions(cx, theme).into_any_element(),
                         Page::Groups => self.groups(cx, theme).into_any_element(),
-                        Page::Rules => self.rules(cx, theme).into_any_element(),
                         Page::Settings => self.settings(cx, theme).into_any_element(),
-                    }),
-            )
+                        Page::Rules => unreachable!(),
+                    })
+                    .into_any_element(),
+            })
     }
 
     fn overview(&self, theme: &Theme) -> impl IntoElement {
@@ -606,102 +787,225 @@ impl AppView {
 
     fn rules(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
+        let editing = self.rule_edit_id.is_some();
+        let composer_title = if let Some(id) = &self.rule_edit_id {
+            match self.strategy.rules.iter().position(|r| &r.id == id) {
+                Some(index) => format!("编辑第 {} 条", index + 1),
+                None => "编辑规则".into(),
+            }
+        } else {
+            "添加规则".into()
+        };
+        let query = self.rule_query.read(cx).value().to_string();
+        let total = self.strategy.rules.len();
+        let visible: Vec<(usize, Rule)> = self
+            .strategy
+            .rules
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, rule)| rule.matches_query(&query))
+            .collect();
+        let visible_len = visible.len();
+        let muted = theme.muted;
+        let muted_fg = theme.muted_foreground;
+        let border = theme.border;
+        let radius = theme.radius;
+        let group_box = theme.group_box;
+
         v_flex()
+            .id("rules-page")
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
             .gap_4()
             .child(page_title(
                 theme,
                 "规则",
-                "按应用或域名选择节点 / 节点组 / Direct / Reject。自上而下第一条命中。应用规则编译为进程名，需流量进入 Mixed 口。",
+                "自上而下第一条命中。单击一行编辑；右键打开菜单。应用规则是进程名，流量要进 Mixed 口。",
             ))
-            .child(
-                h_flex()
+            .child(panel(
+                theme,
+                &composer_title,
+                v_flex()
                     .gap_2()
-                    .child(div().flex_1().child(Input::new(&self.rule_match)))
-                    .child(div().w(px(140.)).child(Input::new(&self.rule_via)))
-                    .child({
-                        let entity = entity.clone();
-                        Button::new("add-rule-app").label("作应用").on_click(
-                            move |_, window, app| {
-                                entity.update(app, |this, cx| {
-                                    let m = this.rule_match.read(cx).value().to_string();
-                                    let via = this.rule_via.read(cx).value().to_string();
-                                    if m.trim().is_empty() {
-                                        this.status = "填写应用名，例如 Arc。".into();
-                                    } else {
-                                        this.strategy.add_rule(Rule::new_app(m.trim().into(), via));
-                                        this.persist();
-                                        this.rule_match.update(cx, |i, cx| i.set_value("", window, cx));
-                                    }
-                                    cx.notify();
-                                });
-                            },
-                        )
-                    })
-                    .child({
-                        let entity = entity.clone();
-                        Button::new("add-rule-domain").primary().label("作域名").on_click(
-                            move |_, window, app| {
-                                entity.update(app, |this, cx| {
-                                    let m = this.rule_match.read(cx).value().to_string();
-                                    let via = this.rule_via.read(cx).value().to_string();
-                                    if m.trim().is_empty() {
-                                        this.status = "填写域名或 *.suffix。".into();
-                                    } else if m.contains('*') || m.starts_with('.') {
-                                        this.strategy.add_rule(Rule::new_suffix(
-                                            m.trim().trim_start_matches("*.").into(),
-                                            via,
-                                        ));
-                                        this.persist();
-                                        this.rule_match.update(cx, |i, cx| i.set_value("", window, cx));
-                                    } else {
-                                        this.strategy.add_rule(Rule::new_domain(m.trim().into(), via));
-                                        this.persist();
-                                        this.rule_match.update(cx, |i, cx| i.set_value("", window, cx));
-                                    }
-                                    cx.notify();
-                                });
-                            },
-                        )
-                    }),
-            )
-            .when(self.strategy.rules.is_empty(), |this| {
-                this.child(empty_hint(
-                    theme,
-                    "还没有规则。未匹配的流量走 PROXY（或第一组）。应用规则目前是进程名，不是系统级拦截。",
-                ))
-            })
-            .children(self.strategy.rules.iter().map(|rule| {
-                let id = rule.id.clone();
-                let entity = entity.clone();
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .p_3()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.group_box)
-                    .child(div().text_sm().child(rule.match_label()))
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(pill(theme, &rule.via, theme.accent))
+                            .items_center()
                             .child(
-                                Button::new(SharedString::from(format!("del-rule-{id}")))
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child("类型"),
+                            )
+                            .child({
+                                let entity = entity.clone();
+                                let mut group = ButtonGroup::new("rule-kind")
+                                    .compact()
+                                    .outline()
+                                    .small();
+                                for kind in RuleDraftKind::ALL {
+                                    group = group.child(
+                                        Button::new(SharedString::from(format!(
+                                            "rule-kind-{}",
+                                            kind.label()
+                                        )))
+                                        .small()
+                                        .label(kind.label())
+                                        .selected(self.rule_draft_kind == kind),
+                                    );
+                                }
+                                group.on_click(move |ixs, window, app| {
+                                    let Some(&ix) = ixs.first() else {
+                                        return;
+                                    };
+                                    let Some(kind) = RuleDraftKind::ALL.get(ix).copied() else {
+                                        return;
+                                    };
+                                    entity.update(app, |this, cx| {
+                                        this.set_rule_kind(kind, window, cx);
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().flex_1().child(Input::new(&self.rule_match)))
+                            .child(div().w(px(140.)).child(Input::new(&self.rule_via)))
+                            .child({
+                                let entity = entity.clone();
+                                Button::new("commit-rule")
                                     .small()
-                                    .danger()
-                                    .label("删除")
-                                    .on_click(move |_, _, app| {
+                                    .primary()
+                                    .label(if editing { "保存" } else { "添加" })
+                                    .on_click(move |_, window, app| {
                                         entity.update(app, |this, cx| {
-                                            this.strategy.remove_rule(&id);
-                                            this.persist();
+                                            this.commit_rule(window, cx);
                                             cx.notify();
                                         });
+                                    })
+                            })
+                            .when(editing, |this| {
+                                let entity = entity.clone();
+                                this.child(
+                                    Button::new("cancel-rule").small().label("取消").on_click(
+                                        move |_, window, app| {
+                                            entity.update(app, |this, cx| {
+                                                this.cancel_edit_rule(window, cx);
+                                                cx.notify();
+                                            });
+                                        },
+                                    ),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("走向填 PROXY、DIRECT、REJECT 或节点组名。"),
+                    ),
+            ))
+            .child(
+                v_flex()
+                    .id("rule-table")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().flex_1().child(Input::new(&self.rule_query)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(if query.trim().is_empty() {
+                                        format!("{total} 条")
+                                    } else {
+                                        format!("{visible_len} / {total} 条")
                                     }),
                             ),
                     )
-            }))
+                    .child(
+                        v_flex()
+                            .id("rule-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(border)
+                            .bg(group_box)
+                            .child(
+                                rule_columns(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("#"),
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("类型"),
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("匹配"),
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("走向"),
+                                )
+                                .px_3()
+                                .py_2()
+                                .bg(muted),
+                            )
+                            .child(
+                                v_flex()
+                                    .id("rules-scroll")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .when(self.strategy.rules.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .p_4()
+                                                .text_sm()
+                                                .text_color(muted_fg)
+                                                .child("还没有规则。选类型、填匹配和走向，再点添加。未匹配的流量走 PROXY。".to_string()),
+                                        )
+                                    })
+                                    .when(
+                                        !self.strategy.rules.is_empty() && visible.is_empty(),
+                                        |this| {
+                                            this.child(
+                                                div()
+                                                    .p_4()
+                                                    .text_sm()
+                                                    .text_color(muted_fg)
+                                                    .child("没有匹配筛选的规则。".to_string()),
+                                            )
+                                        },
+                                    )
+                                    .children(visible.into_iter().map(|(index, rule)| {
+                                        render_rule_row(
+                                            entity.clone(),
+                                            theme,
+                                            index,
+                                            total,
+                                            self.rule_edit_id.as_deref() == Some(rule.id.as_str()),
+                                            &rule,
+                                        )
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn settings(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -771,6 +1075,145 @@ fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
         .text_sm()
         .text_color(theme.muted_foreground)
         .child(text.to_string())
+}
+
+fn rule_columns(
+    index: impl IntoElement,
+    kind: impl IntoElement,
+    match_el: impl IntoElement,
+    via: impl IntoElement,
+) -> Div {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap(px(12.))
+        .child(div().w(px(36.)).flex_shrink_0().child(index))
+        .child(div().w(px(64.)).flex_shrink_0().child(kind))
+        .child(div().flex_1().min_w(px(0.)).child(match_el))
+        .child(div().w(px(120.)).flex_shrink_0().child(via))
+}
+
+fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {
+    div()
+        .px_2()
+        .py(px(2.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(text.to_string())
+}
+
+fn render_rule_row(
+    entity: Entity<AppView>,
+    theme: &Theme,
+    index: usize,
+    total: usize,
+    selected: bool,
+    rule: &Rule,
+) -> impl IntoElement {
+    let id = rule.id.clone();
+    let via = rule.via.clone();
+    let can_up = index > 0;
+    let can_down = index + 1 < total;
+    let muted = theme.muted;
+    let muted_fg = theme.muted_foreground;
+    let accent = theme.accent;
+    let mono = theme.mono_font_family.clone();
+    rule_columns(
+        div()
+            .text_xs()
+            .font_family(mono)
+            .text_color(muted_fg)
+            .child(format!("{}", index + 1)),
+        outline_pill(theme, rule.kind_label()),
+        div().text_sm().child(rule.match_value().to_string()),
+        pill(theme, &via, accent),
+    )
+    .id(SharedString::from(format!("rule-{id}")))
+    .px_3()
+    .py_2()
+    .cursor_pointer()
+    .when(selected, |this| this.bg(accent.opacity(0.14)))
+    .hover(move |style| style.bg(muted))
+    .on_click({
+        let entity = entity.clone();
+        let id = id.clone();
+        move |_, window, app| {
+            entity.update(app, |this, cx| {
+                this.begin_edit_rule(&id, window, cx);
+                cx.notify();
+            });
+        }
+    })
+    .context_menu(move |menu, window, cx| {
+        let edit_id = id.clone();
+        let edit_entity = entity.clone();
+        let up_id = id.clone();
+        let up_entity = entity.clone();
+        let down_id = id.clone();
+        let down_entity = entity.clone();
+        let del_id = id.clone();
+        let del_entity = entity.clone();
+        menu.min_w(px(168.))
+            .item(PopupMenuItem::new("编辑").on_click(move |_, window, app| {
+                edit_entity.update(app, |this, cx| {
+                    this.begin_edit_rule(&edit_id, window, cx);
+                    cx.notify();
+                });
+            }))
+            .separator()
+            .item(
+                PopupMenuItem::new("上移")
+                    .disabled(!can_up)
+                    .on_click(move |_, _, app| {
+                        up_entity.update(app, |this, cx| {
+                            this.move_selected_rule(&up_id, -1);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("下移")
+                    .disabled(!can_down)
+                    .on_click(move |_, _, app| {
+                        down_entity.update(app, |this, cx| {
+                            this.move_selected_rule(&down_id, 1);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .separator()
+            .submenu("改为走向", window, cx, {
+                let entity = entity.clone();
+                let id = id.clone();
+                let via_current = via.clone();
+                move |menu, _, _| {
+                    ["DIRECT", "PROXY", "REJECT"].into_iter().fold(menu, |menu, target| {
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        menu.item(
+                            PopupMenuItem::new(target)
+                                .checked(via_current.eq_ignore_ascii_case(target))
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.set_selected_rule_via(&id, target);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    })
+                }
+            })
+            .separator()
+            .item(PopupMenuItem::new("删除").on_click(move |_, window, app| {
+                del_entity.update(app, |this, cx| {
+                    this.remove_selected_rule(&del_id, window, cx);
+                    cx.notify();
+                });
+            }))
+    })
 }
 
 fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {

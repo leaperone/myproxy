@@ -163,6 +163,40 @@ impl Strategy {
         self.rules.last().expect("just pushed")
     }
 
+    pub fn update_rule(&mut self, id: &str, mut next: Rule) -> bool {
+        let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) else {
+            return false;
+        };
+        next.id = rule.id.clone();
+        *rule = next;
+        true
+    }
+
+    pub fn set_rule_via(&mut self, id: &str, via: String) -> bool {
+        let via = via.trim().to_string();
+        if via.is_empty() {
+            return false;
+        }
+        let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) else {
+            return false;
+        };
+        rule.via = via;
+        true
+    }
+
+    pub fn move_rule(&mut self, id: &str, delta: i32) -> bool {
+        let Some(from) = self.rules.iter().position(|r| r.id == id) else {
+            return false;
+        };
+        let to = from as i32 + delta;
+        if to < 0 || to >= self.rules.len() as i32 {
+            return false;
+        }
+        let item = self.rules.remove(from);
+        self.rules.insert(to as usize, item);
+        true
+    }
+
     pub fn remove_rule(&mut self, id: &str) -> bool {
         let before = self.rules.len();
         self.rules.retain(|r| r.id != id);
@@ -313,6 +347,32 @@ impl Rule {
         }
     }
 
+    pub fn kind_label(&self) -> &'static str {
+        if !self.app.is_empty() {
+            "应用"
+        } else if !self.keyword.is_empty() {
+            "关键字"
+        } else if !self.domain.is_empty() {
+            "精确"
+        } else if !self.suffix.is_empty() {
+            "后缀"
+        } else {
+            "—"
+        }
+    }
+
+    pub fn match_value(&self) -> &str {
+        if !self.app.is_empty() {
+            &self.app
+        } else if !self.keyword.is_empty() {
+            &self.keyword
+        } else if !self.domain.is_empty() {
+            &self.domain
+        } else {
+            self.suffix.trim_start_matches('.')
+        }
+    }
+
     pub fn match_label(&self) -> String {
         if !self.app.is_empty() {
             format!("app:{}", self.app)
@@ -325,6 +385,18 @@ impl Rule {
         } else {
             "any".into()
         }
+    }
+
+    pub fn matches_query(&self, query: &str) -> bool {
+        let q = query.trim();
+        if q.is_empty() {
+            return true;
+        }
+        let lower = q.to_lowercase();
+        self.kind_label().contains(q)
+            || self.match_value().to_lowercase().contains(&lower)
+            || self.via.to_lowercase().contains(&lower)
+            || self.match_label().to_lowercase().contains(&lower)
     }
 }
 
