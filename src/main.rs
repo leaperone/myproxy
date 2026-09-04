@@ -1,4 +1,5 @@
 mod appearance;
+mod sparkle;
 mod ui;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -17,6 +18,7 @@ fn main() {
         appearance::apply_saved(None, cx);
         #[cfg(target_os = "macos")]
         tray::install(cx);
+        sparkle::init();
         cx.spawn(async move |cx| {
             cx.update(|cx| {
                 open_main_window(cx);

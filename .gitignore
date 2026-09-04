@@ -1,8 +1,16 @@
 /target
+/dist
 .DS_Store
 *.swp
 .idea
 .vscode
+.env
+.env.*
+*.p12
+*.cer
+*.cert
+*.mobileprovision
+*.pem
 
 # Local planning artifacts
 /.planning/
@@ -10,6 +18,12 @@
 # Local Git worktrees
 /.worktrees/
 
+# Local secrets (Sparkle EdDSA private key, signing material)
+/.secrets/
+
 # Fetched mihomo binary (GPL-3.0); fetch with scripts/fetch-mihomo.sh
 /resources/mihomo/mihomo
+
+# Fetched Sparkle.framework + tools; fetch with scripts/fetch-sparkle.sh
+/resources/sparkle/
 

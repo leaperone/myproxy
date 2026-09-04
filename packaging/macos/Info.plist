@@ -17,14 +17,22 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.0.1</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.0</string>
+	<string>0.0.1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Dev build</string>
+	<string>Copyright 2026 leaperone</string>
+	<key>SUFeedURL</key>
+	<string>https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>fG4NVXVjLnza5nIfEejiVdXtynN99ZaMJOtpp8oKJ40=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 </dict>
 </plist>

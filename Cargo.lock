@@ -4574,10 +4574,11 @@ dependencies = [
 
 [[package]]
 name = "myproxy"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
+ "cc",
  "clap",
  "dirs 6.0.0",
  "gpui-kit",
