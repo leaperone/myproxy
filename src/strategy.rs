@@ -11,7 +11,7 @@ use crate::paths;
 pub const DEFAULT_EXCLUDE: &str =
     r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
 
-pub const STRATEGY_SCHEMA: u32 = 2;
+pub const STRATEGY_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Strategy {
@@ -27,6 +27,9 @@ pub struct Strategy {
     #[serde(default)]
     pub groups: Vec<Group>,
     #[serde(default)]
+    pub rule_sets: Vec<RuleSet>,
+    /// Legacy flat rules. Read on migrate, never written back.
+    #[serde(default, skip_serializing)]
     pub rules: Vec<Rule>,
 }
 
@@ -82,6 +85,21 @@ pub struct Rule {
     pub via: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Matcher {
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSet {
+    pub id: String,
+    pub name: String,
+    pub via: String,
+    #[serde(default)]
+    pub matchers: Vec<Matcher>,
+}
+
 impl Default for Strategy {
     fn default() -> Self {
         Self {
@@ -91,6 +109,7 @@ impl Default for Strategy {
             developer_mode: false,
             subscriptions: Vec::new(),
             groups: vec![Group::all_nodes("PROXY".into(), "select".into())],
+            rule_sets: Vec::new(),
             rules: Vec::new(),
         }
     }
@@ -108,7 +127,7 @@ impl Strategy {
         let data = fs::read_to_string(&path)
             .with_context(|| format!("read {}", path.display()))?;
         let mut strategy: Self = serde_json::from_str(&data).context("parse strategy.json")?;
-        if strategy.migrate_groups() {
+        if strategy.migrate() {
             if let Err(err) = strategy.save() {
                 log::error("strategy", format!("migrate save failed: {err:#}"));
             } else {
@@ -149,15 +168,32 @@ impl Strategy {
         self.groups.last().expect("just pushed")
     }
 
-    fn migrate_groups(&mut self) -> bool {
+    fn migrate(&mut self) -> bool {
         if self.schema >= STRATEGY_SCHEMA {
-            return false;
+            if self.rules.is_empty() {
+                return false;
+            }
+            self.fold_legacy_rules();
+            return true;
         }
-        for group in &mut self.groups {
-            group.migrate_legacy();
+        if self.schema < 2 {
+            for group in &mut self.groups {
+                group.migrate_legacy();
+            }
+        }
+        if self.schema < 3 {
+            self.fold_legacy_rules();
         }
         self.schema = STRATEGY_SCHEMA;
         true
+    }
+
+    fn fold_legacy_rules(&mut self) {
+        if self.rule_sets.is_empty() {
+            self.rule_sets = self.rules.drain(..).map(RuleSet::from_legacy).collect();
+        } else {
+            self.rules.clear();
+        }
     }
 
     pub fn group_mut(&mut self, name: &str) -> Option<&mut Group> {
@@ -172,11 +208,6 @@ impl Strategy {
         self.groups.len() != before
     }
 
-    pub fn add_rule(&mut self, rule: Rule) -> &Rule {
-        self.rules.push(rule);
-        self.rules.last().expect("just pushed")
-    }
-
     pub fn update_group(&mut self, id: &str, mut next: Group) -> bool {
         let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
             return false;
@@ -186,12 +217,40 @@ impl Strategy {
         true
     }
 
-    pub fn update_rule(&mut self, id: &str, mut next: Rule) -> bool {
-        let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) else {
+    pub fn add_rule_set(&mut self, set: RuleSet) -> &RuleSet {
+        self.rule_sets.push(set);
+        self.rule_sets.last().expect("just pushed")
+    }
+
+    pub fn add_matcher(&mut self, name: String, matcher: Matcher, via: String) -> &RuleSet {
+        if let Some(index) = self
+            .rule_sets
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&name))
+        {
+            let set = &mut self.rule_sets[index];
+            if !set.matchers.iter().any(|m| m.same_as(&matcher)) {
+                set.matchers.push(matcher);
+            }
+            if !via.trim().is_empty() {
+                set.via = via;
+            }
+            return &self.rule_sets[index];
+        }
+        self.add_rule_set(RuleSet {
+            id: Uuid::new_v4().to_string(),
+            name,
+            via,
+            matchers: vec![matcher],
+        })
+    }
+
+    pub fn update_rule_set(&mut self, id: &str, mut next: RuleSet) -> bool {
+        let Some(set) = self.rule_sets.iter_mut().find(|s| s.id == id) else {
             return false;
         };
-        next.id = rule.id.clone();
-        *rule = next;
+        next.id = set.id.clone();
+        *set = next;
         true
     }
 
@@ -200,30 +259,30 @@ impl Strategy {
         if via.is_empty() {
             return false;
         }
-        let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) else {
+        let Some(set) = self.rule_sets.iter_mut().find(|s| s.id == id) else {
             return false;
         };
-        rule.via = via;
+        set.via = via;
         true
     }
 
     pub fn move_rule(&mut self, id: &str, delta: i32) -> bool {
-        let Some(from) = self.rules.iter().position(|r| r.id == id) else {
+        let Some(from) = self.rule_sets.iter().position(|s| s.id == id) else {
             return false;
         };
         let to = from as i32 + delta;
-        if to < 0 || to >= self.rules.len() as i32 {
+        if to < 0 || to >= self.rule_sets.len() as i32 {
             return false;
         }
-        let item = self.rules.remove(from);
-        self.rules.insert(to as usize, item);
+        let item = self.rule_sets.remove(from);
+        self.rule_sets.insert(to as usize, item);
         true
     }
 
     pub fn remove_rule(&mut self, id: &str) -> bool {
-        let before = self.rules.len();
-        self.rules.retain(|r| r.id != id);
-        self.rules.len() != before
+        let before = self.rule_sets.len();
+        self.rule_sets.retain(|s| s.id != id && s.name != id);
+        self.rule_sets.len() != before
     }
 }
 
@@ -434,9 +493,105 @@ impl Rule {
     }
 }
 
+impl Matcher {
+    pub fn app(value: String) -> Self {
+        Self {
+            kind: "app".into(),
+            value,
+        }
+    }
+
+    pub fn domain(value: String) -> Self {
+        Self {
+            kind: "domain".into(),
+            value,
+        }
+    }
+
+    pub fn suffix(value: String) -> Self {
+        Self {
+            kind: "suffix".into(),
+            value: value
+                .trim()
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .to_string(),
+        }
+    }
+
+    pub fn keyword(value: String) -> Self {
+        Self {
+            kind: "keyword".into(),
+            value,
+        }
+    }
+
+    pub fn from_rule(rule: &Rule) -> Self {
+        if !rule.app.is_empty() {
+            Self::app(rule.app.clone())
+        } else if !rule.keyword.is_empty() {
+            Self::keyword(rule.keyword.clone())
+        } else if !rule.domain.is_empty() {
+            Self::domain(rule.domain.clone())
+        } else {
+            Self::suffix(rule.suffix.clone())
+        }
+    }
+
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.value.eq_ignore_ascii_case(&other.value)
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind.as_str() {
+            "app" => "进程",
+            "keyword" => "关键字",
+            "domain" => "域名",
+            "suffix" => "后缀",
+            _ => "—",
+        }
+    }
+
+    pub fn display_value(&self) -> String {
+        if self.kind == "suffix" {
+            format!("*.{}", self.value.trim_start_matches('.'))
+        } else {
+            self.value.clone()
+        }
+    }
+}
+
+impl RuleSet {
+    pub fn from_legacy(rule: Rule) -> Self {
+        let name = rule.match_value().to_string();
+        let matcher = Matcher::from_rule(&rule);
+        Self {
+            id: rule.id,
+            name,
+            via: rule.via,
+            matchers: vec![matcher],
+        }
+    }
+
+    pub fn matches_query(&self, query: &str) -> bool {
+        let q = query.trim();
+        if q.is_empty() {
+            return true;
+        }
+        let lower = q.to_lowercase();
+        self.name.to_lowercase().contains(&lower)
+            || self.via.to_lowercase().contains(&lower)
+            || self.matchers.iter().any(|m| {
+                m.kind_label().contains(q)
+                    || m.value.to_lowercase().contains(&lower)
+                    || m.display_value().to_lowercase().contains(&lower)
+            })
+    }
+}
+
 pub fn load_from(path: &Path) -> Result<Strategy> {
     let data = fs::read_to_string(path)?;
     let mut strategy: Strategy = serde_json::from_str(&data)?;
-    strategy.migrate_groups();
+    strategy.migrate();
     Ok(strategy)
 }

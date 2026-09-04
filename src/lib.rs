@@ -5,4 +5,4 @@ pub mod paths;
 pub mod strategy;
 pub mod supervisor;
 
-pub use strategy::{Group, Rule, Strategy};
+pub use strategy::{Group, Matcher, Rule, RuleSet, Strategy};

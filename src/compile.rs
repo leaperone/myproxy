@@ -52,29 +52,36 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     root.insert("proxy-groups".into(), serde_yaml::Value::Sequence(groups));
 
     let mut rules = Vec::new();
-    for rule in &strategy.rules {
-        let target = via_target(&rule.via, strategy);
-        if !rule.keyword.is_empty() {
-            rules.push(format!("DOMAIN-KEYWORD,{},{}", rule.keyword, target));
-        } else if !rule.suffix.is_empty() {
-            rules.push(format!(
-                "DOMAIN-SUFFIX,{},{}",
-                rule.suffix.trim_start_matches('.'),
-                target
-            ));
-        } else if !rule.domain.is_empty() {
-            if rule.domain.starts_with("*.") {
-                rules.push(format!(
-                    "DOMAIN-SUFFIX,{},{}",
-                    rule.domain.trim_start_matches("*."),
-                    target
-                ));
-            } else {
-                rules.push(format!("DOMAIN,{},{}", rule.domain, target));
+    for set in &strategy.rule_sets {
+        let target = via_target(&set.via, strategy);
+        for matcher in &set.matchers {
+            match matcher.kind.as_str() {
+                "keyword" => {
+                    rules.push(format!("DOMAIN-KEYWORD,{},{}", matcher.value, target));
+                }
+                "suffix" => {
+                    rules.push(format!(
+                        "DOMAIN-SUFFIX,{},{}",
+                        matcher.value.trim_start_matches('.'),
+                        target
+                    ));
+                }
+                "domain" => {
+                    if matcher.value.starts_with("*.") {
+                        rules.push(format!(
+                            "DOMAIN-SUFFIX,{},{}",
+                            matcher.value.trim_start_matches("*."),
+                            target
+                        ));
+                    } else {
+                        rules.push(format!("DOMAIN,{},{}", matcher.value, target));
+                    }
+                }
+                "app" => {
+                    rules.push(format!("PROCESS-NAME,{},{}", matcher.value, target));
+                }
+                _ => {}
             }
-        }
-        if !rule.app.is_empty() {
-            rules.push(format!("PROCESS-NAME,{},{}", rule.app, target));
         }
     }
     rules.push(format!(
@@ -90,10 +97,11 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     log::info(
         "compile",
         format!(
-            "runtime.yaml nodes={} groups={} rules={}",
+            "runtime.yaml nodes={} groups={} rule_sets={} compiled_rules={}",
             catalog.nodes.len(),
             strategy.groups.len(),
-            strategy.rules.len()
+            strategy.rule_sets.len(),
+            rules.len()
         ),
     );
     Ok(yaml)

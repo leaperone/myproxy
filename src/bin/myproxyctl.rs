@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use myproxy::catalog;
 use myproxy::compile;
 use myproxy::paths;
-use myproxy::strategy::{self, Rule, Strategy};
+use myproxy::strategy::{self, Matcher, Strategy};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Parser)]
@@ -85,6 +85,8 @@ enum GroupCmd {
 enum RuleCmd {
     List,
     Add {
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long, default_value = "")]
         app: String,
         #[arg(long, default_value = "")]
@@ -129,7 +131,7 @@ fn main() -> Result<()> {
                 catalog.nodes.len(),
                 catalog.excluded.len(),
                 strategy.groups.len(),
-                strategy.rules.len()
+                strategy.rule_sets.len()
             );
             println!("strategy {}", paths::strategy_path()?.display());
         }
@@ -292,11 +294,21 @@ fn main() -> Result<()> {
         },
         Commands::Rule { cmd } => match cmd {
             RuleCmd::List => {
-                for rule in Strategy::load()?.rules {
-                    println!("{}\t{}\t{}", rule.id, rule.match_label(), rule.via);
+                for set in Strategy::load()?.rule_sets {
+                    println!(
+                        "{}\t{}\t{} matchers\t{}",
+                        set.name,
+                        set.via,
+                        set.matchers.len(),
+                        set.id
+                    );
+                    for matcher in set.matchers {
+                        println!("  {}\t{}", matcher.kind_label(), matcher.display_value());
+                    }
                 }
             }
             RuleCmd::Add {
+                name,
                 app,
                 domain,
                 suffix,
@@ -306,18 +318,21 @@ fn main() -> Result<()> {
                 if app.is_empty() && domain.is_empty() && suffix.is_empty() && keyword.is_empty() {
                     bail!("need --app, --domain, --suffix, or --keyword");
                 }
-                let mut strategy = Strategy::load()?;
-                let rule = if !app.is_empty() {
-                    Rule::new_app(app, via)
+                let matcher = if !app.is_empty() {
+                    Matcher::app(app)
                 } else if !keyword.is_empty() {
-                    Rule::new_keyword(keyword, via)
+                    Matcher::keyword(keyword)
                 } else if !domain.is_empty() {
-                    Rule::new_domain(domain, via)
+                    Matcher::domain(domain)
                 } else {
-                    Rule::new_suffix(suffix, via)
+                    Matcher::suffix(suffix)
                 };
-                println!("{}\t{}", rule.id, rule.match_label());
-                strategy.add_rule(rule);
+                let name = name
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| matcher.display_value());
+                let mut strategy = Strategy::load()?;
+                let set = strategy.add_matcher(name, matcher, via);
+                println!("{}\t{}\t{} matchers", set.name, set.via, set.matchers.len());
                 strategy.save()?;
             }
             RuleCmd::Remove { id } => {

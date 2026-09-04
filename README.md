@@ -26,8 +26,9 @@ cargo run --bin myproxyctl -- group add Japan --contains jp --contains tokyo --c
 cargo run --bin myproxyctl -- group add KittyJP --source Kitty --contains 日 --contains jp
 cargo run --bin myproxyctl -- group add PROXY --all
 cargo run --bin myproxyctl -- group include Japan 'Kitty · JP-01'
-cargo run --bin myproxyctl -- rule add --domain chatgpt.com --via PROXY
-cargo run --bin myproxyctl -- rule add --app Arc --via Japan
+cargo run --bin myproxyctl -- rule add --name Cursor --suffix cursor.sh --via PROXY
+cargo run --bin myproxyctl -- rule add --name Cursor --app Cursor --via PROXY
+cargo run --bin myproxyctl -- rule add --name GitHub --keyword github --via PROXY
 cargo run --bin myproxyctl -- apply
 cargo run --bin myproxyctl -- connect
 ```
