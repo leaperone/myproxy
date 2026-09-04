@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::log;
 use crate::paths;
 
 pub const DEFAULT_EXCLUDE: &str =
@@ -101,13 +102,18 @@ impl Strategy {
         if !path.exists() {
             let strategy = Self::default();
             strategy.save()?;
+            log::info("strategy", "created default strategy.json");
             return Ok(strategy);
         }
         let data = fs::read_to_string(&path)
             .with_context(|| format!("read {}", path.display()))?;
         let mut strategy: Self = serde_json::from_str(&data).context("parse strategy.json")?;
         if strategy.migrate_groups() {
-            let _ = strategy.save();
+            if let Err(err) = strategy.save() {
+                log::error("strategy", format!("migrate save failed: {err:#}"));
+            } else {
+                log::info("strategy", "migrated strategy schema");
+            }
         }
         Ok(strategy)
     }
@@ -118,6 +124,7 @@ impl Strategy {
         let data = serde_json::to_string_pretty(self)?;
         fs::write(&tmp, data)?;
         fs::rename(&tmp, &path)?;
+        log::debug("strategy", "saved strategy.json");
         Ok(())
     }
 

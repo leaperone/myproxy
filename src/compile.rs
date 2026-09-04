@@ -3,6 +3,7 @@ use std::fs;
 use anyhow::{Context, Result};
 
 use crate::catalog::{self, Catalog};
+use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
 
@@ -28,6 +29,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     for group in &strategy.groups {
         let mut members = catalog::resolve_group_members(group, catalog);
         if members.is_empty() {
+            log::warn("compile", format!("group {} empty, using DIRECT", group.name));
             members.push("DIRECT".into());
         }
         let mut item = serde_yaml::Mapping::new();
@@ -85,6 +87,15 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))?;
     let path = paths::runtime_yaml_path()?;
     fs::write(&path, &yaml).with_context(|| format!("write {}", path.display()))?;
+    log::info(
+        "compile",
+        format!(
+            "runtime.yaml nodes={} groups={} rules={}",
+            catalog.nodes.len(),
+            strategy.groups.len(),
+            strategy.rules.len()
+        ),
+    );
     Ok(yaml)
 }
 

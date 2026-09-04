@@ -21,7 +21,7 @@ impl Global for TrayKeepAlive {}
 pub fn install(cx: &mut App) {
     match build_tray() {
         Ok(tray) => cx.set_global(TrayKeepAlive { _tray: tray }),
-        Err(err) => myproxy::log::warn(format!("menu bar icon failed: {err:#}")),
+        Err(err) => myproxy::log::warn("tray", format!("menu bar icon failed: {err:#}")),
     }
     cx.spawn(async move |cx| loop {
         cx.background_executor()
@@ -103,16 +103,16 @@ fn connect() {
     match Strategy::load() {
         Ok(strategy) => {
             if let Err(err) = Supervisor::default().connect(&strategy) {
-                myproxy::log::warn(format!("tray connect failed: {err:#}"));
+                myproxy::log::error("tray", format!("connect failed: {err:#}"));
             }
         }
-        Err(err) => myproxy::log::warn(format!("tray load strategy failed: {err:#}")),
+        Err(err) => myproxy::log::error("tray", format!("load strategy failed: {err:#}")),
     }
 }
 
 fn disconnect() {
     if let Err(err) = Supervisor::default().disconnect() {
-        myproxy::log::warn(format!("tray disconnect failed: {err:#}"));
+        myproxy::log::error("tray", format!("disconnect failed: {err:#}"));
     }
 }
 
@@ -121,7 +121,7 @@ fn apply() {
         catalog::refresh(&strategy).and_then(|catalog| compile::compile(&strategy, &catalog))
     }) {
         Ok(_) => {}
-        Err(err) => myproxy::log::warn(format!("tray apply failed: {err:#}")),
+        Err(err) => myproxy::log::error("tray", format!("apply failed: {err:#}")),
     }
 }
 

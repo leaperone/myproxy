@@ -9,7 +9,7 @@ use ui::AppView;
 
 fn main() {
     myproxy::log::init();
-    myproxy::log::info("myproxy start");
+    myproxy::log::info("main", "myproxy start");
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);

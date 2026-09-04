@@ -333,10 +333,13 @@ impl Render for GroupEditor {
         let members = catalog::resolve_group_members(&draft, &parent.catalog);
         let resolve_ms = started.elapsed().as_millis();
         if resolve_ms >= 8 {
-            log::debug(format!(
-                "group preview resolve {} members in {resolve_ms}ms",
-                members.len()
-            ));
+            log::debug(
+                "ui",
+                format!(
+                    "group preview resolve {} members in {resolve_ms}ms",
+                    members.len()
+                ),
+            );
         }
         const PREVIEW_LIMIT: usize = 80;
         let extra = members.len().saturating_sub(PREVIEW_LIMIT);
@@ -646,15 +649,24 @@ pub struct AppView {
 
 impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let strategy = Strategy::load().unwrap_or_default();
+        let strategy = match Strategy::load() {
+            Ok(strategy) => strategy,
+            Err(err) => {
+                log::error("ui", format!("load strategy failed: {err:#}"));
+                Strategy::default()
+            }
+        };
         let catalog = Catalog::load().unwrap_or_default();
         log::set_developer(strategy.developer_mode);
-        log::info(format!(
-            "window ready nodes={} groups={} rules={}",
-            catalog.nodes.len(),
-            strategy.groups.len(),
-            strategy.rules.len()
-        ));
+        log::info(
+            "ui",
+            format!(
+                "window ready nodes={} groups={} rules={}",
+                catalog.nodes.len(),
+                strategy.groups.len(),
+                strategy.rules.len()
+            ),
+        );
         let strategy_path = myproxy::paths::strategy_path().ok();
         let catalog_path = myproxy::paths::catalog_path().ok();
         cx.spawn(async move |this, cx| {
@@ -683,7 +695,7 @@ impl AppView {
                                         log::set_developer(strategy.developer_mode);
                                         this.strategy = strategy;
                                         dirty = true;
-                                        log::debug("reload strategy.json");
+                                        log::debug("ui", "reload strategy.json");
                                     }
                                 }
                             }
@@ -692,10 +704,13 @@ impl AppView {
                                 if stamp != catalog_stamp {
                                     catalog_stamp = stamp;
                                     if let Ok(catalog) = Catalog::load() {
-                                        log::debug(format!(
-                                            "reload catalog.json nodes={}",
-                                            catalog.nodes.len()
-                                        ));
+                                        log::debug(
+                                            "ui",
+                                            format!(
+                                                "reload catalog.json nodes={}",
+                                                catalog.nodes.len()
+                                            ),
+                                        );
                                         this.catalog = catalog;
                                         dirty = true;
                                     }
@@ -710,7 +725,7 @@ impl AppView {
                         }
                         let ms = started.elapsed().as_millis();
                         if ms >= 8 {
-                            log::debug(format!("poll {ms}ms dirty={dirty}"));
+                            log::trace("ui", format!("poll {ms}ms dirty={dirty}"));
                         }
                     })
                     .is_err()
@@ -759,7 +774,7 @@ impl AppView {
                 true
             }
             Err(err) => {
-                log::warn(format!("save strategy failed: {err:#}"));
+                log::error("ui", format!("save strategy failed: {err:#}"));
                 self.status = format!("保存失败: {err:#}");
                 false
             }
@@ -802,11 +817,6 @@ impl AppView {
                     myproxy::compile::compile(&this.strategy, &cat)
                 }) {
                     Ok(_) => {
-                        log::info(format!(
-                            "apply ok nodes={} excluded={}",
-                            this.catalog.nodes.len(),
-                            this.catalog.excluded.len()
-                        ));
                         this.status = format!(
                             "已编译 {} 个节点，排除 {}。Mixed {}。",
                             this.catalog.nodes.len(),
@@ -815,7 +825,7 @@ impl AppView {
                         );
                     }
                     Err(err) => {
-                        log::warn(format!("apply failed: {err:#}"));
+                        log::error("ui", format!("apply failed: {err:#}"));
                         this.status = format!("Apply 失败: {err:#}");
                     }
                 }
@@ -836,10 +846,9 @@ impl AppView {
                         Ok(()) => {
                             this.connected = false;
                             this.status = "已断开。".into();
-                            log::info("disconnected");
                         }
                         Err(err) => {
-                            log::warn(format!("disconnect failed: {err:#}"));
+                            log::error("ui", format!("disconnect failed: {err:#}"));
                             this.status = format!("{err:#}");
                         }
                     }
@@ -848,17 +857,13 @@ impl AppView {
                         Ok(()) => {
                             this.connected = true;
                             this.catalog = Catalog::load().unwrap_or_default();
-                            log::info(format!(
-                                "connected mixed {}",
-                                this.strategy.mixed_port
-                            ));
                             this.status = format!(
                                 "已连接 127.0.0.1:{} （HTTP + SOCKS5）",
                                 this.strategy.mixed_port
                             );
                         }
                         Err(err) => {
-                            log::warn(format!("connect failed: {err:#}"));
+                            log::error("ui", format!("connect failed: {err:#}"));
                             this.status = format!("{err:#}");
                         }
                     }
@@ -941,13 +946,16 @@ impl AppView {
         }
         self.group_modal_open = true;
         self.group_edit_id = existing.as_ref().map(|g| g.id.clone());
-        log::debug(format!(
-            "open group dialog {}",
-            existing
-                .as_ref()
-                .map(|g| g.name.as_str())
-                .unwrap_or("(new)")
-        ));
+        log::debug(
+            "ui",
+            format!(
+                "open group dialog {}",
+                existing
+                    .as_ref()
+                    .map(|g| g.name.as_str())
+                    .unwrap_or("(new)")
+            ),
+        );
         let parent = cx.entity();
         let editor = cx.new(|cx| GroupEditor::new(parent.clone(), existing, window, cx));
         let editing = id.is_some();
@@ -1678,7 +1686,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("记录操作与慢路径，方便回顾卡顿。MYPROXY_DEV=1 也会打开。"),
+                        .child("error/warn/info 始终写入日志文件；debug/trace 仅开发者模式。不记录订阅 URL。MYPROXY_DEV=1 也会打开。"),
                 )
                 .child(
                     h_flex()

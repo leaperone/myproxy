@@ -5,6 +5,7 @@ use base64::Engine;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
 
@@ -47,12 +48,18 @@ impl Catalog {
 
 pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
     let exclude = Regex::new(&strategy.exclude_filter)
-        .context("invalid exclude_filter regex")?;
+        .context("invalid exclude_filter regex")
+        .inspect_err(|err| log::error("catalog", format!("{err:#}")))?;
     let mut catalog = Catalog::default();
+    log::debug(
+        "catalog",
+        format!("refresh {} subscriptions", strategy.subscriptions.len()),
+    );
 
     for sub in &strategy.subscriptions {
-        match fetch_proxies(&sub.url) {
+        match fetch_proxies(&sub.name, &sub.url) {
             Ok(proxies) => {
+                let before = catalog.nodes.len();
                 for raw in proxies {
                     let original = raw
                         .get("name")
@@ -81,8 +88,13 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
                         raw: prefixed,
                     });
                 }
+                log::debug(
+                    "catalog",
+                    format!("{} kept {} nodes", sub.name, catalog.nodes.len() - before),
+                );
             }
             Err(err) => {
+                log::warn("catalog", format!("fetch {} failed: {err:#}", sub.name));
                 catalog.excluded.push(Excluded {
                     name: format!("<{}>", sub.name),
                     subscription: sub.name.clone(),
@@ -93,21 +105,29 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
     }
 
     catalog.save()?;
+    log::info(
+        "catalog",
+        format!(
+            "refresh nodes={} excluded={}",
+            catalog.nodes.len(),
+            catalog.excluded.len()
+        ),
+    );
     Ok(catalog)
 }
 
-fn fetch_proxies(url: &str) -> Result<Vec<serde_yaml::Value>> {
+fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
     let body = if let Some(path) = url.strip_prefix("file://") {
-        fs::read_to_string(path).with_context(|| format!("read {path}"))?
+        fs::read_to_string(path).with_context(|| format!("read {name}"))?
     } else if url.starts_with("http://") || url.starts_with("https://") {
         ureq::get(url)
             .timeout(std::time::Duration::from_secs(30))
             .set("User-Agent", "clash.meta")
             .call()
-            .with_context(|| format!("GET {url}"))?
+            .with_context(|| format!("GET {name}"))?
             .into_string()?
     } else {
-        fs::read_to_string(url).with_context(|| format!("read {url}"))?
+        fs::read_to_string(url).with_context(|| format!("read {name}"))?
     };
     parse_subscription(&body)
 }

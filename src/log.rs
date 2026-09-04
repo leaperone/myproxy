@@ -10,6 +10,42 @@ use crate::paths;
 const RING: usize = 200;
 const MAX_FILE_BYTES: u64 = 1_500_000;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl Level {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+
+    fn to_file(self, developer: bool) -> bool {
+        match self {
+            Self::Error | Self::Warn | Self::Info => true,
+            Self::Debug | Self::Trace => developer,
+        }
+    }
+
+    fn to_stderr(self, developer: bool) -> bool {
+        match self {
+            Self::Error | Self::Warn => true,
+            Self::Info => developer,
+            Self::Debug | Self::Trace => false,
+        }
+    }
+}
+
 struct State {
     developer: bool,
     lines: VecDeque<String>,
@@ -85,11 +121,14 @@ pub fn set_developer(on: bool) {
     }
     st.developer = on;
     drop(st);
-    info(if on {
-        "developer mode on"
-    } else {
-        "developer mode off"
-    });
+    info(
+        "log",
+        if on {
+            "developer mode on"
+        } else {
+            "developer mode off"
+        },
+    );
 }
 
 pub fn developer() -> bool {
@@ -105,21 +144,30 @@ pub fn recent(limit: usize) -> Vec<String> {
     st.lines.iter().rev().take(limit).rev().cloned().collect()
 }
 
-pub fn info(msg: impl AsRef<str>) {
-    write("info", msg.as_ref(), true);
+pub fn error(target: &str, msg: impl AsRef<str>) {
+    emit(Level::Error, target, msg.as_ref());
 }
 
-pub fn warn(msg: impl AsRef<str>) {
-    write("warn", msg.as_ref(), true);
+pub fn warn(target: &str, msg: impl AsRef<str>) {
+    emit(Level::Warn, target, msg.as_ref());
 }
 
-pub fn debug(msg: impl AsRef<str>) {
-    write("debug", msg.as_ref(), false);
+pub fn info(target: &str, msg: impl AsRef<str>) {
+    emit(Level::Info, target, msg.as_ref());
 }
 
-fn write(level: &str, msg: &str, always: bool) {
+pub fn debug(target: &str, msg: impl AsRef<str>) {
+    emit(Level::Debug, target, msg.as_ref());
+}
+
+pub fn trace(target: &str, msg: impl AsRef<str>) {
+    emit(Level::Trace, target, msg.as_ref());
+}
+
+fn emit(level: Level, target: &str, msg: &str) {
     let mut st = lock();
-    if !always && !st.developer && !env_forced() {
+    let developer = st.developer || env_forced();
+    if !level.to_file(developer) && !level.to_stderr(developer) {
         return;
     }
     let ts = SystemTime::now()
@@ -129,9 +177,15 @@ fn write(level: &str, msg: &str, always: bool) {
     let h = ts / 3600;
     let m = (ts % 3600) / 60;
     let s = ts % 60;
-    let line = format!("{h:02}:{m:02}:{s:02} {level} {msg}");
-    if always {
+    let line = format!(
+        "{h:02}:{m:02}:{s:02}Z {} {target} {msg}",
+        level.as_str()
+    );
+    if level.to_stderr(developer) {
         eprintln!("myproxy {line}");
+    }
+    if !level.to_file(developer) {
+        return;
     }
     st.rotate_if_needed();
     if let Some(file) = &mut st.file {

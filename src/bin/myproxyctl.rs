@@ -100,6 +100,7 @@ enum RuleCmd {
 }
 
 fn main() -> Result<()> {
+    myproxy::log::init();
     let cli = Cli::parse();
     match cli.command {
         Commands::Capabilities => {
@@ -133,6 +134,7 @@ fn main() -> Result<()> {
             println!("strategy {}", paths::strategy_path()?.display());
         }
         Commands::Apply => {
+            myproxy::log::debug("ctl", "apply");
             let strategy = Strategy::load()?;
             let catalog = catalog::refresh(&strategy)?;
             compile::compile(&strategy, &catalog)?;
@@ -144,11 +146,13 @@ fn main() -> Result<()> {
             );
         }
         Commands::Connect => {
+            myproxy::log::debug("ctl", "connect");
             let strategy = Strategy::load()?;
             Supervisor::default().connect(&strategy)?;
             println!("connected mixed-port {}", strategy.mixed_port);
         }
         Commands::Disconnect => {
+            myproxy::log::debug("ctl", "disconnect");
             Supervisor::default().disconnect()?;
             println!("disconnected");
         }
