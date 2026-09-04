@@ -2152,7 +2152,126 @@ impl AppView {
                         )
                     }),
             ))
+            .child(self.startup_panel(cx, theme))
             .child(self.developer_panel(cx, theme))
+    }
+
+    fn startup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let bundled = myproxy::login_item::is_bundled();
+        panel(
+            theme,
+            "启动",
+            v_flex()
+                .gap_3()
+                .child(self.flag_row(
+                    entity.clone(),
+                    theme,
+                    "launch-at-login",
+                    "开机默认启动",
+                    "登录后自动打开 myproxy。需要安装为 .app。",
+                    self.strategy.launch_at_login,
+                    |this, cx| {
+                        this.strategy.launch_at_login = !this.strategy.launch_at_login;
+                        let sync_err = myproxy::login_item::sync(this.strategy.launch_at_login).err();
+                        this.persist();
+                        if let Some(err) = sync_err {
+                            log::warn("login", format!("{err:#}"));
+                            this.status = format!("已保存。开机启动未生效：{err}");
+                        }
+                        cx.notify();
+                    },
+                ))
+                .when(!bundled, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("当前不是 .app，登录项不会注册。安装到 ~/Applications/myproxy.app 后生效。"),
+                    )
+                })
+                .child(self.flag_row(
+                    entity.clone(),
+                    theme,
+                    "silent-launch",
+                    "静默启动",
+                    "启动时不显示主窗口，可从菜单栏打开。",
+                    self.strategy.silent_launch,
+                    |this, cx| {
+                        this.strategy.silent_launch = !this.strategy.silent_launch;
+                        this.persist();
+                        cx.notify();
+                    },
+                ))
+                .child(self.flag_row(
+                    entity.clone(),
+                    theme,
+                    "lite-mode",
+                    "轻量模式",
+                    "不加载主界面，仅运行核心与菜单栏。点菜单栏图标可打开窗口。",
+                    self.strategy.lite_mode,
+                    |this, cx| {
+                        this.strategy.lite_mode = !this.strategy.lite_mode;
+                        this.persist();
+                        cx.notify();
+                    },
+                ))
+                .child(self.flag_row(
+                    entity,
+                    theme,
+                    "connect-on-launch",
+                    "启动时默认连接",
+                    "启动后自动连接 mihomo 核心。",
+                    self.strategy.connect_on_launch,
+                    |this, cx| {
+                        this.strategy.connect_on_launch = !this.strategy.connect_on_launch;
+                        this.persist();
+                        cx.notify();
+                    },
+                )),
+        )
+    }
+
+    fn flag_row<F>(
+        &self,
+        entity: Entity<Self>,
+        theme: &Theme,
+        id: &'static str,
+        title: &'static str,
+        hint: &'static str,
+        on: bool,
+        apply: F,
+    ) -> impl IntoElement
+    where
+        F: Fn(&mut Self, &mut Context<Self>) + 'static,
+    {
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(div().text_sm().child(title))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(hint),
+                    ),
+            )
+            .child({
+                let mut toggle = Button::new(id).small();
+                toggle = if on {
+                    toggle.label("关闭")
+                } else {
+                    toggle.primary().label("开启")
+                };
+                toggle.on_click(move |_, _, app| {
+                    entity.update(app, |this, cx| apply(this, cx));
+                })
+            })
     }
 
     fn appearance_row(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
