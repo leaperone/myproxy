@@ -3,3 +3,9 @@
 *.swp
 .idea
 .vscode
+
+# Local planning artifacts
+/.planning/
+
+# Local Git worktrees
+/.worktrees/
