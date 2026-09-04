@@ -46,7 +46,7 @@ pub fn sync(enable: bool) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn smapp_set(enable: bool) -> Result<()> {
-    use objc::runtime::{BOOL, Object};
+    use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
 
     #[link(name = "ServiceManagement", kind = "framework")]
@@ -68,8 +68,8 @@ fn smapp_set(enable: bool) -> Result<()> {
                 return Ok(());
             }
             let mut err: *mut Object = std::ptr::null_mut();
-            let ok: BOOL = msg_send![service, registerAndReturnError: &mut err];
-            if ok == 0 {
+            let ok: bool = msg_send![service, registerAndReturnError: &mut err];
+            if !ok {
                 bail!("{}", nserror_message(err));
             }
             let status: isize = msg_send![service, status];
@@ -81,8 +81,8 @@ fn smapp_set(enable: bool) -> Result<()> {
             }
         } else if status != NOT_REGISTERED && status != NOT_FOUND {
             let mut err: *mut Object = std::ptr::null_mut();
-            let ok: BOOL = msg_send![service, unregisterAndReturnError: &mut err];
-            if ok == 0 {
+            let ok: bool = msg_send![service, unregisterAndReturnError: &mut err];
+            if !ok {
                 bail!("{}", nserror_message(err));
             }
         }
