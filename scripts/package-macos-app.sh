@@ -26,6 +26,10 @@ fi
 if [[ -n "${identity:-}" && "$identity" != "-" ]]; then
   codesign --force --deep --options runtime --timestamp --sign "$identity" "$app"
 else
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    echo "CI release requires CODESIGN_IDENTITY (Developer ID); refusing ad-hoc" >&2
+    exit 1
+  fi
   codesign --force --deep --sign - "$app"
 fi
 echo "built $app"
