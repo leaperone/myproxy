@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{
+    Button, ButtonVariants as _, Toggle, ToggleGroup, ToggleVariants as _,
+};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
@@ -8,6 +10,8 @@ use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, TitleBar,
 };
 use gpui_kit::*;
+
+use crate::appearance::Appearance;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -24,10 +28,15 @@ pub struct AppView {
     connected: bool,
     down_bps: f64,
     up_bps: f64,
+    appearance: Appearance,
+    _appearance_observer: Subscription,
 }
 
 impl AppView {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let appearance = Appearance::load();
+        appearance.apply(Some(window), cx);
+
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(900))
@@ -44,11 +53,23 @@ impl AppView {
         })
         .detach();
 
+        let entity = cx.entity();
+        let appearance_observer = window.observe_window_appearance(move |window, cx| {
+            entity.update(cx, |this, cx| {
+                if this.appearance == Appearance::System {
+                    Theme::sync_system_appearance(Some(window), cx);
+                    cx.notify();
+                }
+            });
+        });
+
         Self {
             page: Page::Overview,
             connected: true,
             down_bps: 2_400_000.0,
             up_bps: 180_000.0,
+            appearance,
+            _appearance_observer: appearance_observer,
         }
     }
 
@@ -75,6 +96,38 @@ impl AppView {
         move |_, _, app| {
             entity.update(app, |this, cx| {
                 this.page = page;
+                cx.notify();
+            });
+        }
+    }
+
+    fn set_appearance(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&Vec<bool>, &mut Window, &mut App) + 'static {
+        let entity = cx.entity();
+        move |checks, window, app| {
+            entity.update(app, |this, cx| {
+                let current = [
+                    this.appearance == Appearance::Light,
+                    this.appearance == Appearance::Dark,
+                    this.appearance == Appearance::System,
+                ];
+                let appearance = if checks.first() != Some(&current[0]) {
+                    Appearance::Light
+                } else if checks.get(1) != Some(&current[1]) {
+                    Appearance::Dark
+                } else if checks.get(2) != Some(&current[2]) {
+                    Appearance::System
+                } else {
+                    return;
+                };
+                if this.appearance == appearance {
+                    return;
+                }
+                this.appearance = appearance;
+                this.appearance.save();
+                this.appearance.apply(Some(window), cx);
                 cx.notify();
             });
         }
@@ -241,7 +294,7 @@ impl AppView {
             )
     }
 
-    fn page_view(&self, _cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+    fn page_view(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         v_flex()
             .id("page")
             .flex_1()
@@ -256,7 +309,7 @@ impl AppView {
                 Page::Groups => self.groups(theme).into_any_element(),
                 Page::Routing => self.routing(theme).into_any_element(),
                 Page::Connections => self.connections(theme).into_any_element(),
-                Page::Settings => self.settings(theme).into_any_element(),
+                Page::Settings => self.settings(cx, theme).into_any_element(),
             })
     }
 
@@ -419,13 +472,18 @@ impl AppView {
             ))
     }
 
-    fn settings(&self, theme: &Theme) -> impl IntoElement {
+    fn settings(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         v_flex()
             .gap_5()
             .child(page_title(
                 theme,
                 "Settings",
                 "These values will be written into the strategy document.",
+            ))
+            .child(panel(
+                theme,
+                "Appearance",
+                v_flex().gap_3().child(self.appearance_row(cx, theme)),
             ))
             .child(panel(
                 theme,
@@ -444,6 +502,47 @@ impl AppView {
                     .child(row_line(theme, "Engine", "mihomo Alpha · not bundled yet"))
                     .child(row_line(theme, "Controller", "loopback + ephemeral secret")),
             ))
+    }
+
+    fn appearance_row(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(div().text_sm().child("Theme"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Light, Dark, or follow the system"),
+                    ),
+            )
+            .child(
+                ToggleGroup::new("appearance-mode")
+                    .outline()
+                    .segmented()
+                    .small()
+                    .child(
+                        Toggle::new("appearance-light")
+                            .label("Light")
+                            .checked(self.appearance == Appearance::Light),
+                    )
+                    .child(
+                        Toggle::new("appearance-dark")
+                            .label("Dark")
+                            .checked(self.appearance == Appearance::Dark),
+                    )
+                    .child(
+                        Toggle::new("appearance-system")
+                            .label("System")
+                            .checked(self.appearance == Appearance::System),
+                    )
+                    .on_click(self.set_appearance(cx)),
+            )
     }
 }
 

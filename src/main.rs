@@ -1,7 +1,8 @@
+mod appearance;
 mod ui;
 
-use gpui_kit::component::TitleBar;
 use gpui_kit::component::Root;
+use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 use ui::AppView;
@@ -11,6 +12,7 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        appearance::apply_saved(None, cx);
 
         cx.spawn(async move |cx| {
             cx.open_window(
