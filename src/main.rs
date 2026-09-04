@@ -1,4 +1,5 @@
 mod appearance;
+mod sparkle;
 mod ui;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -52,6 +53,7 @@ fn main() {
             }
             tray::install(cx);
         }
+        sparkle::init();
         if show_window {
             cx.spawn(async move |cx| {
                 cx.update(|cx| {

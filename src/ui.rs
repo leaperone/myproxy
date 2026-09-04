@@ -2132,6 +2132,7 @@ impl AppView {
                         )
                     }),
             ))
+            .child(self.updates_panel(cx, theme))
             .child(panel(
                 theme,
                 "排除过滤器",
@@ -2313,6 +2314,49 @@ impl AppView {
                     )
                     .on_click(self.set_appearance(cx)),
             )
+    }
+
+    fn updates_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let version = env!("CARGO_PKG_VERSION");
+        let hint = if crate::sparkle::available() {
+            "稳定渠道走 GitHub Releases 上的 Sparkle appcast。v0.0.1 是完整包，之后的版本才会生成增量 delta。"
+        } else {
+            "此开发构建未链接 Sparkle。打包脚本会带上更新器。"
+        };
+        panel(
+            theme,
+            "更新",
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .child(format!("当前版本 {version}")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(hint),
+                )
+                .child({
+                    let entity = entity.clone();
+                    Button::new("check-updates")
+                        .label("检查更新")
+                        .on_click(move |_, _, app| {
+                            crate::sparkle::check();
+                            entity.update(app, |this, cx| {
+                                this.status = if crate::sparkle::available() {
+                                    "已请求检查更新。".into()
+                                } else {
+                                    "此构建没有更新器。".into()
+                                };
+                                cx.notify();
+                            });
+                        })
+                }),
+        )
     }
 
     fn developer_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {

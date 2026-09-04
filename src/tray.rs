@@ -55,12 +55,14 @@ fn build_tray() -> anyhow::Result<TrayIcon> {
     let connect = MenuItem::with_id("connect", "连接", true, None);
     let disconnect = MenuItem::with_id("disconnect", "断开", true, None);
     let apply = MenuItem::with_id("apply", "更新配置", true, None);
+    let updates = MenuItem::with_id("updates", "检查更新", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let menu = Menu::new();
     menu.append(&open)?;
     menu.append(&connect)?;
     menu.append(&disconnect)?;
     menu.append(&apply)?;
+    menu.append(&updates)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
     let tray = TrayIconBuilder::new()
@@ -91,6 +93,7 @@ fn handle_menu_event(event: MenuEvent, cx: &mut App) {
         "connect" => connect(),
         "disconnect" => disconnect(),
         "apply" => apply(),
+        "updates" => crate::sparkle::check(),
         "quit" => {
             disconnect();
             cx.quit();
