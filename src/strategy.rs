@@ -15,17 +15,34 @@ pub const STRATEGY_SCHEMA: u32 = 4;
 
 pub const TELEGRAM_GROUP: &str = "Telegram";
 
-/// Well-known Telegram DC ranges. MTProto talks to these IPs, not hostnames.
+/// HTTP(S) hosts Telegram's web stack uses. These never match raw MTProto.
+pub const TELEGRAM_SUFFIXES: &[&str] = &[
+    "telegram.org",
+    "t.me",
+    "telegram.me",
+    "telegra.ph",
+    "telegram-cdn.org",
+    "telesco.pe",
+];
+
+/// Published DC ranges from https://core.telegram.org/resources/cidr.txt plus 95.161/20.
+/// MTProto often uses these IPs with an empty SNI/host.
 pub const TELEGRAM_CIDRS: &[&str] = &[
-    "149.154.160.0/20",
+    "91.108.56.0/22",
     "91.108.4.0/22",
     "91.108.8.0/22",
-    "91.108.56.0/22",
     "91.108.16.0/22",
+    "91.108.12.0/22",
+    "149.154.160.0/20",
+    "91.105.192.0/23",
+    "91.108.20.0/22",
+    "185.76.151.0/24",
     "95.161.64.0/20",
-    "2001:67c:4e8::/48",
     "2001:b28:f23d::/48",
     "2001:b28:f23f::/48",
+    "2001:67c:4e8::/48",
+    "2001:b28:f23c::/48",
+    "2a0a:f280::/32",
 ];
 
 fn telegram_matchers() -> Vec<Matcher> {
@@ -34,6 +51,9 @@ fn telegram_matchers() -> Vec<Matcher> {
         Matcher::app("Telegram".into()),
         Matcher::app("ru.keepcoder.telegram".into()),
     ];
+    for suffix in TELEGRAM_SUFFIXES {
+        matchers.push(Matcher::suffix((*suffix).into()));
+    }
     for cidr in TELEGRAM_CIDRS {
         matchers.push(Matcher::cidr((*cidr).into()));
     }
@@ -265,13 +285,6 @@ impl Strategy {
             self.groups.push(group);
             changed = true;
         }
-        let first_name = self.groups.first().map(|g| g.name.clone());
-        let via_is_catch_all = |via: &str| {
-            let via = via.trim();
-            via.eq_ignore_ascii_case("default")
-                || via.eq_ignore_ascii_case("PROXY")
-                || first_name.as_deref() == Some(via)
-        };
         let index = self.rule_sets.iter().position(|s| {
             s.name.eq_ignore_ascii_case(TELEGRAM_GROUP)
                 || s.matchers.iter().any(|m| {
@@ -282,7 +295,10 @@ impl Strategy {
         });
         if let Some(index) = index {
             let set = &mut self.rule_sets[index];
-            if via_is_catch_all(&set.via) {
+            let keep_via = set.via.eq_ignore_ascii_case("direct")
+                || set.via.eq_ignore_ascii_case("reject")
+                || set.via == TELEGRAM_GROUP;
+            if !keep_via {
                 set.via = TELEGRAM_GROUP.into();
                 changed = true;
             }
