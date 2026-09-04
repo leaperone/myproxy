@@ -175,20 +175,19 @@ fn proxies_from_yaml(text: &str) -> Result<Vec<serde_yaml::Value>> {
 }
 
 pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) -> Vec<String> {
-    let mut names: Vec<String> = catalog
-        .nodes
-        .iter()
-        .filter(|node| group_accepts(group, node))
-        .map(|n| n.name.clone())
-        .collect();
-
-    for extra in &group.include {
-        if !names.iter().any(|n| n == extra) {
-            names.push(extra.clone());
+    // Pin order is fallback/select priority. Do not alpha-sort: flag-prefixed
+    // names would otherwise become the implicit first member.
+    let mut names: Vec<String> = Vec::new();
+    for pin in &group.include {
+        if !names.iter().any(|n| n == pin) {
+            names.push(pin.clone());
         }
     }
-    names.sort();
-    names.dedup();
+    for node in &catalog.nodes {
+        if group_accepts(group, node) && !names.iter().any(|n| n == &node.name) {
+            names.push(node.name.clone());
+        }
+    }
     names
 }
 

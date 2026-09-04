@@ -123,12 +123,10 @@ impl GroupEditor {
         let all_nodes = existing.as_ref().map(|g| g.all_nodes).unwrap_or(false);
         let kind = existing
             .as_ref()
-            .map(|g| {
-                if g.kind == "url-test" {
-                    "url-test"
-                } else {
-                    "select"
-                }
+            .map(|g| match g.kind.as_str() {
+                "url-test" => "url-test",
+                "fallback" => "fallback",
+                _ => "select",
             })
             .unwrap_or("select")
             .to_string();
@@ -324,6 +322,19 @@ impl GroupEditor {
         self.notice = format!("取消钉住 {name}。");
     }
 
+    fn move_pin(&mut self, name: &str, delta: i32) {
+        let Some(ix) = self.include.iter().position(|n| n == name) else {
+            return;
+        };
+        let to = ix as i32 + delta;
+        if to < 0 || to >= self.include.len() as i32 {
+            return;
+        }
+        let item = self.include.remove(ix);
+        self.include.insert(to as usize, item);
+        self.notice = "已调整钉住优先度。保存后生效。".into();
+    }
+
     fn unblock_member(&mut self, name: &str) {
         self.blocked.retain(|n| n != name);
         self.notice = format!("取消排除 {name}。");
@@ -402,7 +413,14 @@ impl Render for GroupEditor {
                                 cx.notify();
                             });
                         })
-                    })
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .flex_wrap()
+                    .child(div().text_xs().text_color(muted_fg).child("策略"))
                     .child({
                         let entity = entity.clone();
                         let mut group = ButtonGroup::new("group-kind")
@@ -413,13 +431,19 @@ impl Render for GroupEditor {
                             .child(
                                 Button::new("group-kind-select")
                                     .small()
-                                    .label("select")
-                                    .selected(self.kind != "url-test"),
+                                    .label("手动选择")
+                                    .selected(self.kind != "fallback" && self.kind != "url-test"),
+                            )
+                            .child(
+                                Button::new("group-kind-fallback")
+                                    .small()
+                                    .label("自动切换（不可用则下一个）")
+                                    .selected(self.kind == "fallback"),
                             )
                             .child(
                                 Button::new("group-kind-url")
                                     .small()
-                                    .label("url-test")
+                                    .label("延迟最低")
                                     .selected(self.kind == "url-test"),
                             );
                         group.on_click(move |ixs, _, app| {
@@ -427,10 +451,10 @@ impl Render for GroupEditor {
                                 return;
                             };
                             entity.update(app, |this, cx| {
-                                this.kind = if ix == 1 {
-                                    "url-test".into()
-                                } else {
-                                    "select".into()
+                                this.kind = match ix {
+                                    1 => "fallback".into(),
+                                    2 => "url-test".into(),
+                                    _ => "select".into(),
                                 };
                                 cx.notify();
                             });
@@ -513,7 +537,12 @@ impl Render for GroupEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child(format!("预览 · {} 个节点 · {}", members.len(), draft.policy_label())),
+                    .child(format!(
+                        "预览 · {} 个节点 · {} · {}",
+                        members.len(),
+                        draft.kind_setting_label(),
+                        draft.policy_label()
+                    )),
             )
             .child(
                 v_flex()
@@ -537,13 +566,14 @@ impl Render for GroupEditor {
                                 }),
                         )
                     })
-                    .children(members.iter().take(PREVIEW_LIMIT).map(|name| {
+                    .children(members.iter().take(PREVIEW_LIMIT).enumerate().map(|(ix, name)| {
                         render_member_row(
                             entity.clone(),
                             &theme,
                             name,
                             self.include.iter().any(|n| n == name),
                             false,
+                            (self.kind == "fallback").then_some(ix + 1),
                         )
                     }))
                     .when(extra > 0, |this| {
@@ -560,7 +590,9 @@ impl Render for GroupEditor {
                         self.blocked
                             .iter()
                             .filter(|name| !members.iter().any(|m| m == *name))
-                            .map(|name| render_member_row(entity.clone(), &theme, name, false, true)),
+                            .map(|name| {
+                                render_member_row(entity.clone(), &theme, name, false, true, None)
+                            }),
                     ),
             )
     }
@@ -2540,6 +2572,7 @@ fn render_member_row(
     name: &str,
     pinned: bool,
     blocked: bool,
+    rank: Option<usize>,
 ) -> impl IntoElement {
     let name_owned = name.to_string();
     let muted_fg = theme.muted_foreground;
@@ -2551,6 +2584,15 @@ fn render_member_row(
         .py_1()
         .items_center()
         .gap_2()
+        .when_some(rank, |this, rank| {
+            this.child(
+                div()
+                    .w(px(22.))
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(format!("{rank}")),
+            )
+        })
         .child(
             div()
                 .flex_1()
@@ -2562,15 +2604,41 @@ fn render_member_row(
         .when(pinned, |this| this.child(pill(theme, "钉住", accent)))
         .when(blocked, |this| this.child(pill(theme, "排除", theme.warning)))
         .when(pinned, |this| {
-            let entity = entity.clone();
-            let name = name_owned.clone();
+            let up_entity = entity.clone();
+            let up_name = name_owned.clone();
+            let down_entity = entity.clone();
+            let down_name = name_owned.clone();
+            let unpin_entity = entity.clone();
+            let unpin_name = name_owned.clone();
             this.child(
-                Button::new(SharedString::from(format!("unpin-{name}")))
+                Button::new(SharedString::from(format!("pin-up-{up_name}")))
+                    .small()
+                    .label("上移")
+                    .on_click(move |_, _, app| {
+                        up_entity.update(app, |this, cx| {
+                            this.move_pin(&up_name, -1);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("pin-down-{down_name}")))
+                    .small()
+                    .label("下移")
+                    .on_click(move |_, _, app| {
+                        down_entity.update(app, |this, cx| {
+                            this.move_pin(&down_name, 1);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("unpin-{unpin_name}")))
                     .small()
                     .label("取消钉住")
                     .on_click(move |_, _, app| {
-                        entity.update(app, |this, cx| {
-                            this.unpin_member(&name);
+                        unpin_entity.update(app, |this, cx| {
+                            this.unpin_member(&unpin_name);
                             cx.notify();
                         });
                     }),
@@ -2663,7 +2731,12 @@ fn render_group_card(
                     div()
                         .text_sm()
                         .font_semibold()
-                        .child(format!("{}  ·  {}  ·  {} 个节点", group.name, group.kind, count)),
+                        .child(format!(
+                            "{}  ·  {}  ·  {} 个节点",
+                            group.name,
+                            group.kind_label(),
+                            count
+                        )),
                 )
                 .child({
                     let entity = entity.clone();

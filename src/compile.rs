@@ -68,13 +68,13 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
         }
         let mut item = serde_yaml::Mapping::new();
         item.insert("name".into(), group.name.clone().into());
-        let kind = if group.kind == "url-test" {
-            "url-test"
-        } else {
-            "select"
+        let kind = match group.kind.as_str() {
+            "url-test" => "url-test",
+            "fallback" => "fallback",
+            _ => "select",
         };
         item.insert("type".into(), kind.into());
-        if kind == "url-test" {
+        if kind == "url-test" || kind == "fallback" {
             item.insert("url".into(), "https://www.gstatic.com/generate_204".into());
             item.insert("interval".into(), 300.into());
         }
