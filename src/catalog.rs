@@ -101,7 +101,8 @@ fn fetch_proxies(url: &str) -> Result<Vec<serde_yaml::Value>> {
         fs::read_to_string(path).with_context(|| format!("read {path}"))?
     } else if url.starts_with("http://") || url.starts_with("https://") {
         ureq::get(url)
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(30))
+            .set("User-Agent", "clash.meta")
             .call()
             .with_context(|| format!("GET {url}"))?
             .into_string()?
