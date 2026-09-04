@@ -57,7 +57,7 @@ enum GroupCmd {
     List,
     Add {
         name: String,
-        #[arg(long, default_value = "select")]
+        #[arg(long, default_value = "select", value_parser = ["select", "fallback", "url-test"])]
         kind: String,
         #[arg(long)]
         all: bool,
@@ -70,6 +70,8 @@ enum GroupCmd {
     },
     Set {
         name: String,
+        #[arg(long, value_parser = ["select", "fallback", "url-test"])]
+        kind: Option<String>,
         #[arg(long)]
         all: Option<bool>,
         #[arg(long)]
@@ -238,6 +240,7 @@ fn main() -> Result<()> {
                 contains,
                 not_contains,
             } => {
+                let kind = strategy::Group::parse_kind(&kind)?;
                 let mut strategy = Strategy::load()?;
                 let mut group = if all {
                     let mut group = strategy::Group::all_nodes(name.clone(), kind);
@@ -253,16 +256,24 @@ fn main() -> Result<()> {
             }
             GroupCmd::Set {
                 name,
+                kind,
                 all,
                 source,
                 contains,
                 not_contains,
             } => {
+                let kind = kind
+                    .as_deref()
+                    .map(strategy::Group::parse_kind)
+                    .transpose()?;
                 let mut strategy = Strategy::load()?;
                 {
                     let some = strategy
                         .group_mut(&name)
                         .ok_or_else(|| anyhow::anyhow!("no group"))?;
+                    if let Some(kind) = kind {
+                        some.kind = kind;
+                    }
                     if let Some(all) = all {
                         some.all_nodes = all;
                     }

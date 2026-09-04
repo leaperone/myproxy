@@ -449,6 +449,29 @@ impl Group {
         }
     }
 
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind.as_str() {
+            "fallback" => "自动切换",
+            "url-test" => "延迟最低",
+            _ => "手动选择",
+        }
+    }
+
+    pub fn kind_setting_label(&self) -> &'static str {
+        match self.kind.as_str() {
+            "fallback" => "自动切换（不可用则下一个）",
+            "url-test" => "延迟最低",
+            _ => "手动选择",
+        }
+    }
+
+    pub fn parse_kind(kind: &str) -> Result<String> {
+        match kind.trim() {
+            "select" | "fallback" | "url-test" => Ok(kind.trim().to_string()),
+            _ => anyhow::bail!("kind must be select, fallback, or url-test"),
+        }
+    }
+
     pub fn policy_label(&self) -> String {
         let mut parts = Vec::new();
         if self.all_nodes {
