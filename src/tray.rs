@@ -7,8 +7,6 @@ use tray_icon::{
     TrayIconEvent,
 };
 
-use myproxy::catalog;
-use myproxy::compile;
 use myproxy::strategy::Strategy;
 use myproxy::supervisor::Supervisor;
 
@@ -120,9 +118,7 @@ fn disconnect() {
 }
 
 fn apply() {
-    match Strategy::load().and_then(|strategy| {
-        catalog::refresh(&strategy).and_then(|catalog| compile::compile(&strategy, &catalog))
-    }) {
+    match Strategy::load().and_then(|strategy| Supervisor::default().apply(&strategy)) {
         Ok(_) => {}
         Err(err) => myproxy::log::error("tray", format!("apply failed: {err:#}")),
     }

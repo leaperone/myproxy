@@ -245,7 +245,7 @@ impl GroupEditor {
                 next.id = uuid::Uuid::new_v4().to_string();
                 parent.strategy.add_group(next);
             }
-            if parent.persist() {
+            if parent.persist_and_apply() {
                 parent.group_modal_open = false;
                 parent.group_edit_id = None;
                 parent.status = if edit_id.is_some() {
@@ -727,7 +727,7 @@ impl RuleSetEditor {
                 next.id = uuid::Uuid::new_v4().to_string();
                 parent.strategy.add_rule_set(next);
             }
-            if parent.persist() {
+            if parent.persist_and_apply() {
                 parent.rule_modal_open = false;
                 parent.rule_edit_id = None;
                 parent.status = if edit_id.is_some() {
@@ -1261,6 +1261,23 @@ impl AppView {
         }
     }
 
+    fn persist_and_apply(&mut self) -> bool {
+        if !self.persist() {
+            return false;
+        }
+        match self.supervisor.apply(&self.strategy) {
+            Ok(cat) => {
+                self.catalog = cat;
+                true
+            }
+            Err(err) => {
+                log::error("ui", format!("apply failed: {err:#}"));
+                self.status = format!("应用失败: {err:#}");
+                false
+            }
+        }
+    }
+
     fn clear_traffic(&mut self) -> bool {
         let dirty = !self.traffic.connections.is_empty()
             || self.traffic_has_rate
@@ -1334,11 +1351,9 @@ impl AppView {
         let entity = cx.entity();
         move |_, _, app| {
             entity.update(app, |this, cx| {
-                match catalog::refresh(&this.strategy).and_then(|cat| {
-                    this.catalog = cat.clone();
-                    myproxy::compile::compile(&this.strategy, &cat)
-                }) {
-                    Ok(_) => {
+                match this.supervisor.apply(&this.strategy) {
+                    Ok(cat) => {
+                        this.catalog = cat;
                         this.status = format!(
                             "已编译 {} 个节点，排除 {}。Mixed {}{}。",
                             this.catalog.nodes.len(),
@@ -1349,7 +1364,7 @@ impl AppView {
                     }
                     Err(err) => {
                         log::error("ui", format!("apply failed: {err:#}"));
-                        this.status = format!("Apply 失败: {err:#}");
+                        this.status = format!("应用失败: {err:#}");
                     }
                 }
                 cx.notify();
@@ -1570,7 +1585,7 @@ impl AppView {
             self.status = "改走向失败。".into();
             return;
         }
-        if self.persist() {
+        if self.persist_and_apply() {
             self.status = format!("已改为 {via}。");
         }
     }
@@ -1579,7 +1594,7 @@ impl AppView {
         if !self.strategy.move_rule(id, delta) {
             return;
         }
-        if self.persist() {
+        if self.persist_and_apply() {
             self.status = if delta < 0 {
                 "已上移，优先级提高。".into()
             } else {
@@ -1593,7 +1608,7 @@ impl AppView {
         if !self.strategy.remove_rule(id) {
             return;
         }
-        if self.persist() {
+        if self.persist_and_apply() {
             if editing {
                 self.rule_modal_open = false;
                 self.rule_edit_id = None;
@@ -2757,7 +2772,7 @@ fn render_group_card(
                                     this.group_edit_id = None;
                                 }
                                 this.strategy.remove_group(&del_id);
-                                this.persist();
+                                this.persist_and_apply();
                                 cx.notify();
                             });
                             if close_modal {

@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::compile::{controller_port, CONTROLLER_SECRET};
 use crate::log;
+use crate::paths;
 
 const FETCH_TIMEOUT: Duration = Duration::from_millis(800);
 
@@ -128,6 +129,23 @@ pub fn close_all(mixed_port: u16) -> Result<()> {
         .set("Authorization", &format!("Bearer {CONTROLLER_SECRET}"))
         .call()
         .with_context(|| format!("DELETE connections :{}", controller_port(mixed_port)))?;
+    Ok(())
+}
+
+pub fn reload(mixed_port: u16) -> Result<()> {
+    let path = paths::runtime_yaml_path()?;
+    let url = format!(
+        "http://127.0.0.1:{}/configs?force=true",
+        controller_port(mixed_port)
+    );
+    let body = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+    ureq::put(&url)
+        .timeout(Duration::from_secs(5))
+        .set("Authorization", &format!("Bearer {CONTROLLER_SECRET}"))
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+        .with_context(|| format!("PUT configs :{}", controller_port(mixed_port)))?;
+    log::info("controller", "reloaded runtime.yaml");
     Ok(())
 }
 
