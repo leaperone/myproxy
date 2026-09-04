@@ -52,7 +52,9 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     let mut rules = Vec::new();
     for rule in &strategy.rules {
         let target = via_target(&rule.via, strategy);
-        if !rule.suffix.is_empty() {
+        if !rule.keyword.is_empty() {
+            rules.push(format!("DOMAIN-KEYWORD,{},{}", rule.keyword, target));
+        } else if !rule.suffix.is_empty() {
             rules.push(format!(
                 "DOMAIN-SUFFIX,{},{}",
                 rule.suffix.trim_start_matches('.'),

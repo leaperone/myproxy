@@ -86,6 +86,8 @@ enum RuleCmd {
         domain: String,
         #[arg(long, default_value = "")]
         suffix: String,
+        #[arg(long, default_value = "")]
+        keyword: String,
         #[arg(long)]
         via: String,
     },
@@ -270,14 +272,17 @@ fn main() -> Result<()> {
                 app,
                 domain,
                 suffix,
+                keyword,
                 via,
             } => {
-                if app.is_empty() && domain.is_empty() && suffix.is_empty() {
-                    bail!("need --app, --domain, or --suffix");
+                if app.is_empty() && domain.is_empty() && suffix.is_empty() && keyword.is_empty() {
+                    bail!("need --app, --domain, --suffix, or --keyword");
                 }
                 let mut strategy = Strategy::load()?;
                 let rule = if !app.is_empty() {
                     Rule::new_app(app, via)
+                } else if !keyword.is_empty() {
+                    Rule::new_keyword(keyword, via)
                 } else if !domain.is_empty() {
                     Rule::new_domain(domain, via)
                 } else {

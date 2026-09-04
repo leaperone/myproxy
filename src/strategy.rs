@@ -70,6 +70,8 @@ pub struct Rule {
     pub domain: String,
     #[serde(default)]
     pub suffix: String,
+    #[serde(default)]
+    pub keyword: String,
     pub via: String,
 }
 
@@ -273,6 +275,7 @@ impl Rule {
             app,
             domain: String::new(),
             suffix: String::new(),
+            keyword: String::new(),
             via,
         }
     }
@@ -283,6 +286,7 @@ impl Rule {
             app: String::new(),
             domain,
             suffix: String::new(),
+            keyword: String::new(),
             via,
         }
     }
@@ -293,6 +297,18 @@ impl Rule {
             app: String::new(),
             domain: String::new(),
             suffix,
+            keyword: String::new(),
+            via,
+        }
+    }
+
+    pub fn new_keyword(keyword: String, via: String) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            app: String::new(),
+            domain: String::new(),
+            suffix: String::new(),
+            keyword,
             via,
         }
     }
@@ -300,6 +316,8 @@ impl Rule {
     pub fn match_label(&self) -> String {
         if !self.app.is_empty() {
             format!("app:{}", self.app)
+        } else if !self.keyword.is_empty() {
+            format!("keyword:{}", self.keyword)
         } else if !self.domain.is_empty() {
             format!("domain:{}", self.domain)
         } else if !self.suffix.is_empty() {
