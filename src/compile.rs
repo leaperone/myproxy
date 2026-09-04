@@ -28,7 +28,9 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     );
     root.insert("secret".into(), CONTROLLER_SECRET.into());
 
-    if strategy.tun {
+    if strategy.system_extension {
+        insert_network_extension_listeners(&mut root, strategy);
+    } else if strategy.tun {
         insert_tun_intercept(&mut root);
     }
 
@@ -120,12 +122,13 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     log::info(
         "compile",
         format!(
-            "runtime.yaml nodes={} groups={} rule_sets={} compiled_rules={} tun={}",
+            "runtime.yaml nodes={} groups={} rule_sets={} compiled_rules={} tun={} se={}",
             catalog.nodes.len(),
             strategy.groups.len(),
             strategy.rule_sets.len(),
             compiled,
-            strategy.tun
+            strategy.tun,
+            strategy.system_extension
         ),
     );
     Ok(yaml)
@@ -206,7 +209,77 @@ fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
     root.insert("sniffer".into(), serde_yaml::Value::Mapping(sniffer));
 }
 
-fn via_target(via: &str, strategy: &Strategy) -> String {
+pub fn network_extension_socks_port(mixed_port: u16) -> u16 {
+    let port = mixed_port.saturating_add(1);
+    if port == controller_port(mixed_port) {
+        port.saturating_add(1)
+    } else {
+        port
+    }
+}
+
+fn insert_network_extension_listeners(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
+    let plan = crate::network_extension::inbound_plan(strategy);
+    let mut listeners = Vec::new();
+    push_socks_pair(
+        &mut listeners,
+        "myproxy-network-extension-socks",
+        plan.socks_port,
+        None,
+        &plan.username,
+        &plan.password,
+    );
+    for group in &plan.group_ports {
+        let suffix = group
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>();
+        push_socks_pair(
+            &mut listeners,
+            &format!("myproxy-network-extension-socks-route-{suffix}"),
+            group.port,
+            Some(group.name.as_str()),
+            &plan.username,
+            &plan.password,
+        );
+    }
+    root.insert("listeners".into(), serde_yaml::Value::Sequence(listeners));
+}
+
+fn push_socks_pair(
+    listeners: &mut Vec<serde_yaml::Value>,
+    name_prefix: &str,
+    port: u16,
+    outbound: Option<&str>,
+    username: &str,
+    password: &str,
+) {
+    for (suffix, host) in [("ipv4", "127.0.0.1"), ("ipv6", "::1")] {
+        let mut item = serde_yaml::Mapping::new();
+        item.insert(
+            "name".into(),
+            format!("{name_prefix}-{suffix}").into(),
+        );
+        item.insert("type".into(), "socks".into());
+        item.insert("listen".into(), host.into());
+        item.insert("port".into(), port.into());
+        item.insert("udp".into(), true.into());
+        if let Some(proxy) = outbound {
+            item.insert("proxy".into(), proxy.into());
+        }
+        let mut user = serde_yaml::Mapping::new();
+        user.insert("username".into(), username.into());
+        user.insert("password".into(), password.into());
+        item.insert(
+            "users".into(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(user)]),
+        );
+        listeners.push(serde_yaml::Value::Mapping(item));
+    }
+}
+
+pub fn via_target(via: &str, strategy: &Strategy) -> String {
     let via = via.trim();
     match via.to_ascii_lowercase().as_str() {
         "direct" => "DIRECT".into(),

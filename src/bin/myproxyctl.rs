@@ -26,6 +26,9 @@ enum Commands {
     Tun {
         state: String,
     },
+    Extension {
+        state: String,
+    },
     Filter {
         #[arg(long)]
         set: Option<String>,
@@ -113,7 +116,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Capabilities => {
             println!(
-                "status apply connect disconnect port tun filter subscription group rule log"
+                "status apply connect disconnect port tun extension filter subscription group rule log"
             );
         }
         Commands::Log => {
@@ -131,9 +134,10 @@ fn main() -> Result<()> {
             let strategy = Strategy::load()?;
             let catalog = catalog::Catalog::load()?;
             println!(
-                "mixed-port {}  tun {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
+                "mixed-port {}  tun {}  extension {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
                 strategy.mixed_port,
                 if strategy.tun { "on" } else { "off" },
+                if strategy.system_extension { "on" } else { "off" },
                 strategy.subscriptions.len(),
                 catalog.nodes.len(),
                 catalog.excluded.len(),
@@ -146,7 +150,7 @@ fn main() -> Result<()> {
             myproxy::log::debug("ctl", "apply");
             let strategy = Strategy::load()?;
             let supervisor = Supervisor::default();
-            supervisor.adopt_running(strategy.tun);
+            supervisor.adopt_running(strategy.tun, strategy.system_extension);
             let catalog = supervisor.apply(&strategy)?;
             println!(
                 "applied {} nodes, {} excluded → {}",
@@ -162,7 +166,13 @@ fn main() -> Result<()> {
             println!(
                 "connected mixed-port {}{}",
                 strategy.mixed_port,
-                if strategy.tun { " tun" } else { "" }
+                if strategy.system_extension {
+                    " se"
+                } else if strategy.tun {
+                    " tun"
+                } else {
+                    ""
+                }
             );
         }
         Commands::Disconnect => {
@@ -186,6 +196,20 @@ fn main() -> Result<()> {
             strategy.tun = on;
             strategy.save()?;
             println!("tun {}", if on { "on" } else { "off" });
+        }
+        Commands::Extension { state } => {
+            let on = match state.as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                _ => bail!("extension on|off"),
+            };
+            let mut strategy = Strategy::load()?;
+            strategy.system_extension = on;
+            if on {
+                strategy.tun = false;
+            }
+            strategy.save()?;
+            println!("extension {}", if on { "on" } else { "off" });
         }
         Commands::Filter { set } => {
             let mut strategy = Strategy::load()?;

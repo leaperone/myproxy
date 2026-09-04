@@ -1175,7 +1175,7 @@ impl AppView {
         let supervisor = Arc::new(Supervisor::default());
         let connected = supervisor.is_running();
         if connected {
-            supervisor.adopt_running(strategy.tun);
+            supervisor.adopt_running(strategy.tun, strategy.system_extension);
         }
         let entity = cx.entity();
         let appearance_observer = window.observe_window_appearance(move |window, cx| {
@@ -1373,7 +1373,7 @@ impl AppView {
                             "已编译 {} 个节点，排除 {}。{}Mixed {}。",
                             this.catalog.nodes.len(),
                             this.catalog.excluded.len(),
-                            if this.strategy.tun {
+                            if this.strategy.system_extension {
                                 "系统接管 · "
                             } else {
                                 ""
@@ -1417,7 +1417,7 @@ impl AppView {
                             this.mark_applied();
                             this.status = format!(
                                 "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
-                                if this.strategy.tun {
+                                if this.strategy.system_extension {
                                     "系统接管 · "
                                 } else {
                                     ""
@@ -1802,8 +1802,8 @@ impl AppView {
             .child(page_title(
                 theme,
                 "总览",
-                if self.strategy.tun {
-                    "系统接管是默认入口。应用无需填代理。Mixed 仍可给显式 HTTP/SOCKS 用。"
+                if self.strategy.system_extension {
+                    "系统接管是 System Extension。应用无需填 Mixed。请在系统设置里允许扩展。"
                 } else {
                     "未打开系统接管时，只有填了 Mixed 的应用会进规则。"
                 },
@@ -1839,7 +1839,7 @@ impl AppView {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(if connected {
-                                        if self.strategy.tun {
+                                        if self.strategy.system_extension {
                                             format!(
                                                 "系统接管中 · 应用无需填代理 · Mixed 127.0.0.1:{} 仍可用",
                                                 self.strategy.mixed_port
@@ -1850,8 +1850,8 @@ impl AppView {
                                                 self.strategy.mixed_port
                                             )
                                         }
-                                    } else if self.strategy.tun {
-                                        "下次连接将系统接管。首次会要管理员密码。".into()
+                                    } else if self.strategy.system_extension {
+                                        "下次连接将请求 System Extension。请在系统设置 › 通用 › 登录项与扩展 里允许 myproxy。".into()
                                     } else {
                                         "启动捆绑的 mihomo。要拦截未填代理的应用，先打开设置里的系统接管。".into()
                                     }),
@@ -1876,7 +1876,7 @@ impl AppView {
                     .child(metric(
                         theme,
                         "系统接管",
-                        if self.strategy.tun { "开" } else { "关" },
+                        if self.strategy.system_extension { "开" } else { "关" },
                     ))
                     .child(metric(
                         theme,
@@ -1929,7 +1929,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "连接",
-                if self.strategy.tun {
+                if self.strategy.system_extension {
                     "系统接管打开后，未填代理的应用也会出现在这里。Mixed 仍显示显式代理连接。"
                 } else {
                     "当前只看到走进 Mixed 的连接。要拦截未填代理的应用，先打开设置里的系统接管。"
@@ -2251,9 +2251,9 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                "打开系统接管后应用不必填代理。Mixed 一口仍提供 HTTP + SOCKS5。",
+                "打开系统接管后应用不必填 Mixed。首次会要求在系统设置里允许扩展。",
             ))
-            .child(self.tun_panel(cx, theme))
+            .child(self.system_extension_panel(cx, theme))
             .child(panel(
                 theme,
                 "外观",
@@ -2321,13 +2321,16 @@ impl AppView {
             .child(self.developer_panel(cx, theme))
     }
 
-    fn set_tun(&mut self, on: bool) {
-        self.strategy.tun = on;
+    fn set_system_extension(&mut self, on: bool) {
+        self.strategy.system_extension = on;
+        if on {
+            self.strategy.tun = false;
+        }
         if self.connected {
             if self.persist_and_apply() {
                 self.connected = self.supervisor.is_running();
                 self.status = if on {
-                    "已开启系统接管。应用无需再填代理。".into()
+                    "已开启系统接管。连接后请在系统设置 › 通用 › 登录项与扩展 允许 myproxy。".into()
                 } else {
                     "已关闭系统接管。未填代理的应用不再进核心。".into()
                 };
@@ -2336,16 +2339,42 @@ impl AppView {
             }
         } else if self.persist() {
             self.status = if on {
-                "已记录。下次连接将系统接管；首次会要管理员密码。".into()
+                "已记录。下次连接将请求 System Extension；请在系统设置里允许 myproxy。".into()
             } else {
                 "已关闭系统接管。".into()
             };
         }
     }
 
-    fn tun_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+    fn set_tun(&mut self, on: bool) {
+        self.strategy.tun = on;
+        if on {
+            self.strategy.system_extension = false;
+        }
+        if self.connected {
+            if self.persist_and_apply() {
+                self.connected = self.supervisor.is_running();
+                self.status = if on {
+                    "已开启 TUN（旧）。首次会要管理员密码。".into()
+                } else {
+                    "已关闭 TUN。".into()
+                };
+            } else {
+                self.connected = self.supervisor.is_running();
+            }
+        } else if self.persist() {
+            self.status = if on {
+                "已记录。下次连接走 TUN；首次会要管理员密码。".into()
+            } else {
+                "已关闭 TUN。".into()
+            };
+        }
+    }
+
+    fn system_extension_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
-        let on = self.strategy.tun;
+        let on = self.strategy.system_extension;
+        let tun_on = self.strategy.tun;
         panel(
             theme,
             "系统接管",
@@ -2360,17 +2389,63 @@ impl AppView {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(div().text_sm().child("拦截本机流量再按规则分流"))
+                                .child(div().text_sm().child("System Extension 拦截本机流量"))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("无需在 Telegram、T3、Grok、自动更新里填写 HTTP/SOCKS。进程 / 域名 / 节点组规则在流量进核心后生效。"),
+                                        .child("与 MClash 相同：NETransparentProxyProvider 接管出站连接，进程规则在扩展里选组，其余进同一套 mihomo 规则。无需填写 Mixed。"),
                                 ),
                         )
                         .child({
-                            let mut toggle = Button::new("tun-toggle").small();
+                            let mut toggle = Button::new("se-toggle").small();
                             toggle = if on {
+                                toggle.danger().label("关闭")
+                            } else {
+                                toggle.primary().label("开启")
+                            };
+                            toggle.on_click({
+                                let entity = entity.clone();
+                                move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.set_system_extension(!this.strategy.system_extension);
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if on {
+                            "已打开。连接后 macOS 会提示安装系统扩展。到「系统设置 › 通用 › 登录项与扩展」允许 myproxy，必要时重启。需要 Developer ID 签名的 .app。"
+                        } else {
+                            "默认关闭。打开并连接后才会拦截；未填代理的应用现在不会进规则。"
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(div().text_sm().child("TUN（旧 utun）"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("不是 System Extension。仅作后备；与上面的系统接管互斥。"),
+                                ),
+                        )
+                        .child({
+                            let entity = entity.clone();
+                            let mut toggle = Button::new("tun-toggle").small();
+                            toggle = if tun_on {
                                 toggle.danger().label("关闭")
                             } else {
                                 toggle.primary().label("开启")
@@ -2381,16 +2456,6 @@ impl AppView {
                                     cx.notify();
                                 });
                             })
-                        }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(if on {
-                            "已打开。连接后走 mihomo TUN（自动路由 + 进程识别）。首次或更新核心后会要一次管理员密码，给 mihomo 加 setuid，不是 Network Extension。Mixed 端口仍留给显式代理。"
-                        } else {
-                            "默认关闭。打开并连接后才会接管；未填代理的应用现在不会进规则。"
                         }),
                 ),
         )

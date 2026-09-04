@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>myproxy Network Extension</string>
+	<key>CFBundleExecutable</key>
+	<string>MyproxyNetworkExtension</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.harry.myproxy.network-extension</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>MyproxyNetworkExtension</string>
+	<key>CFBundlePackageType</key>
+	<string>SYSX</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.3</string>
+	<key>CFBundleVersion</key>
+	<string>0.0.3</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NetworkExtension</key>
+	<dict>
+		<key>NEMachServiceName</key>
+		<string>5UAHRS482C.local.harry.myproxy.network-extension</string>
+		<key>NEProviderClasses</key>
+		<dict>
+			<key>com.apple.networkextension.app-proxy</key>
+			<string>MyproxyNetworkExtension.TransparentProxyProvider</string>
+			<key>com.apple.networkextension.dns-proxy</key>
+			<string>MyproxyNetworkExtension.DNSProxyProvider</string>
+		</dict>
+	</dict>
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>myproxy uses a network system extension to intercept outbound connections and apply your process and routing rules.</string>
+</dict>
+</plist>
