@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - name: Fetch bundled mihomo
+        run: scripts/fetch-mihomo.sh
+      - name: Build
+        run: cargo build --bins
