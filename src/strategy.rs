@@ -11,7 +11,43 @@ use crate::paths;
 pub const DEFAULT_EXCLUDE: &str =
     r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
 
-pub const STRATEGY_SCHEMA: u32 = 3;
+pub const STRATEGY_SCHEMA: u32 = 4;
+
+pub const TELEGRAM_GROUP: &str = "Telegram";
+
+/// Well-known Telegram DC ranges. MTProto talks to these IPs, not hostnames.
+pub const TELEGRAM_CIDRS: &[&str] = &[
+    "149.154.160.0/20",
+    "91.108.4.0/22",
+    "91.108.8.0/22",
+    "91.108.56.0/22",
+    "91.108.16.0/22",
+    "95.161.64.0/20",
+    "2001:67c:4e8::/48",
+    "2001:b28:f23d::/48",
+    "2001:b28:f23f::/48",
+];
+
+fn telegram_matchers() -> Vec<Matcher> {
+    let mut matchers = vec![
+        Matcher::keyword("telegram".into()),
+        Matcher::app("Telegram".into()),
+        Matcher::app("ru.keepcoder.telegram".into()),
+    ];
+    for cidr in TELEGRAM_CIDRS {
+        matchers.push(Matcher::cidr((*cidr).into()));
+    }
+    matchers
+}
+
+fn telegram_rule_set() -> RuleSet {
+    RuleSet {
+        id: Uuid::new_v4().to_string(),
+        name: TELEGRAM_GROUP.into(),
+        via: TELEGRAM_GROUP.into(),
+        matchers: telegram_matchers(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Strategy {
@@ -22,6 +58,9 @@ pub struct Strategy {
     /// When true, myproxy writes debug traces to `myproxy.log` and the Settings page.
     #[serde(default)]
     pub developer_mode: bool,
+    /// When true, compile a mihomo TUN inbound so apps that ignore Mixed enter the core.
+    #[serde(default)]
+    pub tun: bool,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
@@ -107,9 +146,13 @@ impl Default for Strategy {
             mixed_port: 17890,
             exclude_filter: DEFAULT_EXCLUDE.into(),
             developer_mode: false,
+            tun: false,
             subscriptions: Vec::new(),
-            groups: vec![Group::all_nodes("PROXY".into(), "select".into())],
-            rule_sets: Vec::new(),
+            groups: vec![
+                Group::all_nodes("PROXY".into(), "select".into()),
+                Group::all_nodes(TELEGRAM_GROUP.into(), "select".into()),
+            ],
+            rule_sets: vec![telegram_rule_set()],
             rules: Vec::new(),
         }
     }
@@ -184,8 +227,60 @@ impl Strategy {
         if self.schema < 3 {
             self.fold_legacy_rules();
         }
+        if self.schema < 4 {
+            self.ensure_telegram_routing();
+        }
         self.schema = STRATEGY_SCHEMA;
         true
+    }
+
+    fn ensure_telegram_routing(&mut self) -> bool {
+        let mut changed = false;
+        if !self.groups.iter().any(|g| g.name == TELEGRAM_GROUP) {
+            let mut group = Group::all_nodes(TELEGRAM_GROUP.into(), "select".into());
+            if let Some(base) = self
+                .groups
+                .iter()
+                .find(|g| g.name.eq_ignore_ascii_case("default") || g.name == "PROXY")
+                .or_else(|| self.groups.first())
+            {
+                group.sources = base.sources.clone();
+            }
+            self.groups.push(group);
+            changed = true;
+        }
+        let first_name = self.groups.first().map(|g| g.name.clone());
+        let via_is_catch_all = |via: &str| {
+            let via = via.trim();
+            via.eq_ignore_ascii_case("default")
+                || via.eq_ignore_ascii_case("PROXY")
+                || first_name.as_deref() == Some(via)
+        };
+        let index = self.rule_sets.iter().position(|s| {
+            s.name.eq_ignore_ascii_case(TELEGRAM_GROUP)
+                || s.matchers.iter().any(|m| {
+                    m.kind == "app"
+                        && (m.value.eq_ignore_ascii_case("Telegram")
+                            || m.value == "ru.keepcoder.telegram")
+                })
+        });
+        if let Some(index) = index {
+            let set = &mut self.rule_sets[index];
+            if via_is_catch_all(&set.via) {
+                set.via = TELEGRAM_GROUP.into();
+                changed = true;
+            }
+            for matcher in telegram_matchers() {
+                if !set.matchers.iter().any(|m| m.same_as(&matcher)) {
+                    set.matchers.push(matcher);
+                    changed = true;
+                }
+            }
+        } else {
+            self.rule_sets.push(telegram_rule_set());
+            changed = true;
+        }
+        changed
     }
 
     fn fold_legacy_rules(&mut self) {
@@ -526,6 +621,13 @@ impl Matcher {
         }
     }
 
+    pub fn cidr(value: String) -> Self {
+        Self {
+            kind: "cidr".into(),
+            value: value.trim().to_string(),
+        }
+    }
+
     pub fn from_rule(rule: &Rule) -> Self {
         if !rule.app.is_empty() {
             Self::app(rule.app.clone())
@@ -548,6 +650,7 @@ impl Matcher {
             "keyword" => "关键字",
             "domain" => "域名",
             "suffix" => "后缀",
+            "cidr" => "网段",
             _ => "—",
         }
     }

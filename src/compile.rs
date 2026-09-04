@@ -28,6 +28,31 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     );
     root.insert("secret".into(), CONTROLLER_SECRET.into());
 
+    if strategy.tun {
+        let mut tun = serde_yaml::Mapping::new();
+        tun.insert("enable".into(), true.into());
+        tun.insert("stack".into(), "system".into());
+        tun.insert("auto-route".into(), true.into());
+        tun.insert("auto-detect-interface".into(), true.into());
+        let hijack: Vec<serde_yaml::Value> = ["any:53", "tcp://any:53"]
+            .into_iter()
+            .map(|s| serde_yaml::Value::String(s.into()))
+            .collect();
+        tun.insert("dns-hijack".into(), serde_yaml::Value::Sequence(hijack));
+        root.insert("tun".into(), serde_yaml::Value::Mapping(tun));
+
+        let mut dns = serde_yaml::Mapping::new();
+        dns.insert("enable".into(), true.into());
+        dns.insert("ipv6".into(), true.into());
+        dns.insert("enhanced-mode".into(), "redir-host".into());
+        let nameservers: Vec<serde_yaml::Value> = ["1.1.1.1", "8.8.8.8"]
+            .into_iter()
+            .map(|s| serde_yaml::Value::String(s.into()))
+            .collect();
+        dns.insert("nameserver".into(), serde_yaml::Value::Sequence(nameservers));
+        root.insert("dns".into(), serde_yaml::Value::Mapping(dns));
+    }
+
     let proxies: Vec<serde_yaml::Value> = catalog.nodes.iter().map(|n| n.raw.clone()).collect();
     root.insert("proxies".into(), serde_yaml::Value::Sequence(proxies));
 
@@ -89,6 +114,18 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
                 "app" => {
                     rules.push(format!("PROCESS-NAME,{},{}", matcher.value, target));
                 }
+                "cidr" => {
+                    let value = matcher.value.trim();
+                    if value.is_empty() {
+                        continue;
+                    }
+                    let kind = if value.contains(':') {
+                        "IP-CIDR6"
+                    } else {
+                        "IP-CIDR"
+                    };
+                    rules.push(format!("{kind},{value},{target},no-resolve"));
+                }
                 _ => {}
             }
         }
@@ -104,11 +141,12 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     log::info(
         "compile",
         format!(
-            "runtime.yaml nodes={} groups={} rule_sets={} compiled_rules={}",
+            "runtime.yaml nodes={} groups={} rule_sets={} compiled_rules={} tun={}",
             catalog.nodes.len(),
             strategy.groups.len(),
             strategy.rule_sets.len(),
-            compiled
+            compiled,
+            strategy.tun
         ),
     );
     Ok(yaml)
