@@ -16,6 +16,12 @@ permissions:
 jobs:
   macos:
     runs-on: macos-15
+    env:
+      SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,17 +45,72 @@ jobs:
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - name: Require release credentials
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in \
+            CSC_LINK \
+            CSC_KEY_PASSWORD \
+            SPARKLE_ED_PRIVATE_KEY \
+            APPLE_ID \
+            APPLE_APP_SPECIFIC_PASSWORD \
+            APPLE_TEAM_ID
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Required release secret is unavailable: ${name}" >&2
+              exit 1
+            fi
+          done
+      - name: Import Developer ID certificate
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate_path="${RUNNER_TEMP}/myproxy-developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/myproxy-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_data="${CSC_LINK}"
+          if [[ "${certificate_data}" == data:*base64,* ]]; then
+            certificate_data="${certificate_data#*,}"
+          fi
+          printf '%s' "${certificate_data}" | base64 --decode > "${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" \
+            -k "${keychain_path}" \
+            -P "${CSC_KEY_PASSWORD}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "${keychain_password}" \
+            "${keychain_path}" >/dev/null
+          security list-keychains -d user -s "${keychain_path}"
+          identity="$(security find-identity -v -p codesigning "${keychain_path}" | \
+            sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+          if [[ -z "${identity}" ]]; then
+            echo "CSC_LINK does not contain a valid Developer ID Application identity." >&2
+            security find-identity -v -p codesigning "${keychain_path}"
+            exit 1
+          fi
+          echo "Using ${identity}"
+          {
+            echo "CODESIGN_IDENTITY=${identity}"
+            echo "MYPROXY_KEYCHAIN_PATH=${keychain_path}"
+            echo "MYPROXY_CERTIFICATE_PATH=${certificate_path}"
+          } >> "${GITHUB_ENV}"
       - name: Package Sparkle zip and appcast
         env:
-          CODESIGN_ADHOC: "1"
-          SKIP_NOTARIZE: "1"
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: scripts/release-macos.sh "$VERSION"
       - name: Publish GitHub Release
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.ver.outputs.tag }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
@@ -68,4 +129,16 @@ jobs:
             gh release upload "$TAG" "${assets[@]}" --clobber
           else
             gh release create "$TAG" "${assets[@]}" --title "myproxy ${TAG}" --notes "$notes"
+          fi
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          set +e
+          keychain_path="${MYPROXY_KEYCHAIN_PATH:-${RUNNER_TEMP}/myproxy-signing.keychain-db}"
+          certificate_path="${MYPROXY_CERTIFICATE_PATH:-${RUNNER_TEMP}/myproxy-developer-id.p12}"
+          if [[ "${keychain_path}" == "${RUNNER_TEMP}"/* && -f "${keychain_path}" ]]; then
+            security delete-keychain "${keychain_path}"
+          fi
+          if [[ "${certificate_path}" == "${RUNNER_TEMP}"/* && -f "${certificate_path}" ]]; then
+            rm -f "${certificate_path}"
           fi

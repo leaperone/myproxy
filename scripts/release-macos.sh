@@ -45,6 +45,9 @@ if [[ "$notarize" -eq 1 ]]; then
   set -euo pipefail
   xcrun stapler staple "$app"
   rm -f "$zip_path"
+elif [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  echo "CI release requires notarization (APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID, and a Developer ID identity)" >&2
+  exit 1
 fi
 
 ditto -c -k --keepParent "$app" "$zip_path"

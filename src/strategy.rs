@@ -61,6 +61,18 @@ pub struct Strategy {
     /// When true, compile a mihomo TUN inbound so apps that ignore Mixed enter the core.
     #[serde(default)]
     pub tun: bool,
+    /// Register a macOS login item when running from a bundled `.app`.
+    #[serde(default)]
+    pub launch_at_login: bool,
+    /// Do not show the main window on process start.
+    #[serde(default)]
+    pub silent_launch: bool,
+    /// Do not construct the main window until the tray asks; hide the Dock icon.
+    #[serde(default)]
+    pub lite_mode: bool,
+    /// Call `Supervisor::connect` during process start.
+    #[serde(default)]
+    pub connect_on_launch: bool,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
@@ -147,6 +159,10 @@ impl Default for Strategy {
             exclude_filter: DEFAULT_EXCLUDE.into(),
             developer_mode: false,
             tun: false,
+            launch_at_login: false,
+            silent_launch: false,
+            lite_mode: false,
+            connect_on_launch: false,
             subscriptions: Vec::new(),
             groups: vec![
                 Group::all_nodes("PROXY".into(), "select".into()),
