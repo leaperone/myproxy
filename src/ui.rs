@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
@@ -74,6 +74,61 @@ fn normalize_suffix(raw: &str) -> String {
         .to_string()
 }
 
+#[derive(Clone)]
+struct ViaChoice {
+    value: String,
+    label: String,
+}
+
+fn default_via(strategy: &Strategy) -> String {
+    strategy
+        .groups
+        .iter()
+        .find(|g| g.name == "PROXY")
+        .or_else(|| strategy.groups.first())
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| "DIRECT".into())
+}
+
+fn via_label(via: &str) -> String {
+    match via.trim().to_ascii_lowercase().as_str() {
+        "direct" => "直连".into(),
+        "reject" => "拒绝".into(),
+        _ => via.trim().to_string(),
+    }
+}
+
+fn via_choices(strategy: &Strategy, extra: Option<&str>) -> Vec<ViaChoice> {
+    let mut out = vec![
+        ViaChoice {
+            value: "DIRECT".into(),
+            label: "直连".into(),
+        },
+        ViaChoice {
+            value: "REJECT".into(),
+            label: "拒绝".into(),
+        },
+    ];
+    for group in &strategy.groups {
+        if out.iter().any(|c| c.value.eq_ignore_ascii_case(&group.name)) {
+            continue;
+        }
+        out.push(ViaChoice {
+            value: group.name.clone(),
+            label: group.name.clone(),
+        });
+    }
+    if let Some(via) = extra.map(str::trim).filter(|s| !s.is_empty()) {
+        if !out.iter().any(|c| c.value.eq_ignore_ascii_case(via)) {
+            out.push(ViaChoice {
+                value: via.to_string(),
+                label: via_label(via),
+            });
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overview,
@@ -108,7 +163,7 @@ pub struct AppView {
     group_sources: Entity<InputState>,
     group_contains: Entity<InputState>,
     rule_match: Entity<InputState>,
-    rule_via: Entity<InputState>,
+    rule_via: String,
     rule_query: Entity<InputState>,
     filter_input: Entity<InputState>,
     port_input: Entity<InputState>,
@@ -144,7 +199,7 @@ impl AppView {
         let connected = supervisor.is_running();
         Self {
             page: initial_page(),
-            status: "策略已加载。用 CLI 或本页编辑，然后点「应用」或「连接」。".into(),
+            status: "策略已加载。用 CLI 或本页编辑，然后点「更新配置」或「连接」。".into(),
             connected,
             supervisor,
             url_input: cx.new(|cx| {
@@ -163,7 +218,7 @@ impl AppView {
             rule_match: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(RuleDraftKind::Suffix.placeholder())
             }),
-            rule_via: cx.new(|cx| InputState::new(window, cx).default_value("PROXY")),
+            rule_via: default_via(&strategy),
             rule_query: cx.new(|cx| InputState::new(window, cx).placeholder("筛选规则…")),
             filter_input: cx.new(|cx| {
                 InputState::new(window, cx).default_value(strategy.exclude_filter.clone())
@@ -287,14 +342,11 @@ impl AppView {
         self.rule_edit_id = Some(id.to_string());
         self.set_rule_kind(RuleDraftKind::from_rule(&rule), window, cx);
         let match_value = rule.match_value().to_string();
-        let via = rule.via.clone();
+        self.rule_via = rule.via.clone();
         self.rule_match.update(cx, |input, cx| {
             input.set_value(match_value, window, cx);
         });
-        self.rule_via.update(cx, |input, cx| {
-            input.set_value(via, window, cx);
-        });
-        self.status = format!("正在编辑 {} → {}", rule.match_label(), rule.via);
+        self.status = format!("正在编辑 {} → {}", rule.match_label(), via_label(&rule.via));
     }
 
     fn cancel_edit_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -303,21 +355,19 @@ impl AppView {
             input.set_value("", window, cx);
             input.set_placeholder(self.rule_draft_kind.placeholder(), window, cx);
         });
-        self.rule_via.update(cx, |input, cx| {
-            input.set_value("PROXY", window, cx);
-        });
+        self.rule_via = default_via(&self.strategy);
         self.status = "已取消编辑。".into();
     }
 
     fn commit_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let match_value = self.rule_match.read(cx).value().trim().to_string();
-        let via = self.rule_via.read(cx).value().trim().to_string();
+        let via = self.rule_via.trim().to_string();
         if match_value.is_empty() {
             self.status = format!("填写{}。", self.rule_draft_kind.placeholder());
             return;
         }
         if via.is_empty() {
-            self.status = "填写走向，例如 PROXY、DIRECT、REJECT。".into();
+            self.status = "选一个走向：直连、拒绝，或一个节点组。".into();
             return;
         }
         let next = self.rule_draft_kind.into_rule(match_value, via);
@@ -875,7 +925,38 @@ impl AppView {
                             .gap_2()
                             .items_center()
                             .child(div().flex_1().child(Input::new(&self.rule_match)))
-                            .child(div().w(px(140.)).child(Input::new(&self.rule_via)))
+                            .child({
+                                let entity = entity.clone();
+                                let current = self.rule_via.clone();
+                                let choices = via_choices(&self.strategy, Some(&current));
+                                Button::new("rule-via")
+                                    .small()
+                                    .label(via_label(&current))
+                                    .icon(IconName::ChevronDown)
+                                    .min_w(px(140.))
+                                    .dropdown_menu(move |menu, _, _| {
+                                        let mut menu = menu.scrollable(true).min_w(px(168.));
+                                        for (i, choice) in choices.iter().enumerate() {
+                                            if i == 2 {
+                                                menu = menu.separator();
+                                            }
+                                            let entity = entity.clone();
+                                            let value = choice.value.clone();
+                                            let checked = current.eq_ignore_ascii_case(&choice.value);
+                                            menu = menu.item(
+                                                PopupMenuItem::new(choice.label.clone())
+                                                    .checked(checked)
+                                                    .on_click(move |_, _, app| {
+                                                        entity.update(app, |this, cx| {
+                                                            this.rule_via = value.clone();
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    })
+                            })
                             .child({
                                 let entity = entity.clone();
                                 Button::new("commit-rule")
@@ -907,7 +988,7 @@ impl AppView {
                         div()
                             .text_xs()
                             .text_color(muted_fg)
-                            .child("走向填 PROXY、DIRECT、REJECT 或节点组名。"),
+                            .child("走向：直连、拒绝，或任意节点组。"),
                     ),
             ))
             .child(
@@ -1001,6 +1082,7 @@ impl AppView {
                                             total,
                                             self.rule_edit_id.as_deref() == Some(rule.id.as_str()),
                                             &rule,
+                                            via_choices(&self.strategy, Some(&rule.via)),
                                         )
                                     })),
                             ),
@@ -1090,7 +1172,7 @@ fn rule_columns(
         .child(div().w(px(36.)).flex_shrink_0().child(index))
         .child(div().w(px(64.)).flex_shrink_0().child(kind))
         .child(div().flex_1().min_w(px(0.)).child(match_el))
-        .child(div().w(px(120.)).flex_shrink_0().child(via))
+        .child(div().w(px(168.)).flex_shrink_0().child(via))
 }
 
 fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {
@@ -1112,6 +1194,7 @@ fn render_rule_row(
     total: usize,
     selected: bool,
     rule: &Rule,
+    via_choices: Vec<ViaChoice>,
 ) -> impl IntoElement {
     let id = rule.id.clone();
     let via = rule.via.clone();
@@ -1129,7 +1212,7 @@ fn render_rule_row(
             .child(format!("{}", index + 1)),
         outline_pill(theme, rule.kind_label()),
         div().text_sm().child(rule.match_value().to_string()),
-        pill(theme, &via, accent),
+        pill(theme, &via_label(&via), accent),
     )
     .id(SharedString::from(format!("rule-{id}")))
     .px_3()
@@ -1189,21 +1272,29 @@ fn render_rule_row(
                 let entity = entity.clone();
                 let id = id.clone();
                 let via_current = via.clone();
+                let choices = via_choices.clone();
                 move |menu, _, _| {
-                    ["DIRECT", "PROXY", "REJECT"].into_iter().fold(menu, |menu, target| {
+                    let mut menu = menu.scrollable(true).min_w(px(168.));
+                    for (i, choice) in choices.iter().enumerate() {
+                        if i == 2 {
+                            menu = menu.separator();
+                        }
                         let entity = entity.clone();
                         let id = id.clone();
-                        menu.item(
-                            PopupMenuItem::new(target)
-                                .checked(via_current.eq_ignore_ascii_case(target))
+                        let value = choice.value.clone();
+                        let checked = via_current.eq_ignore_ascii_case(&choice.value);
+                        menu = menu.item(
+                            PopupMenuItem::new(choice.label.clone())
+                                .checked(checked)
                                 .on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
-                                        this.set_selected_rule_via(&id, target);
+                                        this.set_selected_rule_via(&id, &value);
                                         cx.notify();
                                     });
                                 }),
-                        )
-                    })
+                        );
+                    }
+                    menu
                 }
             })
             .separator()
