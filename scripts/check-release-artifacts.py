@@ -20,6 +20,7 @@ parser.add_argument("build_number")
 parser.add_argument("tag")
 parser.add_argument("--dist", type=Path, default=Path("dist"))
 args = parser.parse_args()
+require(args.tag == f"v{args.version}", "release tag must match the display version")
 
 sparkle = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
 archive_name = f"myproxy-{args.version}.sparkle.zip"
@@ -40,6 +41,10 @@ require(enclosure.get(sparkle + "edSignature"), "missing Sparkle EdDSA signature
 require(
     (item.findtext(sparkle + "version") or enclosure.get(sparkle + "version")) == args.build_number,
     "appcast build number does not match the release",
+)
+require(
+    (item.findtext(sparkle + "shortVersionString") or enclosure.get(sparkle + "shortVersionString")) == args.version,
+    "appcast display version does not match the release",
 )
 require(
     item.findtext(sparkle + "channel", "") == ("nightly" if args.channel == "nightly" else ""),

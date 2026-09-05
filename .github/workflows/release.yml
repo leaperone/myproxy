@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "!v*-*"]
   schedule:
     - cron: "0 18 * * *"
   workflow_dispatch:
@@ -59,6 +59,10 @@ jobs:
             tag="$DISPATCH_TAG"
           fi
           package_version=$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Cargo.toml must contain the next target MAJOR.MINOR.PATCH version" >&2
+            exit 1
+          fi
           if [[ "$channel" == "prod" ]]; then
             if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "Prod requires an existing vMAJOR.MINOR.PATCH tag" >&2
@@ -75,8 +79,8 @@ jobs:
               exit 1
             fi
           elif [[ "$channel" == "nightly" ]]; then
-            version="${package_version}-nightly.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
-            tag="nightly-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+            version="${package_version}-nightly.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+            tag="v${version}"
           else
             echo "invalid channel" >&2
             exit 1

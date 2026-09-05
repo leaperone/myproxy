@@ -21,6 +21,8 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 
 Nightly builds are GitHub prereleases with immutable build tags and full archives. The `nightly` prerelease points to the latest Nightly feed. Prod generates deltas only from previous Prod archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow.
 
+`Cargo.toml` holds the next target release version. Since `v0.0.3` is already released, `main` now targets `0.0.4`: Prod uses `v0.0.4`, while Nightly uses `v0.0.4-nightly.20260905.42.1` (UTC date, Release run number, attempt). The app displays the same version without the `v` prefix; the source commit is recorded in release notes. When a Prod release is ready, tag its matching commit, then advance `main` to the next target version. Nightly tags do not trigger the Prod workflow.
+
 Both channels use the Release workflow's run number and attempt as `CFBundleVersion`, so Sparkle can compare builds across channels. The display version, build number, feed, and channel are validated against the packaged app before publication. A manually dispatched Prod release checks out the requested tag; its version must match `Cargo.toml` at that commit.
 
 The title shows **Dev** for development builds and **Nightly** for Nightly builds; Prod has no badge. This identifies the installed build, independently of the selected update channel or developer logging. Local debug builds default to Dev and release builds to Prod; `MYPROXY_BUILD_CHANNEL=dev|prod|nightly` overrides this at build time.
