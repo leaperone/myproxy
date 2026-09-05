@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod cli_install;
 pub mod compile;
 pub mod controller;
 pub mod log;
