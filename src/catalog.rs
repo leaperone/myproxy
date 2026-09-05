@@ -1,4 +1,5 @@
 use std::fs;
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -50,6 +51,7 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
     let exclude = Regex::new(&strategy.exclude_filter)
         .context("invalid exclude_filter regex")
         .inspect_err(|err| log::error("catalog", format!("{err:#}")))?;
+    let previous = Catalog::load().unwrap_or_default();
     let mut catalog = Catalog::default();
     log::debug(
         "catalog",
@@ -95,6 +97,23 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
             }
             Err(err) => {
                 log::warn("catalog", format!("fetch {} failed: {err:#}", sub.name));
+                let reused = previous
+                    .nodes
+                    .iter()
+                    .filter(|node| node.subscription == sub.name)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !reused.is_empty() {
+                    log::info(
+                        "catalog",
+                        format!(
+                            "{} reused {} cached nodes after fetch failure",
+                            sub.name,
+                            reused.len()
+                        ),
+                    );
+                    catalog.nodes.extend(reused);
+                }
                 catalog.excluded.push(Excluded {
                     name: format!("<{}>", sub.name),
                     subscription: sub.name.clone(),
@@ -120,16 +139,52 @@ fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
     let body = if let Some(path) = url.strip_prefix("file://") {
         fs::read_to_string(path).with_context(|| format!("read {name}"))?
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        ureq::get(url)
-            .timeout(std::time::Duration::from_secs(30))
-            .set("User-Agent", "clash.meta")
-            .call()
-            .with_context(|| format!("GET {name}"))?
-            .into_string()?
+        fetch_http_body(name, url)?
     } else {
         fs::read_to_string(url).with_context(|| format!("read {name}"))?
     };
     parse_subscription(&body)
+}
+
+fn fetch_http_body(name: &str, url: &str) -> Result<String> {
+    // ureq 2 is HTTP/1.1 only and has no Happy Eyeballs. Cloudflare AAAA
+    // records that blackhole (Cunoe) hit the 30s read timeout whenever IPv6
+    // is tried first. Prefer curl --ipv4 on macOS; fall back to ureq.
+    if let Ok(body) = fetch_http_body_curl_ipv4(url) {
+        return Ok(body);
+    }
+    log::warn(
+        "catalog",
+        format!("{name} IPv4 curl failed, trying default HTTP"),
+    );
+    ureq::get(url)
+        .timeout(std::time::Duration::from_secs(45))
+        .set("User-Agent", "clash.meta")
+        .call()
+        .with_context(|| format!("GET {name}"))?
+        .into_string()
+        .with_context(|| format!("read {name}"))
+}
+
+fn fetch_http_body_curl_ipv4(url: &str) -> Result<String> {
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--ipv4",
+            "-A",
+            "clash.meta",
+            "--max-time",
+            "45",
+            "--connect-timeout",
+            "15",
+            url,
+        ])
+        .output()
+        .context("spawn curl")?;
+    if !output.status.success() {
+        bail!("curl IPv4 failed");
+    }
+    String::from_utf8(output.stdout).context("curl body is not UTF-8")
 }
 
 fn parse_subscription(body: &str) -> Result<Vec<serde_yaml::Value>> {
@@ -179,6 +234,13 @@ pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) 
     // names would otherwise become the implicit first member.
     let mut names: Vec<String> = Vec::new();
     for pin in &group.include {
+        if !catalog.nodes.iter().any(|node| node.name == *pin) {
+            log::warn(
+                "catalog",
+                format!("group {} skip missing pin {}", group.name, pin),
+            );
+            continue;
+        }
         if !names.iter().any(|n| n == pin) {
             names.push(pin.clone());
         }
@@ -198,6 +260,10 @@ pub fn count_group_members(group: &crate::strategy::Group, catalog: &Catalog) ->
         .filter(|node| group_accepts(group, node))
         .count();
     for extra in &group.include {
+        let in_catalog = catalog.nodes.iter().any(|node| node.name == *extra);
+        if !in_catalog {
+            continue;
+        }
         let already = catalog
             .nodes
             .iter()
