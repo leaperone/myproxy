@@ -28,14 +28,15 @@ struct MenuFace {
 }
 
 pub fn install(cx: &mut App) {
+    let initial = menu_face();
     match build_tray() {
         Ok(tray) => {
-            tray.apply(&menu_face());
+            tray.apply(&initial);
             cx.set_global(tray);
         }
         Err(err) => myproxy::log::warn("tray", format!("menu bar icon failed: {err:#}")),
     }
-    let last = Arc::new(Mutex::new(None::<MenuFace>));
+    let last = Arc::new(Mutex::new(initial));
     cx.spawn(async move |cx| loop {
         cx.background_executor()
             .timer(Duration::from_millis(250))
@@ -44,10 +45,8 @@ pub fn install(cx: &mut App) {
             .background_executor()
             .spawn(async { menu_face() })
             .await;
-        let face_changed = {
-            let cache = last.lock().expect("tray menu face");
-            cache.as_ref() != Some(&face)
-        };
+        let displayed = last.lock().expect("tray menu face").clone();
+        let face_changed = displayed != face;
         let mut clicks = Vec::new();
         let mut menus = Vec::new();
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
@@ -60,17 +59,17 @@ pub fn install(cx: &mut App) {
             continue;
         }
         cx.update(|cx| {
-            if face_changed {
-                if let Some(tray) = cx.try_global::<TrayKeepAlive>() {
-                    tray.apply(&face);
-                }
-                *last.lock().expect("tray menu face") = Some(face);
-            }
             for event in clicks {
                 handle_tray_event(event, cx);
             }
             for event in menus {
-                handle_menu_event(event, cx);
+                handle_menu_event(event, cx, displayed.connected);
+            }
+            if face_changed {
+                if let Some(tray) = cx.try_global::<TrayKeepAlive>() {
+                    tray.apply(&face);
+                }
+                *last.lock().expect("tray menu face") = face;
             }
         });
     })
@@ -161,22 +160,15 @@ fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
     crate::show_main_window(cx);
 }
 
-fn handle_menu_event(event: MenuEvent, cx: &mut App) {
+fn handle_menu_event(event: MenuEvent, cx: &mut App, displayed_connected: bool) {
     match event.id.as_ref() {
         "open" => crate::show_main_window(cx),
-        "toggle" => toggle_connection(cx),
+        "toggle" if displayed_connected => disconnect_async(cx),
+        "toggle" => connect(cx),
         "apply" => apply(cx),
         "updates" => crate::sparkle::check(),
         "quit" => disconnect_and_quit(cx),
         _ => {}
-    }
-}
-
-fn toggle_connection(cx: &mut App) {
-    if Supervisor::shared().is_running() {
-        disconnect_async(cx);
-    } else {
-        connect(cx);
     }
 }
 
