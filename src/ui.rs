@@ -1961,9 +1961,9 @@ impl AppView {
                 theme,
                 "总览",
                 if self.strategy.system_extension {
-                    "系统接管是 System Extension。应用无需填 Mixed。请在系统设置里允许扩展。"
+                    "系统接管已打开。应用不用自己填代理。请在系统设置里允许扩展。"
                 } else {
-                    "未打开系统接管时，只有填了 Mixed 的应用会进规则。"
+                    "未打开系统接管时，只有自己填了代理的应用会进规则。"
                 },
             ))
             .child(
@@ -2009,9 +2009,9 @@ impl AppView {
                                             )
                                         }
                                     } else if self.strategy.system_extension {
-                                        "下次连接将请求 System Extension。请在系统设置 › 通用 › 登录项与扩展 里允许 myproxy。".into()
+                                        "下次连接会请求系统扩展。请在系统设置 › 通用 › 登录项与扩展 › 网络扩展 里允许 myproxy。".into()
                                     } else {
-                                        "启动捆绑的 mihomo。要拦截未填代理的应用，先打开设置里的系统接管。".into()
+                                        "连接后，自己填了代理的应用会进规则。要拦截其他应用，先打开设置里的系统接管。".into()
                                     }),
                             ),
                     )
@@ -2089,9 +2089,9 @@ impl AppView {
                 theme,
                 "连接",
                 if self.strategy.system_extension {
-                    "系统接管打开后，未填代理的应用也会出现在这里。Mixed 仍显示显式代理连接。"
+                    "系统接管打开后，未自己填代理的应用也会出现在这里。主动指定代理的连接仍会列出。"
                 } else {
-                    "当前只看到走进 Mixed 的连接。要拦截未填代理的应用，先打开设置里的系统接管。"
+                    "当前只看到主动指定代理的连接。要拦截其他应用，先打开设置里的系统接管。"
                 },
             ))
             .child(
@@ -2410,7 +2410,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                "打开系统接管后应用不必填 Mixed。首次会要求在系统设置里允许扩展。",
+                "打开系统接管后，应用不用自己填代理。第一次会请你在系统设置里允许 myproxy。",
             ))
             .child(self.system_extension_panel(cx, theme))
             .child(panel(
@@ -2559,7 +2559,7 @@ impl AppView {
             self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
-                "已记录。下次连接将请求 System Extension；请在系统设置里允许 myproxy。".into()
+                "已记录。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
             } else {
                 "已关闭系统接管。".into()
             };
@@ -2600,12 +2600,12 @@ impl AppView {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(div().text_sm().child("System Extension 拦截本机流量"))
+                                .child(div().text_sm().child("拦截本机应用"))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("与 MClash 相同：NETransparentProxyProvider 接管出站连接，进程规则在扩展里选组，其余进同一套 mihomo 规则。无需填写 Mixed。"),
+                                        .child("按规则接管未自己填写代理的应用，不必再给每个客户端设端口。"),
                                 ),
                         )
                         .child({
@@ -2634,9 +2634,9 @@ impl AppView {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(if on {
-                            "已打开。连接后到「系统设置 › 通用 › 登录项与扩展 › 网络扩展」允许 myproxy，必要时重启。需要装在 /Applications 的 Developer ID .app。"
+                            "已打开。连接后到「系统设置 › 通用 › 登录项与扩展 › 网络扩展」允许 myproxy。"
                         } else {
-                            "默认关闭。打开并连接后才会拦截；未填代理的应用现在不会进规则。"
+                            "关闭时，只有自己填了代理的应用会进规则。"
                         }),
                 )
                 .child(
@@ -2648,12 +2648,12 @@ impl AppView {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(div().text_sm().child("TUN（旧 utun）"))
+                                .child(div().text_sm().child("TUN"))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("不是 System Extension。仅作后备；与上面的系统接管互斥。"),
+                                        .child("用虚拟网卡拦截流量，与系统接管不能同时开。一般保持关闭。"),
                                 ),
                         )
                         .child({
@@ -2740,7 +2740,7 @@ impl AppView {
                     theme,
                     "connect-on-launch",
                     "启动时默认连接",
-                    "启动后自动连接 mihomo 核心。",
+                    "启动后自动连接。",
                     self.strategy.connect_on_launch,
                     |this, cx| {
                         this.strategy.connect_on_launch = !this.strategy.connect_on_launch;
