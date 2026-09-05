@@ -34,12 +34,8 @@ fn main() {
     if let Err(err) = login_item::sync(strategy.launch_at_login) {
         myproxy::log::warn("login", format!("{err:#}"));
     }
-    if strategy.connect_on_launch {
-        if let Err(err) = Supervisor::default().connect(&strategy) {
-            myproxy::log::error("main", format!("connect on launch failed: {err:#}"));
-        }
-    }
     let lite = strategy.lite_mode;
+    Supervisor::shared().adopt_running(strategy.tun, strategy.system_extension);
     let show_window = !lite && !strategy.silent_launch;
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.on_reopen(show_main_window);
@@ -54,6 +50,16 @@ fn main() {
             tray::install(cx);
         }
         sparkle::init();
+        if strategy.connect_on_launch {
+            let strategy = strategy.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(err) = Supervisor::shared().connect(&strategy) {
+                        myproxy::log::error("main", format!("connect on launch failed: {err:#}"));
+                    }
+                })
+                .detach();
+        }
         if show_window {
             cx.spawn(async move |cx| {
                 cx.update(|cx| {

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -21,6 +21,10 @@ pub struct Supervisor {
     running_se: Mutex<bool>,
 }
 
+// ponytail: one core per process; cross-process CLI operations need a file lock.
+// The flag remains set after shutdown so queued operations cannot restart the core.
+static OPERATION: Mutex<bool> = Mutex::new(false);
+
 impl Default for Supervisor {
     fn default() -> Self {
         Self {
@@ -32,6 +36,11 @@ impl Default for Supervisor {
 }
 
 impl Supervisor {
+    pub fn shared() -> Arc<Self> {
+        static INSTANCE: OnceLock<Arc<Supervisor>> = OnceLock::new();
+        INSTANCE.get_or_init(|| Arc::new(Self::default())).clone()
+    }
+
     pub fn adopt_running(&self, tun: bool, system_extension: bool) {
         if self.is_running() {
             *self.running_tun.lock().expect("supervisor lock") = tun;
@@ -40,6 +49,14 @@ impl Supervisor {
     }
 
     pub fn connect(&self, strategy: &Strategy) -> Result<()> {
+        let shutting_down = OPERATION.lock().expect("supervisor operation lock");
+        if *shutting_down {
+            bail!("application is shutting down");
+        }
+        self.connect_inner(strategy)
+    }
+
+    fn connect_inner(&self, strategy: &Strategy) -> Result<()> {
         log::info(
             "supervisor",
             format!(
@@ -47,7 +64,7 @@ impl Supervisor {
                 strategy.mixed_port, strategy.tun, strategy.system_extension
             ),
         );
-        self.disconnect()?;
+        self.disconnect_inner()?;
         let catalog = catalog::refresh(strategy)?;
         compile::compile(strategy, &catalog)?;
         let yaml = paths::runtime_yaml_path()?;
@@ -140,6 +157,10 @@ impl Supervisor {
     }
 
     pub fn apply(&self, strategy: &Strategy) -> Result<Catalog> {
+        let shutting_down = OPERATION.lock().expect("supervisor operation lock");
+        if *shutting_down {
+            bail!("application is shutting down");
+        }
         log::debug("supervisor", "apply");
         let catalog = catalog::refresh(strategy)?;
         compile::compile(strategy, &catalog)?;
@@ -154,7 +175,7 @@ impl Supervisor {
                         strategy.tun, strategy.system_extension
                     ),
                 );
-                self.connect(strategy)?;
+                self.connect_inner(strategy)?;
             } else {
                 controller::reload(strategy.mixed_port)?;
                 if strategy.system_extension {
@@ -166,9 +187,21 @@ impl Supervisor {
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        let _operation = OPERATION.lock().expect("supervisor operation lock");
+        self.disconnect_inner()
+    }
+
+    pub fn shutdown(&self) -> Result<()> {
+        let mut shutting_down = OPERATION.lock().expect("supervisor operation lock");
+        *shutting_down = true;
+        self.disconnect_inner()
+    }
+
+    fn disconnect_inner(&self) -> Result<()> {
         crate::network_extension::disable_async();
         let mut stopped = false;
-        if let Some(mut child) = self.child.lock().expect("supervisor lock").take() {
+        let child = self.child.lock().expect("supervisor lock").take();
+        if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
             stopped = true;
@@ -210,6 +243,34 @@ impl Supervisor {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_apply_observes_shutdown() {
+        let mut operation = OPERATION.lock().unwrap();
+        let (ready, started) = std::sync::mpsc::channel();
+        let queued = std::thread::spawn(move || {
+            // A regressed guard still fails before any disk or core operations.
+            let strategy = Strategy {
+                exclude_filter: "[".into(),
+                ..Strategy::default()
+            };
+            ready.send(()).unwrap();
+            Supervisor::default()
+                .apply(&strategy)
+                .unwrap_err()
+                .to_string()
+        });
+        started.recv().unwrap();
+        *operation = true;
+        drop(operation);
+        assert_eq!(queued.join().unwrap(), "application is shutting down");
+        *OPERATION.lock().unwrap() = false;
     }
 }
 
