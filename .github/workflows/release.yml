@@ -17,6 +17,10 @@ on:
         description: "Prod only: existing version tag (e.g. v0.0.4)"
         required: false
         type: string
+      notarization_id:
+        description: "Read an existing notarization report without building or publishing"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -26,7 +30,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  notarization-log:
+    if: github.event_name == 'workflow_dispatch' && inputs.notarization_id != ''
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Read Apple notarization report
+        env:
+          SUBMISSION_ID: ${{ inputs.notarization_id }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$SUBMISSION_ID" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]
+          xcrun notarytool log "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"
   macos:
+    if: inputs.notarization_id == ''
     runs-on: macos-15
     env:
       SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
