@@ -98,7 +98,7 @@ sign_nested() {
       codesign --force "${extra[@]}" --preserve-metadata=entitlements \
         --sign "$sign_identity" "$sparkle/XPCServices/Downloader.xpc"
     fi
-    if [[ -d "$sparkle/Autoupdate" ]]; then
+    if [[ -f "$sparkle/Autoupdate" ]]; then
       codesign --force "${extra[@]}" --sign "$sign_identity" "$sparkle/Autoupdate"
     fi
     if [[ -d "$sparkle/Updater.app" ]]; then
