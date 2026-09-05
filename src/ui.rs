@@ -2634,7 +2634,7 @@ impl AppView {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(if on {
-                            "已打开。连接后 macOS 会提示安装系统扩展。到「系统设置 › 通用 › 登录项与扩展」允许 myproxy，必要时重启。需要 Developer ID 签名的 .app。"
+                            "已打开。连接后到「系统设置 › 通用 › 登录项与扩展 › 网络扩展」允许 myproxy，必要时重启。需要装在 /Applications 的 Developer ID .app。"
                         } else {
                             "默认关闭。打开并连接后才会拦截；未填代理的应用现在不会进规则。"
                         }),
@@ -2706,7 +2706,7 @@ impl AppView {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("当前不是 .app，登录项不会注册。安装到 ~/Applications/myproxy.app 后生效。"),
+                            .child("当前不是 .app，登录项不会注册。安装到 /Applications/myproxy.app 后生效。"),
                     )
                 })
                 .child(self.flag_row(

@@ -36,7 +36,7 @@ pub fn sync(enable: bool) -> Result<()> {
     {
         if !is_bundled() {
             if enable {
-                bail!("开机启动需要安装为 .app，例如 ~/Applications/myproxy.app");
+                bail!("开机启动需要安装为 .app，例如 /Applications/myproxy.app");
             }
             return Ok(());
         }
