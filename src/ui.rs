@@ -2482,7 +2482,64 @@ impl AppView {
                     }),
             ))
             .child(self.startup_panel(cx, theme))
+            .child(self.cli_install_panel(cx, theme))
             .child(self.developer_panel(cx, theme))
+    }
+
+    fn cli_install_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let installed = myproxy::cli_install::is_installed();
+        panel(
+            theme,
+            "命令行工具",
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(div().text_sm().child("安装 myproxyctl"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("让 Agent 或终端直接使用 myproxyctl 配置代理。"),
+                                ),
+                        )
+                        .child({
+                            let mut button = Button::new("install-cli").small();
+                            button = if installed {
+                                button.label("已安装，更新链接")
+                            } else {
+                                button.primary().label("安装")
+                            };
+                            button.disabled(self.busy).on_click(move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    match myproxy::cli_install::install() {
+                                        Ok(path) => {
+                                            this.status = format!("命令行工具已安装：{}", path.display());
+                                        }
+                                        Err(error) => {
+                                            this.status = format!("命令行工具安装失败：{error:#}");
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("安装路径：{}", myproxy::cli_install::destination().display())),
+                ),
+        )
     }
 
     fn set_system_extension(&mut self, on: bool, cx: &mut Context<Self>) {
