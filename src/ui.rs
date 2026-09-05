@@ -616,13 +616,14 @@ impl RuleSetEditor {
     fn new(
         parent: Entity<AppView>,
         existing: Option<RuleSet>,
+        fallback_via: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let via = existing
             .as_ref()
             .map(|s| s.via.clone())
-            .unwrap_or_else(|| default_via(&parent.read(cx).strategy));
+            .unwrap_or(fallback_via);
         let name = existing
             .as_ref()
             .map(|s| s.name.clone())
@@ -1607,7 +1608,8 @@ impl AppView {
             ),
         );
         let parent = cx.entity();
-        let editor = cx.new(|cx| RuleSetEditor::new(parent.clone(), existing, window, cx));
+        let fallback_via = default_via(&self.strategy);
+        let editor = cx.new(|cx| RuleSetEditor::new(parent.clone(), existing, fallback_via, window, cx));
         let editing = id.is_some();
         window.open_dialog(cx, move |dialog, window, _| {
             let ok_label = if editing { "保存" } else { "添加" };
