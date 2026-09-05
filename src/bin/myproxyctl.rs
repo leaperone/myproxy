@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use myproxy::catalog;
 use myproxy::paths;
@@ -6,8 +6,11 @@ use myproxy::strategy::{self, Matcher, Strategy};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Parser)]
-#[command(name = "myproxyctl", about = "Configure myproxy without the window")]
+#[command(name = "myproxyctl", version = myproxy::updates::VERSION, about = "Configure myproxy without the window")]
 struct Cli {
+    /// Emit one JSON value on stdout for Agent and automation use.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -50,8 +53,14 @@ enum Commands {
 #[derive(Subcommand)]
 enum SubCmd {
     List,
-    Add { url: String, #[arg(long)] name: Option<String> },
-    Remove { id: String },
+    Add {
+        url: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Remove {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -83,9 +92,17 @@ enum GroupCmd {
         #[arg(long = "not-contains")]
         not_contains: Vec<String>,
     },
-    Remove { name: String },
-    Include { group: String, node: String },
-    Exclude { group: String, node: String },
+    Remove {
+        name: String,
+    },
+    Include {
+        group: String,
+        node: String,
+    },
+    Exclude {
+        group: String,
+        node: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -107,33 +124,98 @@ enum RuleCmd {
         #[arg(long)]
         via: String,
     },
-    Remove { id: String },
+    Remove {
+        id: String,
+    },
 }
 
-fn main() -> Result<()> {
-    myproxy::log::init();
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
+    myproxy::log::init();
+    match run(cli) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            if json {
+                println!("{}", serde_json::json!({"error": format!("{error:#}")}));
+            } else {
+                eprintln!("Error: {error:#}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let json = cli.json;
     match cli.command {
         Commands::Capabilities => {
-            println!(
-                "status apply connect disconnect port tun extension filter subscription group rule log"
+            let commands = [
+                "status",
+                "apply",
+                "connect",
+                "disconnect",
+                "port",
+                "tun",
+                "extension",
+                "filter",
+                "subscription",
+                "group",
+                "rule",
+                "log",
+            ];
+            emit(
+                json,
+                serde_json::json!({"commands": commands, "json": true, "version": myproxy::updates::VERSION}),
+                commands.join(" "),
             );
         }
         Commands::Log => {
             let path = paths::app_log_path()?;
             if !path.exists() {
-                println!("no log yet: {}", path.display());
+                emit(
+                    json,
+                    serde_json::json!({"lines": [], "path": path.display().to_string()}),
+                    format!("no log yet: {}", path.display()),
+                );
                 return Ok(());
             }
             let text = std::fs::read_to_string(&path)?;
-            for line in text.lines().rev().take(80).collect::<Vec<_>>().into_iter().rev() {
-                println!("{line}");
+            let lines: Vec<_> = text
+                .lines()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"lines": lines, "path": path.display().to_string()})
+                );
+            } else {
+                for line in lines {
+                    println!("{line}");
+                }
             }
         }
         Commands::Status => {
             let strategy = Strategy::load()?;
             let catalog = catalog::Catalog::load()?;
-            println!(
+            let status = serde_json::json!({
+                "mixed_port": strategy.mixed_port,
+                "tun": strategy.tun,
+                "extension": strategy.system_extension,
+                "subscriptions": strategy.subscriptions.len(),
+                "nodes": catalog.nodes.len(),
+                "excluded": catalog.excluded.len(),
+                "groups": strategy.groups.len(),
+                "rules": strategy.rule_sets.len(),
+                "strategy": paths::strategy_path()?.display().to_string(),
+            });
+            emit(json, status,
+                format!(
                 "mixed-port {}  tun {}  extension {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
                 strategy.mixed_port,
                 if strategy.tun { "on" } else { "off" },
@@ -143,8 +225,10 @@ fn main() -> Result<()> {
                 catalog.excluded.len(),
                 strategy.groups.len(),
                 strategy.rule_sets.len()
-            );
-            println!("strategy {}", paths::strategy_path()?.display());
+            ));
+            if !json {
+                println!("strategy {}", paths::strategy_path()?.display());
+            }
         }
         Commands::Apply => {
             myproxy::log::debug("ctl", "apply");
@@ -152,39 +236,64 @@ fn main() -> Result<()> {
             let supervisor = Supervisor::default();
             supervisor.adopt_running(strategy.tun, strategy.system_extension);
             let catalog = supervisor.apply(&strategy)?;
-            println!(
-                "applied {} nodes, {} excluded → {}",
-                catalog.nodes.len(),
-                catalog.excluded.len(),
-                paths::runtime_yaml_path()?.display()
+            emit(
+                json,
+                serde_json::json!({
+                    "status": "applied",
+                    "nodes": catalog.nodes.len(),
+                    "excluded": catalog.excluded.len(),
+                    "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
+                }),
+                format!(
+                    "applied {} nodes, {} excluded → {}",
+                    catalog.nodes.len(),
+                    catalog.excluded.len(),
+                    paths::runtime_yaml_path()?.display()
+                ),
             );
         }
         Commands::Connect => {
             myproxy::log::debug("ctl", "connect");
             let strategy = Strategy::load()?;
             Supervisor::default().connect(&strategy)?;
-            println!(
-                "connected mixed-port {}{}",
-                strategy.mixed_port,
-                if strategy.system_extension {
-                    " se"
-                } else if strategy.tun {
-                    " tun"
-                } else {
-                    ""
-                }
+            emit(
+                json,
+                serde_json::json!({
+                    "status": "connected",
+                    "mixed_port": strategy.mixed_port,
+                    "transport": if strategy.system_extension { "extension" } else if strategy.tun { "tun" } else { "mixed" },
+                }),
+                format!(
+                    "connected mixed-port {}{}",
+                    strategy.mixed_port,
+                    if strategy.system_extension {
+                        " se"
+                    } else if strategy.tun {
+                        " tun"
+                    } else {
+                        ""
+                    }
+                ),
             );
         }
         Commands::Disconnect => {
             myproxy::log::debug("ctl", "disconnect");
             Supervisor::default().disconnect()?;
-            println!("disconnected");
+            emit(
+                json,
+                serde_json::json!({"status": "disconnected"}),
+                "disconnected",
+            );
         }
         Commands::Port { port } => {
             let mut strategy = Strategy::load()?;
             strategy.mixed_port = port;
             strategy.save()?;
-            println!("mixed-port {port}");
+            emit(
+                json,
+                serde_json::json!({"mixed_port": port}),
+                format!("mixed-port {port}"),
+            );
         }
         Commands::Tun { state } => {
             let on = match state.as_str() {
@@ -195,7 +304,11 @@ fn main() -> Result<()> {
             let mut strategy = Strategy::load()?;
             strategy.tun = on;
             strategy.save()?;
-            println!("tun {}", if on { "on" } else { "off" });
+            emit(
+                json,
+                serde_json::json!({"tun": on}),
+                format!("tun {}", if on { "on" } else { "off" }),
+            );
         }
         Commands::Extension { state } => {
             let on = match state.as_str() {
@@ -209,7 +322,11 @@ fn main() -> Result<()> {
                 strategy.tun = false;
             }
             strategy.save()?;
-            println!("extension {}", if on { "on" } else { "off" });
+            emit(
+                json,
+                serde_json::json!({"extension": on, "tun": strategy.tun}),
+                format!("extension {}", if on { "on" } else { "off" }),
+            );
         }
         Commands::Filter { set } => {
             let mut strategy = Strategy::load()?;
@@ -217,12 +334,21 @@ fn main() -> Result<()> {
                 strategy.exclude_filter = value;
                 strategy.save()?;
             }
-            println!("{}", strategy.exclude_filter);
+            emit(
+                json,
+                serde_json::json!({"exclude_filter": strategy.exclude_filter}),
+                strategy.exclude_filter,
+            );
         }
         Commands::Subscription { cmd } => match cmd {
             SubCmd::List => {
-                for sub in Strategy::load()?.subscriptions {
-                    println!("{}\t{}\t{}", sub.id, sub.name, sub.url);
+                let subscriptions = Strategy::load()?.subscriptions;
+                if json {
+                    println!("{}", serde_json::json!({"subscriptions": subscriptions}));
+                } else {
+                    for sub in subscriptions {
+                        println!("{}\t{}\t{}", sub.id, sub.name, sub.url);
+                    }
                 }
             }
             SubCmd::Add { url, name } => {
@@ -231,7 +357,11 @@ fn main() -> Result<()> {
                 let added = strategy.add_subscription(name.clone(), url);
                 let id = added.id.clone();
                 strategy.save()?;
-                println!("added {id} {name}");
+                emit(
+                    json,
+                    serde_json::json!({"status": "added", "id": id, "name": name}),
+                    format!("added {id} {name}"),
+                );
             }
             SubCmd::Remove { id } => {
                 let mut strategy = Strategy::load()?;
@@ -239,21 +369,40 @@ fn main() -> Result<()> {
                     bail!("subscription not found");
                 }
                 strategy.save()?;
+                emit(
+                    json,
+                    serde_json::json!({"status": "removed", "id": id}),
+                    format!("removed {id}"),
+                );
             }
         },
         Commands::Group { cmd } => match cmd {
             GroupCmd::List => {
                 let strategy = Strategy::load()?;
                 let catalog = catalog::Catalog::load()?;
-                for group in &strategy.groups {
-                    let members = catalog::resolve_group_members(group, &catalog);
-                    println!(
-                        "{}\t{}\t{}\tmembers={}",
-                        group.name,
-                        group.kind,
-                        group.policy_label(),
-                        members.len()
-                    );
+                if json {
+                    let groups = strategy
+                        .groups
+                        .iter()
+                        .map(|group| {
+                            let mut value = serde_json::to_value(group)?;
+                            value["members"] =
+                                serde_json::json!(catalog::resolve_group_members(group, &catalog));
+                            Ok(value)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    println!("{}", serde_json::json!({"groups": groups}));
+                } else {
+                    for group in &strategy.groups {
+                        let members = catalog::resolve_group_members(group, &catalog);
+                        println!(
+                            "{}\t{}\t{}\tmembers={}",
+                            group.name,
+                            group.kind,
+                            group.policy_label(),
+                            members.len()
+                        );
+                    }
                 }
             }
             GroupCmd::Add {
@@ -276,7 +425,11 @@ fn main() -> Result<()> {
                 group.name_excludes = not_contains;
                 strategy.add_group(group);
                 strategy.save()?;
-                println!("added group {name}");
+                emit(
+                    json,
+                    serde_json::json!({"status": "added", "name": name}),
+                    format!("added group {name}"),
+                );
             }
             GroupCmd::Set {
                 name,
@@ -313,7 +466,11 @@ fn main() -> Result<()> {
                     }
                 }
                 strategy.save()?;
-                println!("updated group {name}");
+                emit(
+                    json,
+                    serde_json::json!({"status": "updated", "name": name}),
+                    format!("updated group {name}"),
+                );
             }
             GroupCmd::Remove { name } => {
                 let mut strategy = Strategy::load()?;
@@ -321,6 +478,11 @@ fn main() -> Result<()> {
                     bail!("group not found");
                 }
                 strategy.save()?;
+                emit(
+                    json,
+                    serde_json::json!({"status": "removed", "name": name}),
+                    format!("removed group {name}"),
+                );
             }
             GroupCmd::Include { group, node } => {
                 let mut strategy = Strategy::load()?;
@@ -329,10 +491,15 @@ fn main() -> Result<()> {
                         .group_mut(&group)
                         .ok_or_else(|| anyhow::anyhow!("no group"))?;
                     if !some.include.contains(&node) {
-                        some.include.push(node);
+                        some.include.push(node.clone());
                     }
                 }
                 strategy.save()?;
+                emit(
+                    json,
+                    serde_json::json!({"status": "included", "group": group, "node": node}),
+                    format!("included {node} in {group}"),
+                );
             }
             GroupCmd::Exclude { group, node } => {
                 let mut strategy = Strategy::load()?;
@@ -342,24 +509,34 @@ fn main() -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("no group"))?;
                     some.include.retain(|n| n != &node);
                     if !some.exclude.contains(&node) {
-                        some.exclude.push(node);
+                        some.exclude.push(node.clone());
                     }
                 }
                 strategy.save()?;
+                emit(
+                    json,
+                    serde_json::json!({"status": "excluded", "group": group, "node": node}),
+                    format!("excluded {node} from {group}"),
+                );
             }
         },
         Commands::Rule { cmd } => match cmd {
             RuleCmd::List => {
-                for set in Strategy::load()?.rule_sets {
-                    println!(
-                        "{}\t{}\t{} matchers\t{}",
-                        set.name,
-                        set.via,
-                        set.matchers.len(),
-                        set.id
-                    );
-                    for matcher in set.matchers {
-                        println!("  {}\t{}", matcher.kind_label(), matcher.display_value());
+                let rule_sets = Strategy::load()?.rule_sets;
+                if json {
+                    println!("{}", serde_json::json!({"rules": rule_sets}));
+                } else {
+                    for set in rule_sets {
+                        println!(
+                            "{}\t{}\t{} matchers\t{}",
+                            set.name,
+                            set.via,
+                            set.matchers.len(),
+                            set.id
+                        );
+                        for matcher in set.matchers {
+                            println!("  {}\t{}", matcher.kind_label(), matcher.display_value());
+                        }
                     }
                 }
             }
@@ -396,8 +573,10 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| matcher.display_value());
                 let mut strategy = Strategy::load()?;
                 let set = strategy.add_matcher(name, matcher, via);
-                println!("{}\t{}\t{} matchers", set.name, set.via, set.matchers.len());
+                let value = serde_json::json!({"status": "added", "id": set.id, "name": set.name, "via": set.via, "matchers": set.matchers.len()});
+                let message = format!("{}\t{}\t{} matchers", set.name, set.via, set.matchers.len());
                 strategy.save()?;
+                emit(json, value, message);
             }
             RuleCmd::Remove { id } => {
                 let mut strategy = Strategy::load()?;
@@ -405,10 +584,23 @@ fn main() -> Result<()> {
                     bail!("rule not found");
                 }
                 strategy.save()?;
+                emit(
+                    json,
+                    serde_json::json!({"status": "removed", "id": id}),
+                    format!("removed rule {id}"),
+                );
             }
         },
     }
     Ok(())
+}
+
+fn emit(json: bool, value: serde_json::Value, human: impl std::fmt::Display) {
+    if json {
+        println!("{value}");
+    } else {
+        println!("{human}");
+    }
 }
 
 fn infer_name(url: &str) -> String {
