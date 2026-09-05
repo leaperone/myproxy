@@ -9,9 +9,9 @@ Public repo: https://github.com/leaperone/myproxy. Stable Sparkle channel: `http
 ```sh
 scripts/fetch-mihomo.sh
 scripts/fetch-sparkle.sh
-scripts/dev.sh                 # local watchexec restart + push debug binaries to macbook-air
-scripts/install-macbook-air.sh # release .app on macbook-air, mixed-port 7891
-scripts/dev-air.sh             # compile here, copy binaries, relaunch Air
+scripts/dev.sh                 # local watchexec restart
+scripts/install-macbook-air.sh # signed /Applications app on macbook-air, mixed-port 7891
+scripts/dev-air.sh             # refused; use install-macbook-air.sh
 scripts/package-macos-app.sh
 scripts/release-macos.sh
 cargo run --bin myproxyctl -- capabilities
