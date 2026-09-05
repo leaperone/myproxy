@@ -35,6 +35,7 @@ mkdir -p \
   "$app/Contents/Library/SystemExtensions/${extension_bundle_id}.systemextension/Contents/MacOS"
 
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+cp packaging/macos/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 if /usr/libexec/PlistBuddy -c 'Print :NSSystemExtensionUsageDescription' "$app/Contents/Info.plist" >/dev/null 2>&1; then
   /usr/libexec/PlistBuddy -c \
     'Set :NSSystemExtensionUsageDescription myproxy uses a network system extension to intercept outbound connections and apply your process and routing rules.' \
