@@ -92,10 +92,7 @@ fn handle_menu_event(event: MenuEvent, cx: &mut App) {
         "disconnect" => disconnect_async(cx),
         "apply" => apply(cx),
         "updates" => crate::sparkle::check(),
-        "quit" => {
-            disconnect();
-            cx.quit();
-        }
+        "quit" => disconnect_and_quit(cx),
         _ => {}
     }
 }
@@ -127,6 +124,18 @@ fn disconnect_async(cx: &mut App) {
             disconnect();
         })
         .detach();
+}
+
+fn disconnect_and_quit(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .spawn(async move {
+                disconnect();
+            })
+            .await;
+        cx.update(|cx| cx.quit()).ok();
+    })
+    .detach();
 }
 
 fn apply(cx: &mut App) {

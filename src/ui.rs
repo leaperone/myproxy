@@ -1017,6 +1017,7 @@ pub struct AppView {
     connected: bool,
     busy: bool,
     external_change_pending: bool,
+    strategy_stamp: Option<SystemTime>,
     supervisor: Arc<Supervisor>,
     url_input: Entity<InputState>,
     name_input: Entity<InputState>,
@@ -1063,8 +1064,8 @@ impl AppView {
         );
         let strategy_path = myproxy::paths::strategy_path().ok();
         let catalog_path = myproxy::paths::catalog_path().ok();
+        let initial_strategy_stamp = strategy_path.as_deref().and_then(file_stamp);
         cx.spawn(async move |this, cx| {
-            let mut strategy_stamp = strategy_path.as_deref().and_then(file_stamp);
             let mut catalog_stamp = catalog_path.as_deref().and_then(file_stamp);
             loop {
                 let wait_ms = this
@@ -1128,16 +1129,25 @@ impl AppView {
                             }
                         }
                         let editing = this.group_modal_open || this.rule_modal_open;
-                        if !editing && !this.busy {
+                        if !this.busy {
                             if let Some(path) = strategy_path.as_deref() {
                                 let stamp = file_stamp(path);
-                                if stamp != strategy_stamp {
+                                if stamp != this.strategy_stamp {
                                     if let Ok(strategy) = Strategy::load() {
-                                        strategy_stamp = stamp;
+                                        this.strategy_stamp = stamp;
                                         log::set_developer(strategy.developer_mode);
-                                        if this.is_dirty() {
+                                        let local_inputs_dirty = this.port_input.read(cx).value().trim()
+                                            != this.strategy.mixed_port.to_string()
+                                            || this.filter_input.read(cx).value().to_string()
+                                                != this.strategy.exclude_filter;
+                                        if editing || this.is_dirty() || local_inputs_dirty {
                                             this.external_change_pending = true;
-                                            this.status = "检测到外部策略变更。点击「应用」覆盖外部变更，或重新打开窗口放弃本地修改。".into();
+                                            this.status = if editing {
+                                                "编辑期间检测到外部策略变更。请取消编辑后再决定是否应用覆盖。"
+                                            } else {
+                                                "检测到外部策略变更。点击「应用」覆盖外部变更，或重新打开窗口放弃本地修改。"
+                                            }
+                                            .into();
                                         } else {
                                             let sync_port = this.port_input.read(cx).value().trim()
                                                 == this.strategy.mixed_port.to_string();
@@ -1221,6 +1231,7 @@ impl AppView {
             connected,
             busy: false,
             external_change_pending: false,
+            strategy_stamp: initial_strategy_stamp,
             supervisor,
             url_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("https://…/clash.yaml")
@@ -1296,6 +1307,9 @@ impl AppView {
         }
         match self.strategy.save() {
             Ok(()) => {
+                if let Ok(path) = myproxy::paths::strategy_path() {
+                    self.strategy_stamp = file_stamp(&path);
+                }
                 self.status = "已保存策略。".into();
                 true
             }
@@ -1312,10 +1326,7 @@ impl AppView {
             self.status = "正在处理上一项操作。".into();
             return false;
         }
-        let had_external_change = self.external_change_pending;
-        self.external_change_pending = false;
         if !self.persist() {
-            self.external_change_pending = had_external_change;
             return false;
         }
         self.start_apply(cx)

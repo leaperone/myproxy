@@ -3,7 +3,7 @@ use std::fs::File;
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -19,6 +19,11 @@ pub struct Supervisor {
     child: Mutex<Option<Child>>,
     running_tun: Mutex<bool>,
     running_se: Mutex<bool>,
+}
+
+fn operation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 impl Default for Supervisor {
@@ -40,6 +45,11 @@ impl Supervisor {
     }
 
     pub fn connect(&self, strategy: &Strategy) -> Result<()> {
+        let _operation = operation_lock().lock().expect("supervisor operation lock");
+        self.connect_inner(strategy)
+    }
+
+    fn connect_inner(&self, strategy: &Strategy) -> Result<()> {
         log::info(
             "supervisor",
             format!(
@@ -47,7 +57,7 @@ impl Supervisor {
                 strategy.mixed_port, strategy.tun, strategy.system_extension
             ),
         );
-        self.disconnect()?;
+        self.disconnect_inner()?;
         let catalog = catalog::refresh(strategy)?;
         compile::compile(strategy, &catalog)?;
         let yaml = paths::runtime_yaml_path()?;
@@ -140,6 +150,11 @@ impl Supervisor {
     }
 
     pub fn apply(&self, strategy: &Strategy) -> Result<Catalog> {
+        let _operation = operation_lock().lock().expect("supervisor operation lock");
+        self.apply_inner(strategy)
+    }
+
+    fn apply_inner(&self, strategy: &Strategy) -> Result<Catalog> {
         log::debug("supervisor", "apply");
         let catalog = catalog::refresh(strategy)?;
         compile::compile(strategy, &catalog)?;
@@ -154,7 +169,7 @@ impl Supervisor {
                         strategy.tun, strategy.system_extension
                     ),
                 );
-                self.connect(strategy)?;
+                self.connect_inner(strategy)?;
             } else {
                 controller::reload(strategy.mixed_port)?;
                 if strategy.system_extension {
@@ -166,6 +181,11 @@ impl Supervisor {
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        let _operation = operation_lock().lock().expect("supervisor operation lock");
+        self.disconnect_inner()
+    }
+
+    fn disconnect_inner(&self) -> Result<()> {
         crate::network_extension::disable_async();
         let mut stopped = false;
         if let Some(mut child) = self.child.lock().expect("supervisor lock").take() {
