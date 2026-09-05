@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export MYPROXY_BUILD_CHANNEL="${MYPROXY_BUILD_CHANNEL:-prod}"
+export MYPROXY_VERSION="${MYPROXY_VERSION:-$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)}"
+build_number="${MYPROXY_BUILD_NUMBER:-$MYPROXY_VERSION}"
+if [[ ! "$MYPROXY_BUILD_CHANNEL" =~ ^(prod|nightly|dev)$ || ! "$MYPROXY_VERSION" =~ ^[0-9][0-9A-Za-z.+-]*$ || ! "$build_number" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+  echo "invalid build channel, version, or numeric MYPROXY_BUILD_NUMBER" >&2
+  exit 1
+fi
 if [[ ! -d resources/sparkle/Sparkle.framework ]]; then
   scripts/fetch-sparkle.sh
 fi
@@ -46,6 +53,23 @@ cp packaging/macos/zh-Hans.lproj/InfoPlist.strings \
 
 system_extension="$app/Contents/Library/SystemExtensions/${extension_bundle_id}.systemextension"
 cp packaging/macos/NetworkExtension/Info.plist "$system_extension/Contents/Info.plist"
+python3 - "$app/Contents/Info.plist" "$system_extension/Contents/Info.plist" "$MYPROXY_VERSION" "$build_number" "$MYPROXY_BUILD_CHANNEL" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+host, extension, version, build_number, channel = sys.argv[1:]
+for filename in (host, extension):
+    path = Path(filename)
+    info = plistlib.loads(path.read_bytes())
+    info['CFBundleShortVersionString'] = version
+    info['CFBundleVersion'] = build_number
+    if filename == host:
+        info['MyproxyBuildChannel'] = channel
+        suffix = 'download/nightly/appcast.xml' if channel == 'nightly' else 'latest/download/appcast.xml'
+        info['SUFeedURL'] = 'https://github.com/leaperone/myproxy/releases/' + suffix
+    path.write_bytes(plistlib.dumps(info, sort_keys=False))
+PY
 cp target/network-extension/MyproxyNetworkExtension \
   "$system_extension/Contents/MacOS/MyproxyNetworkExtension"
 chmod +x "$app/Contents/MacOS/"* "$system_extension/Contents/MacOS/MyproxyNetworkExtension"

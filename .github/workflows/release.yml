@@ -2,16 +2,28 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "!v*-*"]
+  schedule:
+    - cron: "0 18 * * *"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing git tag to publish (e.g. v0.0.1)"
+      channel:
+        description: "Release channel"
         required: true
+        default: nightly
+        type: choice
+        options: [prod, nightly]
+      tag:
+        description: "Prod only: existing version tag (e.g. v0.0.4)"
+        required: false
         type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: myproxy-release
+  cancel-in-progress: false
 
 jobs:
   macos:
@@ -28,6 +40,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.channel == 'prod' && inputs.tag || github.event_name == 'push' && github.ref || 'main' }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.1
@@ -35,18 +48,49 @@ jobs:
         id: ver
         env:
           DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_CHANNEL: ${{ inputs.channel }}
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            tag="$DISPATCH_TAG"
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            channel=prod
+            tag="$GITHUB_REF_NAME"
           else
-            tag="${GITHUB_REF_NAME}"
+            channel="${DISPATCH_CHANNEL:-nightly}"
+            tag="$DISPATCH_TAG"
           fi
-          if [[ ! "$tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
-            echo "invalid tag" >&2
+          package_version=$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Cargo.toml must contain the next target MAJOR.MINOR.PATCH version" >&2
             exit 1
           fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          if [[ "$channel" == "prod" ]]; then
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Prod requires an existing vMAJOR.MINOR.PATCH tag" >&2
+              exit 1
+            fi
+            test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${tag}^{commit}")"
+            version="${tag#v}"
+            if [[ "$version" != "$package_version" ]]; then
+              echo "Prod tag must match Cargo.toml version" >&2
+              exit 1
+            fi
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "Release $tag already exists; publish a new version instead of replacing it" >&2
+              exit 1
+            fi
+          elif [[ "$channel" == "nightly" ]]; then
+            version="${package_version}-nightly.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+            tag="v${version}"
+          else
+            echo "invalid channel" >&2
+            exit 1
+          fi
+          {
+            echo "channel=$channel"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "build_number=${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_OUTPUT"
       - name: Require release credentials
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
@@ -122,27 +166,50 @@ jobs:
       - name: Package Sparkle zip and appcast
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          MYPROXY_BUILD_CHANNEL: ${{ steps.ver.outputs.channel }}
+          MYPROXY_RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+          MYPROXY_BUILD_NUMBER: ${{ steps.ver.outputs.build_number }}
         run: scripts/release-macos.sh "$VERSION"
+      - name: Validate release artifacts
+        env:
+          CHANNEL: ${{ steps.ver.outputs.channel }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          BUILD_NUMBER: ${{ steps.ver.outputs.build_number }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: python3 scripts/check-release-artifacts.py "$CHANNEL" "$VERSION" "$BUILD_NUMBER" "$TAG"
       - name: Publish GitHub Release
         env:
           TAG: ${{ steps.ver.outputs.tag }}
           VERSION: ${{ steps.ver.outputs.version }}
+          CHANNEL: ${{ steps.ver.outputs.channel }}
         run: |
-          notes="macOS .app (Sparkle zip). v${VERSION} is a full install."
-          if [[ "$VERSION" == "0.0.1" ]]; then
-            notes="${notes} No previous release, so generate_appcast produced no delta."
-          else
-            notes="${notes} Incremental Sparkle deltas are attached when a previous zip is available."
-          fi
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          notes="macOS .app with Sparkle updates. Channel: ${CHANNEL}. Source: ${sha}."
           assets=("dist/myproxy-${VERSION}.sparkle.zip" "dist/appcast.xml")
           shopt -s nullglob
           for delta in dist/*.delta; do
             assets+=("$delta")
           done
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${assets[@]}" --clobber
+          if [[ "$CHANNEL" == "nightly" ]]; then
+            gh release create "$TAG" "${assets[@]}" --draft --prerelease --latest=false \
+              --target "$sha" --title "myproxy Nightly ${VERSION}" --notes "$notes"
+            gh release edit "$TAG" --draft=false --prerelease --latest=false
+            # This prerelease is a feed pointer. Archives stay on immutable build tags.
+            feed_notes="Latest Nightly: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+            if gh release view nightly >/dev/null 2>&1; then
+              gh release upload nightly dist/appcast.xml --clobber
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/nightly" \
+                -f sha="$sha" -F force=true >/dev/null
+              gh release edit nightly --prerelease --latest=false --notes "$feed_notes"
+            else
+              gh release create nightly dist/appcast.xml --target "$sha" --prerelease --latest=false \
+                --title "myproxy Nightly update channel" --notes "$feed_notes"
+            fi
           else
-            gh release create "$TAG" "${assets[@]}" --title "myproxy ${TAG}" --notes "$notes"
+            gh release create "$TAG" "${assets[@]}" --draft --target "$sha" \
+              --title "myproxy ${TAG}" --notes "$notes"
+            gh release edit "$TAG" --draft=false --latest
           fi
       - name: Remove temporary signing material
         if: always()

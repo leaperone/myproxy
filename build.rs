@@ -2,6 +2,23 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=MYPROXY_BUILD_CHANNEL");
+    println!("cargo:rerun-if-env-changed=MYPROXY_VERSION");
+    let channel = std::env::var("MYPROXY_BUILD_CHANNEL").unwrap_or_else(|_| {
+        if std::env::var("PROFILE").ok().as_deref() == Some("release") {
+            "prod"
+        } else {
+            "dev"
+        }.into()
+    });
+    assert!(
+        matches!(channel.as_str(), "prod" | "nightly" | "dev"),
+        "invalid build channel"
+    );
+    let version = std::env::var("MYPROXY_VERSION")
+        .unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap());
+    println!("cargo:rustc-env=MYPROXY_BUILD_CHANNEL={channel}");
+    println!("cargo:rustc-env=MYPROXY_VERSION={version}");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=packaging/macos/sparkle_bridge.m");
     println!("cargo:rerun-if-changed=macos/NetworkShared");

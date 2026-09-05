@@ -78,6 +78,9 @@ pub struct Strategy {
     /// When true, myproxy writes debug traces to `myproxy.log` and the Settings page.
     #[serde(default)]
     pub developer_mode: bool,
+    /// None follows the installed build's default until a channel is selected.
+    #[serde(default)]
+    pub update_channel: Option<crate::updates::UpdateChannel>,
     /// When true, compile mihomo TUN so apps need not point HTTP/SOCKS at Mixed.
     #[serde(default)]
     pub tun: bool,
@@ -181,6 +184,7 @@ impl Default for Strategy {
             mixed_port: 17890,
             exclude_filter: DEFAULT_EXCLUDE.into(),
             developer_mode: false,
+            update_channel: None,
             tun: false,
             system_extension: false,
             launch_at_login: false,

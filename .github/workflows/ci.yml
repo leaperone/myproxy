@@ -15,7 +15,9 @@ jobs:
           toolchain: 1.98.1
       - name: Fetch bundled mihomo
         run: scripts/fetch-mihomo.sh
+      - name: Fetch Sparkle
+        run: scripts/fetch-sparkle.sh
       - name: Build Network Extension
         run: scripts/build-network-extension.sh
       - name: Build
-        run: cargo build --bins
+        run: cargo build --bins --features sparkle

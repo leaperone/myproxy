@@ -49,6 +49,7 @@ fn main() {
             }
             tray::install(cx);
         }
+        sparkle::set_channel(strategy.update_channel.unwrap_or_default());
         sparkle::init();
         if strategy.connect_on_launch {
             let strategy = strategy.clone();

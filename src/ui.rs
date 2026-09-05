@@ -22,6 +22,7 @@ use myproxy::controller::{self, TrafficSnapshot};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::Supervisor;
+use myproxy::updates::{self, UpdateChannel};
 
 use crate::appearance::Appearance;
 
@@ -1156,6 +1157,8 @@ impl AppView {
                                         } else {
                                             this.strategy = strategy.clone();
                                             this.saved = strategy.clone();
+                                            this.applied.update_channel = strategy.update_channel;
+                                            crate::sparkle::set_channel(strategy.update_channel.unwrap_or_default());
                                             this.pending_port_input =
                                                 Some(strategy.mixed_port.to_string());
                                             this.pending_filter_input =
@@ -1317,6 +1320,8 @@ impl AppView {
                     self.strategy_stamp = file_stamp(&path);
                 }
                 self.saved = self.strategy.clone();
+                self.applied.update_channel = self.strategy.update_channel;
+                crate::sparkle::set_channel(self.strategy.update_channel.unwrap_or_default());
                 self.external_change_pending = false;
                 self.status = "已保存策略。".into();
                 true
@@ -1828,7 +1833,7 @@ impl AppView {
                         .gap_2()
                         .items_center()
                         .child(div().text_sm().font_semibold().child("myproxy"))
-                        .child(pill(theme, "DEV", theme.warning)),
+                        .children(updates::build_badge().map(|label| pill(theme, label, theme.warning))),
                 )
                 .child(
                     h_flex()
@@ -2766,11 +2771,11 @@ impl AppView {
 
     fn updates_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
-        let version = env!("CARGO_PKG_VERSION");
-        let hint = if crate::sparkle::available() {
-            "稳定渠道走 GitHub Releases 上的 Sparkle appcast。v0.0.1 是完整包，之后的版本才会生成增量 delta。"
-        } else {
-            "此开发构建未链接 Sparkle。打包脚本会带上更新器。"
+        let version = updates::VERSION;
+        let channel = self.strategy.update_channel.unwrap_or_default();
+        let hint = match channel {
+            UpdateChannel::Prod => "仅接收正式版本。切回后，会在发布比当前版本更新的正式版时更新。",
+            UpdateChannel::Nightly => "接收 main 分支的每日构建，可能包含尚未稳定的改动。",
         };
         panel(
             theme,
@@ -2783,15 +2788,59 @@ impl AppView {
                         .child(format!("当前版本 {version}")),
                 )
                 .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(div().text_sm().child("更新通道"))
+                        .child({
+                            let entity = entity.clone();
+                            ButtonGroup::new("update-channel")
+                                .compact()
+                                .outline()
+                                .small()
+                                .child(Button::new("update-prod")
+                                    .label(UpdateChannel::Prod.label())
+                                    .selected(channel == UpdateChannel::Prod)
+                                    .disabled(self.busy))
+                                .child(Button::new("update-nightly")
+                                    .label(UpdateChannel::Nightly.label())
+                                    .selected(channel == UpdateChannel::Nightly)
+                                    .disabled(self.busy))
+                                .on_click(move |indices, _, app| {
+                                    let next = match indices.first() {
+                                        Some(0) => UpdateChannel::Prod,
+                                        Some(1) => UpdateChannel::Nightly,
+                                        _ => return,
+                                    };
+                                    entity.update(app, |this, cx| {
+                                        let previous = this.strategy.update_channel;
+                                        this.strategy.update_channel = Some(next);
+                                        if this.persist() {
+                                            this.status = format!("更新通道已切换为{}。", next.label());
+                                        } else {
+                                            this.strategy.update_channel = previous;
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                )
+                .child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(hint),
                 )
+                .when(!crate::sparkle::available(), |this| {
+                    this.child(div().text_xs().text_color(theme.muted_foreground)
+                        .child("此开发构建不支持应用内更新。安装发布版后可按所选通道更新。"))
+                })
                 .child({
                     let entity = entity.clone();
                     Button::new("check-updates")
                         .label("检查更新")
+                        .disabled(!crate::sparkle::available())
                         .on_click(move |_, _, app| {
                             crate::sparkle::check();
                             entity.update(app, |this, cx| {
