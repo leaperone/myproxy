@@ -2,10 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-pub fn destination() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".cargo/bin/myproxyctl")
+pub fn destination() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".cargo/bin/myproxyctl"))
 }
 
 fn bundled_cli() -> Option<PathBuf> {
@@ -19,7 +17,9 @@ pub fn is_installed() -> bool {
     let Some(source) = bundled_cli() else {
         return false;
     };
-    let link = destination();
+    let Some(link) = destination() else {
+        return false;
+    };
     std::fs::read_link(&link)
         .ok()
         .and_then(|target| {
@@ -35,7 +35,7 @@ pub fn is_installed() -> bool {
 
 pub fn install() -> Result<PathBuf> {
     let source = bundled_cli().context("当前应用包没有 myproxyctl")?;
-    let link = destination();
+    let link = destination().context("无法确定当前用户的主目录")?;
     let parent = link.parent().context("无效的 CLI 安装路径")?;
     std::fs::create_dir_all(parent).with_context(|| format!("创建 {}", parent.display()))?;
     match std::fs::symlink_metadata(&link) {
