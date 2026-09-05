@@ -12,10 +12,9 @@ use gpui_kit::component::sidebar::{
     Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, IconName, Root, Selectable, Sizable, StyledExt, Theme, TitleBar,
-    WindowExt,
+    h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Selectable, Sizable, StyledExt,
+    Theme, TitleBar, WindowExt,
 };
-use gpui_kit::gpui_base::Disableable;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
