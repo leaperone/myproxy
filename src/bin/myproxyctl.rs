@@ -137,7 +137,7 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             if json {
-                println!("{}", serde_json::json!({"error": format!("{error:#}")}));
+                eprintln!("{}", serde_json::json!({"error": format!("{error:#}")}));
             } else {
                 eprintln!("Error: {error:#}");
             }
