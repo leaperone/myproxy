@@ -46,11 +46,25 @@ if [[ "$notarize" -eq 1 ]]; then
   echo "submitting app for notarization"
   ditto -c -k --keepParent "$app" "$zip_path"
   set +x
+  notary_result="$dist/notarization.json"
+  notary_exit=0
   xcrun notarytool submit "$zip_path" \
     --apple-id "$APPLE_ID" \
     --password "$APPLE_APP_SPECIFIC_PASSWORD" \
     --team-id "$APPLE_TEAM_ID" \
-    --wait
+    --wait --output-format json > "$notary_result" || notary_exit=$?
+  cat "$notary_result"
+  status=$(plutil -extract status raw -o - "$notary_result" 2>/dev/null) || status=""
+  if [[ "$notary_exit" -ne 0 || "$status" != "Accepted" ]]; then
+    if submission_id=$(plutil -extract id raw -o - "$notary_result" 2>/dev/null); then
+      xcrun notarytool log "$submission_id" \
+        --apple-id "$APPLE_ID" \
+        --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+        --team-id "$APPLE_TEAM_ID" >&2 || true
+    fi
+    echo "Notarization was not accepted (status: ${status:-unavailable}, exit: $notary_exit)" >&2
+    exit 1
+  fi
   set -euo pipefail
   xcrun stapler staple "$app"
   rm -f "$zip_path"
