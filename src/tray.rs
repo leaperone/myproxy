@@ -88,9 +88,9 @@ fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
 fn handle_menu_event(event: MenuEvent, cx: &mut App) {
     match event.id.as_ref() {
         "open" => crate::show_main_window(cx),
-        "connect" => connect(),
-        "disconnect" => disconnect(),
-        "apply" => apply(),
+        "connect" => connect(cx),
+        "disconnect" => disconnect_async(cx),
+        "apply" => apply(cx),
         "updates" => crate::sparkle::check(),
         "quit" => {
             disconnect();
@@ -100,15 +100,19 @@ fn handle_menu_event(event: MenuEvent, cx: &mut App) {
     }
 }
 
-fn connect() {
-    match Strategy::load() {
-        Ok(strategy) => {
-            if let Err(err) = Supervisor::default().connect(&strategy) {
-                myproxy::log::error("tray", format!("connect failed: {err:#}"));
+fn connect(cx: &mut App) {
+    cx.background_executor()
+        .spawn(async move {
+            match Strategy::load() {
+                Ok(strategy) => {
+                    if let Err(err) = Supervisor::default().connect(&strategy) {
+                        myproxy::log::error("tray", format!("connect failed: {err:#}"));
+                    }
+                }
+                Err(err) => myproxy::log::error("tray", format!("load strategy failed: {err:#}")),
             }
-        }
-        Err(err) => myproxy::log::error("tray", format!("load strategy failed: {err:#}")),
-    }
+        })
+        .detach();
 }
 
 fn disconnect() {
@@ -117,11 +121,23 @@ fn disconnect() {
     }
 }
 
-fn apply() {
-    match Strategy::load().and_then(|strategy| Supervisor::default().apply(&strategy)) {
-        Ok(_) => {}
-        Err(err) => myproxy::log::error("tray", format!("apply failed: {err:#}")),
-    }
+fn disconnect_async(cx: &mut App) {
+    cx.background_executor()
+        .spawn(async move {
+            disconnect();
+        })
+        .detach();
+}
+
+fn apply(cx: &mut App) {
+    cx.background_executor()
+        .spawn(async move {
+            match Strategy::load().and_then(|strategy| Supervisor::default().apply(&strategy)) {
+                Ok(_) => {}
+                Err(err) => myproxy::log::error("tray", format!("apply failed: {err:#}")),
+            }
+        })
+        .detach();
 }
 
 fn template_icon() -> Icon {

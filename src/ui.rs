@@ -245,7 +245,7 @@ impl GroupEditor {
                 next.id = uuid::Uuid::new_v4().to_string();
                 parent.strategy.add_group(next);
             }
-            if parent.persist_and_apply() {
+            if parent.persist_and_apply(cx) {
                 parent.group_modal_open = false;
                 parent.group_edit_id = None;
                 parent.status = if edit_id.is_some() {
@@ -727,7 +727,7 @@ impl RuleSetEditor {
                 next.id = uuid::Uuid::new_v4().to_string();
                 parent.strategy.add_rule_set(next);
             }
-            if parent.persist_and_apply() {
+            if parent.persist_and_apply(cx) {
                 parent.rule_modal_open = false;
                 parent.rule_edit_id = None;
                 parent.status = if edit_id.is_some() {
@@ -1015,6 +1015,8 @@ pub struct AppView {
     catalog: Catalog,
     status: String,
     connected: bool,
+    busy: bool,
+    external_change_pending: bool,
     supervisor: Arc<Supervisor>,
     url_input: Entity<InputState>,
     name_input: Entity<InputState>,
@@ -1025,6 +1027,8 @@ pub struct AppView {
     rule_query: Entity<InputState>,
     filter_input: Entity<InputState>,
     port_input: Entity<InputState>,
+    pending_filter_input: Option<String>,
+    pending_port_input: Option<String>,
     appearance: Appearance,
     _appearance_observer: Subscription,
     traffic: TrafficSnapshot,
@@ -1113,23 +1117,48 @@ impl AppView {
                     .update(cx, |this, cx| {
                         let started = Instant::now();
                         let mut dirty = false;
-                        let connected = this.supervisor.is_running();
-                        if connected != this.connected {
-                            this.connected = connected;
-                            if !connected {
-                                this.clear_traffic();
+                        if !this.busy {
+                            let connected = this.supervisor.is_running();
+                            if connected != this.connected {
+                                this.connected = connected;
+                                if !connected {
+                                    this.clear_traffic();
+                                }
+                                dirty = true;
                             }
-                            dirty = true;
                         }
                         let editing = this.group_modal_open || this.rule_modal_open;
-                        if !editing {
+                        if !editing && !this.busy {
                             if let Some(path) = strategy_path.as_deref() {
                                 let stamp = file_stamp(path);
                                 if stamp != strategy_stamp {
-                                    strategy_stamp = stamp;
                                     if let Ok(strategy) = Strategy::load() {
+                                        strategy_stamp = stamp;
                                         log::set_developer(strategy.developer_mode);
-                                        this.strategy = strategy;
+                                        if this.is_dirty() {
+                                            this.external_change_pending = true;
+                                            this.status = "检测到外部策略变更。点击「应用」覆盖外部变更，或重新打开窗口放弃本地修改。".into();
+                                        } else {
+                                            let sync_port = this.port_input.read(cx).value().trim()
+                                                == this.strategy.mixed_port.to_string();
+                                            let sync_filter = this.filter_input.read(cx).value()
+                                                .to_string()
+                                                == this.strategy.exclude_filter;
+                                            this.strategy = strategy.clone();
+                                            if sync_port {
+                                                this.pending_port_input =
+                                                    Some(strategy.mixed_port.to_string());
+                                            } else {
+                                                this.pending_port_input = None;
+                                            }
+                                            if sync_filter {
+                                                this.pending_filter_input =
+                                                    Some(strategy.exclude_filter.clone());
+                                            } else {
+                                                this.pending_filter_input = None;
+                                            }
+                                            this.external_change_pending = false;
+                                        }
                                         dirty = true;
                                         log::debug("ui", "reload strategy.json");
                                     }
@@ -1138,8 +1167,8 @@ impl AppView {
                             if let Some(path) = catalog_path.as_deref() {
                                 let stamp = file_stamp(path);
                                 if stamp != catalog_stamp {
-                                    catalog_stamp = stamp;
                                     if let Ok(catalog) = Catalog::load() {
+                                        catalog_stamp = stamp;
                                         log::debug(
                                             "ui",
                                             format!(
@@ -1190,6 +1219,8 @@ impl AppView {
             page: initial_page(),
             status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
             connected,
+            busy: false,
+            external_change_pending: false,
             supervisor,
             url_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("https://…/clash.yaml")
@@ -1217,6 +1248,8 @@ impl AppView {
             traffic_has_rate: false,
             traffic_error: None,
             traffic_prev: None,
+            pending_port_input: None,
+            pending_filter_input: None,
         }
     }
 
@@ -1253,6 +1286,14 @@ impl AppView {
     }
 
     fn persist(&mut self) -> bool {
+        if self.busy {
+            self.status = "正在处理上一项操作。".into();
+            return false;
+        }
+        if self.external_change_pending {
+            self.status = "检测到外部策略变更，请先点击「应用」明确覆盖，或重新打开窗口放弃本地修改。".into();
+            return false;
+        }
         match self.strategy.save() {
             Ok(()) => {
                 self.status = "已保存策略。".into();
@@ -1266,22 +1307,72 @@ impl AppView {
         }
     }
 
-    fn persist_and_apply(&mut self) -> bool {
-        if !self.persist() {
+    fn persist_and_apply(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.busy {
+            self.status = "正在处理上一项操作。".into();
             return false;
         }
-        match self.supervisor.apply(&self.strategy) {
-            Ok(cat) => {
-                self.catalog = cat;
-                self.mark_applied();
-                true
-            }
-            Err(err) => {
-                log::error("ui", format!("apply failed: {err:#}"));
-                self.status = format!("应用失败: {err:#}");
-                false
-            }
+        let had_external_change = self.external_change_pending;
+        self.external_change_pending = false;
+        if !self.persist() {
+            self.external_change_pending = had_external_change;
+            return false;
         }
+        self.start_apply(cx)
+    }
+
+    fn start_apply(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.busy {
+            self.status = "正在处理上一项操作。".into();
+            return false;
+        }
+        let strategy = self.strategy.clone();
+        let supervisor = self.supervisor.clone();
+        self.busy = true;
+        self.status = "正在应用策略…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let apply_strategy = strategy.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    supervisor
+                        .apply(&apply_strategy)
+                        .map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(cat) => {
+                        this.catalog = cat;
+                        if this.strategy == strategy {
+                            this.mark_applied();
+                            this.external_change_pending = false;
+                        }
+                        this.status = format!(
+                            "已编译 {} 个节点，排除 {}。{}Mixed {}。",
+                            this.catalog.nodes.len(),
+                            this.catalog.excluded.len(),
+                            if this.strategy.system_extension {
+                                "系统接管 · "
+                            } else {
+                                ""
+                            },
+                            this.strategy.mixed_port
+                        );
+                    }
+                    Err(err) => {
+                        log::error("ui", format!("apply failed: {err}"));
+                        this.status = format!("应用失败: {err}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        true
     }
 
     fn is_dirty(&self) -> bool {
@@ -1365,28 +1456,14 @@ impl AppView {
         let entity = cx.entity();
         move |_, _, app| {
             entity.update(app, |this, cx| {
-                match this.supervisor.apply(&this.strategy) {
-                    Ok(cat) => {
-                        this.catalog = cat;
-                        this.mark_applied();
-                        this.status = format!(
-                            "已编译 {} 个节点，排除 {}。{}Mixed {}。",
-                            this.catalog.nodes.len(),
-                            this.catalog.excluded.len(),
-                            if this.strategy.system_extension {
-                                "系统接管 · "
-                            } else {
-                                ""
-                            },
-                            this.strategy.mixed_port
-                        );
-                    }
-                    Err(err) => {
-                        log::error("ui", format!("apply failed: {err:#}"));
-                        this.status = format!("应用失败: {err:#}");
-                    }
+                if this.busy {
+                    this.status = "正在处理上一项操作。".into();
+                } else {
+                    this.external_change_pending = false;
                 }
-                cx.notify();
+                if !this.busy && this.persist_and_apply(cx) {
+                    cx.notify();
+                }
             });
         }
     }
@@ -1398,42 +1475,79 @@ impl AppView {
         let entity = cx.entity();
         move |_, _, app| {
             entity.update(app, |this, cx| {
-                if this.connected {
-                    match this.supervisor.disconnect() {
-                        Ok(()) => {
-                            this.connected = false;
-                            this.status = "已断开。".into();
-                        }
-                        Err(err) => {
-                            log::error("ui", format!("disconnect failed: {err:#}"));
-                            this.status = format!("{err:#}");
-                        }
+                this.start_connect(cx);
+            });
+        }
+    }
+
+    fn start_connect(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            self.status = "正在处理上一项操作。".into();
+            cx.notify();
+            return;
+        }
+        let connect = !self.connected;
+        let strategy = self.strategy.clone();
+        let supervisor = self.supervisor.clone();
+        self.busy = true;
+        self.status = if connect {
+            "正在连接…".into()
+        } else {
+            "正在断开…".into()
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let connect_strategy = strategy.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if connect {
+                        supervisor
+                            .connect(&connect_strategy)
+                            .map(|_| Some(Catalog::load().unwrap_or_default()))
+                            .map_err(|err| err.to_string())
+                    } else {
+                        supervisor
+                            .disconnect()
+                            .map(|_| None)
+                            .map_err(|err| err.to_string())
                     }
-                } else {
-                    match this.supervisor.connect(&this.strategy) {
-                        Ok(()) => {
-                            this.connected = true;
-                            this.catalog = Catalog::load().unwrap_or_default();
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(Some(catalog)) => {
+                        this.connected = true;
+                        this.catalog = catalog;
+                        if this.strategy == strategy {
                             this.mark_applied();
-                            this.status = format!(
-                                "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
-                                if this.strategy.system_extension {
-                                    "系统接管 · "
-                                } else {
-                                    ""
-                                },
-                                this.strategy.mixed_port
-                            );
                         }
-                        Err(err) => {
-                            log::error("ui", format!("connect failed: {err:#}"));
-                            this.status = format!("{err:#}");
-                        }
+                        this.status = format!(
+                            "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
+                            if this.strategy.system_extension {
+                                "系统接管 · "
+                            } else {
+                                ""
+                            },
+                            this.strategy.mixed_port
+                        );
+                    }
+                    Ok(None) => {
+                        this.connected = false;
+                        this.clear_traffic();
+                        this.status = "已断开。".into();
+                    }
+                    Err(err) => {
+                        log::error("ui", format!("connection operation failed: {err}"));
+                        this.status = format!("操作失败: {err}");
                     }
                 }
                 cx.notify();
-            });
-        }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_rule_dialog(&mut self, id: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1604,27 +1718,19 @@ impl AppView {
         });
     }
 
-    fn set_selected_rule_via(&mut self, id: &str, via: &str) {
+    fn set_selected_rule_via(&mut self, id: &str, via: &str, cx: &mut Context<Self>) {
         if !self.strategy.set_rule_via(id, via.to_string()) {
             self.status = "改走向失败。".into();
             return;
         }
-        if self.persist_and_apply() {
-            self.status = format!("已改为 {via}。");
-        }
+        self.persist_and_apply(cx);
     }
 
-    fn move_selected_rule(&mut self, id: &str, delta: i32) {
+    fn move_selected_rule(&mut self, id: &str, delta: i32, cx: &mut Context<Self>) {
         if !self.strategy.move_rule(id, delta) {
             return;
         }
-        if self.persist_and_apply() {
-            self.status = if delta < 0 {
-                "已上移，优先级提高。".into()
-            } else {
-                "已下移，优先级降低。".into()
-            };
-        }
+        self.persist_and_apply(cx);
     }
 
     fn remove_selected_rule(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1632,7 +1738,7 @@ impl AppView {
         if !self.strategy.remove_rule(id) {
             return;
         }
-        if self.persist_and_apply() {
+        if self.persist_and_apply(cx) {
             if editing {
                 self.rule_modal_open = false;
                 self.rule_edit_id = None;
@@ -1645,6 +1751,14 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(value) = self.pending_port_input.take() {
+            self.port_input
+                .update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        if let Some(value) = self.pending_filter_input.take() {
+            self.filter_input
+                .update(cx, |input, cx| input.set_value(value, window, cx));
+        }
         let theme = cx.theme().clone();
         div()
             .size_full()
@@ -1671,6 +1785,7 @@ impl Render for AppView {
 impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
+        let busy = self.busy;
         TitleBar::new().child(
             h_flex()
                 .id("title-contents")
@@ -1700,6 +1815,7 @@ impl AppView {
                             this.child(
                                 Button::new("apply")
                                     .small()
+                                    .disabled(busy)
                                     .label("应用")
                                     .on_click(self.on_apply(cx)),
                             )
@@ -1791,6 +1907,7 @@ impl AppView {
 
     fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
+        let busy = self.busy;
         let mut connect = Button::new("hero-connect").large();
         connect = if connected {
             connect.danger().label("断开")
@@ -1862,6 +1979,7 @@ impl AppView {
                             .h(px(48.))
                             .px_8()
                             .min_w(px(132.))
+                            .disabled(busy)
                             .on_click(self.on_connect(cx)),
                     ),
             )
@@ -2278,7 +2396,10 @@ impl AppView {
                             .child(div().w(px(100.)).child(Input::new(&self.port_input)))
                             .child({
                                 let entity = entity.clone();
-                                Button::new("save-port").label("保存端口").on_click(
+                                Button::new("save-port")
+                                    .disabled(self.busy)
+                                    .label("保存端口")
+                                    .on_click(
                                     move |_, _, app| {
                                         entity.update(app, |this, cx| {
                                             if let Ok(port) =
@@ -2305,7 +2426,11 @@ impl AppView {
                     .child(Input::new(&self.filter_input))
                     .child({
                         let entity = entity.clone();
-                        Button::new("save-filter").primary().label("保存过滤器").on_click(
+                        Button::new("save-filter")
+                            .disabled(self.busy)
+                            .primary()
+                            .label("保存过滤器")
+                            .on_click(
                             move |_, _, app| {
                                 entity.update(app, |this, cx| {
                                     this.strategy.exclude_filter =
@@ -2321,22 +2446,13 @@ impl AppView {
             .child(self.developer_panel(cx, theme))
     }
 
-    fn set_system_extension(&mut self, on: bool) {
+    fn set_system_extension(&mut self, on: bool, cx: &mut Context<Self>) {
         self.strategy.system_extension = on;
         if on {
             self.strategy.tun = false;
         }
         if self.connected {
-            if self.persist_and_apply() {
-                self.connected = self.supervisor.is_running();
-                self.status = if on {
-                    "已开启系统接管。连接后请在系统设置 › 通用 › 登录项与扩展 允许 myproxy。".into()
-                } else {
-                    "已关闭系统接管。未填代理的应用不再进核心。".into()
-                };
-            } else {
-                self.connected = self.supervisor.is_running();
-            }
+            self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
                 "已记录。下次连接将请求 System Extension；请在系统设置里允许 myproxy。".into()
@@ -2346,22 +2462,13 @@ impl AppView {
         }
     }
 
-    fn set_tun(&mut self, on: bool) {
+    fn set_tun(&mut self, on: bool, cx: &mut Context<Self>) {
         self.strategy.tun = on;
         if on {
             self.strategy.system_extension = false;
         }
         if self.connected {
-            if self.persist_and_apply() {
-                self.connected = self.supervisor.is_running();
-                self.status = if on {
-                    "已开启 TUN（旧）。首次会要管理员密码。".into()
-                } else {
-                    "已关闭 TUN。".into()
-                };
-            } else {
-                self.connected = self.supervisor.is_running();
-            }
+            self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
                 "已记录。下次连接走 TUN；首次会要管理员密码。".into()
@@ -2404,11 +2511,14 @@ impl AppView {
                             } else {
                                 toggle.primary().label("开启")
                             };
-                            toggle.on_click({
+                            toggle.disabled(self.busy).on_click({
                                 let entity = entity.clone();
                                 move |_, _, app| {
                                     entity.update(app, |this, cx| {
-                                        this.set_system_extension(!this.strategy.system_extension);
+                                        this.set_system_extension(
+                                            !this.strategy.system_extension,
+                                            cx,
+                                        );
                                         cx.notify();
                                     });
                                 }
@@ -2450,9 +2560,9 @@ impl AppView {
                             } else {
                                 toggle.primary().label("开启")
                             };
-                            toggle.on_click(move |_, _, app| {
+                            toggle.disabled(self.busy).on_click(move |_, _, app| {
                                 entity.update(app, |this, cx| {
-                                    this.set_tun(!this.strategy.tun);
+                                    this.set_tun(!this.strategy.tun, cx);
                                     cx.notify();
                                 });
                             })
@@ -2573,7 +2683,7 @@ impl AppView {
                 } else {
                     toggle.primary().label("开启")
                 };
-                toggle.on_click(move |_, _, app| {
+                toggle.disabled(self.busy).on_click(move |_, _, app| {
                     entity.update(app, |this, cx| apply(this, cx));
                 })
             })
@@ -2974,7 +3084,7 @@ fn render_group_card(
                                     this.group_edit_id = None;
                                 }
                                 this.strategy.remove_group(&del_id);
-                                this.persist_and_apply();
+                                this.persist_and_apply(cx);
                                 cx.notify();
                             });
                             if close_modal {
@@ -3195,7 +3305,7 @@ fn render_rule_set_card(
                             .disabled(!can_up)
                             .on_click(move |_, _, app| {
                                 up_entity.update(app, |this, cx| {
-                                    this.move_selected_rule(&up_id, -1);
+                                    this.move_selected_rule(&up_id, -1, cx);
                                     cx.notify();
                                 });
                             }),
@@ -3205,7 +3315,7 @@ fn render_rule_set_card(
                             .disabled(!can_down)
                             .on_click(move |_, _, app| {
                                 down_entity.update(app, |this, cx| {
-                                    this.move_selected_rule(&down_id, 1);
+                                    this.move_selected_rule(&down_id, 1, cx);
                                     cx.notify();
                                 });
                             }),
@@ -3221,7 +3331,7 @@ fn render_rule_set_card(
                             let id = id.clone();
                             via_menu(menu, &choices, &via_current, move |app, value| {
                                 entity.update(app, |this, cx| {
-                                    this.set_selected_rule_via(&id, &value);
+                                    this.set_selected_rule_via(&id, &value, cx);
                                     cx.notify();
                                 });
                             })
