@@ -37,6 +37,7 @@ pub fn app_log_path() -> Result<PathBuf> {
 
 pub fn bundled_mihomo() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
     let next_to_exe = exe.parent().map(|p| p.join("mihomo")).unwrap_or_default();
     if next_to_exe.is_file() {
         return next_to_exe;
