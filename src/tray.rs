@@ -102,7 +102,7 @@ fn connect(cx: &mut App) {
         .spawn(async move {
             match Strategy::load() {
                 Ok(strategy) => {
-                    if let Err(err) = Supervisor::default().connect(&strategy) {
+                    if let Err(err) = Supervisor::shared().connect(&strategy) {
                         myproxy::log::error("tray", format!("connect failed: {err:#}"));
                     }
                 }
@@ -113,7 +113,7 @@ fn connect(cx: &mut App) {
 }
 
 fn disconnect() {
-    if let Err(err) = Supervisor::default().disconnect() {
+    if let Err(err) = Supervisor::shared().disconnect() {
         myproxy::log::error("tray", format!("disconnect failed: {err:#}"));
     }
 }
@@ -130,7 +130,9 @@ fn disconnect_and_quit(cx: &mut App) {
     cx.spawn(async move |cx| {
         cx.background_executor()
             .spawn(async move {
-                disconnect();
+                if let Err(err) = Supervisor::shared().shutdown() {
+                    myproxy::log::error("tray", format!("shutdown failed: {err:#}"));
+                }
             })
             .await;
         cx.update(|cx| cx.quit()).ok();
@@ -141,7 +143,7 @@ fn disconnect_and_quit(cx: &mut App) {
 fn apply(cx: &mut App) {
     cx.background_executor()
         .spawn(async move {
-            match Strategy::load().and_then(|strategy| Supervisor::default().apply(&strategy)) {
+            match Strategy::load().and_then(|strategy| Supervisor::shared().apply(&strategy)) {
                 Ok(_) => {}
                 Err(err) => myproxy::log::error("tray", format!("apply failed: {err:#}")),
             }

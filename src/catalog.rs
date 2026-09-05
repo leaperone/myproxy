@@ -36,7 +36,7 @@ impl Catalog {
             return Ok(Self::default());
         }
         let data = fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&data).unwrap_or_default())
+        serde_json::from_str(&data).context("parse catalog.json")
     }
 
     pub fn save(&self) -> Result<()> {

@@ -237,6 +237,7 @@ impl GroupEditor {
         }
         let edit_id = self.edit_id.clone();
         let result = self.parent.update(cx, |parent, cx| {
+            let previous = parent.strategy.clone();
             if let Some(id) = &edit_id {
                 if !parent.strategy.update_group(id, next) {
                     return Err("保存失败：节点组已不存在。".to_string());
@@ -256,6 +257,7 @@ impl GroupEditor {
                 cx.notify();
                 Ok(())
             } else {
+                parent.strategy = previous;
                 Err(parent.status.clone())
             }
         });
@@ -704,6 +706,7 @@ impl RuleSetEditor {
         }
         let edit_id = self.edit_id.clone();
         let result = self.parent.update(cx, |parent, cx| {
+            let previous = parent.strategy.clone();
             if let Some(id) = &edit_id {
                 if !parent.strategy.update_rule_set(id, next) {
                     return Err("保存失败：规则已不存在。".to_string());
@@ -738,6 +741,7 @@ impl RuleSetEditor {
                 cx.notify();
                 Ok(())
             } else {
+                parent.strategy = previous;
                 Err(parent.status.clone())
             }
         });
@@ -1011,6 +1015,7 @@ fn initial_page() -> Page {
 pub struct AppView {
     page: Page,
     strategy: Strategy,
+    saved: Strategy,
     applied: Strategy,
     catalog: Catalog,
     status: String,
@@ -1140,33 +1145,21 @@ impl AppView {
                                             != this.strategy.mixed_port.to_string()
                                             || this.filter_input.read(cx).value().to_string()
                                                 != this.strategy.exclude_filter;
-                                        if editing || this.is_dirty() || local_inputs_dirty {
+                                        if editing || this.strategy != this.saved || local_inputs_dirty {
                                             this.external_change_pending = true;
                                             this.status = if editing {
                                                 "编辑期间检测到外部策略变更。请取消编辑后再决定是否应用覆盖。"
                                             } else {
-                                                "检测到外部策略变更。点击「应用」覆盖外部变更，或重新打开窗口放弃本地修改。"
+                                                "检测到外部策略变更。点击「覆盖并应用」保留本地配置，或重新打开窗口放弃本地修改。"
                                             }
                                             .into();
                                         } else {
-                                            let sync_port = this.port_input.read(cx).value().trim()
-                                                == this.strategy.mixed_port.to_string();
-                                            let sync_filter = this.filter_input.read(cx).value()
-                                                .to_string()
-                                                == this.strategy.exclude_filter;
                                             this.strategy = strategy.clone();
-                                            if sync_port {
-                                                this.pending_port_input =
-                                                    Some(strategy.mixed_port.to_string());
-                                            } else {
-                                                this.pending_port_input = None;
-                                            }
-                                            if sync_filter {
-                                                this.pending_filter_input =
-                                                    Some(strategy.exclude_filter.clone());
-                                            } else {
-                                                this.pending_filter_input = None;
-                                            }
+                                            this.saved = strategy.clone();
+                                            this.pending_port_input =
+                                                Some(strategy.mixed_port.to_string());
+                                            this.pending_filter_input =
+                                                Some(strategy.exclude_filter.clone());
                                             this.external_change_pending = false;
                                         }
                                         dirty = true;
@@ -1211,11 +1204,8 @@ impl AppView {
         })
         .detach();
 
-        let supervisor = Arc::new(Supervisor::default());
+        let supervisor = Supervisor::shared();
         let connected = supervisor.is_running();
-        if connected {
-            supervisor.adopt_running(strategy.tun, strategy.system_extension);
-        }
         let entity = cx.entity();
         let appearance_observer = window.observe_window_appearance(move |window, cx| {
             entity.update(cx, |this, cx| {
@@ -1249,6 +1239,7 @@ impl AppView {
                 InputState::new(window, cx).default_value(strategy.mixed_port.to_string())
             }),
             strategy: strategy.clone(),
+            saved: strategy.clone(),
             applied: strategy,
             catalog,
             appearance,
@@ -1297,12 +1288,27 @@ impl AppView {
     }
 
     fn persist(&mut self) -> bool {
+        self.persist_with_override(false)
+    }
+
+    fn persist_with_override(&mut self, overwrite_external: bool) -> bool {
         if self.busy {
             self.status = "正在处理上一项操作。".into();
             return false;
         }
-        if self.external_change_pending {
-            self.status = "检测到外部策略变更，请先点击「应用」明确覆盖，或重新打开窗口放弃本地修改。".into();
+        // Check at the write boundary too: the watcher may not have polled yet.
+        let disk = match myproxy::paths::strategy_path()
+            .and_then(|path| myproxy::strategy::load_from(&path))
+        {
+            Ok(strategy) => strategy,
+            Err(err) => {
+                self.status = format!("无法读取磁盘策略，未保存：{err}");
+                return false;
+            }
+        };
+        if !overwrite_external && (self.external_change_pending || disk != self.saved) {
+            self.external_change_pending = true;
+            self.status = "检测到外部策略变更。点击「覆盖并应用」保留本地配置，或重新打开窗口放弃本地修改。".into();
             return false;
         }
         match self.strategy.save() {
@@ -1310,6 +1316,8 @@ impl AppView {
                 if let Ok(path) = myproxy::paths::strategy_path() {
                     self.strategy_stamp = file_stamp(&path);
                 }
+                self.saved = self.strategy.clone();
+                self.external_change_pending = false;
                 self.status = "已保存策略。".into();
                 true
             }
@@ -1359,7 +1367,6 @@ impl AppView {
                         this.catalog = cat;
                         if this.strategy == strategy {
                             this.mark_applied();
-                            this.external_change_pending = false;
                         }
                         this.status = format!(
                             "已编译 {} 个节点，排除 {}。{}Mixed {}。",
@@ -1469,12 +1476,20 @@ impl AppView {
             entity.update(app, |this, cx| {
                 if this.busy {
                     this.status = "正在处理上一项操作。".into();
-                } else {
-                    this.external_change_pending = false;
-                }
-                if !this.busy && this.persist_and_apply(cx) {
                     cx.notify();
+                    return;
                 }
+                let Ok(port) = this.port_input.read(cx).value().trim().parse::<u16>() else {
+                    this.status = "端口无效。".into();
+                    cx.notify();
+                    return;
+                };
+                this.strategy.mixed_port = port;
+                this.strategy.exclude_filter = this.filter_input.read(cx).value().to_string();
+                if this.persist_with_override(this.external_change_pending) {
+                    this.start_apply(cx);
+                }
+                cx.notify();
             });
         }
     }
@@ -1498,6 +1513,10 @@ impl AppView {
             return;
         }
         let connect = !self.connected;
+        if connect && !self.persist() {
+            cx.notify();
+            return;
+        }
         let strategy = self.strategy.clone();
         let supervisor = self.supervisor.clone();
         self.busy = true;
@@ -1822,12 +1841,16 @@ impl AppView {
                                 .text_color(theme.muted_foreground)
                                 .child(if connected { "已连接" } else { "未连接" }),
                         )
-                        .when(self.is_dirty(), |this| {
+                        .when(self.is_dirty() || self.external_change_pending, |this| {
                             this.child(
                                 Button::new("apply")
                                     .small()
                                     .disabled(busy)
-                                    .label("应用")
+                                    .label(if self.external_change_pending {
+                                        "覆盖并应用"
+                                    } else {
+                                        "应用"
+                                    })
                                     .on_click(self.on_apply(cx)),
                             )
                         }),
