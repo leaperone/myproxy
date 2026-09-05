@@ -80,6 +80,7 @@ impl Supervisor {
             .arg("-t")
             .arg("-f")
             .arg(&yaml)
+            .stdout(std::io::stderr())
             .status()
             .context("mihomo -t")?;
         if !status.success() {
@@ -294,6 +295,7 @@ fn ensure_tun_privileges(bin: &Path) -> Result<()> {
                 "do shell script {} with administrator privileges",
                 applescript_string(&shell)
             ))
+            .stdout(std::io::stderr())
             .status()
             .context("osascript")?;
         if !status.success() || !mihomo_has_tun_privs(bin) {
