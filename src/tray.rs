@@ -135,7 +135,7 @@ fn disconnect_and_quit(cx: &mut App) {
                 }
             })
             .await;
-        cx.update(|cx| cx.quit()).ok();
+        cx.update(|cx| cx.quit());
     })
     .detach();
 }
