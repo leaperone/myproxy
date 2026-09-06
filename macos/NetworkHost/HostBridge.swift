@@ -56,15 +56,22 @@ private actor HostController {
             && preservesRouteEndpoints(lastEndpoints, endpoints)
         if canLiveUpdate {
             do {
-                try await transparentProxy.configure(configuration)
-                try await transparentProxy.applyRunningConfiguration(
+                try await transparentProxy.configureAndApplyRunning(
                     configuration,
                     revision: request.revision
                 )
                 remember(request, endpoints: endpoints)
                 return .running
             } catch {
-                // Port-preserving live apply failed; tear down and start clean.
+                try? await transparentProxy.stop()
+                let restart = try providerConfiguration(
+                    from: request,
+                    endpoints: endpoints
+                )
+                try await transparentProxy.configure(restart)
+                try await transparentProxy.start()
+                remember(request, endpoints: endpoints)
+                return .running
             }
         }
         try? await transparentProxy.stop()

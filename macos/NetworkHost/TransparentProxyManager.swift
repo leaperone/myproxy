@@ -60,6 +60,14 @@ actor AppleTransparentProxyManager {
         }
     }
 
+    func configureAndApplyRunning(
+        _ configuration: [String: NSObject],
+        revision: UInt64
+    ) async throws {
+        try await configure(configuration)
+        try await applyRunningConfiguration(configuration, revision: revision)
+    }
+
     func applyRunningConfiguration(
         _ configuration: [String: NSObject],
         revision: UInt64
