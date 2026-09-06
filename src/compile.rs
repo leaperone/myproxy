@@ -93,7 +93,9 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
                     }
                 }
                 "app" => {
-                    rules.push(format!("PROCESS-NAME,{},{}", matcher.value, target));
+                    if !strategy.system_extension {
+                        rules.push(format!("PROCESS-NAME,{},{}", matcher.value, target));
+                    }
                 }
                 "cidr" => {
                     let value = matcher.value.trim();
