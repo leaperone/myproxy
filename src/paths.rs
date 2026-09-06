@@ -31,6 +31,10 @@ pub fn wanted_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("core.wanted"))
 }
 
+pub fn operation_lock_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("operation.lock"))
+}
+
 pub fn mihomo_log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mihomo.log"))
 }
