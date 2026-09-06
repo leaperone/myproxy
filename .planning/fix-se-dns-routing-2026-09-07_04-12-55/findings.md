@@ -1,0 +1,6 @@
+- 2026-09-07：Mac mini 活动扩展为 0.0.7-nightly.20260906.17.1；runtime.yaml 含 mihomo DNS 127.0.0.1:1053，NEDNSProxy session 日志显示 connected/running yes。
+- mihomo 日志中存在大量 UDP/53 流量和重复 `local:53 error: can't resolve ip`；需要结合 provider 路由确认根因。
+- MClash 扩展此前同时启用；用户已关闭，需重新采样确认影响。
+- 2026-09-07 04:10-04:11：统一日志显示 DNS Proxy 启动后立即 `Plugin initiated` 断开；同一时间透明代理收到来自不同 myproxy host PID（39565、72397）的 stop/start，确认重复宿主实例会反复移除并重建 NE 配置。
+- MClash 已为 activated disabled 且无进程，排除当前竞争。
+- DNSRelayRoutingPolicy 原先只识别 IP 形式的局域网 resolver；`local:53` 这类域名 endpoint 会误走 mihomo SOCKS，触发 `can't resolve ip`。已加入本地域名识别。
