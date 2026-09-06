@@ -51,6 +51,7 @@ struct State {
     lines: VecDeque<String>,
     file: Option<File>,
     path: Option<PathBuf>,
+    generation: u64,
 }
 
 static LOG: OnceLock<Mutex<State>> = OnceLock::new();
@@ -78,6 +79,7 @@ impl State {
             lines: VecDeque::with_capacity(RING),
             file,
             path,
+            generation: 0,
         }
     }
 
@@ -144,6 +146,10 @@ pub fn recent(limit: usize) -> Vec<String> {
     st.lines.iter().rev().take(limit).rev().cloned().collect()
 }
 
+pub fn generation() -> u64 {
+    lock().generation
+}
+
 pub fn error(target: &str, msg: impl AsRef<str>) {
     emit(Level::Error, target, msg.as_ref());
 }
@@ -196,4 +202,5 @@ fn emit(level: Level, target: &str, msg: &str) {
         st.lines.pop_front();
     }
     st.lines.push_back(line);
+    st.generation = st.generation.saturating_add(1);
 }

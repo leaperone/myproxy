@@ -39,7 +39,7 @@ pub fn install(cx: &mut App) {
     let last = Arc::new(Mutex::new(initial));
     cx.spawn(async move |cx| loop {
         cx.background_executor()
-            .timer(Duration::from_millis(250))
+            .timer(Duration::from_millis(1000))
             .await;
         let face = cx
             .background_executor()
