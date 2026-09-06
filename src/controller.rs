@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -12,15 +13,24 @@ use crate::paths;
 use crate::strategy::Strategy;
 
 const FETCH_TIMEOUT: Duration = Duration::from_millis(800);
+pub const UI_CONNECTION_CAP: usize = 200;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrafficSnapshot {
     pub connections: Vec<LiveConnection>,
+    pub connection_count: usize,
     pub upload_total: u64,
     pub download_total: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrafficTotals {
+    pub upload_total: u64,
+    pub download_total: u64,
+    pub connection_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveConnection {
     pub id: String,
     pub process: String,
@@ -32,7 +42,7 @@ pub struct LiveConnection {
     pub duration: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiveGroup {
     pub name: String,
     pub kind: String,
@@ -40,10 +50,20 @@ pub struct LiveGroup {
     pub members: Vec<LiveMember>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveMember {
     pub name: String,
     pub delay: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct TotalsResponse {
+    #[serde(default, rename = "uploadTotal")]
+    upload_total: u64,
+    #[serde(default, rename = "downloadTotal")]
+    download_total: u64,
+    #[serde(default, deserialize_with = "count_seq")]
+    connections: usize,
 }
 
 #[derive(Deserialize)]
@@ -134,11 +154,39 @@ pub fn fetch(mixed_port: u16) -> Result<TrafficSnapshot> {
     connections.sort_by(|a, b| {
         (b.upload.saturating_add(b.download)).cmp(&(a.upload.saturating_add(a.download)))
     });
-    log::debug("controller", format!("connections n={}", connections.len()));
+    let connection_count = connections.len();
+    if connections.len() > UI_CONNECTION_CAP {
+        connections.truncate(UI_CONNECTION_CAP);
+    }
+    log::debug(
+        "controller",
+        format!("connections n={connection_count} shown={}", connections.len()),
+    );
     Ok(TrafficSnapshot {
         connections,
+        connection_count,
         upload_total: parsed.upload_total,
         download_total: parsed.download_total,
+    })
+}
+
+pub fn fetch_totals(mixed_port: u16) -> Result<TrafficTotals> {
+    let url = format!(
+        "http://127.0.0.1:{}/connections",
+        controller_port(mixed_port)
+    );
+    let body = authorized_get(&url, FETCH_TIMEOUT)
+        .with_context(|| format!("GET connections totals :{}", controller_port(mixed_port)))?;
+    let parsed: TotalsResponse =
+        serde_json::from_str(&body).context("parse connections totals json")?;
+    log::debug(
+        "controller",
+        format!("connections totals n={}", parsed.connections),
+    );
+    Ok(TrafficTotals {
+        upload_total: parsed.upload_total,
+        download_total: parsed.download_total,
+        connection_count: parsed.connections,
     })
 }
 
@@ -315,6 +363,24 @@ fn normalize_group_kind(kind: &str) -> String {
 
 fn latest_delay(raw: &RawProxy) -> Option<u32> {
     raw.history.last().map(|item| item.delay)
+}
+
+fn count_seq<'de, D: Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
+    struct CountVisitor;
+    impl<'de> Visitor<'de> for CountVisitor {
+        type Value = usize;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("connection array")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<usize, A::Error> {
+            let mut n = 0usize;
+            while seq.next_element::<de::IgnoredAny>()?.is_some() {
+                n += 1;
+            }
+            Ok(n)
+        }
+    }
+    deserializer.deserialize_seq(CountVisitor)
 }
 
 fn authorized_get(url: &str, timeout: Duration) -> Result<String> {
