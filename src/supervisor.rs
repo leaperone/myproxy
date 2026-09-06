@@ -15,10 +15,82 @@ use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
 
+const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
+const FAIL_BEFORE_RETRY: u32 = 3;
+const RECOVER_INTERVAL: Duration = Duration::from_secs(8);
+const MAX_RECOVERIES: u32 = 5;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreHealth {
+    pub wanted: bool,
+    pub ready: bool,
+    pub note: Option<String>,
+    pub proxy_now: String,
+}
+
+impl CoreHealth {
+    fn idle() -> Self {
+        Self {
+            wanted: false,
+            ready: false,
+            note: None,
+            proxy_now: String::new(),
+        }
+    }
+
+    fn ready(proxy_now: impl Into<String>) -> Self {
+        Self {
+            wanted: true,
+            ready: true,
+            note: None,
+            proxy_now: proxy_now.into(),
+        }
+    }
+
+    fn recovered(proxy_now: impl Into<String>, note: &str) -> Self {
+        Self {
+            wanted: true,
+            ready: true,
+            note: Some(note.into()),
+            proxy_now: proxy_now.into(),
+        }
+    }
+
+    fn failing(note: &str) -> Self {
+        Self {
+            wanted: true,
+            ready: false,
+            note: Some(note.into()),
+            proxy_now: String::new(),
+        }
+    }
+}
+
+struct HealthWatch {
+    last_check: Option<Instant>,
+    last_recover: Option<Instant>,
+    last: CoreHealth,
+    fails: u32,
+    recoveries: u32,
+}
+
+impl Default for HealthWatch {
+    fn default() -> Self {
+        Self {
+            last_check: None,
+            last_recover: None,
+            last: CoreHealth::idle(),
+            fails: 0,
+            recoveries: 0,
+        }
+    }
+}
+
 pub struct Supervisor {
     child: Mutex<Option<Child>>,
     running_tun: Mutex<bool>,
     running_se: Mutex<bool>,
+    health: Mutex<HealthWatch>,
 }
 
 // ponytail: one core per process; cross-process CLI operations need a file lock.
@@ -31,6 +103,7 @@ impl Default for Supervisor {
             child: Mutex::new(None),
             running_tun: Mutex::new(false),
             running_se: Mutex::new(false),
+            health: Mutex::new(HealthWatch::default()),
         }
     }
 }
@@ -45,7 +118,30 @@ impl Supervisor {
         if self.is_running() {
             *self.running_tun.lock().expect("supervisor lock") = tun;
             *self.running_se.lock().expect("supervisor lock") = system_extension;
+            set_wanted(true);
         }
+    }
+
+    pub fn sync_wanted_on_launch(&self) {
+        if self.is_running() {
+            set_wanted(true);
+        } else {
+            set_wanted(false);
+            self.reset_health();
+        }
+    }
+
+    pub fn wanted(&self) -> bool {
+        is_wanted()
+    }
+
+    pub fn last_health(&self) -> CoreHealth {
+        if !is_wanted() {
+            return CoreHealth::idle();
+        }
+        let mut health = self.health.lock().expect("supervisor health lock").last.clone();
+        health.wanted = true;
+        health
     }
 
     pub fn connect(&self, strategy: &Strategy) -> Result<()> {
@@ -53,6 +149,8 @@ impl Supervisor {
         if *shutting_down {
             bail!("application is shutting down");
         }
+        set_wanted(true);
+        self.reset_health();
         self.connect_inner(strategy)
     }
 
@@ -136,27 +234,6 @@ impl Supervisor {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let ctrl_deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if controller::ping(strategy.mixed_port).is_ok() {
-                break;
-            }
-            if Instant::now() >= ctrl_deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                log::error("supervisor", "controller did not come up");
-                bail!(
-                    "controller did not come up on 127.0.0.1:{}. See {}",
-                    compile::controller_port(strategy.mixed_port),
-                    paths::mihomo_log_path()?.display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        controller::publish_live(controller::PublishedLive {
-            reach: controller::LiveReach::Ok,
-            proxy_now: String::new(),
-        });
         *self.child.lock().expect("supervisor lock") = Some(child);
         *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
         *self.running_se.lock().expect("supervisor lock") = strategy.system_extension;
@@ -176,6 +253,7 @@ impl Supervisor {
             crate::network_extension::enable_async(strategy);
         }
         controller::restore_selections(strategy.mixed_port, strategy);
+        let _ = self.wait_ready(strategy, Duration::from_secs(2));
         Ok(())
     }
 
@@ -211,14 +289,42 @@ impl Supervisor {
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        set_wanted(false);
+        self.reset_health();
         let _operation = OPERATION.lock().expect("supervisor operation lock");
         self.disconnect_inner()
     }
 
     pub fn shutdown(&self) -> Result<()> {
+        set_wanted(false);
+        self.reset_health();
         let mut shutting_down = OPERATION.lock().expect("supervisor operation lock");
         *shutting_down = true;
         self.disconnect_inner()
+    }
+
+    pub fn observe(&self, strategy: &Strategy) -> CoreHealth {
+        if !is_wanted() {
+            self.reset_health();
+            return CoreHealth::idle();
+        }
+        let now = Instant::now();
+        {
+            let mut watch = self.health.lock().expect("supervisor health lock");
+            if let Some(last_check) = watch.last_check {
+                if now.duration_since(last_check) < HEALTH_INTERVAL {
+                    let mut health = watch.last.clone();
+                    health.wanted = true;
+                    return health;
+                }
+            }
+            watch.last_check = Some(now);
+        }
+        let Some(proxy_now) = self.probe_now(strategy) else {
+            return self.note_failure(strategy, now);
+        };
+        self.mark_ready(proxy_now.clone());
+        CoreHealth::ready(proxy_now)
     }
 
     fn disconnect_inner(&self) -> Result<()> {
@@ -243,10 +349,6 @@ impl Supervisor {
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
         *self.running_se.lock().expect("supervisor lock") = false;
-        controller::publish_live(controller::PublishedLive {
-            reach: controller::LiveReach::Down,
-            proxy_now: String::new(),
-        });
         if stopped {
             log::info("supervisor", "disconnect");
         }
@@ -272,6 +374,170 @@ impl Supervisor {
         }
         false
     }
+
+    fn probe_now(&self, strategy: &Strategy) -> Option<String> {
+        if !self.is_running() || !mixed_listening(strategy.mixed_port) {
+            return None;
+        }
+        controller::probe(strategy.mixed_port, compile::default_group(strategy)).ok()
+    }
+
+    fn check_ready(&self, strategy: &Strategy) -> bool {
+        self.probe_now(strategy).is_some()
+    }
+
+    fn wait_ready(&self, strategy: &Strategy, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(proxy_now) = self.probe_now(strategy) {
+                self.mark_ready(proxy_now);
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn mark_ready(&self, proxy_now: String) {
+        let mut watch = self.health.lock().expect("supervisor health lock");
+        watch.last_check = Some(Instant::now());
+        watch.fails = 0;
+        watch.recoveries = 0;
+        watch.last = CoreHealth::ready(proxy_now);
+    }
+
+    fn reset_health(&self) {
+        *self.health.lock().expect("supervisor health lock") = HealthWatch::default();
+    }
+
+    fn note_failure(&self, strategy: &Strategy, now: Instant) -> CoreHealth {
+        let (fails, recoveries, last_recover) = {
+            let mut watch = self.health.lock().expect("supervisor health lock");
+            watch.last_check = Some(now);
+            watch.fails = watch.fails.saturating_add(1);
+            (watch.fails, watch.recoveries, watch.last_recover)
+        };
+        let health = if !is_wanted() {
+            CoreHealth::idle()
+        } else if fails < FAIL_BEFORE_RETRY {
+            CoreHealth::failing("核心暂时无响应，正在确认…")
+        } else if recoveries >= MAX_RECOVERIES {
+            CoreHealth::failing("核心反复异常，已停止自动恢复。请手动连接。")
+        } else if last_recover
+            .map(|at| now.duration_since(at) < RECOVER_INTERVAL)
+            .unwrap_or(false)
+        {
+            CoreHealth::failing("核心异常，等待自动重试…")
+        } else {
+            return self.recover(strategy, now);
+        };
+        self.store_health(health.clone());
+        health
+    }
+
+    fn recover(&self, strategy: &Strategy, now: Instant) -> CoreHealth {
+        if !is_wanted() {
+            self.reset_health();
+            return CoreHealth::idle();
+        }
+        let Ok(guard) = OPERATION.try_lock() else {
+            let health = CoreHealth::failing("核心异常，正在等待当前操作结束…");
+            self.store_health(health.clone());
+            return health;
+        };
+        if *guard {
+            let health = CoreHealth::failing("核心异常，应用正在退出…");
+            self.store_health(health.clone());
+            return health;
+        }
+        {
+            let mut watch = self.health.lock().expect("supervisor health lock");
+            if watch.recoveries >= MAX_RECOVERIES {
+                let health = CoreHealth::failing("核心反复异常，已停止自动恢复。请手动连接。");
+                watch.last = health.clone();
+                return health;
+            }
+            if watch
+                .last_recover
+                .map(|at| now.duration_since(at) < RECOVER_INTERVAL)
+                .unwrap_or(false)
+            {
+                let health = CoreHealth::failing("核心异常，等待自动重试…");
+                watch.last = health.clone();
+                return health;
+            }
+            watch.last_recover = Some(now);
+            watch.recoveries = watch.recoveries.saturating_add(1);
+            watch.fails = 0;
+        }
+        let n = self.health.lock().expect("supervisor health lock").recoveries;
+        if self.is_running() {
+            log::info("supervisor", format!("health reload #{n}"));
+            match controller::reload(strategy.mixed_port) {
+                Ok(()) => {
+                    controller::restore_selections(strategy.mixed_port, strategy);
+                    if let Some(proxy_now) = self.probe_now(strategy) {
+                        drop(guard);
+                        self.mark_ready(proxy_now.clone());
+                        return CoreHealth::recovered(proxy_now, "核心已重新加载。");
+                    }
+                    log::info("supervisor", "health reload still unready, reconnect");
+                }
+                Err(err) => {
+                    log::warn("supervisor", format!("health reload failed: {err:#}"));
+                }
+            }
+        }
+        log::info("supervisor", format!("health reconnect #{n}"));
+        let health = match self.connect_inner(strategy) {
+            Ok(()) => {
+                if let Some(proxy_now) = self.probe_now(strategy) {
+                    drop(guard);
+                    self.mark_ready(proxy_now.clone());
+                    return CoreHealth::recovered(proxy_now, "核心已重新连接。");
+                }
+                CoreHealth::failing("核心异常，正在重新连接…")
+            }
+            Err(err) => {
+                log::warn("supervisor", format!("health reconnect failed: {err:#}"));
+                CoreHealth::failing("核心重连失败，稍后会再试。")
+            }
+        };
+        drop(guard);
+        self.store_health(health.clone());
+        health
+    }
+
+    fn store_health(&self, health: CoreHealth) {
+        let mut watch = self.health.lock().expect("supervisor health lock");
+        watch.last = health;
+    }
+}
+
+fn is_wanted() -> bool {
+    paths::wanted_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+fn set_wanted(on: bool) {
+    let Ok(path) = paths::wanted_path() else {
+        return;
+    };
+    if on {
+        let _ = fs::write(path, "1");
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn mixed_listening(port: u16) -> bool {
+    let Ok(addr) = format!("127.0.0.1:{port}").parse() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_ok()
 }
 
 #[cfg(test)]

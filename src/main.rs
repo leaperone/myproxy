@@ -37,6 +37,7 @@ fn main() {
     }
     let lite = strategy.lite_mode;
     Supervisor::shared().adopt_running(strategy.tun, strategy.system_extension);
+    Supervisor::shared().sync_wanted_on_launch();
     let show_window = !lite && !strategy.silent_launch;
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.on_reopen(show_main_window);

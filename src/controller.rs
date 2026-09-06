@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
@@ -70,35 +70,13 @@ pub struct LiveSnapshot {
     pub fetched_rows: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LiveReach {
-    #[default]
-    Unknown,
-    Down,
-    Unreachable,
-    Ok,
-}
+static LAST_GROUPS: Mutex<Vec<LiveGroup>> = Mutex::new(Vec::new());
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PublishedLive {
-    pub reach: LiveReach,
-    pub proxy_now: String,
-}
-
-static PUBLISHED: Mutex<PublishedLive> = Mutex::new(PublishedLive {
-    reach: LiveReach::Unknown,
-    proxy_now: String::new(),
-});
-
-pub fn published_live() -> PublishedLive {
-    PUBLISHED
+pub fn last_probed_groups() -> Vec<LiveGroup> {
+    LAST_GROUPS
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .clone()
-}
-
-pub fn publish_live(live: PublishedLive) {
-    *PUBLISHED.lock().unwrap_or_else(|err| err.into_inner()) = live;
 }
 
 pub fn proxy_now_from_groups(groups: &[LiveGroup]) -> String {
@@ -274,6 +252,28 @@ pub fn close_all(mixed_port: u16) -> Result<()> {
     Ok(())
 }
 
+pub fn probe(mixed_port: u16, group_name: &str) -> Result<String> {
+    let groups = fetch_proxies(mixed_port)?;
+    let group = groups
+        .iter()
+        .find(|group| group.name == group_name)
+        .or_else(|| groups.iter().find(|group| group.name == "PROXY"))
+        .or_else(|| {
+            groups
+                .iter()
+                .find(|group| group.name.eq_ignore_ascii_case("default"))
+        });
+    match group {
+        Some(group) if !group.now.trim().is_empty() => {
+            let now = group.now.clone();
+            *LAST_GROUPS.lock().unwrap_or_else(|err| err.into_inner()) = groups;
+            Ok(now)
+        }
+        Some(group) => bail!("group {} has no now", group.name),
+        None => bail!("proxy group missing"),
+    }
+}
+
 pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
     let url = format!("http://127.0.0.1:{}/proxies", controller_port(mixed_port));
     let body = authorized_get(&url, FETCH_TIMEOUT)
@@ -311,13 +311,6 @@ pub fn fetch_live(mixed_port: u16, need: LiveNeed) -> Result<LiveSnapshot> {
         groups,
         fetched_rows,
     })
-}
-
-pub fn ping(mixed_port: u16) -> Result<()> {
-    let url = format!("http://127.0.0.1:{}/version", controller_port(mixed_port));
-    authorized_get(&url, Duration::from_millis(400))
-        .with_context(|| format!("GET version :{}", controller_port(mixed_port)))?;
-    Ok(())
 }
 
 pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {
