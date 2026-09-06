@@ -244,7 +244,11 @@ fn run(cli: Cli) -> Result<()> {
             myproxy::log::debug("ctl", "apply");
             let strategy = Strategy::load()?;
             let supervisor = Supervisor::default();
-            supervisor.adopt_running(strategy.tun, strategy.system_extension);
+            supervisor.adopt_running(
+                strategy.tun,
+                strategy.system_extension,
+                strategy.mixed_port,
+            );
             let catalog = supervisor.apply(&strategy)?;
             emit(
                 json,

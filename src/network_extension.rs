@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 
@@ -54,6 +55,9 @@ struct Session {
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static LAST_ENABLE: Mutex<Option<CaptureFace>> = Mutex::new(None);
+static LAST_ENABLE_REVISION: Mutex<Option<u64>> = Mutex::new(None);
+static OPERATION_REVISION: AtomicU64 = AtomicU64::new(0);
+static OPERATION_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
     let socks_port = compile::network_extension_socks_port(strategy.mixed_port);
@@ -180,11 +184,25 @@ pub fn enable_async(strategy: &Strategy) {
         }
         *last = Some(face);
     }
+    let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
+    *LAST_ENABLE_REVISION.lock().expect("ne last enable revision") = Some(revision);
     thread::Builder::new()
         .name("myproxy-ne".into())
         .spawn(move || {
+            let _operation = OPERATION_LOCK.lock().expect("ne operation");
+            if OPERATION_REVISION.load(Ordering::SeqCst) != revision {
+                let mut last_revision = LAST_ENABLE_REVISION.lock().expect("ne last enable revision");
+                if *last_revision == Some(revision) {
+                    *last_revision = None;
+                    *LAST_ENABLE.lock().expect("ne last enable") = None;
+                }
+                return;
+            }
             if let Err(err) = enable_blocking(&request) {
-                *LAST_ENABLE.lock().expect("ne last enable") = None;
+                if OPERATION_REVISION.load(Ordering::SeqCst) == revision {
+                    *LAST_ENABLE.lock().expect("ne last enable") = None;
+                    *LAST_ENABLE_REVISION.lock().expect("ne last enable revision") = None;
+                }
                 log::error("ne", format!("{err:#}"));
             }
         })
@@ -193,9 +211,15 @@ pub fn enable_async(strategy: &Strategy) {
 
 pub fn disable_async() {
     *LAST_ENABLE.lock().expect("ne last enable") = None;
+    *LAST_ENABLE_REVISION.lock().expect("ne last enable revision") = None;
+    let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
     thread::Builder::new()
         .name("myproxy-ne-stop".into())
-        .spawn(|| {
+        .spawn(move || {
+            let _operation = OPERATION_LOCK.lock().expect("ne operation");
+            if OPERATION_REVISION.load(Ordering::SeqCst) != revision {
+                return;
+            }
             if let Err(err) = disable_blocking() {
                 log::error("ne", format!("{err:#}"));
             }

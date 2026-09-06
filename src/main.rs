@@ -36,7 +36,11 @@ fn main() {
         myproxy::log::warn("login", format!("{err:#}"));
     }
     let lite = strategy.lite_mode;
-    Supervisor::shared().adopt_running(strategy.tun, strategy.system_extension);
+    Supervisor::shared().adopt_running(
+        strategy.tun,
+        strategy.system_extension,
+        strategy.mixed_port,
+    );
     Supervisor::shared().sync_wanted_on_launch();
     let show_window = !lite && !strategy.silent_launch;
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
