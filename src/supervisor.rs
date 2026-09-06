@@ -117,7 +117,7 @@ impl Supervisor {
     }
 
     pub fn adopt_running(&self, tun: bool, system_extension: bool, mixed_port: u16) {
-        if self.is_running() {
+        if pid_file_alive(Some(mixed_port)) {
             *self.running_tun.lock().expect("supervisor lock") = tun;
             *self.running_se.lock().expect("supervisor lock") = system_extension;
             *self.running_mixed_port.lock().expect("supervisor lock") = Some(mixed_port);
@@ -377,15 +377,22 @@ impl Supervisor {
             if let Ok(path) = paths::pid_path() {
                 if let Ok(pid) = fs::read_to_string(&path) {
                     if let Ok(pid) = pid.trim().parse::<i32>() {
-                        unsafe {
-                            libc::kill(pid, libc::SIGTERM);
+                        let port = *self.running_mixed_port.lock().expect("supervisor lock");
+                        if port.map(mixed_listening).unwrap_or(false) {
+                            unsafe {
+                                libc::kill(pid, libc::SIGTERM);
+                            }
+                            wait_for_pid_exit(pid);
+                            stopped = true;
+                        } else {
+                            log::warn("supervisor", "ignoring stale mihomo pid without a listening port");
                         }
-                        wait_for_pid_exit(pid);
-                        stopped = true;
                     }
-                    let _ = fs::remove_file(path);
                 }
             }
+        }
+        if let Ok(path) = paths::pid_path() {
+            let _ = fs::remove_file(path);
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
         *self.running_se.lock().expect("supervisor lock") = false;
@@ -403,20 +410,22 @@ impl Supervisor {
                 match child.try_wait() {
                     Ok(None) => return true,
                     _ => {
+                        let pid = child.id();
                         *slot = None;
                         *self.running_mixed_port.lock().expect("supervisor lock") = None;
+                        if let Ok(path) = paths::pid_path() {
+                            let matches = fs::read_to_string(&path)
+                                .map(|value| value.trim() == pid.to_string())
+                                .unwrap_or(false);
+                            if matches {
+                                let _ = fs::remove_file(path);
+                            }
+                        }
                     }
                 }
             }
         }
-        if let Ok(path) = paths::pid_path() {
-            if let Ok(pid) = fs::read_to_string(path) {
-                if let Ok(pid) = pid.trim().parse::<i32>() {
-                    return unsafe { libc::kill(pid, 0) == 0 };
-                }
-            }
-        }
-        false
+        pid_file_alive(*self.running_mixed_port.lock().expect("supervisor lock"))
     }
 
     fn probe_now(&self, strategy: &Strategy) -> Option<String> {
@@ -600,6 +609,29 @@ fn wait_for_pid_exit(pid: i32) {
     while unsafe { libc::kill(pid, 0) == 0 } && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn pid_file_alive(port: Option<u16>) -> bool {
+    let Ok(path) = paths::pid_path() else {
+        return false;
+    };
+    let Ok(raw_pid) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(pid) = raw_pid.trim().parse::<i32>() else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, 0) != 0 } {
+        let _ = fs::remove_file(path);
+        return false;
+    }
+    if let Some(port) = port {
+        if !mixed_listening(port) {
+            let _ = fs::remove_file(path);
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

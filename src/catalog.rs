@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
 
@@ -18,6 +19,10 @@ const SUBSCRIPTION_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from
 pub struct Catalog {
     pub nodes: Vec<Node>,
     pub excluded: Vec<Excluded>,
+    #[serde(default)]
+    pub subscription_urls: HashMap<String, String>,
+    #[serde(default)]
+    pub exclude_filter: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +61,7 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
         .context("invalid exclude_filter regex")
         .inspect_err(|err| log::error("catalog", format!("{err:#}")))?;
     let previous = Catalog::load().unwrap_or_default();
+    let cache_filter_matches = previous.exclude_filter == strategy.exclude_filter;
     let mut catalog = Catalog::default();
     log::debug(
         "catalog",
@@ -101,12 +107,18 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
             }
             Err(err) => {
                 log::warn("catalog", format!("fetch {} failed: {err:#}", sub.name));
-                let reused = previous
-                    .nodes
-                    .iter()
-                    .filter(|node| node.subscription == sub.name)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let reused = if cache_filter_matches
+                    && previous.subscription_urls.get(&sub.name) == Some(&sub.url)
+                {
+                    previous
+                        .nodes
+                        .iter()
+                        .filter(|node| node.subscription == sub.name)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 if !reused.is_empty() {
                     log::info(
                         "catalog",
@@ -126,6 +138,13 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
             }
         }
     }
+
+    catalog.exclude_filter = strategy.exclude_filter.clone();
+    catalog.subscription_urls = strategy
+        .subscriptions
+        .iter()
+        .map(|sub| (sub.name.clone(), sub.url.clone()))
+        .collect();
 
     catalog.save()?;
     log::info(
