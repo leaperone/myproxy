@@ -2536,6 +2536,7 @@ impl AppView {
                                 ),
                         )
                         .child({
+                            let entity = entity.clone();
                             let mut button = Button::new("install-cli").small();
                             button = if installed {
                                 button.label("已安装，更新链接")
