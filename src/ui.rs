@@ -111,6 +111,7 @@ struct GroupEditor {
     excludes: Entity<InputState>,
     include: Vec<String>,
     blocked: Vec<String>,
+    selected: String,
 }
 
 impl GroupEditor {
@@ -155,6 +156,10 @@ impl GroupEditor {
             .as_ref()
             .map(|g| join_list(&g.name_excludes))
             .unwrap_or_default();
+        let selected = existing
+            .as_ref()
+            .map(|g| g.selected.clone())
+            .unwrap_or_default();
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("组名")
@@ -190,6 +195,7 @@ impl GroupEditor {
             excludes,
             include,
             blocked,
+            selected,
         }
     }
 
@@ -216,6 +222,7 @@ impl GroupEditor {
             name_excludes: parse_list(&self.excludes.read(cx).value()),
             include: self.include.clone(),
             exclude: self.blocked.clone(),
+            selected: self.selected.clone(),
             filter: String::new(),
         }
     }

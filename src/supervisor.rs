@@ -154,6 +154,7 @@ impl Supervisor {
         if strategy.system_extension {
             crate::network_extension::enable_async(strategy);
         }
+        controller::restore_selections(strategy.mixed_port, strategy);
         Ok(())
     }
 
@@ -179,6 +180,7 @@ impl Supervisor {
                 self.connect_inner(strategy)?;
             } else {
                 controller::reload(strategy.mixed_port)?;
+                controller::restore_selections(strategy.mixed_port, strategy);
                 if strategy.system_extension {
                     crate::network_extension::enable_async(strategy);
                 }

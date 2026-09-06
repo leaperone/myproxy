@@ -139,6 +139,9 @@ pub struct Group {
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Last user-picked member for select groups. Restored after connect/reload.
+    #[serde(default)]
+    pub selected: String,
     /// Legacy single regex. Read on migrate, never written back.
     #[serde(default, skip_serializing)]
     pub filter: String,
@@ -348,7 +351,21 @@ impl Strategy {
             return false;
         };
         next.id = group.id.clone();
+        if next.selected.trim().is_empty() {
+            next.selected = group.selected.clone();
+        }
         *group = next;
+        true
+    }
+
+    pub fn set_group_selected(&mut self, id: &str, node: String) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == id || g.name == id) else {
+            return false;
+        };
+        if group.kind != "select" {
+            return false;
+        }
+        group.selected = node;
         true
     }
 
@@ -433,6 +450,7 @@ impl Group {
             name_excludes: Vec::new(),
             include: Vec::new(),
             exclude: Vec::new(),
+            selected: String::new(),
             filter: String::new(),
         }
     }
@@ -453,6 +471,7 @@ impl Group {
             name_excludes: Vec::new(),
             include: Vec::new(),
             exclude: Vec::new(),
+            selected: String::new(),
             filter: String::new(),
         }
     }
