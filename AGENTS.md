@@ -16,3 +16,5 @@ scripts/package-macos-app.sh
 scripts/release-macos.sh
 cargo run --bin myproxyctl -- capabilities
 ```
+
+Cloud Agent VMs are Linux. `scripts/fetch-mihomo.sh` is darwin-arm64; the environment install fetches host-native mihomo into `resources/mihomo/mihomo`. Strategy on Linux is `~/.local/share/myproxy/` (`dirs::data_dir`), not `~/Library/Application Support/myproxy/`. System Extension, Sparkle, login items, and TUN setuid stay macOS-only. Use `myproxyctl` for apply/connect; the GPUI window builds here and needs `DISPLAY=:1 WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1`. Do not start the GUI or Mixed inbound from `install`.
