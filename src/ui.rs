@@ -19,7 +19,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::controller::{self, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals};
+use myproxy::controller::{
+    self, ConnectionColumn, ConnectionFilters, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals,
+};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::{CoreHealth, Supervisor};
@@ -1066,6 +1068,7 @@ pub struct AppView {
     delaying: HashSet<String>,
     window_active: bool,
     log_generation: u64,
+    connection_filters: ConnectionFilters,
 }
 
 impl AppView {
@@ -1329,6 +1332,7 @@ impl AppView {
             log_generation: log::generation(),
             pending_port_input: None,
             pending_filter_input: None,
+            connection_filters: ConnectionFilters::default(),
         };
         if crate::onboard::should_prompt() {
             cx.defer_in(window, |_this, window, cx| {
@@ -2689,6 +2693,24 @@ impl AppView {
             "—".into()
         };
         let mixed = format!("127.0.0.1:{}", self.strategy.mixed_port);
+        let filtered = controller::filter_connections(
+            &self.traffic.connections,
+            &self.connection_filters,
+        );
+        let filter_note = if !connected || self.traffic.connections.is_empty() {
+            String::new()
+        } else if filtered.len() == self.traffic.connections.len()
+            && self.connection_filters.show_direct
+            && !self.connection_filters.has_column_filter()
+        {
+            String::new()
+        } else {
+            format!(
+                "显示 {} / {} 条",
+                filtered.len(),
+                self.traffic.connections.len()
+            )
+        };
         v_flex()
             .id("connections-page")
             .flex_1()
@@ -2725,6 +2747,7 @@ impl AppView {
                         h_flex()
                             .items_center()
                             .justify_between()
+                            .gap_2()
                             .child(
                                 div()
                                     .text_xs()
@@ -2733,36 +2756,81 @@ impl AppView {
                                     } else {
                                         muted_fg
                                     })
-                                    .child(self.traffic_error.clone().unwrap_or_default()),
+                                    .child(
+                                        self.traffic_error
+                                            .clone()
+                                            .unwrap_or(filter_note),
+                                    ),
                             )
                             .when(connected && !self.traffic.connections.is_empty(), |this| {
-                                this.child({
-                                    let entity = entity.clone();
-                                    Button::new("close-all-connections")
-                                        .small()
-                                        .danger()
-                                        .label("关闭全部")
-                                        .on_click(move |_, _, app| {
-                                            entity.update(app, |this, cx| {
-                                                let port = this.strategy.mixed_port;
-                                                this.traffic.connections.clear();
-                                                this.status = "已关闭全部连接。".into();
-                                                cx.background_executor()
-                                                    .spawn(async move {
-                                                        if let Err(err) =
-                                                            controller::close_all(port)
-                                                        {
-                                                            log::debug(
-                                                                "ui",
-                                                                format!("close all failed: {err:#}"),
-                                                            );
-                                                        }
-                                                    })
-                                                    .detach();
-                                                cx.notify();
-                                            });
+                                this.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child({
+                                            let entity = entity.clone();
+                                            Toggle::new("show-direct-connections")
+                                                .small()
+                                                .outline()
+                                                .label("显示直连")
+                                                .checked(self.connection_filters.show_direct)
+                                                .on_click(move |checked, _, app| {
+                                                    let show = *checked;
+                                                    entity.update(app, |this, cx| {
+                                                        this.connection_filters.show_direct = show;
+                                                        cx.notify();
+                                                    });
+                                                })
                                         })
-                                })
+                                        .when(
+                                            self.connection_filters.has_column_filter(),
+                                            |this| {
+                                                this.child({
+                                                    let entity = entity.clone();
+                                                    Button::new("clear-connection-filters")
+                                                        .small()
+                                                        .ghost()
+                                                        .label("清除筛选")
+                                                        .on_click(move |_, _, app| {
+                                                            entity.update(app, |this, cx| {
+                                                                this.connection_filters
+                                                                    .clear_columns();
+                                                                cx.notify();
+                                                            });
+                                                        })
+                                                })
+                                            },
+                                        )
+                                        .child({
+                                            let entity = entity.clone();
+                                            Button::new("close-all-connections")
+                                                .small()
+                                                .danger()
+                                                .label("关闭全部")
+                                                .on_click(move |_, _, app| {
+                                                    entity.update(app, |this, cx| {
+                                                        let port = this.strategy.mixed_port;
+                                                        this.traffic.connections.clear();
+                                                        this.status = "已关闭全部连接。".into();
+                                                        cx.background_executor()
+                                                            .spawn(async move {
+                                                                if let Err(err) =
+                                                                    controller::close_all(port)
+                                                                {
+                                                                    log::debug(
+                                                                        "ui",
+                                                                        format!(
+                                                                            "close all failed: {err:#}"
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            })
+                                                            .detach();
+                                                        cx.notify();
+                                                    });
+                                                })
+                                        }),
+                                )
                             }),
                     )
                 },
@@ -2805,8 +2873,27 @@ impl AppView {
                         .min_h_0()
                         .overflow_y_scroll()
                         .gap_1()
-                        .child(connection_header_row(theme))
-                        .children(self.traffic.connections.iter().map(|conn| {
+                        .child(connection_header_row(
+                            entity.clone(),
+                            theme,
+                            &self.traffic.connections,
+                            &self.connection_filters,
+                        ))
+                        .when(filtered.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(if self.connection_filters.show_direct {
+                                        "没有符合筛选的连接。"
+                                    } else {
+                                        "没有符合筛选的连接。打开「显示直连」可查看直连。"
+                                    }),
+                            )
+                        })
+                        .children(filtered.into_iter().map(|conn| {
                             render_connection_row(entity.clone(), theme, conn)
                         }))
                         .when(
@@ -4134,7 +4221,12 @@ fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn connection_header_row(theme: &Theme) -> impl IntoElement {
+fn connection_header_row(
+    entity: Entity<AppView>,
+    theme: &Theme,
+    connections: &[controller::LiveConnection],
+    filters: &ConnectionFilters,
+) -> impl IntoElement {
     let muted_fg = theme.muted_foreground;
     h_flex()
         .w_full()
@@ -4142,14 +4234,125 @@ fn connection_header_row(theme: &Theme) -> impl IntoElement {
         .px_3()
         .py_1()
         .gap_2()
-        .child(connection_col(px(108.), "进程", muted_fg, None))
-        .child(connection_col_flex("目标", muted_fg, None))
-        .child(connection_col(px(52.), "协议", muted_fg, None))
-        .child(connection_col(px(168.), "走向", muted_fg, None))
+        .child(connection_filter_header(
+            entity.clone(),
+            theme,
+            "conn-filter-process",
+            Some(px(108.)),
+            ConnectionColumn::Process,
+            "进程",
+            controller::connection_column_values(connections, filters, ConnectionColumn::Process),
+            filters.process.clone(),
+        ))
+        .child(connection_filter_header(
+            entity.clone(),
+            theme,
+            "conn-filter-destination",
+            None,
+            ConnectionColumn::Destination,
+            "目标",
+            controller::connection_column_values(
+                connections,
+                filters,
+                ConnectionColumn::Destination,
+            ),
+            filters.destination.clone(),
+        ))
+        .child(connection_filter_header(
+            entity.clone(),
+            theme,
+            "conn-filter-network",
+            Some(px(64.)),
+            ConnectionColumn::Network,
+            "协议",
+            controller::connection_column_values(connections, filters, ConnectionColumn::Network),
+            filters.network.clone(),
+        ))
+        .child(connection_filter_header(
+            entity,
+            theme,
+            "conn-filter-chain",
+            Some(px(168.)),
+            ConnectionColumn::Chain,
+            "走向",
+            controller::connection_column_values(connections, filters, ConnectionColumn::Chain),
+            filters.chain.clone(),
+        ))
         .child(connection_col(px(72.), "上传", muted_fg, None))
         .child(connection_col(px(72.), "下载", muted_fg, None))
         .child(connection_col(px(80.), "时长", muted_fg, None))
         .child(div().w(px(56.)))
+}
+
+fn connection_filter_header(
+    entity: Entity<AppView>,
+    theme: &Theme,
+    id: &'static str,
+    width: Option<Pixels>,
+    column: ConnectionColumn,
+    title: &'static str,
+    mut values: Vec<String>,
+    current: Option<String>,
+) -> impl IntoElement {
+    if let Some(current) = &current {
+        if !values.iter().any(|value| value == current) {
+            values.insert(0, current.clone());
+        }
+    }
+    let active = current.is_some();
+    let color = if active {
+        theme.accent
+    } else {
+        theme.muted_foreground
+    };
+    let button = Button::new(id)
+        .text()
+        .small()
+        .label(title)
+        .icon(IconName::ChevronDown)
+        .text_color(color)
+        .dropdown_menu({
+            let entity = entity.clone();
+            let current = current.clone();
+            move |menu, _, _| {
+                let mut menu = menu.scrollable(true).min_w(px(168.));
+                let clear_entity = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("全部")
+                        .checked(current.is_none())
+                        .on_click(move |_, _, app| {
+                            clear_entity.update(app, |this, cx| {
+                                this.connection_filters.set_column(column, None);
+                                cx.notify();
+                            });
+                        }),
+                );
+                if !values.is_empty() {
+                    menu = menu.separator();
+                }
+                for value in &values {
+                    let checked = current.as_deref() == Some(value.as_str());
+                    let pick_entity = entity.clone();
+                    let picked = value.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(value.clone())
+                            .checked(checked)
+                            .on_click(move |_, _, app| {
+                                pick_entity.update(app, |this, cx| {
+                                    this.connection_filters
+                                        .set_column(column, Some(picked.clone()));
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            }
+        });
+    div()
+        .when_some(width, |this, width| this.w(width).min_w(width))
+        .when(width.is_none(), |this| this.flex_1().min_w(px(96.)))
+        .child(button)
 }
 
 fn connection_col(
@@ -4211,7 +4414,7 @@ fn render_connection_row(
             muted_fg,
             Some(mono.clone()),
         ))
-        .child(connection_col(px(52.), conn.network.clone(), muted_fg, None))
+        .child(connection_col(px(64.), conn.network.clone(), muted_fg, None))
         .child(connection_col(px(168.), conn.chain.clone(), fg, None))
         .child(connection_col(px(72.), up, muted_fg, Some(mono.clone())))
         .child(connection_col(px(72.), down, muted_fg, Some(mono)))
