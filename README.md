@@ -45,9 +45,9 @@ Rust 1.98+ (`rust-toolchain.toml`). Subscription URLs are never written to `mypr
 
 ## CLI
 
-`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. After a drag-and-drop installation, invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly or add your own PATH link. The MacBook Air install script creates `~/.cargo/bin/myproxyctl` automatically.
+`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. A first launch that does not yet have the PATH link opens a one-screen prompt to create `~/.cargo/bin/myproxyctl`. Skipping or installing writes `onboard.json` next to `strategy.json`, so the prompt does not return. The MacBook Air install script creates the same link automatically.
 
-The app's **设置 → 命令行工具** panel can create or update the same `~/.cargo/bin/myproxyctl` link. It refuses to replace an existing regular file.
+The app's **设置 → 命令行工具** panel can create or update that link later. It refuses to replace an existing regular file. If a terminal cannot find `myproxyctl`, add `~/.cargo/bin` to `PATH`. You can still invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly.
 
 All commands accept `--json` for one machine-readable success result on stdout. Runtime errors return a JSON `error` on stderr and a non-zero exit. The official [Agent CLI skill](.agents/skills/agent/SKILL.md) explains how to inspect and configure myproxy.
 
