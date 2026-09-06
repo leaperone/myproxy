@@ -136,6 +136,23 @@ impl Supervisor {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        let ctrl_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller::ping(strategy.mixed_port).is_ok() {
+                break;
+            }
+            if Instant::now() >= ctrl_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                log::error("supervisor", "controller did not come up");
+                bail!(
+                    "controller did not come up on 127.0.0.1:{}. See {}",
+                    compile::controller_port(strategy.mixed_port),
+                    paths::mihomo_log_path()?.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         *self.child.lock().expect("supervisor lock") = Some(child);
         *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
         *self.running_se.lock().expect("supervisor lock") = strategy.system_extension;

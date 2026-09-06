@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -44,6 +45,43 @@ pub struct LiveGroup {
 pub struct LiveMember {
     pub name: String,
     pub delay: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveSnapshot {
+    pub traffic: TrafficSnapshot,
+    pub groups: Vec<LiveGroup>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LiveReach {
+    #[default]
+    Unknown,
+    Down,
+    Unreachable,
+    Ok,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublishedLive {
+    pub reach: LiveReach,
+    pub proxy_now: String,
+}
+
+static PUBLISHED: Mutex<PublishedLive> = Mutex::new(PublishedLive {
+    reach: LiveReach::Unknown,
+    proxy_now: String::new(),
+});
+
+pub fn published_live() -> PublishedLive {
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+pub fn publish_live(live: PublishedLive) {
+    *PUBLISHED.lock().unwrap_or_else(|err| err.into_inner()) = live;
 }
 
 #[derive(Deserialize)]
@@ -185,6 +223,19 @@ pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     log::debug("controller", format!("proxies groups={}", groups.len()));
     Ok(groups)
+}
+
+pub fn fetch_live(mixed_port: u16) -> Result<LiveSnapshot> {
+    let traffic = fetch(mixed_port)?;
+    let groups = fetch_proxies(mixed_port)?;
+    Ok(LiveSnapshot { traffic, groups })
+}
+
+pub fn ping(mixed_port: u16) -> Result<()> {
+    let url = format!("http://127.0.0.1:{}/version", controller_port(mixed_port));
+    authorized_get(&url, Duration::from_millis(400))
+        .with_context(|| format!("GET version :{}", controller_port(mixed_port)))?;
+    Ok(())
 }
 
 pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {

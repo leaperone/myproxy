@@ -8,6 +8,7 @@ use tray_icon::{
     TrayIconEvent,
 };
 
+use myproxy::controller::{self, LiveReach};
 use myproxy::strategy::Strategy;
 use myproxy::supervisor::Supervisor;
 
@@ -126,15 +127,21 @@ fn menu_face() -> MenuFace {
             tooltip: "myproxy · 未连接".into(),
         };
     }
+    let live = controller::published_live();
+    if live.reach == LiveReach::Unreachable {
+        return MenuFace {
+            connected: true,
+            status: "核心无响应".into(),
+            action: "断开".into(),
+            tooltip: "myproxy · 核心无响应".into(),
+        };
+    }
+    let now = (live.reach == LiveReach::Ok)
+        .then(|| live.proxy_now.as_str())
+        .filter(|name| !name.is_empty());
     let (status, tooltip) = match Strategy::load() {
         Ok(strategy) => {
             let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
-            let now = strategy
-                .groups
-                .iter()
-                .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
-                .map(|group| group.selected.as_str())
-                .filter(|name| !name.is_empty());
             let mode = if strategy.system_extension {
                 "系统接管"
             } else if strategy.tun {

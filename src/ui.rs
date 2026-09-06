@@ -19,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::controller::{self, LiveGroup, TrafficSnapshot};
+use myproxy::controller::{self, LiveGroup, LiveReach, PublishedLive, TrafficSnapshot};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::Supervisor;
@@ -1022,6 +1022,11 @@ fn initial_page() -> Page {
     }
 }
 
+enum LivePoll {
+    Down,
+    Ready(Result<controller::LiveSnapshot, String>),
+}
+
 pub struct AppView {
     page: Page,
     strategy: Strategy,
@@ -1056,6 +1061,9 @@ pub struct AppView {
     traffic_prev: Option<(Instant, u64, u64)>,
     proxy_groups: Vec<LiveGroup>,
     proxy_error: Option<String>,
+    live_ok: bool,
+    live_error: Option<String>,
+    live_inflight: bool,
     delays: HashMap<String, u32>,
     delaying: HashSet<String>,
 }
@@ -1087,13 +1095,22 @@ impl AppView {
         let initial_strategy_stamp = strategy_path.as_deref().and_then(file_stamp);
         cx.spawn(async move |this, cx| {
             let mut catalog_stamp = catalog_path.as_deref().and_then(file_stamp);
+            let mut fail_streak: u32 = 0;
             loop {
                 let wait_ms = this
                     .update(cx, |this, _| {
-                        if this.page == Page::Connections {
+                        if this.live_inflight {
+                            return 200;
+                        }
+                        let base = if this.page == Page::Connections {
                             500
                         } else {
                             1500
+                        };
+                        if fail_streak == 0 {
+                            base
+                        } else {
+                            base.saturating_mul(1 << fail_streak.min(3)).min(8000)
                         }
                     })
                     .unwrap_or(1500);
@@ -1101,57 +1118,36 @@ impl AppView {
                     .timer(Duration::from_millis(wait_ms))
                     .await;
 
-                let fetch_port = this
-                    .update(cx, |this, cx| {
-                        if !this.connected {
-                            if this.clear_live() {
-                                cx.notify();
-                            }
-                            None
-                        } else {
-                            Some(this.strategy.mixed_port)
-                        }
-                    })
-                    .ok()
-                    .flatten();
-                if let Some(port) = fetch_port {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            controller::fetch(port).map_err(|err| err.to_string())
-                        })
-                        .await;
-                    if this
-                        .update(cx, |this, cx| {
-                            this.apply_traffic(result);
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-
-                let proxy_port = this
+                let request = this
                     .update(cx, |this, _| {
-                        if this.connected && matches!(this.page, Page::Groups | Page::Overview) {
-                            Some(this.strategy.mixed_port)
-                        } else {
-                            None
+                        if this.busy || this.live_inflight {
+                            return None;
                         }
+                        this.live_inflight = true;
+                        Some((this.strategy.mixed_port, this.supervisor.clone()))
                     })
                     .ok()
                     .flatten();
-                if let Some(port) = proxy_port {
-                    let result = cx
+                if let Some((port, supervisor)) = request {
+                    let outcome = cx
                         .background_executor()
                         .spawn(async move {
-                            controller::fetch_proxies(port).map_err(|err| err.to_string())
+                            if !supervisor.is_running() {
+                                return LivePoll::Down;
+                            }
+                            LivePoll::Ready(
+                                controller::fetch_live(port).map_err(|err| err.to_string()),
+                            )
                         })
                         .await;
+                    fail_streak = match &outcome {
+                        LivePoll::Ready(Err(_)) => fail_streak.saturating_add(1).min(3),
+                        _ => 0,
+                    };
                     if this
                         .update(cx, |this, cx| {
-                            this.apply_proxies(result);
+                            this.live_inflight = false;
+                            this.apply_live_poll(outcome);
                             cx.notify();
                         })
                         .is_err()
@@ -1164,16 +1160,6 @@ impl AppView {
                     .update(cx, |this, cx| {
                         let started = Instant::now();
                         let mut dirty = false;
-                        if !this.busy {
-                            let connected = this.supervisor.is_running();
-                            if connected != this.connected {
-                                this.connected = connected;
-                                if !connected {
-                                    this.clear_live();
-                                }
-                                dirty = true;
-                            }
-                        }
                         let editing = this.group_modal_open || this.rule_modal_open;
                         if !this.busy {
                             if let Some(path) = strategy_path.as_deref() {
@@ -1260,7 +1246,11 @@ impl AppView {
         });
         let this = Self {
             page: initial_page(),
-            status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
+            status: if connected {
+                "正在读取核心状态…".into()
+            } else {
+                "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into()
+            },
             connected,
             busy: false,
             cli_installed: myproxy::cli_install::is_installed(),
@@ -1296,6 +1286,9 @@ impl AppView {
             traffic_prev: None,
             proxy_groups: Vec::new(),
             proxy_error: None,
+            live_ok: false,
+            live_error: None,
+            live_inflight: false,
             delays: HashMap::new(),
             delaying: HashSet::new(),
             pending_port_input: None,
@@ -1451,6 +1444,9 @@ impl AppView {
                         );
                         if this.connected {
                             this.refresh_live(cx);
+                        } else {
+                            this.live_ok = false;
+                            this.publish_session();
                         }
                     }
                     Err(err) => {
@@ -1501,13 +1497,142 @@ impl AppView {
         let dirty = self.clear_traffic()
             || !self.proxy_groups.is_empty()
             || self.proxy_error.is_some()
+            || self.live_ok
+            || self.live_error.is_some()
             || !self.delays.is_empty()
             || !self.delaying.is_empty();
         self.proxy_groups.clear();
         self.proxy_error = None;
+        self.live_ok = false;
+        self.live_error = None;
         self.delays.clear();
         self.delaying.clear();
         dirty
+    }
+
+    fn publish_session(&self) {
+        let reach = if !self.connected {
+            LiveReach::Down
+        } else if self.live_ok {
+            LiveReach::Ok
+        } else if self.live_error.is_some() {
+            LiveReach::Unreachable
+        } else {
+            LiveReach::Unknown
+        };
+        controller::publish_live(PublishedLive {
+            reach,
+            proxy_now: self.live_now("PROXY").unwrap_or("").to_string(),
+        });
+    }
+
+    fn apply_live_poll(&mut self, poll: LivePoll) {
+        match poll {
+            LivePoll::Down => {
+                self.connected = false;
+                self.clear_live();
+                self.publish_session();
+            }
+            LivePoll::Ready(Ok(snap)) => {
+                self.connected = true;
+                self.live_ok = true;
+                self.live_error = None;
+                self.apply_traffic(Ok(snap.traffic));
+                self.apply_proxies(Ok(snap.groups));
+                self.publish_session();
+            }
+            LivePoll::Ready(Err(err)) => {
+                log::debug("ui", format!("live poll failed: {err}"));
+                self.connected = true;
+                self.live_ok = false;
+                self.live_error = Some("读不到核心状态。".into());
+                self.traffic = TrafficSnapshot::default();
+                self.traffic_up = 0;
+                self.traffic_down = 0;
+                self.traffic_has_rate = false;
+                self.traffic_prev = None;
+                self.proxy_groups.clear();
+                self.traffic_error = self.live_error.clone();
+                self.proxy_error = self.live_error.clone();
+                self.publish_session();
+            }
+        }
+    }
+
+    fn session_healthy(&self) -> bool {
+        self.connected && self.live_ok
+    }
+
+    fn session_title(&self) -> String {
+        if self.busy {
+            return self.status.clone();
+        }
+        if !self.connected {
+            return "未连接".into();
+        }
+        if self.live_ok {
+            if self.traffic_has_rate {
+                return format!(
+                    "已连接 · ↑{} · ↓{}",
+                    controller::format_rate(self.traffic_up),
+                    controller::format_rate(self.traffic_down)
+                );
+            }
+            return "已连接".into();
+        }
+        if self.live_error.is_some() {
+            "核心无响应".into()
+        } else {
+            "正在读取核心…".into()
+        }
+    }
+
+    fn session_headline(&self) -> &'static str {
+        if !self.connected {
+            "未连接"
+        } else if self.live_ok {
+            "已连接"
+        } else if self.live_error.is_some() {
+            "核心无响应"
+        } else {
+            "正在读取核心…"
+        }
+    }
+
+    fn live_metric(&self, value: String) -> String {
+        if self.session_healthy() {
+            value
+        } else if self.connected && self.live_error.is_some() {
+            "读不到".into()
+        } else {
+            "—".into()
+        }
+    }
+
+    fn overview_proxy_label(&self) -> String {
+        if !self.connected {
+            return "未连接".into();
+        }
+        if !self.live_ok {
+            return if self.live_error.is_some() {
+                "读不到".into()
+            } else {
+                "—".into()
+            };
+        }
+        self.live_now("PROXY")
+            .map(str::to_string)
+            .or_else(|| {
+                self.strategy
+                    .groups
+                    .iter()
+                    .find(|group| {
+                        group.name == "PROXY" || group.name.eq_ignore_ascii_case("default")
+                    })
+                    .map(|group| group.selected.clone())
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or_else(|| "—".into())
     }
 
     fn apply_proxies(&mut self, result: Result<Vec<LiveGroup>, String>) {
@@ -1541,25 +1666,19 @@ impl AppView {
     fn refresh_live(&mut self, cx: &mut Context<Self>) {
         if !self.connected {
             self.clear_live();
+            self.publish_session();
             return;
         }
         let port = self.strategy.mixed_port;
+        self.live_inflight = true;
         cx.spawn(async move |this, cx| {
-            let traffic_port = port;
-            let proxy_port = port;
-            let traffic = cx
+            let result = cx
                 .background_executor()
-                .spawn(async move { controller::fetch(traffic_port).map_err(|err| err.to_string()) })
-                .await;
-            let proxies = cx
-                .background_executor()
-                .spawn(async move {
-                    controller::fetch_proxies(proxy_port).map_err(|err| err.to_string())
-                })
+                .spawn(async move { controller::fetch_live(port).map_err(|err| err.to_string()) })
                 .await;
             this.update(cx, |this, cx| {
-                this.apply_traffic(traffic);
-                this.apply_proxies(proxies);
+                this.live_inflight = false;
+                this.apply_live_poll(LivePoll::Ready(result));
                 cx.notify();
             })
             .ok();
@@ -1700,6 +1819,8 @@ impl AppView {
                 match result {
                     Ok(Some(catalog)) => {
                         this.connected = true;
+                        this.live_ok = false;
+                        this.live_error = None;
                         this.catalog = catalog;
                         if this.strategy == strategy {
                             this.mark_applied();
@@ -1713,11 +1834,13 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        this.publish_session();
                         this.refresh_live(cx);
                     }
                     Ok(None) => {
                         this.connected = false;
                         this.clear_live();
+                        this.publish_session();
                         this.status = "已断开。".into();
                     }
                     Err(err) => {
@@ -2111,20 +2234,13 @@ impl Render for AppView {
 
 impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        let connected = self.connected;
+        let healthy = self.session_healthy();
         let busy = self.busy;
-        let live_label = if busy {
-            self.status.clone()
-        } else if connected && self.traffic_has_rate {
-            format!(
-                "已连接 · ↑{} · ↓{}",
-                controller::format_rate(self.traffic_up),
-                controller::format_rate(self.traffic_down)
-            )
-        } else if connected {
-            "已连接".into()
+        let live_label = self.session_title();
+        let label_color = if !busy && self.connected && self.live_error.is_some() {
+            theme.warning
         } else {
-            "未连接".into()
+            theme.muted_foreground
         };
         TitleBar::new().child(
             h_flex()
@@ -2144,11 +2260,11 @@ impl AppView {
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(status_dot(theme, connected))
+                        .child(status_dot(theme, healthy))
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(theme.muted_foreground)
+                                .text_color(label_color)
                                 .child(live_label),
                         )
                         .when(self.is_dirty() || self.external_change_pending, |this| {
@@ -2266,35 +2382,22 @@ impl AppView {
         } else {
             connect.primary().label("连接")
         };
-        let up = if connected && self.traffic_has_rate {
+        let up = self.live_metric(if self.session_healthy() && self.traffic_has_rate {
             controller::format_rate(self.traffic_up)
         } else {
             "—".into()
-        };
-        let down = if connected && self.traffic_has_rate {
+        });
+        let down = self.live_metric(if self.session_healthy() && self.traffic_has_rate {
             controller::format_rate(self.traffic_down)
         } else {
             "—".into()
-        };
-        let conns = if connected {
+        });
+        let conns = self.live_metric(if self.session_healthy() {
             self.traffic.connections.len().to_string()
         } else {
             "—".into()
-        };
-        let now = self
-            .live_now("PROXY")
-            .map(str::to_string)
-            .or_else(|| {
-                self.strategy
-                    .groups
-                    .iter()
-                    .find(|group| {
-                        group.name == "PROXY" || group.name.eq_ignore_ascii_case("default")
-                    })
-                    .map(|group| group.selected.clone())
-                    .filter(|name| !name.is_empty())
-            })
-            .unwrap_or_else(|| if connected { "—".into() } else { "未连接".into() });
+        });
+        let now = self.overview_proxy_label();
         v_flex()
             .gap_4()
             .child(page_title(
@@ -2324,12 +2427,12 @@ impl AppView {
                                 h_flex()
                                     .gap_2()
                                     .items_center()
-                                    .child(status_dot(theme, connected))
+                                    .child(status_dot(theme, self.session_healthy()))
                                     .child(
                                         div()
                                             .text_lg()
                                             .font_semibold()
-                                            .child(if connected { "已连接" } else { "未连接" }),
+                                            .child(self.session_headline()),
                                     ),
                             )
                             .child(
@@ -2370,7 +2473,7 @@ impl AppView {
                     .child(metric(
                         theme,
                         "状态",
-                        if connected { "已连接" } else { "空闲" },
+                        self.session_headline(),
                     ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
@@ -2396,27 +2499,36 @@ impl AppView {
                         ),
                     )),
             )
+            .when(self.live_error.is_some(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child(self.live_error.clone().unwrap_or_default()),
+                )
+            })
     }
 
     fn connections(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
         let connected = self.connected;
+        let healthy = self.session_healthy();
         let muted_fg = theme.muted_foreground;
-        let up = if connected && self.traffic_has_rate {
+        let up = self.live_metric(if healthy && self.traffic_has_rate {
             controller::format_rate(self.traffic_up)
         } else {
             "—".into()
-        };
-        let down = if connected && self.traffic_has_rate {
+        });
+        let down = self.live_metric(if healthy && self.traffic_has_rate {
             controller::format_rate(self.traffic_down)
         } else {
             "—".into()
-        };
-        let count = if connected {
+        });
+        let count = self.live_metric(if healthy {
             self.traffic.connections.len().to_string()
         } else {
             "—".into()
-        };
+        });
         let mixed = format!("127.0.0.1:{}", self.strategy.mixed_port);
         v_flex()
             .id("connections-page")
@@ -2439,7 +2551,7 @@ impl AppView {
                     .child(metric(
                         theme,
                         "状态",
-                        if connected { "已连接" } else { "未连接" },
+                        self.session_headline(),
                     ))
                     .child(metric(theme, "Mixed 端口", &mixed))
                     .child(metric(theme, "上传", &up))
@@ -2447,8 +2559,9 @@ impl AppView {
                     .child(metric(theme, "连接数", &count)),
             )
             .when(
-                self.traffic_error.is_some()
-                    || (connected && !self.traffic.connections.is_empty()),
+                self.live_error.is_some()
+                    || self.traffic_error.is_some()
+                    || (healthy && !self.traffic.connections.is_empty()),
                 |this| {
                     this.child(
                         h_flex()
@@ -2457,10 +2570,19 @@ impl AppView {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(self.traffic_error.clone().unwrap_or_default()),
+                                    .text_color(if self.live_error.is_some() {
+                                        theme.warning
+                                    } else {
+                                        muted_fg
+                                    })
+                                    .child(
+                                        self.live_error
+                                            .clone()
+                                            .or_else(|| self.traffic_error.clone())
+                                            .unwrap_or_default(),
+                                    ),
                             )
-                            .when(connected && !self.traffic.connections.is_empty(), |this| {
+                            .when(healthy && !self.traffic.connections.is_empty(), |this| {
                                 this.child({
                                     let entity = entity.clone();
                                     Button::new("close-all-connections")
@@ -2499,7 +2621,7 @@ impl AppView {
                 ))
             })
             .when(
-                connected && self.traffic.connections.is_empty() && self.traffic_error.is_none(),
+                healthy && self.traffic.connections.is_empty(),
                 |this| {
                     this.child(empty_hint(
                         theme,
@@ -2508,15 +2630,15 @@ impl AppView {
                 },
             )
             .when(
-                connected && self.traffic.connections.is_empty() && self.traffic_error.is_some(),
+                connected && !healthy && self.traffic.connections.is_empty(),
                 |this| {
                     this.child(empty_hint(
                         theme,
-                        "核心已连接，但还读不到连接列表。等 Mixed 端口起来后再看。",
+                        "核心在跑，但读不到连接列表。不是没有流量，是控制器没响应。",
                     ))
                 },
             )
-            .when(connected && !self.traffic.connections.is_empty(), |this| {
+            .when(healthy && !self.traffic.connections.is_empty(), |this| {
                 this.child(
                     v_flex()
                         .id("connection-list")
@@ -2649,14 +2771,22 @@ impl AppView {
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
             })
-            .when(self.connected && self.proxy_error.is_some(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(self.proxy_error.clone().unwrap_or_default()),
-                )
-            })
+            .when(
+                self.connected && (self.live_error.is_some() || self.proxy_error.is_some()),
+                |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.warning)
+                            .child(
+                                self.live_error
+                                    .clone()
+                                    .or_else(|| self.proxy_error.clone())
+                                    .unwrap_or_default(),
+                            ),
+                    )
+                },
+            )
             .children(self.strategy.groups.iter().map(|group| {
                 let count = catalog::count_group_members(group, &self.catalog);
                 let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
