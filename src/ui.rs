@@ -1064,6 +1064,7 @@ pub struct AppView {
     live_ok: bool,
     live_error: Option<String>,
     live_inflight: bool,
+    live_epoch: u64,
     delays: HashMap<String, u32>,
     delaying: HashSet<String>,
 }
@@ -1110,7 +1111,7 @@ impl AppView {
                         if fail_streak == 0 {
                             base
                         } else {
-                            base.saturating_mul(1 << fail_streak.min(3)).min(8000)
+                            base.saturating_mul(1 << fail_streak.min(2)).min(3000)
                         }
                     })
                     .unwrap_or(1500);
@@ -1124,11 +1125,15 @@ impl AppView {
                             return None;
                         }
                         this.live_inflight = true;
-                        Some((this.strategy.mixed_port, this.supervisor.clone()))
+                        Some((
+                            this.strategy.mixed_port,
+                            this.supervisor.clone(),
+                            this.live_epoch,
+                        ))
                     })
                     .ok()
                     .flatten();
-                if let Some((port, supervisor)) = request {
+                if let Some((port, supervisor, epoch)) = request {
                     let outcome = cx
                         .background_executor()
                         .spawn(async move {
@@ -1141,13 +1146,13 @@ impl AppView {
                         })
                         .await;
                     fail_streak = match &outcome {
-                        LivePoll::Ready(Err(_)) => fail_streak.saturating_add(1).min(3),
+                        LivePoll::Ready(Err(_)) => fail_streak.saturating_add(1).min(2),
                         _ => 0,
                     };
                     if this
                         .update(cx, |this, cx| {
                             this.live_inflight = false;
-                            this.apply_live_poll(outcome);
+                            this.apply_live_poll(outcome, epoch);
                             cx.notify();
                         })
                         .is_err()
@@ -1289,6 +1294,7 @@ impl AppView {
             live_ok: false,
             live_error: None,
             live_inflight: false,
+            live_epoch: 0,
             delays: HashMap::new(),
             delaying: HashSet::new(),
             pending_port_input: None,
@@ -1522,13 +1528,17 @@ impl AppView {
         };
         controller::publish_live(PublishedLive {
             reach,
-            proxy_now: self.live_now("PROXY").unwrap_or("").to_string(),
+            proxy_now: controller::proxy_now_from_groups(&self.proxy_groups),
         });
     }
 
-    fn apply_live_poll(&mut self, poll: LivePoll) {
+    fn apply_live_poll(&mut self, poll: LivePoll, epoch: u64) {
+        if epoch != self.live_epoch {
+            return;
+        }
         match poll {
             LivePoll::Down => {
+                self.live_epoch = self.live_epoch.wrapping_add(1);
                 self.connected = false;
                 self.clear_live();
                 self.publish_session();
@@ -1665,11 +1675,13 @@ impl AppView {
 
     fn refresh_live(&mut self, cx: &mut Context<Self>) {
         if !self.connected {
+            self.live_epoch = self.live_epoch.wrapping_add(1);
             self.clear_live();
             self.publish_session();
             return;
         }
         let port = self.strategy.mixed_port;
+        let epoch = self.live_epoch;
         self.live_inflight = true;
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1678,7 +1690,7 @@ impl AppView {
                 .await;
             this.update(cx, |this, cx| {
                 this.live_inflight = false;
-                this.apply_live_poll(LivePoll::Ready(result));
+                this.apply_live_poll(LivePoll::Ready(result), epoch);
                 cx.notify();
             })
             .ok();
@@ -1838,6 +1850,7 @@ impl AppView {
                         this.refresh_live(cx);
                     }
                     Ok(None) => {
+                        this.live_epoch = this.live_epoch.wrapping_add(1);
                         this.connected = false;
                         this.clear_live();
                         this.publish_session();
@@ -2630,12 +2643,21 @@ impl AppView {
                 },
             )
             .when(
-                connected && !healthy && self.traffic.connections.is_empty(),
+                connected && self.live_error.is_some() && self.traffic.connections.is_empty(),
                 |this| {
                     this.child(empty_hint(
                         theme,
                         "核心在跑，但读不到连接列表。不是没有流量，是控制器没响应。",
                     ))
+                },
+            )
+            .when(
+                connected
+                    && !healthy
+                    && self.live_error.is_none()
+                    && self.traffic.connections.is_empty(),
+                |this| {
+                    this.child(empty_hint(theme, "正在读取核心连接…"))
                 },
             )
             .when(healthy && !self.traffic.connections.is_empty(), |this| {

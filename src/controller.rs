@@ -84,6 +84,15 @@ pub fn publish_live(live: PublishedLive) {
     *PUBLISHED.lock().unwrap_or_else(|err| err.into_inner()) = live;
 }
 
+pub fn proxy_now_from_groups(groups: &[LiveGroup]) -> String {
+    groups
+        .iter()
+        .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
+        .map(|group| group.now.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_default()
+}
+
 #[derive(Deserialize)]
 struct ConnectionsResponse {
     #[serde(default, rename = "uploadTotal")]

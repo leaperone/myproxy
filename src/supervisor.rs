@@ -153,6 +153,10 @@ impl Supervisor {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        controller::publish_live(controller::PublishedLive {
+            reach: controller::LiveReach::Ok,
+            proxy_now: String::new(),
+        });
         *self.child.lock().expect("supervisor lock") = Some(child);
         *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
         *self.running_se.lock().expect("supervisor lock") = strategy.system_extension;
@@ -239,6 +243,10 @@ impl Supervisor {
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
         *self.running_se.lock().expect("supervisor lock") = false;
+        controller::publish_live(controller::PublishedLive {
+            reach: controller::LiveReach::Down,
+            proxy_now: String::new(),
+        });
         if stopped {
             log::info("supervisor", "disconnect");
         }
