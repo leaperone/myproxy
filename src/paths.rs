@@ -35,6 +35,10 @@ pub fn app_log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("myproxy.log"))
 }
 
+pub fn onboard_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("onboard.json"))
+}
+
 pub fn bundled_mihomo() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
     let exe = fs::canonicalize(&exe).unwrap_or(exe);

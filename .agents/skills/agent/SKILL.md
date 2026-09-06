@@ -5,7 +5,7 @@ description: Use the installed myproxyctl CLI to inspect and configure myproxy f
 
 # Agent CLI for myproxy
 
-Use `myproxyctl` instead of editing `~/Library/Application Support/myproxy/strategy.json` directly. The release app includes the CLI and updates it together with the GUI. Find it on `PATH`, or use `/Applications/myproxy.app/Contents/MacOS/myproxyctl` or `~/Applications/myproxy.app/Contents/MacOS/myproxyctl`. Dragging the app into Applications does not add it to `PATH`; the repository's MacBook Air install script creates a link in `~/.cargo/bin`.
+Use the bundled `myproxyctl` shipped inside the `.app` (`Contents/MacOS/myproxyctl`) or the `~/.cargo/bin/myproxyctl` link. Do not edit `~/Library/Application Support/myproxy/strategy.json` directly. The release app updates the CLI with the GUI. A first-launch dialog or **设置 → 命令行工具** creates the PATH link; the MacBook Air install script does the same. If the command is missing from `PATH`, add `~/.cargo/bin`.
 
 Put `--json` before or after the command. Successful commands emit one JSON value on stdout. Errors use stderr and a non-zero exit; do not parse an error as a successful JSON result. Discover the current command surface with:
 

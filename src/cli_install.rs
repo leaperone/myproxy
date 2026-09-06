@@ -13,6 +13,11 @@ fn bundled_cli() -> Option<PathBuf> {
     cli.is_file().then_some(cli)
 }
 
+/// True when this process is a `.app` bundle that ships `myproxyctl`.
+pub fn available() -> bool {
+    bundled_cli().is_some() && crate::login_item::is_bundled()
+}
+
 pub fn is_installed() -> bool {
     let Some(source) = bundled_cli() else {
         return false;

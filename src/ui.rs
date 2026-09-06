@@ -1258,7 +1258,7 @@ impl AppView {
                 }
             });
         });
-        Self {
+        let this = Self {
             page: initial_page(),
             status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
             connected,
@@ -1300,7 +1300,27 @@ impl AppView {
             delaying: HashSet::new(),
             pending_port_input: None,
             pending_filter_input: None,
+        };
+        if crate::onboard::should_prompt() {
+            cx.defer_in(window, |_this, window, cx| {
+                let entity = cx.entity();
+                crate::onboard::open(window, cx, move |result, cx| {
+                    entity.update(cx, |this, cx| {
+                        match result {
+                            Ok(path) => {
+                                this.cli_installed = true;
+                                this.status = format!("命令行工具已安装：{}", path.display());
+                            }
+                            Err(error) => {
+                                this.status = format!("命令行工具安装失败：{error}");
+                            }
+                        }
+                        cx.notify();
+                    });
+                });
+            });
         }
+        this
     }
 
     fn set_appearance(
@@ -2862,6 +2882,7 @@ impl AppView {
                                 ),
                         )
                         .child({
+                            let entity = entity.clone();
                             let mut button = Button::new("install-cli").small();
                             button = if installed {
                                 button.label("已安装，更新链接")
@@ -2894,6 +2915,32 @@ impl AppView {
                                 .map(|path| path.display().to_string())
                                 .unwrap_or_else(|| "无法确定用户主目录".into())
                         )),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("官方 Agent skill，复制后交给 Cursor / Codex。"),
+                        )
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("copy-cli-skill")
+                                .small()
+                                .label("复制 Agent skill")
+                                .on_click(move |_, _, cx| {
+                                    crate::onboard::copy_agent_skill(cx);
+                                    entity.update(cx, |this, cx| {
+                                        this.status = "已复制 Agent skill。".into();
+                                        cx.notify();
+                                    });
+                                })
+                        }),
                 ),
         )
     }
