@@ -382,10 +382,6 @@ impl Supervisor {
         controller::probe(strategy.mixed_port, compile::default_group(strategy)).ok()
     }
 
-    fn check_ready(&self, strategy: &Strategy) -> bool {
-        self.probe_now(strategy).is_some()
-    }
-
     fn wait_ready(&self, strategy: &Strategy, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
