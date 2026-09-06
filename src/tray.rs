@@ -129,14 +129,28 @@ fn menu_face() -> MenuFace {
     let (status, tooltip) = match Strategy::load() {
         Ok(strategy) => {
             let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
-            let status = if strategy.system_extension {
-                "已连接 · 系统接管".into()
+            let now = strategy
+                .groups
+                .iter()
+                .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
+                .map(|group| group.selected.as_str())
+                .filter(|name| !name.is_empty());
+            let mode = if strategy.system_extension {
+                "系统接管"
             } else if strategy.tun {
-                "已连接 · TUN".into()
+                "TUN"
             } else {
-                "已连接".into()
+                "Mixed"
             };
-            (status, format!("myproxy · 已连接 · {endpoint}"))
+            let status = match now {
+                Some(now) => format!("已连接 · {mode} · {now}"),
+                None => format!("已连接 · {mode}"),
+            };
+            let tooltip = match now {
+                Some(now) => format!("myproxy · 已连接 · {endpoint} · {now}"),
+                None => format!("myproxy · 已连接 · {endpoint}"),
+            };
+            (status, tooltip)
         }
         Err(_) => ("已连接".into(), "myproxy · 已连接".into()),
     };

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -18,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::controller::{self, TrafficSnapshot};
+use myproxy::controller::{self, LiveGroup, TrafficSnapshot};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::Supervisor;
@@ -111,6 +112,7 @@ struct GroupEditor {
     excludes: Entity<InputState>,
     include: Vec<String>,
     blocked: Vec<String>,
+    selected: String,
 }
 
 impl GroupEditor {
@@ -155,6 +157,10 @@ impl GroupEditor {
             .as_ref()
             .map(|g| join_list(&g.name_excludes))
             .unwrap_or_default();
+        let selected = existing
+            .as_ref()
+            .map(|g| g.selected.clone())
+            .unwrap_or_default();
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("组名")
@@ -190,6 +196,7 @@ impl GroupEditor {
             excludes,
             include,
             blocked,
+            selected,
         }
     }
 
@@ -216,6 +223,7 @@ impl GroupEditor {
             name_excludes: parse_list(&self.excludes.read(cx).value()),
             include: self.include.clone(),
             exclude: self.blocked.clone(),
+            selected: self.selected.clone(),
             filter: String::new(),
         }
     }
@@ -1046,6 +1054,10 @@ pub struct AppView {
     traffic_has_rate: bool,
     traffic_error: Option<String>,
     traffic_prev: Option<(Instant, u64, u64)>,
+    proxy_groups: Vec<LiveGroup>,
+    proxy_error: Option<String>,
+    delays: HashMap<String, u32>,
+    delaying: HashSet<String>,
 }
 
 impl AppView {
@@ -1079,7 +1091,7 @@ impl AppView {
                 let wait_ms = this
                     .update(cx, |this, _| {
                         if this.page == Page::Connections {
-                            1000
+                            500
                         } else {
                             1500
                         }
@@ -1092,14 +1104,12 @@ impl AppView {
                 let fetch_port = this
                     .update(cx, |this, cx| {
                         if !this.connected {
-                            if this.clear_traffic() {
+                            if this.clear_live() {
                                 cx.notify();
                             }
                             None
-                        } else if this.page == Page::Connections {
-                            Some(this.strategy.mixed_port)
                         } else {
-                            None
+                            Some(this.strategy.mixed_port)
                         }
                     })
                     .ok()
@@ -1122,6 +1132,34 @@ impl AppView {
                     }
                 }
 
+                let proxy_port = this
+                    .update(cx, |this, _| {
+                        if this.connected && matches!(this.page, Page::Groups | Page::Overview) {
+                            Some(this.strategy.mixed_port)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(port) = proxy_port {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            controller::fetch_proxies(port).map_err(|err| err.to_string())
+                        })
+                        .await;
+                    if this
+                        .update(cx, |this, cx| {
+                            this.apply_proxies(result);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
                 if this
                     .update(cx, |this, cx| {
                         let started = Instant::now();
@@ -1131,7 +1169,7 @@ impl AppView {
                             if connected != this.connected {
                                 this.connected = connected;
                                 if !connected {
-                                    this.clear_traffic();
+                                    this.clear_live();
                                 }
                                 dirty = true;
                             }
@@ -1256,6 +1294,10 @@ impl AppView {
             traffic_has_rate: false,
             traffic_error: None,
             traffic_prev: None,
+            proxy_groups: Vec::new(),
+            proxy_error: None,
+            delays: HashMap::new(),
+            delaying: HashSet::new(),
             pending_port_input: None,
             pending_filter_input: None,
         }
@@ -1387,6 +1429,9 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        if this.connected {
+                            this.refresh_live(cx);
+                        }
                     }
                     Err(err) => {
                         log::error("ui", format!("apply failed: {err}"));
@@ -1402,7 +1447,15 @@ impl AppView {
     }
 
     fn is_dirty(&self) -> bool {
-        self.strategy != self.applied
+        let mut current = self.strategy.clone();
+        let mut applied = self.applied.clone();
+        for group in &mut current.groups {
+            group.selected.clear();
+        }
+        for group in &mut applied.groups {
+            group.selected.clear();
+        }
+        current != applied
     }
 
     fn mark_applied(&mut self) {
@@ -1422,6 +1475,76 @@ impl AppView {
         self.traffic_error = None;
         self.traffic_prev = None;
         dirty
+    }
+
+    fn clear_live(&mut self) -> bool {
+        let dirty = self.clear_traffic()
+            || !self.proxy_groups.is_empty()
+            || self.proxy_error.is_some()
+            || !self.delays.is_empty()
+            || !self.delaying.is_empty();
+        self.proxy_groups.clear();
+        self.proxy_error = None;
+        self.delays.clear();
+        self.delaying.clear();
+        dirty
+    }
+
+    fn apply_proxies(&mut self, result: Result<Vec<LiveGroup>, String>) {
+        match result {
+            Ok(mut groups) => {
+                for group in &mut groups {
+                    for member in &mut group.members {
+                        if let Some(delay) = self.delays.get(&member.name) {
+                            member.delay = Some(*delay);
+                        }
+                    }
+                }
+                self.proxy_groups = groups;
+                self.proxy_error = None;
+            }
+            Err(err) => {
+                log::debug("ui", format!("proxies poll failed: {err}"));
+                self.proxy_error = Some("暂时读不到节点组状态。".into());
+            }
+        }
+    }
+
+    fn live_now(&self, name: &str) -> Option<&str> {
+        self.proxy_groups
+            .iter()
+            .find(|group| group.name == name)
+            .map(|group| group.now.as_str())
+            .filter(|now| !now.is_empty())
+    }
+
+    fn refresh_live(&mut self, cx: &mut Context<Self>) {
+        if !self.connected {
+            self.clear_live();
+            return;
+        }
+        let port = self.strategy.mixed_port;
+        cx.spawn(async move |this, cx| {
+            let traffic_port = port;
+            let proxy_port = port;
+            let traffic = cx
+                .background_executor()
+                .spawn(async move { controller::fetch(traffic_port).map_err(|err| err.to_string()) })
+                .await;
+            let proxies = cx
+                .background_executor()
+                .spawn(async move {
+                    controller::fetch_proxies(proxy_port).map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_traffic(traffic);
+                this.apply_proxies(proxies);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn apply_traffic(&mut self, result: Result<TrafficSnapshot, String>) {
@@ -1570,10 +1693,11 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        this.refresh_live(cx);
                     }
                     Ok(None) => {
                         this.connected = false;
-                        this.clear_traffic();
+                        this.clear_live();
                         this.status = "已断开。".into();
                     }
                     Err(err) => {
@@ -1786,6 +1910,150 @@ impl AppView {
             self.status = "已删除规则。".into();
         }
     }
+
+    fn group_now<'a>(&'a self, group: &'a Group) -> &'a str {
+        self.live_now(&group.name)
+            .or_else(|| {
+                if group.selected.is_empty() {
+                    None
+                } else {
+                    Some(group.selected.as_str())
+                }
+            })
+            .unwrap_or("—")
+    }
+
+    fn group_member_names(&self, group: &Group) -> Vec<String> {
+        if let Some(live) = self
+            .proxy_groups
+            .iter()
+            .find(|live| live.name == group.name)
+        {
+            return live.members.iter().map(|member| member.name.clone()).collect();
+        }
+        catalog::resolve_group_members(group, &self.catalog)
+    }
+
+    fn member_delay(&self, name: &str) -> Option<u32> {
+        self.delays.get(name).copied().or_else(|| {
+            self.proxy_groups
+                .iter()
+                .flat_map(|group| group.members.iter())
+                .find(|member| member.name == name)
+                .and_then(|member| member.delay)
+        })
+    }
+
+    fn select_group_member(&mut self, group_id: &str, node: &str, cx: &mut Context<Self>) {
+        if !self.strategy.set_group_selected(group_id, node.to_string()) {
+            self.status = "只能在手动选择组里点选节点。".into();
+            cx.notify();
+            return;
+        }
+        let group_name = self
+            .strategy
+            .groups
+            .iter()
+            .find(|group| group.id == group_id || group.name == group_id)
+            .map(|group| group.name.clone())
+            .unwrap_or_default();
+        if let Some(applied) = self
+            .applied
+            .groups
+            .iter_mut()
+            .find(|group| group.id == group_id || group.name == group_id)
+        {
+            applied.selected = node.to_string();
+        }
+        if let Some(live) = self
+            .proxy_groups
+            .iter_mut()
+            .find(|group| group.name == group_name)
+        {
+            live.now = node.to_string();
+        }
+        if self.persist() {
+            self.status = format!("已切换到 {node}");
+        }
+        if self.connected && !group_name.is_empty() {
+            let port = self.strategy.mixed_port;
+            let group_name = group_name.clone();
+            let node = node.to_string();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        controller::select_proxy(port, &group_name, &node)
+                            .map_err(|err| err.to_string())
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if let Err(err) = result {
+                        this.status = format!("切换失败: {err}");
+                    }
+                    this.refresh_live(cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn start_group_delay(&mut self, group_name: &str, cx: &mut Context<Self>) {
+        if !self.connected {
+            self.status = "连接后再测延迟。".into();
+            cx.notify();
+            return;
+        }
+        if !self.delaying.insert(group_name.to_string()) {
+            return;
+        }
+        self.status = format!("正在测 {group_name} 延迟…");
+        let port = self.strategy.mixed_port;
+        let name = group_name.to_string();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let probe = name.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    controller::test_group_delay(port, &probe).map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.delaying.remove(&name);
+                match result {
+                    Ok(map) => {
+                        for (member, delay) in map {
+                            if member.is_empty() {
+                                if let Some(now) = this.live_now(&name).map(str::to_string) {
+                                    this.delays.insert(now, delay);
+                                }
+                            } else {
+                                this.delays.insert(member, delay);
+                            }
+                        }
+                        for group in &mut this.proxy_groups {
+                            for member in &mut group.members {
+                                if let Some(delay) = this.delays.get(&member.name) {
+                                    member.delay = Some(*delay);
+                                }
+                            }
+                        }
+                        this.status = format!("已更新 {name} 延迟。");
+                    }
+                    Err(err) => {
+                        this.status = format!("测延迟失败: {err}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
 }
 
 impl Render for AppView {
@@ -1825,6 +2093,19 @@ impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
         let busy = self.busy;
+        let live_label = if busy {
+            self.status.clone()
+        } else if connected && self.traffic_has_rate {
+            format!(
+                "已连接 · ↑{} · ↓{}",
+                controller::format_rate(self.traffic_up),
+                controller::format_rate(self.traffic_down)
+            )
+        } else if connected {
+            "已连接".into()
+        } else {
+            "未连接".into()
+        };
         TitleBar::new().child(
             h_flex()
                 .id("title-contents")
@@ -1848,14 +2129,16 @@ impl AppView {
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child(if connected { "已连接" } else { "未连接" }),
+                                .child(live_label),
                         )
                         .when(self.is_dirty() || self.external_change_pending, |this| {
                             this.child(
                                 Button::new("apply")
                                     .small()
                                     .disabled(busy)
-                                    .label(if self.external_change_pending {
+                                    .label(if busy {
+                                        "处理中…"
+                                    } else if self.external_change_pending {
                                         "覆盖并应用"
                                     } else {
                                         "应用"
@@ -1926,7 +2209,11 @@ impl AppView {
                 div()
                     .id("status")
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(if self.status.contains("失败") {
+                        theme.warning
+                    } else {
+                        theme.muted_foreground
+                    })
                     .child(self.status.clone()),
             )
             .child(match self.page {
@@ -1952,11 +2239,42 @@ impl AppView {
         let connected = self.connected;
         let busy = self.busy;
         let mut connect = Button::new("hero-connect").large();
-        connect = if connected {
+        connect = if busy {
+            connect.label(if connected { "正在断开…" } else { "正在连接…" })
+        } else if connected {
             connect.danger().label("断开")
         } else {
             connect.primary().label("连接")
         };
+        let up = if connected && self.traffic_has_rate {
+            controller::format_rate(self.traffic_up)
+        } else {
+            "—".into()
+        };
+        let down = if connected && self.traffic_has_rate {
+            controller::format_rate(self.traffic_down)
+        } else {
+            "—".into()
+        };
+        let conns = if connected {
+            self.traffic.connections.len().to_string()
+        } else {
+            "—".into()
+        };
+        let now = self
+            .live_now("PROXY")
+            .map(str::to_string)
+            .or_else(|| {
+                self.strategy
+                    .groups
+                    .iter()
+                    .find(|group| {
+                        group.name == "PROXY" || group.name.eq_ignore_ascii_case("default")
+                    })
+                    .map(|group| group.selected.clone())
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or_else(|| if connected { "—".into() } else { "未连接".into() });
         v_flex()
             .gap_4()
             .child(page_title(
@@ -2031,9 +2349,13 @@ impl AppView {
                     .gap_3()
                     .child(metric(
                         theme,
-                        "Status",
+                        "状态",
                         if connected { "已连接" } else { "空闲" },
                     ))
+                    .child(metric(theme, "上传", &up))
+                    .child(metric(theme, "下载", &down))
+                    .child(metric(theme, "连接数", &conns))
+                    .child(metric(theme, "PROXY", &now))
                     .child(metric(
                         theme,
                         "系统接管",
@@ -2041,22 +2363,17 @@ impl AppView {
                     ))
                     .child(metric(
                         theme,
-                        "Mixed port",
+                        "Mixed",
                         &format!("127.0.0.1:{}", self.strategy.mixed_port),
                     ))
                     .child(metric(
                         theme,
-                        "Nodes",
+                        "节点",
                         &format!(
                             "{} kept / {} excluded",
                             self.catalog.nodes.len(),
                             self.catalog.excluded.len()
                         ),
-                    ))
-                    .child(metric(
-                        theme,
-                        "Rules",
-                        &self.strategy.rule_sets.len().to_string(),
                     )),
             )
     }
@@ -2293,7 +2610,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "节点组",
-                "点卡片打开编辑窗。来源 ∩ 名称含（或，支持 * ?）∪ 钉住 − 排除。名称不含只打自动命中。",
+                "点节点切换当前出口；点卡片空白处编辑匹配条件。来源 ∩ 名称含（或，支持 * ?）∪ 钉住 − 排除。",
             ))
             .child(
                 h_flex().child({
@@ -2312,10 +2629,39 @@ impl AppView {
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
             })
+            .when(self.connected && self.proxy_error.is_some(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(self.proxy_error.clone().unwrap_or_default()),
+                )
+            })
             .children(self.strategy.groups.iter().map(|group| {
                 let count = catalog::count_group_members(group, &self.catalog);
                 let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
-                render_group_card(entity.clone(), theme, group, count, selected, accent)
+                let now = self.group_now(group).to_string();
+                let members: Vec<(String, Option<u32>)> = self
+                    .group_member_names(group)
+                    .into_iter()
+                    .map(|name| {
+                        let delay = self.member_delay(&name);
+                        (name, delay)
+                    })
+                    .collect();
+                render_group_card(
+                    entity.clone(),
+                    theme,
+                    group,
+                    count,
+                    selected,
+                    accent,
+                    &now,
+                    &members,
+                    group.kind == "select",
+                    self.delaying.contains(&group.name),
+                    self.connected,
+                )
             }))
     }
 
@@ -3166,6 +3512,15 @@ fn render_member_row(
         })
 }
 
+fn format_delay(delay: Option<u32>) -> String {
+    match delay {
+        None => String::new(),
+        Some(0) => "超时".into(),
+        Some(n) if n >= 10_000 => "失败".into(),
+        Some(n) => format!("{n}ms"),
+    }
+}
+
 fn render_group_card(
     entity: Entity<AppView>,
     theme: &Theme,
@@ -3173,11 +3528,19 @@ fn render_group_card(
     count: usize,
     selected: bool,
     accent: Hsla,
+    now: &str,
+    members: &[(String, Option<u32>)],
+    can_select: bool,
+    delaying: bool,
+    connected: bool,
 ) -> impl IntoElement {
     let id = group.id.clone();
     let del_id = group.id.clone();
+    let group_name = group.name.clone();
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
+    let shown = members.iter().take(36).cloned().collect::<Vec<_>>();
+    let extra = members.len().saturating_sub(shown.len());
     v_flex()
         .id(SharedString::from(format!("group-card-{id}")))
         .p_4()
@@ -3215,40 +3578,100 @@ fn render_group_card(
                             count
                         )),
                 )
-                .child({
-                    let entity = entity.clone();
-                    Button::new(SharedString::from(format!("del-group-{del_id}")))
-                        .small()
-                        .danger()
-                        .label("删除")
-                        .on_click(move |_, window, app| {
-                            app.stop_propagation();
-                            let close_modal = entity
-                                .read(app)
-                                .group_edit_id
-                                .as_deref()
-                                == Some(del_id.as_str());
-                            entity.update(app, |this, cx| {
-                                if close_modal {
-                                    this.group_modal_open = false;
-                                    this.group_edit_id = None;
-                                }
-                                this.strategy.remove_group(&del_id);
-                                this.persist_and_apply(cx);
-                                cx.notify();
-                            });
-                            if close_modal {
-                                window.close_dialog(app);
-                            }
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child({
+                            let entity = entity.clone();
+                            let name = group_name.clone();
+                            Button::new(SharedString::from(format!("delay-group-{id}")))
+                                .small()
+                                .label(if delaying { "测延迟…" } else { "测延迟" })
+                                .disabled(delaying || !connected)
+                                .on_click(move |_, _, app| {
+                                    app.stop_propagation();
+                                    entity.update(app, |this, cx| {
+                                        this.start_group_delay(&name, cx);
+                                    });
+                                })
                         })
-                }),
+                        .child({
+                            let entity = entity.clone();
+                            Button::new(SharedString::from(format!("del-group-{del_id}")))
+                                .small()
+                                .danger()
+                                .label("删除")
+                                .on_click(move |_, window, app| {
+                                    app.stop_propagation();
+                                    let close_modal = entity
+                                        .read(app)
+                                        .group_edit_id
+                                        .as_deref()
+                                        == Some(del_id.as_str());
+                                    entity.update(app, |this, cx| {
+                                        if close_modal {
+                                            this.group_modal_open = false;
+                                            this.group_edit_id = None;
+                                        }
+                                        this.strategy.remove_group(&del_id);
+                                        this.persist_and_apply(cx);
+                                        cx.notify();
+                                    });
+                                    if close_modal {
+                                        window.close_dialog(app);
+                                    }
+                                })
+                        }),
+                ),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(muted_fg)
-                .child(group.policy_label()),
+                .child(format!("当前 {}  ·  {}", now, group.policy_label())),
         )
+        .when(!shown.is_empty(), |this| {
+            this.child(
+                h_flex().w_full().flex_wrap().gap_1().children(
+                    shown.into_iter().map(|(name, delay)| {
+                        let delay_text = format_delay(delay);
+                        let label = if delay_text.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{name}  {delay_text}")
+                        };
+                        let is_now = name == now;
+                        let entity = entity.clone();
+                        let group_id = id.clone();
+                        let mut button = Button::new(SharedString::from(format!(
+                            "pick-{id}-{name}"
+                        )))
+                        .small()
+                        .label(label);
+                        if is_now {
+                            button = button.primary();
+                        }
+                        if can_select {
+                            button = button.on_click(move |_, _, app| {
+                                app.stop_propagation();
+                                entity.update(app, |this, cx| {
+                                    this.select_group_member(&group_id, &name, cx);
+                                });
+                            });
+                        }
+                        button
+                    }),
+                ),
+            )
+        })
+        .when(extra > 0, |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(format!("其余 {extra} 个在编辑窗查看")),
+            )
+        })
 }
 
 fn file_stamp(path: &Path) -> Option<SystemTime> {

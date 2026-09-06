@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,7 @@ use serde_json::Value;
 use crate::compile::{controller_port, CONTROLLER_SECRET};
 use crate::log;
 use crate::paths;
+use crate::strategy::Strategy;
 
 const FETCH_TIMEOUT: Duration = Duration::from_millis(800);
 
@@ -28,6 +30,20 @@ pub struct LiveConnection {
     pub upload: u64,
     pub download: u64,
     pub duration: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveGroup {
+    pub name: String,
+    pub kind: String,
+    pub now: String,
+    pub members: Vec<LiveMember>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveMember {
+    pub name: String,
+    pub delay: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +86,30 @@ struct RawMetadata {
     process: String,
     #[serde(default, rename = "processPath")]
     process_path: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ProxiesResponse {
+    #[serde(default)]
+    proxies: HashMap<String, RawProxy>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawProxy {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    now: String,
+    #[serde(default)]
+    all: Vec<String>,
+    #[serde(default)]
+    history: Vec<RawHistory>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawHistory {
+    #[serde(default)]
+    delay: u32,
 }
 
 pub fn fetch(mixed_port: u16) -> Result<TrafficSnapshot> {
@@ -132,6 +172,75 @@ pub fn close_all(mixed_port: u16) -> Result<()> {
     Ok(())
 }
 
+pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
+    let url = format!("http://127.0.0.1:{}/proxies", controller_port(mixed_port));
+    let body = authorized_get(&url, FETCH_TIMEOUT)
+        .with_context(|| format!("GET proxies :{}", controller_port(mixed_port)))?;
+    let parsed: ProxiesResponse = serde_json::from_str(&body).context("parse proxies json")?;
+    let mut groups: Vec<LiveGroup> = parsed
+        .proxies
+        .iter()
+        .filter_map(|(name, raw)| LiveGroup::from_raw(name, raw, &parsed.proxies))
+        .collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    log::debug("controller", format!("proxies groups={}", groups.len()));
+    Ok(groups)
+}
+
+pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {
+    if group.is_empty() || name.is_empty() {
+        return Ok(());
+    }
+    let url = format!(
+        "http://127.0.0.1:{}/proxies/{}",
+        controller_port(mixed_port),
+        encode_path_segment(group)
+    );
+    let body = serde_json::json!({ "name": name }).to_string();
+    ureq::put(&url)
+        .timeout(FETCH_TIMEOUT)
+        .set("Authorization", &format!("Bearer {CONTROLLER_SECRET}"))
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+        .with_context(|| format!("PUT proxy {group} :{}", controller_port(mixed_port)))?;
+    log::info("controller", format!("select {group} -> {name}"));
+    Ok(())
+}
+
+pub fn test_group_delay(mixed_port: u16, group: &str) -> Result<HashMap<String, u32>> {
+    let port = controller_port(mixed_port);
+    let encoded = encode_path_segment(group);
+    let probe = encode_path_segment("https://www.gstatic.com/generate_204");
+    let url = format!("http://127.0.0.1:{port}/group/{encoded}/delay?url={probe}&timeout=5000");
+    match authorized_get(&url, Duration::from_secs(8)) {
+        Ok(body) => parse_delay_map(&body),
+        Err(_) => {
+            let url = format!("http://127.0.0.1:{port}/proxies/{encoded}/delay?url={probe}&timeout=5000");
+            let body = authorized_get(&url, Duration::from_secs(8))
+                .with_context(|| format!("GET delay {group} :{port}"))?;
+            parse_delay_map(&body)
+        }
+    }
+}
+
+pub fn restore_selections(mixed_port: u16, strategy: &Strategy) {
+    for group in &strategy.groups {
+        if group.kind != "select" {
+            continue;
+        }
+        let pick = group.selected.trim();
+        if pick.is_empty() {
+            continue;
+        }
+        if let Err(err) = select_proxy(mixed_port, &group.name, pick) {
+            log::debug(
+                "controller",
+                format!("restore {} -> {}: {err:#}", group.name, pick),
+            );
+        }
+    }
+}
+
 pub fn reload(mixed_port: u16) -> Result<()> {
     let path = paths::runtime_yaml_path()?;
     let url = format!(
@@ -147,6 +256,88 @@ pub fn reload(mixed_port: u16) -> Result<()> {
         .with_context(|| format!("PUT configs :{}", controller_port(mixed_port)))?;
     log::info("controller", "reloaded runtime.yaml");
     Ok(())
+}
+
+impl LiveGroup {
+    fn from_raw(name: &str, raw: &RawProxy, all: &HashMap<String, RawProxy>) -> Option<Self> {
+        if !is_group_kind(&raw.kind) {
+            return None;
+        }
+        let members = raw
+            .all
+            .iter()
+            .map(|member| LiveMember {
+                name: member.clone(),
+                delay: all.get(member).and_then(latest_delay),
+            })
+            .collect();
+        Some(Self {
+            name: name.to_string(),
+            kind: normalize_group_kind(&raw.kind),
+            now: raw.now.clone(),
+            members,
+        })
+    }
+}
+
+fn is_group_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "selector" | "urltest" | "fallback" | "loadbalance" | "relay"
+    )
+}
+
+fn normalize_group_kind(kind: &str) -> String {
+    match kind.to_ascii_lowercase().as_str() {
+        "urltest" => "url-test".into(),
+        "fallback" => "fallback".into(),
+        other => other.to_string(),
+    }
+}
+
+fn latest_delay(raw: &RawProxy) -> Option<u32> {
+    raw.history.last().map(|item| item.delay)
+}
+
+fn authorized_get(url: &str, timeout: Duration) -> Result<String> {
+    ureq::get(url)
+        .timeout(timeout)
+        .set("Authorization", &format!("Bearer {CONTROLLER_SECRET}"))
+        .call()
+        .with_context(|| format!("GET {url}"))?
+        .into_string()
+        .context("read controller body")
+}
+
+fn parse_delay_map(body: &str) -> Result<HashMap<String, u32>> {
+    let value: Value = serde_json::from_str(body).context("parse delay json")?;
+    match value {
+        Value::Object(map) => {
+            if let Some(delay) = map.get("delay").and_then(Value::as_u64) {
+                let mut out = HashMap::new();
+                out.insert(String::new(), delay as u32);
+                return Ok(out);
+            }
+            Ok(map
+                .into_iter()
+                .filter_map(|(name, delay)| delay.as_u64().map(|n| (name, n as u32)))
+                .collect())
+        }
+        _ => anyhow::bail!("unexpected delay json"),
+    }
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 impl LiveConnection {
