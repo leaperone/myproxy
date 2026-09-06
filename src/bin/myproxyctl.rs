@@ -32,6 +32,11 @@ enum Commands {
     Extension {
         state: String,
     },
+    /// Traffic that matches no rule (`MATCH`): `direct` or a group name.
+    Unmatched {
+        /// `direct`, `group` (the default group), or a group name such as `default` / `PROXY`.
+        via: Option<String>,
+    },
     Filter {
         #[arg(long)]
         set: Option<String>,
@@ -158,6 +163,7 @@ fn run(cli: Cli) -> Result<()> {
                 "port",
                 "tun",
                 "extension",
+                "unmatched",
                 "filter",
                 "subscription",
                 "group",
@@ -203,10 +209,13 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Status => {
             let strategy = Strategy::load()?;
             let catalog = catalog::Catalog::load()?;
+            let unmatched = myproxy::compile::unmatched_target(&strategy);
             let status = serde_json::json!({
                 "mixed_port": strategy.mixed_port,
                 "tun": strategy.tun,
                 "extension": strategy.system_extension,
+                "unmatched": unmatched,
+                "unmatched_via": strategy.unmatched_via,
                 "subscriptions": strategy.subscriptions.len(),
                 "nodes": catalog.nodes.len(),
                 "excluded": catalog.excluded.len(),
@@ -216,10 +225,11 @@ fn run(cli: Cli) -> Result<()> {
             });
             emit(json, status,
                 format!(
-                "mixed-port {}  tun {}  extension {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
+                "mixed-port {}  tun {}  extension {}  unmatched {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
                 strategy.mixed_port,
                 if strategy.tun { "on" } else { "off" },
                 if strategy.system_extension { "on" } else { "off" },
+                unmatched,
                 strategy.subscriptions.len(),
                 catalog.nodes.len(),
                 catalog.excluded.len(),
@@ -326,6 +336,33 @@ fn run(cli: Cli) -> Result<()> {
                 json,
                 serde_json::json!({"extension": on, "tun": strategy.tun}),
                 format!("extension {}", if on { "on" } else { "off" }),
+            );
+        }
+        Commands::Unmatched { via } => {
+            let mut strategy = Strategy::load()?;
+            if let Some(via) = via {
+                let via = via.trim();
+                if via.is_empty() {
+                    bail!("unmatched direct|<group>");
+                }
+                if via.eq_ignore_ascii_case("direct") {
+                    strategy.unmatched_via = "DIRECT".into();
+                } else if via.eq_ignore_ascii_case("group") {
+                    strategy.unmatched_via = myproxy::compile::default_group(&strategy).to_string();
+                } else {
+                    strategy.unmatched_via = via.to_string();
+                }
+                strategy.save()?;
+            }
+            let unmatched = myproxy::compile::unmatched_target(&strategy);
+            emit(
+                json,
+                serde_json::json!({
+                    "unmatched": unmatched,
+                    "unmatched_via": strategy.unmatched_via,
+                    "direct": myproxy::compile::unmatched_is_direct(&strategy),
+                }),
+                format!("unmatched {unmatched}"),
             );
         }
         Commands::Filter { set } => {

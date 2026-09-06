@@ -102,6 +102,10 @@ pub struct Strategy {
     /// Call `Supervisor::connect` during process start.
     #[serde(default)]
     pub connect_on_launch: bool,
+    /// Unmatched traffic (`MATCH`). Empty and `DIRECT` are whitelist
+    /// (positive list only). Any other value is a group name.
+    #[serde(default)]
+    pub unmatched_via: String,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
@@ -201,6 +205,7 @@ impl Default for Strategy {
             silent_launch: false,
             lite_mode: false,
             connect_on_launch: false,
+            unmatched_via: "DIRECT".into(),
             subscriptions: Vec::new(),
             groups: vec![
                 Group::all_nodes("PROXY".into(), "select".into()),

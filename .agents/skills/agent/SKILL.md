@@ -24,6 +24,6 @@ myproxyctl --json apply
 myproxyctl --json connect
 ```
 
-Use `subscription list`, `group list`, and `rule list` with `--json` when reading existing configuration. Use `port <number>`, `tun on|off`, and `extension on|off` for transport settings; enabling `extension` disables TUN. Never print subscription URLs or logs to a public response unless the operator asks for them.
+Use `subscription list`, `group list`, and `rule list` with `--json` when reading existing configuration. Use `port <number>`, `tun on|off`, and `extension on|off` for transport settings; enabling `extension` disables TUN. Use `unmatched direct` or `unmatched <group>` for traffic that matches no rule. Never print subscription URLs or logs to a public response unless the operator asks for them.
 
 `--json` is for machine-readable results, not a permission bypass. Keep mutations explicit, check the returned status, and run `apply` after configuration changes that should reach mihomo.
