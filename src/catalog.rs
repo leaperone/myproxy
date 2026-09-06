@@ -10,9 +10,9 @@ use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
 
-const SUBSCRIPTION_CURL_MAX_TIME: &str = "12";
-const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "5";
-const SUBSCRIPTION_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const SUBSCRIPTION_CURL_MAX_TIME: &str = "8";
+const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "3";
+const SUBSCRIPTION_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
@@ -156,10 +156,10 @@ fn fetch_http_body(name: &str, url: &str) -> Result<String> {
     // is tried first. Prefer curl --ipv4 on macOS; fall back to ureq.
     match fetch_http_body_curl_ipv4(url) {
         Ok(body) => Ok(body),
-        Err(err) if err.is::<std::io::Error>() => {
+        Err(err) => {
             log::warn(
                 "catalog",
-                format!("{name} IPv4 curl unavailable, trying default HTTP"),
+                format!("{name} IPv4 curl failed ({err:#}), trying default HTTP"),
             );
             ureq::get(url)
                 .timeout(SUBSCRIPTION_HTTP_TIMEOUT)
@@ -169,7 +169,6 @@ fn fetch_http_body(name: &str, url: &str) -> Result<String> {
                 .into_string()
                 .with_context(|| format!("read {name}"))
         }
-        Err(err) => Err(err).with_context(|| format!("GET {name} via IPv4 curl")),
     }
 }
 
