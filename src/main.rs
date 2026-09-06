@@ -16,6 +16,17 @@ use ui::AppView;
 
 fn main() {
     myproxy::log::init();
+    let _instance_guard = match myproxy::instance::InstanceGuard::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            myproxy::log::info("main", "another myproxy instance is already running");
+            return;
+        }
+        Err(err) => {
+            myproxy::log::error("main", format!("acquire instance lock failed: {err}"));
+            return;
+        }
+    };
     myproxy::log::info("main", "myproxy start");
     let strategy = Strategy::load().unwrap_or_else(|err| {
         myproxy::log::error("main", format!("load strategy failed: {err:#}"));
@@ -36,7 +47,11 @@ fn main() {
         myproxy::log::warn("login", format!("{err:#}"));
     }
     let lite = strategy.lite_mode;
-    Supervisor::shared().adopt_running(strategy.tun, strategy.system_extension);
+    Supervisor::shared().adopt_running(
+        strategy.tun,
+        strategy.system_extension,
+        strategy.mixed_port,
+    );
     Supervisor::shared().sync_wanted_on_launch();
     let show_window = !lite && !strategy.silent_launch;
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);

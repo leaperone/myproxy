@@ -5,6 +5,8 @@ enum NetworkExtensionControlOperation: String, Sendable {
     case configureTransparentProxy
     case startTransparentProxy
     case stopTransparentProxy
+    case configureDNSProxy
+    case stopDNSProxy
 }
 
 struct NetworkExtensionControlFailure: Error, Sendable, LocalizedError {

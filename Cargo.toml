@@ -1,6 +1,6 @@
 [package]
 name = "myproxy"
-version = "0.0.5"
+version = "0.0.7"
 edition = "2021"
 description = "GPUI controller for a bundled mihomo core"
 publish = false

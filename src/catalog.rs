@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
 
@@ -10,10 +11,17 @@ use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
 
+const SUBSCRIPTION_CURL_MAX_TIME: &str = "8";
+const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "3";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     pub nodes: Vec<Node>,
     pub excluded: Vec<Excluded>,
+    #[serde(default)]
+    pub subscription_urls: HashMap<String, String>,
+    #[serde(default)]
+    pub exclude_filter: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +60,7 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
         .context("invalid exclude_filter regex")
         .inspect_err(|err| log::error("catalog", format!("{err:#}")))?;
     let previous = Catalog::load().unwrap_or_default();
+    let cache_filter_matches = previous.exclude_filter == strategy.exclude_filter;
     let mut catalog = Catalog::default();
     log::debug(
         "catalog",
@@ -97,12 +106,25 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
             }
             Err(err) => {
                 log::warn("catalog", format!("fetch {} failed: {err:#}", sub.name));
-                let reused = previous
-                    .nodes
+                let unique_name = strategy
+                    .subscriptions
                     .iter()
-                    .filter(|node| node.subscription == sub.name)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                    .filter(|candidate| candidate.name == sub.name)
+                    .count()
+                    == 1;
+                let reused = if cache_filter_matches
+                    && unique_name
+                    && previous.subscription_urls.get(&sub.name) == Some(&sub.url)
+                {
+                    previous
+                        .nodes
+                        .iter()
+                        .filter(|node| node.subscription == sub.name)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 if !reused.is_empty() {
                     log::info(
                         "catalog",
@@ -122,6 +144,13 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
             }
         }
     }
+
+    catalog.exclude_filter = strategy.exclude_filter.clone();
+    catalog.subscription_urls = strategy
+        .subscriptions
+        .iter()
+        .map(|sub| (sub.name.clone(), sub.url.clone()))
+        .collect();
 
     catalog.save()?;
     log::info(
@@ -147,23 +176,11 @@ fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
 }
 
 fn fetch_http_body(name: &str, url: &str) -> Result<String> {
-    // ureq 2 is HTTP/1.1 only and has no Happy Eyeballs. Cloudflare AAAA
-    // records that blackhole (Cunoe) hit the 30s read timeout whenever IPv6
-    // is tried first. Prefer curl --ipv4 on macOS; fall back to ureq.
-    if let Ok(body) = fetch_http_body_curl_ipv4(url) {
-        return Ok(body);
-    }
-    log::warn(
-        "catalog",
-        format!("{name} IPv4 curl failed, trying default HTTP"),
-    );
-    ureq::get(url)
-        .timeout(std::time::Duration::from_secs(45))
-        .set("User-Agent", "clash.meta")
-        .call()
-        .with_context(|| format!("GET {name}"))?
-        .into_string()
-        .with_context(|| format!("read {name}"))
+    // curl is available on macOS and lets us force IPv4. Do not fall back to
+    // a second HTTP client here: a broken DNS/IPv6 path would otherwise pay
+    // the full timeout twice for every subscription and make Apply appear
+    // hung. The previous catalog remains available to the caller.
+    fetch_http_body_curl_ipv4(url).with_context(|| format!("GET {name} via IPv4 curl"))
 }
 
 fn fetch_http_body_curl_ipv4(url: &str) -> Result<String> {
@@ -174,9 +191,9 @@ fn fetch_http_body_curl_ipv4(url: &str) -> Result<String> {
             "-A",
             "clash.meta",
             "--max-time",
-            "45",
+            SUBSCRIPTION_CURL_MAX_TIME,
             "--connect-timeout",
-            "15",
+            SUBSCRIPTION_CURL_CONNECT_TIMEOUT,
             url,
         ])
         .output()

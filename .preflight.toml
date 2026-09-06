@@ -1,0 +1,7 @@
+base_branch = "main"
+
+[[scope]]
+name = "Rust"
+prefix = "src/"
+check = "cargo check --quiet"
+build = "cargo build --quiet"

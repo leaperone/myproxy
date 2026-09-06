@@ -43,6 +43,154 @@ pub struct LiveConnection {
     pub duration: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionColumn {
+    Process,
+    Destination,
+    Network,
+    Chain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionFilters {
+    pub process: Option<String>,
+    pub destination: Option<String>,
+    pub network: Option<String>,
+    pub chain: Option<String>,
+    pub show_direct: bool,
+}
+
+impl Default for ConnectionFilters {
+    fn default() -> Self {
+        Self {
+            process: None,
+            destination: None,
+            network: None,
+            chain: None,
+            show_direct: false,
+        }
+    }
+}
+
+impl ConnectionFilters {
+    pub fn column(&self, column: ConnectionColumn) -> Option<&str> {
+        match column {
+            ConnectionColumn::Process => self.process.as_deref(),
+            ConnectionColumn::Destination => self.destination.as_deref(),
+            ConnectionColumn::Network => self.network.as_deref(),
+            ConnectionColumn::Chain => self.chain.as_deref(),
+        }
+    }
+
+    pub fn set_column(&mut self, column: ConnectionColumn, value: Option<String>) {
+        match column {
+            ConnectionColumn::Process => self.process = value,
+            ConnectionColumn::Destination => self.destination = value,
+            ConnectionColumn::Network => self.network = value,
+            ConnectionColumn::Chain => self.chain = value,
+        }
+    }
+
+    pub fn has_column_filter(&self) -> bool {
+        self.process.is_some()
+            || self.destination.is_some()
+            || self.network.is_some()
+            || self.chain.is_some()
+    }
+
+    pub fn clear_columns(&mut self) {
+        self.process = None;
+        self.destination = None;
+        self.network = None;
+        self.chain = None;
+    }
+
+    pub fn matches(&self, conn: &LiveConnection) -> bool {
+        self.matches_except(conn, None)
+    }
+
+    pub fn matches_except(&self, conn: &LiveConnection, skip: Option<ConnectionColumn>) -> bool {
+        if !self.show_direct && conn.is_direct() {
+            return false;
+        }
+        if skip != Some(ConnectionColumn::Process) {
+            if let Some(value) = &self.process {
+                if conn.process != *value {
+                    return false;
+                }
+            }
+        }
+        if skip != Some(ConnectionColumn::Destination) {
+            if let Some(value) = &self.destination {
+                if conn.destination != *value {
+                    return false;
+                }
+            }
+        }
+        if skip != Some(ConnectionColumn::Network) {
+            if let Some(value) = &self.network {
+                if conn.network != *value {
+                    return false;
+                }
+            }
+        }
+        if skip != Some(ConnectionColumn::Chain) {
+            if let Some(value) = &self.chain {
+                if conn.chain != *value {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+impl LiveConnection {
+    pub fn is_direct(&self) -> bool {
+        chain_has_direct(&self.chain)
+    }
+
+    pub fn column_value(&self, column: ConnectionColumn) -> &str {
+        match column {
+            ConnectionColumn::Process => &self.process,
+            ConnectionColumn::Destination => &self.destination,
+            ConnectionColumn::Network => &self.network,
+            ConnectionColumn::Chain => &self.chain,
+        }
+    }
+}
+
+pub fn chain_has_direct(chain: &str) -> bool {
+    chain
+        .split(" → ")
+        .any(|hop| hop.eq_ignore_ascii_case("DIRECT"))
+}
+
+pub fn filter_connections<'a>(
+    connections: &'a [LiveConnection],
+    filters: &ConnectionFilters,
+) -> Vec<&'a LiveConnection> {
+    connections
+        .iter()
+        .filter(|conn| filters.matches(conn))
+        .collect()
+}
+
+pub fn connection_column_values(
+    connections: &[LiveConnection],
+    filters: &ConnectionFilters,
+    column: ConnectionColumn,
+) -> Vec<String> {
+    let mut values: Vec<String> = connections
+        .iter()
+        .filter(|conn| filters.matches_except(conn, Some(column)))
+        .map(|conn| conn.column_value(column).to_string())
+        .collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiveGroup {
     pub name: String,
@@ -651,4 +799,88 @@ fn unix_from_civil(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> Option<
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     Some(days * 86400 + i64::from(hh) * 3600 + i64::from(mm) * 60 + i64::from(ss))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(process: &str, destination: &str, network: &str, chain: &str) -> LiveConnection {
+        LiveConnection {
+            id: process.to_string(),
+            process: process.into(),
+            destination: destination.into(),
+            network: network.into(),
+            chain: chain.into(),
+            upload: 0,
+            download: 0,
+            duration: "1秒".into(),
+        }
+    }
+
+    #[test]
+    fn chain_has_direct_reads_hops() {
+        assert!(chain_has_direct("DIRECT"));
+        assert!(chain_has_direct("direct"));
+        assert!(chain_has_direct("PROXY → DIRECT"));
+        assert!(!chain_has_direct("PROXY → HK"));
+        assert!(!chain_has_direct("—"));
+    }
+
+    #[test]
+    fn hide_direct_drops_direct_rows() {
+        let rows = [
+            conn("Arc", "example.com:443", "TCP", "PROXY → HK"),
+            conn("Safari", "apple.com:443", "TCP", "DIRECT"),
+        ];
+        let hidden = filter_connections(&rows, &ConnectionFilters::default());
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].process, "Arc");
+
+        let mut shown = ConnectionFilters::default();
+        shown.show_direct = true;
+        assert_eq!(filter_connections(&rows, &shown).len(), 2);
+    }
+
+    #[test]
+    fn column_filters_and_together() {
+        let rows = [
+            conn("Arc", "github.com:443", "TCP", "PROXY → HK"),
+            conn("Arc", "example.com:443", "UDP", "PROXY → JP"),
+            conn("Safari", "github.com:443", "TCP", "PROXY → HK"),
+        ];
+        let mut filters = ConnectionFilters {
+            show_direct: true,
+            process: Some("Arc".into()),
+            destination: Some("github.com:443".into()),
+            ..ConnectionFilters::default()
+        };
+        let shown = filter_connections(&rows, &filters);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].network, "TCP");
+
+        filters.set_column(ConnectionColumn::Process, None);
+        assert_eq!(filter_connections(&rows, &filters).len(), 2);
+    }
+
+    #[test]
+    fn column_values_ignore_own_filter() {
+        let rows = [
+            conn("Arc", "github.com:443", "TCP", "PROXY → HK"),
+            conn("Safari", "apple.com:443", "TCP", "PROXY → HK"),
+        ];
+        let filters = ConnectionFilters {
+            show_direct: true,
+            process: Some("Arc".into()),
+            ..ConnectionFilters::default()
+        };
+        assert_eq!(
+            connection_column_values(&rows, &filters, ConnectionColumn::Process),
+            ["Arc", "Safari"]
+        );
+        assert_eq!(
+            connection_column_values(&rows, &filters, ConnectionColumn::Destination),
+            ["github.com:443"]
+        );
+    }
 }

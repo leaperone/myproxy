@@ -1,0 +1,4 @@
+- `TransparentProxyProvider` 已有 `prepareDNS` 控制命令，要求活动 revision、activationIdentifier 和 bootstrap；host 必须在透明代理连接后通过 `sendProviderMessage` 准备 registry。
+- `NEDNSProxyManager` 使用 singleton `shared()`；保存 `isEnabled=true` 的 `NEDNSProxyProviderProtocol` 会激活 DNS provider，禁用保存/移除配置可恢复系统解析器。
+- `scripts/build-network-host.sh` 会通过 glob 自动包含新增 `DNSProxyManager.swift`；host 与 extension Swift 静态构建均已通过。
+- `src/compile.rs` 现在把 DNS 引擎抽成可复用配置：SE 开启 listener/nameserver 但不写 `dns-hijack`，TUN 保留 UDP/TCP 53 hijack；对应 Rust 单测已通过。

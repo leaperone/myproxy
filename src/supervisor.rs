@@ -1,6 +1,7 @@
 use std::fs;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -19,6 +20,7 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
 const FAIL_BEFORE_RETRY: u32 = 3;
 const RECOVER_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_RECOVERIES: u32 = 5;
+const STARTUP_GRACE: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreHealth {
@@ -69,6 +71,7 @@ impl CoreHealth {
 struct HealthWatch {
     last_check: Option<Instant>,
     last_recover: Option<Instant>,
+    recover_after: Option<Instant>,
     last: CoreHealth,
     fails: u32,
     recoveries: u32,
@@ -79,6 +82,7 @@ impl Default for HealthWatch {
         Self {
             last_check: None,
             last_recover: None,
+            recover_after: None,
             last: CoreHealth::idle(),
             fails: 0,
             recoveries: 0,
@@ -90,12 +94,59 @@ pub struct Supervisor {
     child: Mutex<Option<Child>>,
     running_tun: Mutex<bool>,
     running_se: Mutex<bool>,
+    running_mixed_port: Mutex<Option<u16>>,
     health: Mutex<HealthWatch>,
 }
 
-// ponytail: one core per process; cross-process CLI operations need a file lock.
 // The flag remains set after shutdown so queued operations cannot restart the core.
 static OPERATION: Mutex<bool> = Mutex::new(false);
+const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct OperationGuard {
+    _state: std::sync::MutexGuard<'static, bool>,
+    file: File,
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_operation() -> Result<OperationGuard> {
+    acquire_operation_with_timeout(OPERATION_LOCK_TIMEOUT)
+}
+
+fn acquire_operation_with_timeout(timeout: Duration) -> Result<OperationGuard> {
+    let deadline = Instant::now() + timeout;
+    let state = loop {
+        match OPERATION.try_lock() {
+            Ok(state) => break state,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => bail!("另一个核心操作正在进行中，请稍后重试"),
+        }
+    };
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(paths::operation_lock_path()?)
+        .context("open operation lock")?;
+    loop {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(OperationGuard { _state: state, file });
+        }
+        if Instant::now() >= deadline {
+            bail!("另一个核心操作正在进行中，请稍后重试");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 impl Default for Supervisor {
     fn default() -> Self {
@@ -103,6 +154,7 @@ impl Default for Supervisor {
             child: Mutex::new(None),
             running_tun: Mutex::new(false),
             running_se: Mutex::new(false),
+            running_mixed_port: Mutex::new(None),
             health: Mutex::new(HealthWatch::default()),
         }
     }
@@ -114,10 +166,11 @@ impl Supervisor {
         INSTANCE.get_or_init(|| Arc::new(Self::default())).clone()
     }
 
-    pub fn adopt_running(&self, tun: bool, system_extension: bool) {
-        if self.is_running() {
+    pub fn adopt_running(&self, tun: bool, system_extension: bool, mixed_port: u16) {
+        if pid_file_alive(Some(mixed_port)) {
             *self.running_tun.lock().expect("supervisor lock") = tun;
             *self.running_se.lock().expect("supervisor lock") = system_extension;
+            *self.running_mixed_port.lock().expect("supervisor lock") = Some(mixed_port);
             set_wanted(true);
         }
     }
@@ -145,13 +198,15 @@ impl Supervisor {
     }
 
     pub fn connect(&self, strategy: &Strategy) -> Result<()> {
-        let shutting_down = OPERATION.lock().expect("supervisor operation lock");
-        if *shutting_down {
+        let operation = acquire_operation()?;
+        if *operation._state {
             bail!("application is shutting down");
         }
         set_wanted(true);
         self.reset_health();
-        self.connect_inner(strategy)
+        let result = self.connect_inner(strategy);
+        drop(operation);
+        result
     }
 
     fn connect_inner(&self, strategy: &Strategy) -> Result<()> {
@@ -164,7 +219,11 @@ impl Supervisor {
         );
         self.disconnect_inner()?;
         let catalog = catalog::refresh(strategy)?;
-        compile::compile(strategy, &catalog)?;
+        self.start_with_catalog(strategy, &catalog)
+    }
+
+    fn start_with_catalog(&self, strategy: &Strategy, catalog: &Catalog) -> Result<()> {
+        compile::compile(strategy, catalog)?;
         let yaml = paths::runtime_yaml_path()?;
         let bin = paths::bundled_mihomo();
         if !bin.is_file() {
@@ -237,6 +296,11 @@ impl Supervisor {
         *self.child.lock().expect("supervisor lock") = Some(child);
         *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
         *self.running_se.lock().expect("supervisor lock") = strategy.system_extension;
+        *self.running_mixed_port.lock().expect("supervisor lock") = Some(strategy.mixed_port);
+        self.health
+            .lock()
+            .expect("supervisor health lock")
+            .recover_after = Some(Instant::now() + STARTUP_GRACE);
         log::info(
             "supervisor",
             format!(
@@ -258,48 +322,82 @@ impl Supervisor {
     }
 
     pub fn apply(&self, strategy: &Strategy) -> Result<Catalog> {
-        let shutting_down = OPERATION.lock().expect("supervisor operation lock");
-        if *shutting_down {
+        self.apply_inner(strategy, true)
+    }
+
+    pub fn apply_cached(&self, strategy: &Strategy) -> Result<Catalog> {
+        self.apply_inner(strategy, false)
+    }
+
+    fn apply_inner(&self, strategy: &Strategy, refresh_catalog: bool) -> Result<Catalog> {
+        let operation = acquire_operation()?;
+        if *operation._state {
             bail!("application is shutting down");
         }
         log::debug("supervisor", "apply");
-        let catalog = catalog::refresh(strategy)?;
-        compile::compile(strategy, &catalog)?;
-        if self.is_running() {
-            let was_tun = *self.running_tun.lock().expect("supervisor lock");
-            let was_se = *self.running_se.lock().expect("supervisor lock");
-            if was_tun != strategy.tun || was_se != strategy.system_extension {
+        let catalog = if refresh_catalog {
+            catalog::refresh(strategy)?
+        } else {
+            Catalog::load().unwrap_or_default()
+        };
+        let running = self.is_running();
+        let was_tun = *self.running_tun.lock().expect("supervisor lock");
+        let was_se = *self.running_se.lock().expect("supervisor lock");
+        let was_port = *self.running_mixed_port.lock().expect("supervisor lock");
+        let needs_reconnect = needs_reconnect(
+            running,
+            is_wanted(),
+            was_tun,
+            was_se,
+            was_port,
+            strategy,
+        );
+        if needs_reconnect {
+            if running {
                 log::info(
                     "supervisor",
                     format!(
-                        "intercept tun {was_tun}→{} se {was_se}→{}, reconnect",
-                        strategy.tun, strategy.system_extension
+                        "apply requires reconnect: port {:?}→{} tun {was_tun}→{} se {was_se}→{}",
+                        was_port,
+                        strategy.mixed_port,
+                        strategy.tun,
+                        strategy.system_extension
                     ),
                 );
-                self.connect_inner(strategy)?;
-            } else {
-                controller::reload(strategy.mixed_port)?;
+            }
+            self.disconnect_inner()?;
+            self.start_with_catalog(strategy, &catalog)?;
+        } else {
+            compile::compile(strategy, &catalog)?;
+            if running {
+                if let Err(err) = controller::reload(strategy.mixed_port) {
+                    log::warn("supervisor", format!("controller reload failed, restarting core: {err:#}"));
+                    self.disconnect_inner()?;
+                    self.start_with_catalog(strategy, &catalog)?;
+                    return Ok(catalog);
+                }
                 controller::restore_selections(strategy.mixed_port, strategy);
                 if strategy.system_extension {
                     crate::network_extension::enable_async(strategy);
                 }
             }
         }
+        drop(operation);
         Ok(catalog)
     }
 
     pub fn disconnect(&self) -> Result<()> {
         set_wanted(false);
         self.reset_health();
-        let _operation = OPERATION.lock().expect("supervisor operation lock");
+        let _operation = acquire_operation()?;
         self.disconnect_inner()
     }
 
     pub fn shutdown(&self) -> Result<()> {
         set_wanted(false);
         self.reset_health();
-        let mut shutting_down = OPERATION.lock().expect("supervisor operation lock");
-        *shutting_down = true;
+        let mut operation = acquire_operation()?;
+        *operation._state = true;
         self.disconnect_inner()
     }
 
@@ -331,24 +429,36 @@ impl Supervisor {
         crate::network_extension::disable_async();
         let mut stopped = false;
         let child = self.child.lock().expect("supervisor lock").take();
+        let child_pid = child.as_ref().map(Child::id);
         if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
             stopped = true;
         }
-        if let Ok(path) = paths::pid_path() {
-            if let Ok(pid) = fs::read_to_string(&path) {
-                if let Ok(pid) = pid.trim().parse::<i32>() {
-                    unsafe {
-                        libc::kill(pid, libc::SIGTERM);
+        if child_pid.is_none() {
+            if let Ok(path) = paths::pid_path() {
+                if let Ok(pid) = fs::read_to_string(&path) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        let port = *self.running_mixed_port.lock().expect("supervisor lock");
+                        if port.map(mixed_listening).unwrap_or(false) {
+                            unsafe {
+                                libc::kill(pid, libc::SIGTERM);
+                            }
+                            wait_for_pid_exit(pid);
+                            stopped = true;
+                        } else {
+                            log::warn("supervisor", "ignoring stale mihomo pid without a listening port");
+                        }
                     }
-                    stopped = true;
                 }
-                let _ = fs::remove_file(path);
             }
+        }
+        if let Ok(path) = paths::pid_path() {
+            let _ = fs::remove_file(path);
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
         *self.running_se.lock().expect("supervisor lock") = false;
+        *self.running_mixed_port.lock().expect("supervisor lock") = None;
         if stopped {
             log::info("supervisor", "disconnect");
         }
@@ -361,18 +471,23 @@ impl Supervisor {
             if let Some(child) = slot.as_mut() {
                 match child.try_wait() {
                     Ok(None) => return true,
-                    _ => *slot = None,
+                    _ => {
+                        let pid = child.id();
+                        *slot = None;
+                        *self.running_mixed_port.lock().expect("supervisor lock") = None;
+                        if let Ok(path) = paths::pid_path() {
+                            let matches = fs::read_to_string(&path)
+                                .map(|value| value.trim() == pid.to_string())
+                                .unwrap_or(false);
+                            if matches {
+                                let _ = fs::remove_file(path);
+                            }
+                        }
+                    }
                 }
             }
         }
-        if let Ok(path) = paths::pid_path() {
-            if let Ok(pid) = fs::read_to_string(path) {
-                if let Ok(pid) = pid.trim().parse::<i32>() {
-                    return unsafe { libc::kill(pid, 0) == 0 };
-                }
-            }
-        }
-        false
+        pid_file_alive(*self.running_mixed_port.lock().expect("supervisor lock"))
     }
 
     fn probe_now(&self, strategy: &Strategy) -> Option<String> {
@@ -401,6 +516,7 @@ impl Supervisor {
         watch.last_check = Some(Instant::now());
         watch.fails = 0;
         watch.recoveries = 0;
+        watch.recover_after = None;
         watch.last = CoreHealth::ready(proxy_now);
     }
 
@@ -415,8 +531,17 @@ impl Supervisor {
             watch.fails = watch.fails.saturating_add(1);
             (watch.fails, watch.recoveries, watch.last_recover)
         };
+        let warming_up = self
+            .health
+            .lock()
+            .expect("supervisor health lock")
+            .recover_after
+            .map(|until| now < until)
+            .unwrap_or(false);
         let health = if !is_wanted() {
             CoreHealth::idle()
+        } else if warming_up {
+            CoreHealth::failing("核心正在启动，等待就绪…")
         } else if fails < FAIL_BEFORE_RETRY {
             CoreHealth::failing("核心暂时无响应，正在确认…")
         } else if recoveries >= MAX_RECOVERIES {
@@ -438,12 +563,12 @@ impl Supervisor {
             self.reset_health();
             return CoreHealth::idle();
         }
-        let Ok(guard) = OPERATION.try_lock() else {
+        let Ok(guard) = acquire_operation_with_timeout(Duration::ZERO) else {
             let health = CoreHealth::failing("核心异常，正在等待当前操作结束…");
             self.store_health(health.clone());
             return health;
         };
-        if *guard {
+        if *guard._state {
             let health = CoreHealth::failing("核心异常，应用正在退出…");
             self.store_health(health.clone());
             return health;
@@ -536,13 +661,58 @@ fn mixed_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_ok()
 }
 
+fn needs_reconnect(
+    running: bool,
+    wanted: bool,
+    running_tun: bool,
+    running_se: bool,
+    running_port: Option<u16>,
+    strategy: &Strategy,
+) -> bool {
+    (running
+        && (running_tun != strategy.tun
+            || running_se != strategy.system_extension
+            || running_port != Some(strategy.mixed_port)))
+        || (!running && wanted)
+}
+
+fn wait_for_pid_exit(pid: i32) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while unsafe { libc::kill(pid, 0) == 0 } && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn pid_file_alive(port: Option<u16>) -> bool {
+    let Ok(path) = paths::pid_path() else {
+        return false;
+    };
+    let Ok(raw_pid) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(pid) = raw_pid.trim().parse::<i32>() else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, 0) != 0 } {
+        let _ = fs::remove_file(path);
+        return false;
+    }
+    if let Some(port) = port {
+        if !mixed_listening(port) {
+            let _ = fs::remove_file(path);
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn queued_apply_observes_shutdown() {
-        let mut operation = OPERATION.lock().unwrap();
+        *OPERATION.lock().unwrap() = true;
         let (ready, started) = std::sync::mpsc::channel();
         let queued = std::thread::spawn(move || {
             // A regressed guard still fails before any disk or core operations.
@@ -557,10 +727,45 @@ mod tests {
                 .to_string()
         });
         started.recv().unwrap();
-        *operation = true;
-        drop(operation);
         assert_eq!(queued.join().unwrap(), "application is shutting down");
         *OPERATION.lock().unwrap() = false;
+    }
+
+    #[test]
+    fn port_change_requires_reconnect() {
+        let strategy = Strategy {
+            mixed_port: 7891,
+            ..Strategy::default()
+        };
+        assert!(needs_reconnect(
+            true,
+            true,
+            strategy.tun,
+            strategy.system_extension,
+            Some(7890),
+            &strategy,
+        ));
+    }
+
+    #[test]
+    fn wanted_but_missing_core_requires_reconnect() {
+        let strategy = Strategy::default();
+        assert!(needs_reconnect(
+            false,
+            true,
+            strategy.tun,
+            strategy.system_extension,
+            None,
+            &strategy,
+        ));
+        assert!(!needs_reconnect(
+            false,
+            false,
+            strategy.tun,
+            strategy.system_extension,
+            None,
+            &strategy,
+        ));
     }
 }
 
