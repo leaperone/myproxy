@@ -1530,18 +1530,28 @@ impl AppView {
         }
         let strategy = self.strategy.clone();
         let supervisor = self.supervisor.clone();
+        let refresh_catalog = self.catalog.nodes.is_empty()
+            || self.applied.subscriptions != strategy.subscriptions
+            || self.applied.exclude_filter != strategy.exclude_filter;
         let apply_note = self.pending_apply_note.take();
         self.busy = true;
-        self.status = "正在应用策略…".into();
+        self.status = if refresh_catalog {
+            "正在刷新订阅并应用策略…".into()
+        } else {
+            "正在应用策略…".into()
+        };
         cx.notify();
         cx.spawn(async move |this, cx| {
             let apply_strategy = strategy.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    supervisor
-                        .apply(&apply_strategy)
-                        .map_err(|err| err.to_string())
+                    let result = if refresh_catalog {
+                        supervisor.apply(&apply_strategy)
+                    } else {
+                        supervisor.apply_cached(&apply_strategy)
+                    };
+                    result.map_err(|err| err.to_string())
                 })
                 .await;
             this.update(cx, |this, cx| {

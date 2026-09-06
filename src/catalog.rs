@@ -10,6 +10,10 @@ use crate::log;
 use crate::paths;
 use crate::strategy::Strategy;
 
+const SUBSCRIPTION_CURL_MAX_TIME: &str = "12";
+const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "5";
+const SUBSCRIPTION_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     pub nodes: Vec<Node>,
@@ -150,20 +154,23 @@ fn fetch_http_body(name: &str, url: &str) -> Result<String> {
     // ureq 2 is HTTP/1.1 only and has no Happy Eyeballs. Cloudflare AAAA
     // records that blackhole (Cunoe) hit the 30s read timeout whenever IPv6
     // is tried first. Prefer curl --ipv4 on macOS; fall back to ureq.
-    if let Ok(body) = fetch_http_body_curl_ipv4(url) {
-        return Ok(body);
+    match fetch_http_body_curl_ipv4(url) {
+        Ok(body) => Ok(body),
+        Err(err) if err.is::<std::io::Error>() => {
+            log::warn(
+                "catalog",
+                format!("{name} IPv4 curl unavailable, trying default HTTP"),
+            );
+            ureq::get(url)
+                .timeout(SUBSCRIPTION_HTTP_TIMEOUT)
+                .set("User-Agent", "clash.meta")
+                .call()
+                .with_context(|| format!("GET {name}"))?
+                .into_string()
+                .with_context(|| format!("read {name}"))
+        }
+        Err(err) => Err(err).with_context(|| format!("GET {name} via IPv4 curl")),
     }
-    log::warn(
-        "catalog",
-        format!("{name} IPv4 curl failed, trying default HTTP"),
-    );
-    ureq::get(url)
-        .timeout(std::time::Duration::from_secs(45))
-        .set("User-Agent", "clash.meta")
-        .call()
-        .with_context(|| format!("GET {name}"))?
-        .into_string()
-        .with_context(|| format!("read {name}"))
 }
 
 fn fetch_http_body_curl_ipv4(url: &str) -> Result<String> {
@@ -174,9 +181,9 @@ fn fetch_http_body_curl_ipv4(url: &str) -> Result<String> {
             "-A",
             "clash.meta",
             "--max-time",
-            "45",
+            SUBSCRIPTION_CURL_MAX_TIME,
             "--connect-timeout",
-            "15",
+            SUBSCRIPTION_CURL_CONNECT_TIMEOUT,
             url,
         ])
         .output()
