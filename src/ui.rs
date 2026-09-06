@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -18,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::controller::{self, TrafficSnapshot};
+use myproxy::controller::{self, LiveGroup, TrafficSnapshot};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::Supervisor;
@@ -1053,6 +1054,10 @@ pub struct AppView {
     traffic_has_rate: bool,
     traffic_error: Option<String>,
     traffic_prev: Option<(Instant, u64, u64)>,
+    proxy_groups: Vec<LiveGroup>,
+    proxy_error: Option<String>,
+    delays: HashMap<String, u32>,
+    delaying: HashSet<String>,
 }
 
 impl AppView {
@@ -1086,7 +1091,7 @@ impl AppView {
                 let wait_ms = this
                     .update(cx, |this, _| {
                         if this.page == Page::Connections {
-                            1000
+                            500
                         } else {
                             1500
                         }
@@ -1099,14 +1104,12 @@ impl AppView {
                 let fetch_port = this
                     .update(cx, |this, cx| {
                         if !this.connected {
-                            if this.clear_traffic() {
+                            if this.clear_live() {
                                 cx.notify();
                             }
                             None
-                        } else if this.page == Page::Connections {
-                            Some(this.strategy.mixed_port)
                         } else {
-                            None
+                            Some(this.strategy.mixed_port)
                         }
                     })
                     .ok()
@@ -1129,6 +1132,34 @@ impl AppView {
                     }
                 }
 
+                let proxy_port = this
+                    .update(cx, |this, _| {
+                        if this.connected && matches!(this.page, Page::Groups | Page::Overview) {
+                            Some(this.strategy.mixed_port)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(port) = proxy_port {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            controller::fetch_proxies(port).map_err(|err| err.to_string())
+                        })
+                        .await;
+                    if this
+                        .update(cx, |this, cx| {
+                            this.apply_proxies(result);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
                 if this
                     .update(cx, |this, cx| {
                         let started = Instant::now();
@@ -1138,7 +1169,7 @@ impl AppView {
                             if connected != this.connected {
                                 this.connected = connected;
                                 if !connected {
-                                    this.clear_traffic();
+                                    this.clear_live();
                                 }
                                 dirty = true;
                             }
@@ -1263,6 +1294,10 @@ impl AppView {
             traffic_has_rate: false,
             traffic_error: None,
             traffic_prev: None,
+            proxy_groups: Vec::new(),
+            proxy_error: None,
+            delays: HashMap::new(),
+            delaying: HashSet::new(),
             pending_port_input: None,
             pending_filter_input: None,
         }
@@ -1394,6 +1429,9 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        if this.connected {
+                            this.refresh_live(cx);
+                        }
                     }
                     Err(err) => {
                         log::error("ui", format!("apply failed: {err}"));
@@ -1409,7 +1447,15 @@ impl AppView {
     }
 
     fn is_dirty(&self) -> bool {
-        self.strategy != self.applied
+        let mut current = self.strategy.clone();
+        let mut applied = self.applied.clone();
+        for group in &mut current.groups {
+            group.selected.clear();
+        }
+        for group in &mut applied.groups {
+            group.selected.clear();
+        }
+        current != applied
     }
 
     fn mark_applied(&mut self) {
@@ -1429,6 +1475,76 @@ impl AppView {
         self.traffic_error = None;
         self.traffic_prev = None;
         dirty
+    }
+
+    fn clear_live(&mut self) -> bool {
+        let dirty = self.clear_traffic()
+            || !self.proxy_groups.is_empty()
+            || self.proxy_error.is_some()
+            || !self.delays.is_empty()
+            || !self.delaying.is_empty();
+        self.proxy_groups.clear();
+        self.proxy_error = None;
+        self.delays.clear();
+        self.delaying.clear();
+        dirty
+    }
+
+    fn apply_proxies(&mut self, result: Result<Vec<LiveGroup>, String>) {
+        match result {
+            Ok(mut groups) => {
+                for group in &mut groups {
+                    for member in &mut group.members {
+                        if let Some(delay) = self.delays.get(&member.name) {
+                            member.delay = Some(*delay);
+                        }
+                    }
+                }
+                self.proxy_groups = groups;
+                self.proxy_error = None;
+            }
+            Err(err) => {
+                log::debug("ui", format!("proxies poll failed: {err}"));
+                self.proxy_error = Some("暂时读不到节点组状态。".into());
+            }
+        }
+    }
+
+    fn live_now(&self, name: &str) -> Option<&str> {
+        self.proxy_groups
+            .iter()
+            .find(|group| group.name == name)
+            .map(|group| group.now.as_str())
+            .filter(|now| !now.is_empty())
+    }
+
+    fn refresh_live(&mut self, cx: &mut Context<Self>) {
+        if !self.connected {
+            self.clear_live();
+            return;
+        }
+        let port = self.strategy.mixed_port;
+        cx.spawn(async move |this, cx| {
+            let traffic_port = port;
+            let proxy_port = port;
+            let traffic = cx
+                .background_executor()
+                .spawn(async move { controller::fetch(traffic_port).map_err(|err| err.to_string()) })
+                .await;
+            let proxies = cx
+                .background_executor()
+                .spawn(async move {
+                    controller::fetch_proxies(proxy_port).map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_traffic(traffic);
+                this.apply_proxies(proxies);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn apply_traffic(&mut self, result: Result<TrafficSnapshot, String>) {
@@ -1577,10 +1693,11 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        this.refresh_live(cx);
                     }
                     Ok(None) => {
                         this.connected = false;
-                        this.clear_traffic();
+                        this.clear_live();
                         this.status = "已断开。".into();
                     }
                     Err(err) => {
@@ -1832,6 +1949,19 @@ impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
         let busy = self.busy;
+        let live_label = if busy {
+            self.status.clone()
+        } else if connected && self.traffic_has_rate {
+            format!(
+                "已连接 · ↑{} · ↓{}",
+                controller::format_rate(self.traffic_up),
+                controller::format_rate(self.traffic_down)
+            )
+        } else if connected {
+            "已连接".into()
+        } else {
+            "未连接".into()
+        };
         TitleBar::new().child(
             h_flex()
                 .id("title-contents")
@@ -1855,7 +1985,7 @@ impl AppView {
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child(if connected { "已连接" } else { "未连接" }),
+                                .child(live_label),
                         )
                         .when(self.is_dirty() || self.external_change_pending, |this| {
                             this.child(
@@ -1959,11 +2089,42 @@ impl AppView {
         let connected = self.connected;
         let busy = self.busy;
         let mut connect = Button::new("hero-connect").large();
-        connect = if connected {
+        connect = if busy {
+            connect.label(if connected { "正在断开…" } else { "正在连接…" })
+        } else if connected {
             connect.danger().label("断开")
         } else {
             connect.primary().label("连接")
         };
+        let up = if connected && self.traffic_has_rate {
+            controller::format_rate(self.traffic_up)
+        } else {
+            "—".into()
+        };
+        let down = if connected && self.traffic_has_rate {
+            controller::format_rate(self.traffic_down)
+        } else {
+            "—".into()
+        };
+        let conns = if connected {
+            self.traffic.connections.len().to_string()
+        } else {
+            "—".into()
+        };
+        let now = self
+            .live_now("PROXY")
+            .map(str::to_string)
+            .or_else(|| {
+                self.strategy
+                    .groups
+                    .iter()
+                    .find(|group| {
+                        group.name == "PROXY" || group.name.eq_ignore_ascii_case("default")
+                    })
+                    .map(|group| group.selected.clone())
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or_else(|| if connected { "—".into() } else { "未连接".into() });
         v_flex()
             .gap_4()
             .child(page_title(
@@ -2038,9 +2199,13 @@ impl AppView {
                     .gap_3()
                     .child(metric(
                         theme,
-                        "Status",
+                        "状态",
                         if connected { "已连接" } else { "空闲" },
                     ))
+                    .child(metric(theme, "上传", &up))
+                    .child(metric(theme, "下载", &down))
+                    .child(metric(theme, "连接数", &conns))
+                    .child(metric(theme, "PROXY", &now))
                     .child(metric(
                         theme,
                         "系统接管",
@@ -2048,22 +2213,17 @@ impl AppView {
                     ))
                     .child(metric(
                         theme,
-                        "Mixed port",
+                        "Mixed",
                         &format!("127.0.0.1:{}", self.strategy.mixed_port),
                     ))
                     .child(metric(
                         theme,
-                        "Nodes",
+                        "节点",
                         &format!(
                             "{} kept / {} excluded",
                             self.catalog.nodes.len(),
                             self.catalog.excluded.len()
                         ),
-                    ))
-                    .child(metric(
-                        theme,
-                        "Rules",
-                        &self.strategy.rule_sets.len().to_string(),
                     )),
             )
     }
