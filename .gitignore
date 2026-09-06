@@ -27,3 +27,7 @@
 # Fetched Sparkle.framework + tools; fetch with scripts/fetch-sparkle.sh
 /resources/sparkle/
 
+
+# Keep project planning artifacts tracked
+!.planning/
+!.planning/**
