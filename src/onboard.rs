@@ -8,6 +8,13 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 
+/// Official agent skill; keep this the only copy-paste source.
+pub const AGENT_SKILL: &str = include_str!("../.agents/skills/agent/SKILL.md");
+
+pub fn copy_agent_skill(cx: &App) {
+    cx.write_to_clipboard(ClipboardItem::new_string(AGENT_SKILL.to_string()));
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct OnboardState {
     #[serde(default)]
@@ -55,16 +62,24 @@ pub fn should_prompt() -> bool {
 
 struct OnboardView {
     notice: String,
+    installed: bool,
+    copied: bool,
     on_result: Rc<dyn Fn(Result<PathBuf, String>, &mut App)>,
 }
 
 impl OnboardView {
     fn install(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.installed {
+            return true;
+        }
         match myproxy::cli_install::install() {
             Ok(path) => {
                 mark_cli_done();
+                self.installed = true;
+                self.notice = format!("已安装到 {}。复制 skill 后关掉即可。", path.display());
                 (self.on_result)(Ok(path), cx);
-                true
+                cx.notify();
+                false
             }
             Err(error) => {
                 let message = format!("{error:#}");
@@ -108,8 +123,27 @@ impl Render for OnboardView {
                     .text_color(theme.muted_foreground)
                     .child("之后若打开「系统接管」，请到系统设置 › 通用 › 登录项与扩展 允许 myproxy。"),
             )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(if self.copied {
+                        "已复制官方 Agent skill，可贴给 Cursor / Codex。"
+                    } else {
+                        "复制官方 Agent skill，交给 Cursor / Codex 即可管理 myproxy。"
+                    }),
+            )
             .when(!self.notice.is_empty(), |this| {
-                this.child(div().text_sm().text_color(theme.danger).child(self.notice.clone()))
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(if self.installed {
+                            theme.success
+                        } else {
+                            theme.danger
+                        })
+                        .child(self.notice.clone()),
+                )
             })
     }
 }
@@ -124,12 +158,14 @@ pub fn open(
     }
     let view = cx.new(|_| OnboardView {
         notice: String::new(),
+        installed: false,
+        copied: false,
         on_result: Rc::new(on_result),
     });
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
             .title("安装命令行工具")
-            .width(px(480.))
+            .width(px(520.))
             .overlay_closable(true)
             .button_props(
                 DialogButtonProps::default()
@@ -152,6 +188,18 @@ pub fn open(
                             |_, window, cx| window.dispatch_action(Box::new(Cancel), cx),
                         ),
                     )
+                    .child({
+                        let view = view.clone();
+                        Button::new("onboard-copy-skill")
+                            .label("复制 Agent skill")
+                            .on_click(move |_, _, cx| {
+                                copy_agent_skill(cx);
+                                view.update(cx, |this, cx| {
+                                    this.copied = true;
+                                    cx.notify();
+                                });
+                            })
+                    })
                     .child(
                         Button::new("onboard-install")
                             .primary()

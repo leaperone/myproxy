@@ -2568,6 +2568,32 @@ impl AppView {
                                 .map(|path| path.display().to_string())
                                 .unwrap_or_else(|| "无法确定用户主目录".into())
                         )),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("官方 Agent skill，复制后交给 Cursor / Codex。"),
+                        )
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("copy-cli-skill")
+                                .small()
+                                .label("复制 Agent skill")
+                                .on_click(move |_, _, cx| {
+                                    crate::onboard::copy_agent_skill(cx);
+                                    entity.update(cx, |this, cx| {
+                                        this.status = "已复制 Agent skill。".into();
+                                        cx.notify();
+                                    });
+                                })
+                        }),
                 ),
         )
     }
