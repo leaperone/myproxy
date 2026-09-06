@@ -107,7 +107,14 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
             }
             Err(err) => {
                 log::warn("catalog", format!("fetch {} failed: {err:#}", sub.name));
+                let unique_name = strategy
+                    .subscriptions
+                    .iter()
+                    .filter(|candidate| candidate.name == sub.name)
+                    .count()
+                    == 1;
                 let reused = if cache_filter_matches
+                    && unique_name
                     && previous.subscription_urls.get(&sub.name) == Some(&sub.url)
                 {
                     previous
