@@ -11,6 +11,8 @@ use crate::paths;
 pub const DEFAULT_EXCLUDE: &str =
     r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
 
+pub const DEFAULT_MIXED_PORT: u16 = 7890;
+
 pub const STRATEGY_SCHEMA: u32 = 5;
 
 pub const TELEGRAM_GROUP: &str = "Telegram";
@@ -73,6 +75,7 @@ fn telegram_rule_set() -> RuleSet {
 pub struct Strategy {
     #[serde(default)]
     pub schema: u32,
+    #[serde(default = "default_mixed_port")]
     pub mixed_port: u16,
     pub exclude_filter: String,
     /// When true, myproxy writes debug traces to `myproxy.log` and the Settings page.
@@ -144,6 +147,10 @@ pub struct Group {
     pub filter: String,
 }
 
+fn default_mixed_port() -> u16 {
+    DEFAULT_MIXED_PORT
+}
+
 fn default_select() -> String {
     "select".into()
 }
@@ -181,7 +188,7 @@ impl Default for Strategy {
     fn default() -> Self {
         Self {
             schema: STRATEGY_SCHEMA,
-            mixed_port: 17890,
+            mixed_port: DEFAULT_MIXED_PORT,
             exclude_filter: DEFAULT_EXCLUDE.into(),
             developer_mode: false,
             update_channel: None,

@@ -66,7 +66,7 @@ cargo run --bin myproxyctl -- apply
 cargo run --bin myproxyctl -- connect
 ```
 
-Default Mixed port is **17890**.
+Default Mixed port is **7890**.
 
 ## Signing
 
