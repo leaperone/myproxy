@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::*;
@@ -11,20 +12,41 @@ use myproxy::strategy::Strategy;
 use myproxy::supervisor::Supervisor;
 
 struct TrayKeepAlive {
-    _tray: TrayIcon,
+    tray: TrayIcon,
+    status: MenuItem,
+    toggle: MenuItem,
 }
 
 impl Global for TrayKeepAlive {}
 
+#[derive(Clone, PartialEq, Eq)]
+struct MenuFace {
+    connected: bool,
+    status: String,
+    action: String,
+    tooltip: String,
+}
+
 pub fn install(cx: &mut App) {
+    let initial = menu_face();
     match build_tray() {
-        Ok(tray) => cx.set_global(TrayKeepAlive { _tray: tray }),
+        Ok(tray) => {
+            tray.apply(&initial);
+            cx.set_global(tray);
+        }
         Err(err) => myproxy::log::warn("tray", format!("menu bar icon failed: {err:#}")),
     }
+    let last = Arc::new(Mutex::new(initial));
     cx.spawn(async move |cx| loop {
         cx.background_executor()
             .timer(Duration::from_millis(250))
             .await;
+        let face = cx
+            .background_executor()
+            .spawn(async { menu_face() })
+            .await;
+        let displayed = last.lock().expect("tray menu face").clone();
+        let face_changed = displayed != face;
         let mut clicks = Vec::new();
         let mut menus = Vec::new();
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
@@ -33,7 +55,7 @@ pub fn install(cx: &mut App) {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             menus.push(event);
         }
-        if clicks.is_empty() && menus.is_empty() {
+        if !face_changed && clicks.is_empty() && menus.is_empty() {
             continue;
         }
         cx.update(|cx| {
@@ -41,24 +63,32 @@ pub fn install(cx: &mut App) {
                 handle_tray_event(event, cx);
             }
             for event in menus {
-                handle_menu_event(event, cx);
+                handle_menu_event(event, cx, displayed.connected);
+            }
+            if face_changed {
+                if let Some(tray) = cx.try_global::<TrayKeepAlive>() {
+                    tray.apply(&face);
+                }
+                *last.lock().expect("tray menu face") = face;
             }
         });
     })
     .detach();
 }
 
-fn build_tray() -> anyhow::Result<TrayIcon> {
+fn build_tray() -> anyhow::Result<TrayKeepAlive> {
+    let status = MenuItem::with_id("status", "未连接", false, None);
+    let toggle = MenuItem::with_id("toggle", "连接", true, None);
     let open = MenuItem::with_id("open", "打开窗口", true, None);
-    let connect = MenuItem::with_id("connect", "连接", true, None);
-    let disconnect = MenuItem::with_id("disconnect", "断开", true, None);
     let apply = MenuItem::with_id("apply", "更新配置", true, None);
     let updates = MenuItem::with_id("updates", "检查更新", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let menu = Menu::new();
+    menu.append(&status)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&toggle)?;
     menu.append(&open)?;
-    menu.append(&connect)?;
-    menu.append(&disconnect)?;
+    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&apply)?;
     menu.append(&updates)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -70,7 +100,52 @@ fn build_tray() -> anyhow::Result<TrayIcon> {
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .build()?;
-    Ok(tray)
+    Ok(TrayKeepAlive {
+        tray,
+        status,
+        toggle,
+    })
+}
+
+impl TrayKeepAlive {
+    fn apply(&self, face: &MenuFace) {
+        self.status.set_text(&face.status);
+        self.toggle.set_text(&face.action);
+        if let Err(err) = self.tray.set_tooltip(Some(&face.tooltip)) {
+            myproxy::log::debug("tray", format!("tooltip failed: {err:#}"));
+        }
+    }
+}
+
+fn menu_face() -> MenuFace {
+    if !Supervisor::shared().is_running() {
+        return MenuFace {
+            connected: false,
+            status: "未连接".into(),
+            action: "连接".into(),
+            tooltip: "myproxy · 未连接".into(),
+        };
+    }
+    let (status, tooltip) = match Strategy::load() {
+        Ok(strategy) => {
+            let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
+            let status = if strategy.system_extension {
+                "已连接 · 系统接管".into()
+            } else if strategy.tun {
+                "已连接 · TUN".into()
+            } else {
+                "已连接".into()
+            };
+            (status, format!("myproxy · 已连接 · {endpoint}"))
+        }
+        Err(_) => ("已连接".into(), "myproxy · 已连接".into()),
+    };
+    MenuFace {
+        connected: true,
+        status,
+        action: "断开".into(),
+        tooltip,
+    }
 }
 
 fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
@@ -85,11 +160,11 @@ fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
     crate::show_main_window(cx);
 }
 
-fn handle_menu_event(event: MenuEvent, cx: &mut App) {
+fn handle_menu_event(event: MenuEvent, cx: &mut App, displayed_connected: bool) {
     match event.id.as_ref() {
         "open" => crate::show_main_window(cx),
-        "connect" => connect(cx),
-        "disconnect" => disconnect_async(cx),
+        "toggle" if displayed_connected => disconnect_async(cx),
+        "toggle" => connect(cx),
         "apply" => apply(cx),
         "updates" => crate::sparkle::check(),
         "quit" => disconnect_and_quit(cx),
