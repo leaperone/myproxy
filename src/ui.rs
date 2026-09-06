@@ -16,7 +16,7 @@ use gpui_kit::component::sidebar::{
 };
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Collapsible, Disableable, IconName, Root, Selectable, Sizable,
+    h_flex, v_flex, ActiveTheme, Collapsible, Disableable, Icon, IconName, Root, Selectable, Sizable,
     StyledExt, Theme, TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -2631,26 +2631,95 @@ impl AppView {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let warn_live = !self.busy
+            && (self.wanted && !self.connected
+                || self.traffic_error.is_some()
+                || self.proxy_error.is_some());
+        let live = !self.busy && self.connected && !warn_live;
+        let live_label = if self.busy {
+            "处理中…"
+        } else if live {
+            "已连接"
+        } else if self.wanted {
+            "连接异常"
+        } else {
+            "未连接"
+        };
         Sidebar::new("nav")
             .collapsible(false)
-            .w(px(216.))
+            .w(px(232.))
             .header(
-                SidebarHeader::new().child(
+                SidebarHeader::new().p_2().child(
                     v_flex()
-                        .gap(px(2.))
-                        .child(div().text_sm().font_semibold().child("控制"))
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("strategy.json"),
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .size_7()
+                                        .rounded(px(8.))
+                                        .bg(theme.sidebar_accent)
+                                        .text_color(theme.sidebar_accent_foreground)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(IconName::Cpu).size_4()),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap(px(1.))
+                                        .child(div().text_sm().font_semibold().child("myproxy"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child("代理控制台 · strategy.json"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py(px(5.))
+                                .rounded(px(6.))
+                                .bg(theme.background.opacity(0.35))
+                                .child(
+                                    div()
+                                        .size_2()
+                                        .rounded_full()
+                                        .bg(if live {
+                                            theme.success
+                                        } else if warn_live {
+                                            theme.warning
+                                        } else {
+                                            theme.muted_foreground
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if live {
+                                            theme.success
+                                        } else if warn_live {
+                                            theme.warning
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(live_label),
+                                ),
                         ),
                 ),
             )
             .child(
-                SidebarGroup::new("会话")
+                SidebarGroup::new("监控")
                     .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
-                    .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
+                    .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network)),
+            )
+            .child(
+                SidebarGroup::new("配置")
                     .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
                     .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
                     .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
@@ -2661,14 +2730,43 @@ impl AppView {
             )
             .footer(
                 SidebarFooter::new().child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!(
-                            "{} 个节点 · {} 个已排除",
-                            self.catalog.nodes.len(),
-                            self.catalog.excluded.len()
-                        )),
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("节点库"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_semibold()
+                                        .child(self.catalog.nodes.len().to_string()),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("已排除"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_semibold()
+                                        .child(self.catalog.excluded.len().to_string()),
+                                ),
+                        ),
                 ),
             )
     }
