@@ -289,23 +289,82 @@ pub fn via_target(via: &str, strategy: &Strategy) -> String {
         _ => {
             if let Some(name) = via.strip_prefix("node:") {
                 name.to_string()
-            } else if strategy.groups.iter().any(|g| g.name == via) {
-                via.to_string()
-            } else if via.starts_with("group:") {
-                via.trim_start_matches("group:").to_string()
+            } else if let Some(name) = via.strip_prefix("group:") {
+                resolve_group_target(name, strategy)
             } else {
-                via.to_string()
+                resolve_group_target(via, strategy)
             }
         }
     }
+}
+
+fn resolve_group_target(via: &str, strategy: &Strategy) -> String {
+    if let Some(group) = strategy
+        .groups
+        .iter()
+        .find(|group| group.name.eq_ignore_ascii_case(via))
+    {
+        return group.name.clone();
+    }
+    if via.eq_ignore_ascii_case("default") || via.eq_ignore_ascii_case("proxy") {
+        return default_group(strategy).to_string();
+    }
+    via.to_string()
 }
 
 pub fn default_group(strategy: &Strategy) -> &str {
     strategy
         .groups
         .iter()
-        .find(|g| g.name == "PROXY")
+        .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
         .or_else(|| strategy.groups.first())
-        .map(|g| g.name.as_str())
+        .map(|group| group.name.as_str())
         .unwrap_or("DIRECT")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::{Group, Strategy};
+
+    fn strategy_with_groups(names: &[&str]) -> Strategy {
+        let mut strategy = Strategy::default();
+        strategy.groups = names
+            .iter()
+            .map(|name| Group::all_nodes((*name).into(), "select".into()))
+            .collect();
+        strategy
+    }
+
+    #[test]
+    fn via_target_resolves_default_to_stored_group_name() {
+        let strategy = strategy_with_groups(&["Default", "Telegram"]);
+        assert_eq!(via_target("default", &strategy), "Default");
+        assert_eq!(via_target("Default", &strategy), "Default");
+        assert_eq!(via_target("PROXY", &strategy), "Default");
+        assert_eq!(via_target("proxy", &strategy), "Default");
+        assert_eq!(via_target("group:default", &strategy), "Default");
+    }
+
+    #[test]
+    fn via_target_resolves_proxy_alias_when_group_is_proxy() {
+        let strategy = strategy_with_groups(&["PROXY", "Telegram"]);
+        assert_eq!(via_target("default", &strategy), "PROXY");
+        assert_eq!(via_target("PROXY", &strategy), "PROXY");
+    }
+
+    #[test]
+    fn via_target_preserves_direct_reject_and_named_groups() {
+        let strategy = strategy_with_groups(&["Default", "AI Proxy"]);
+        assert_eq!(via_target("direct", &strategy), "DIRECT");
+        assert_eq!(via_target("REJECT", &strategy), "REJECT");
+        assert_eq!(via_target("ai proxy", &strategy), "AI Proxy");
+        assert_eq!(via_target("node:Some Node", &strategy), "Some Node");
+    }
+
+    #[test]
+    fn default_group_prefers_proxy_or_default_name() {
+        let strategy = strategy_with_groups(&["AI Proxy", "Default"]);
+        assert_eq!(default_group(&strategy), "Default");
+    }
 }
