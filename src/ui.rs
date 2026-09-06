@@ -3040,7 +3040,7 @@ impl AppView {
             .when(self.strategy.rule_sets.is_empty(), |this| {
                 this.child(empty_hint(
                     theme,
-                    "还没有规则。添加一个项目，把 Cursor、GitHub 这类收进去，再选走向。未匹配的流量走 PROXY。",
+                    "还没有规则。添加一个项目，把 Cursor、GitHub 这类收进去，再选走向。未匹配的流量按设置里的模式走直连或默认组。",
                 ))
             })
             .when(
@@ -3079,6 +3079,7 @@ impl AppView {
                 "打开系统接管后，应用不用自己填代理。第一次会请你在系统设置里允许 myproxy。",
             ))
             .child(self.system_extension_panel(cx, theme))
+            .child(self.unmatched_panel(cx, theme))
             .child(panel(
                 theme,
                 "外观",
@@ -3273,6 +3274,105 @@ impl AppView {
                 "已关闭 TUN。".into()
             };
         }
+    }
+
+    fn unmatched_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let direct = myproxy::compile::unmatched_is_direct(&self.strategy);
+        let current = myproxy::compile::unmatched_target(&self.strategy);
+        panel(
+            theme,
+            "未匹配流量",
+            v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("对不上规则的流量走这里。默认直连是正面清单；默认走组是现在的全局代理。"),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .children({
+                            let entity_direct = entity.clone();
+                            let entity_group = entity.clone();
+                            let mut direct_btn = Button::new("unmatched-direct").small();
+                            direct_btn = if direct {
+                                direct_btn.primary().label("默认直连")
+                            } else {
+                                direct_btn.label("默认直连")
+                            };
+                            let mut group_btn = Button::new("unmatched-group").small();
+                            group_btn = if !direct {
+                                group_btn.primary().label("默认走组")
+                            } else {
+                                group_btn.label("默认走组")
+                            };
+                            [
+                                direct_btn
+                                    .disabled(self.busy)
+                                    .on_click(move |_, _, app| {
+                                        entity_direct.update(app, |this, cx| {
+                                            this.strategy.unmatched_via = "DIRECT".into();
+                                            this.persist();
+                                            cx.notify();
+                                        });
+                                    })
+                                    .into_any_element(),
+                                group_btn
+                                    .disabled(self.busy)
+                                    .on_click(move |_, _, app| {
+                                        entity_group.update(app, |this, cx| {
+                                            this.strategy.unmatched_via =
+                                                myproxy::compile::default_group(&this.strategy)
+                                                    .to_string();
+                                            this.persist();
+                                            cx.notify();
+                                        });
+                                    })
+                                    .into_any_element(),
+                            ]
+                        }),
+                )
+                .when(!direct, |this| {
+                    this.child(
+                        h_flex().gap_1().flex_wrap().children(
+                            self.strategy.groups.iter().map(|group| {
+                                let name = group.name.clone();
+                                let selected = current == name;
+                                let entity = entity.clone();
+                                let mut btn = Button::new(SharedString::from(format!(
+                                    "unmatched-via-{name}"
+                                )))
+                                .small();
+                                btn = if selected {
+                                    btn.primary().label(name.clone())
+                                } else {
+                                    btn.label(name.clone())
+                                };
+                                btn.disabled(self.busy).on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.strategy.unmatched_via = name.clone();
+                                        this.persist();
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                        ),
+                    )
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if direct {
+                            "未匹配走 DIRECT。GitHub、Safari 这些规则仍按各自走向。".to_string()
+                        } else {
+                            format!("未匹配走 {current}。连接或应用后生效。")
+                        }),
+                ),
+        )
     }
 
     fn system_extension_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {

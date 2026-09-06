@@ -9,6 +9,30 @@ use crate::strategy::Strategy;
 
 pub const CONTROLLER_SECRET: &str = "myproxy-local";
 
+/// Addresses and names that must stay on the local network. These rules are
+/// compiled ahead of user rules so a broad user matcher cannot send local
+/// traffic through a proxy.
+const DEFAULT_DIRECT_RULES: &[&str] = &[
+    "DOMAIN,localhost,DIRECT",
+    "DOMAIN-SUFFIX,local,DIRECT",
+    "DOMAIN-SUFFIX,lan,DIRECT",
+    "DOMAIN-SUFFIX,localdomain,DIRECT",
+    "DOMAIN-SUFFIX,home.arpa,DIRECT",
+    "IP-CIDR,0.0.0.0/32,DIRECT,no-resolve",
+    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+    "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR,224.0.0.0/4,DIRECT,no-resolve",
+    "IP-CIDR,255.255.255.255/32,DIRECT,no-resolve",
+    "IP-CIDR6,::/128,DIRECT,no-resolve",
+    "IP-CIDR6,::1/128,DIRECT,no-resolve",
+    "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
+    "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+    "IP-CIDR6,ff00::/8,DIRECT,no-resolve",
+];
+
 pub fn controller_port(mixed_port: u16) -> u16 {
     mixed_port.saturating_add(107)
 }
@@ -67,6 +91,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     root.insert("proxy-groups".into(), serde_yaml::Value::Sequence(groups));
 
     let mut rules = Vec::new();
+    append_default_direct_rules(&mut rules);
     for set in &strategy.rule_sets {
         let target = via_target(&set.via, strategy);
         for matcher in &set.matchers {
@@ -113,7 +138,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
             }
         }
     }
-    rules.push(format!("MATCH,{}", default_group(strategy)));
+    rules.push(format!("MATCH,{}", unmatched_target(strategy)));
     let compiled = rules.len();
     let rules: Vec<serde_yaml::Value> = rules.into_iter().map(serde_yaml::Value::String).collect();
     root.insert("rules".into(), serde_yaml::Value::Sequence(rules));
@@ -134,6 +159,10 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
         ),
     );
     Ok(yaml)
+}
+
+fn append_default_direct_rules(rules: &mut Vec<String>) {
+    rules.extend(DEFAULT_DIRECT_RULES.iter().map(|rule| (*rule).to_string()));
 }
 
 fn yaml_strings(items: &[&str]) -> serde_yaml::Value {
@@ -259,10 +288,7 @@ fn push_socks_pair(
 ) {
     for (suffix, host) in [("ipv4", "127.0.0.1"), ("ipv6", "::1")] {
         let mut item = serde_yaml::Mapping::new();
-        item.insert(
-            "name".into(),
-            format!("{name_prefix}-{suffix}").into(),
-        );
+        item.insert("name".into(), format!("{name_prefix}-{suffix}").into());
         item.insert("type".into(), "socks".into());
         item.insert("listen".into(), host.into());
         item.insert("port".into(), port.into());
@@ -310,6 +336,19 @@ fn resolve_group_target(via: &str, strategy: &Strategy) -> String {
         return default_group(strategy).to_string();
     }
     via.to_string()
+}
+
+pub fn unmatched_target(strategy: &Strategy) -> String {
+    let via = strategy.unmatched_via.trim();
+    if via.is_empty() {
+        "DIRECT".into()
+    } else {
+        via_target(via, strategy)
+    }
+}
+
+pub fn unmatched_is_direct(strategy: &Strategy) -> bool {
+    unmatched_target(strategy).eq_ignore_ascii_case("DIRECT")
 }
 
 pub fn default_group(strategy: &Strategy) -> &str {
@@ -366,5 +405,25 @@ mod tests {
     fn default_group_prefers_proxy_or_default_name() {
         let strategy = strategy_with_groups(&["AI Proxy", "Default"]);
         assert_eq!(default_group(&strategy), "Default");
+    }
+
+    #[test]
+    fn unmatched_target_defaults_to_direct() {
+        let strategy = strategy_with_groups(&["Default", "AI Proxy"]);
+        assert_eq!(unmatched_target(&strategy), "DIRECT");
+        assert!(unmatched_is_direct(&strategy));
+    }
+
+    #[test]
+    fn unmatched_target_can_be_direct_or_a_named_group() {
+        let mut strategy = strategy_with_groups(&["Default", "AI Proxy"]);
+        strategy.unmatched_via = "DIRECT".into();
+        assert_eq!(unmatched_target(&strategy), "DIRECT");
+        assert!(unmatched_is_direct(&strategy));
+        strategy.unmatched_via = "AI Proxy".into();
+        assert_eq!(unmatched_target(&strategy), "AI Proxy");
+        assert!(!unmatched_is_direct(&strategy));
+        strategy.unmatched_via = "default".into();
+        assert_eq!(unmatched_target(&strategy), "Default");
     }
 }

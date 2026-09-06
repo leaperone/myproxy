@@ -2,8 +2,10 @@ import Foundation
 
 public enum BuiltInBypassReason: String, Codable, Hashable, Sendable {
     case trustedmyproxyComponent
+    case privateNetwork
     case loopback
     case linkLocal
+    case localHostname
     case multicast
     case unspecifiedAddress
 }
@@ -330,12 +332,29 @@ public struct BuiltInBypassPolicy: Sendable {
         if context.source.isTrustedMyproxyComponent {
             return .trustedmyproxyComponent
         }
-        guard let address = context.destination.ipAddress else { return nil }
-        if address.isLoopback { return .loopback }
-        if address.isLinkLocal { return .linkLocal }
-        if address.isMulticast { return .multicast }
-        if address.isUnspecified { return .unspecifiedAddress }
+        if let address = context.destination.ipAddress {
+            if address.isPrivate { return .privateNetwork }
+            if address.isLoopback { return .loopback }
+            if address.isLinkLocal { return .linkLocal }
+            if address.isMulticast { return .multicast }
+            if address.isUnspecified { return .unspecifiedAddress }
+        }
+        if let hostname = context.destination.hostname,
+           Self.isLocalHostname(hostname) {
+            return .localHostname
+        }
         return nil
+    }
+
+    private static func isLocalHostname(_ hostname: String) -> Bool {
+        var normalized = hostname.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while normalized.last == "." { normalized.removeLast() }
+        guard !normalized.isEmpty else { return false }
+        return normalized == "localhost"
+            || normalized.hasSuffix(".local")
+            || normalized.hasSuffix(".lan")
+            || normalized.hasSuffix(".localdomain")
+            || normalized.hasSuffix(".home.arpa")
     }
 }
 
