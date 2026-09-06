@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -54,6 +55,37 @@ pub struct LiveGroup {
 pub struct LiveMember {
     pub name: String,
     pub delay: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveNeed {
+    Rows,
+    Totals,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveSnapshot {
+    pub traffic: TrafficSnapshot,
+    pub groups: Vec<LiveGroup>,
+    pub fetched_rows: bool,
+}
+
+static LAST_GROUPS: Mutex<Vec<LiveGroup>> = Mutex::new(Vec::new());
+
+pub fn last_probed_groups() -> Vec<LiveGroup> {
+    LAST_GROUPS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+pub fn proxy_now_from_groups(groups: &[LiveGroup]) -> String {
+    groups
+        .iter()
+        .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
+        .map(|group| group.now.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_default()
 }
 
 #[derive(Deserialize)]
@@ -232,7 +264,11 @@ pub fn probe(mixed_port: u16, group_name: &str) -> Result<String> {
                 .find(|group| group.name.eq_ignore_ascii_case("default"))
         });
     match group {
-        Some(group) if !group.now.trim().is_empty() => Ok(group.now.clone()),
+        Some(group) if !group.now.trim().is_empty() => {
+            let now = group.now.clone();
+            *LAST_GROUPS.lock().unwrap_or_else(|err| err.into_inner()) = groups;
+            Ok(now)
+        }
         Some(group) => bail!("group {} has no now", group.name),
         None => bail!("proxy group missing"),
     }
@@ -251,6 +287,30 @@ pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     log::debug("controller", format!("proxies groups={}", groups.len()));
     Ok(groups)
+}
+
+pub fn fetch_live(mixed_port: u16, need: LiveNeed) -> Result<LiveSnapshot> {
+    let (traffic, fetched_rows) = match need {
+        LiveNeed::Rows => (fetch(mixed_port)?, true),
+        LiveNeed::Totals => {
+            let totals = fetch_totals(mixed_port)?;
+            (
+                TrafficSnapshot {
+                    connections: Vec::new(),
+                    connection_count: totals.connection_count,
+                    upload_total: totals.upload_total,
+                    download_total: totals.download_total,
+                },
+                false,
+            )
+        }
+    };
+    let groups = fetch_proxies(mixed_port)?;
+    Ok(LiveSnapshot {
+        traffic,
+        groups,
+        fetched_rows,
+    })
 }
 
 pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {

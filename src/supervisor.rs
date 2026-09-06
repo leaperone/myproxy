@@ -25,6 +25,7 @@ pub struct CoreHealth {
     pub wanted: bool,
     pub ready: bool,
     pub note: Option<String>,
+    pub proxy_now: String,
 }
 
 impl CoreHealth {
@@ -33,6 +34,34 @@ impl CoreHealth {
             wanted: false,
             ready: false,
             note: None,
+            proxy_now: String::new(),
+        }
+    }
+
+    fn ready(proxy_now: impl Into<String>) -> Self {
+        Self {
+            wanted: true,
+            ready: true,
+            note: None,
+            proxy_now: proxy_now.into(),
+        }
+    }
+
+    fn recovered(proxy_now: impl Into<String>, note: &str) -> Self {
+        Self {
+            wanted: true,
+            ready: true,
+            note: Some(note.into()),
+            proxy_now: proxy_now.into(),
+        }
+    }
+
+    fn failing(note: &str) -> Self {
+        Self {
+            wanted: true,
+            ready: false,
+            note: Some(note.into()),
+            proxy_now: String::new(),
         }
     }
 }
@@ -291,15 +320,11 @@ impl Supervisor {
             }
             watch.last_check = Some(now);
         }
-        if !self.check_ready(strategy) {
+        let Some(proxy_now) = self.probe_now(strategy) else {
             return self.note_failure(strategy, now);
-        }
-        self.mark_ready();
-        CoreHealth {
-            wanted: true,
-            ready: true,
-            note: None,
-        }
+        };
+        self.mark_ready(proxy_now.clone());
+        CoreHealth::ready(proxy_now)
     }
 
     fn disconnect_inner(&self) -> Result<()> {
@@ -350,17 +375,18 @@ impl Supervisor {
         false
     }
 
-    fn check_ready(&self, strategy: &Strategy) -> bool {
-        self.is_running()
-            && mixed_listening(strategy.mixed_port)
-            && controller::probe(strategy.mixed_port, compile::default_group(strategy)).is_ok()
+    fn probe_now(&self, strategy: &Strategy) -> Option<String> {
+        if !self.is_running() || !mixed_listening(strategy.mixed_port) {
+            return None;
+        }
+        controller::probe(strategy.mixed_port, compile::default_group(strategy)).ok()
     }
 
     fn wait_ready(&self, strategy: &Strategy, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.check_ready(strategy) {
-                self.mark_ready();
+            if let Some(proxy_now) = self.probe_now(strategy) {
+                self.mark_ready(proxy_now);
                 return true;
             }
             if Instant::now() >= deadline {
@@ -370,16 +396,12 @@ impl Supervisor {
         }
     }
 
-    fn mark_ready(&self) {
+    fn mark_ready(&self, proxy_now: String) {
         let mut watch = self.health.lock().expect("supervisor health lock");
         watch.last_check = Some(Instant::now());
         watch.fails = 0;
         watch.recoveries = 0;
-        watch.last = CoreHealth {
-            wanted: true,
-            ready: true,
-            note: None,
-        };
+        watch.last = CoreHealth::ready(proxy_now);
     }
 
     fn reset_health(&self) {
@@ -396,26 +418,14 @@ impl Supervisor {
         let health = if !is_wanted() {
             CoreHealth::idle()
         } else if fails < FAIL_BEFORE_RETRY {
-            CoreHealth {
-                wanted: true,
-                ready: false,
-                note: Some("核心暂时无响应，正在确认…".into()),
-            }
+            CoreHealth::failing("核心暂时无响应，正在确认…")
         } else if recoveries >= MAX_RECOVERIES {
-            CoreHealth {
-                wanted: true,
-                ready: false,
-                note: Some("核心反复异常，已停止自动恢复。请手动连接。".into()),
-            }
+            CoreHealth::failing("核心反复异常，已停止自动恢复。请手动连接。")
         } else if last_recover
             .map(|at| now.duration_since(at) < RECOVER_INTERVAL)
             .unwrap_or(false)
         {
-            CoreHealth {
-                wanted: true,
-                ready: false,
-                note: Some("核心异常，等待自动重试…".into()),
-            }
+            CoreHealth::failing("核心异常，等待自动重试…")
         } else {
             return self.recover(strategy, now);
         };
@@ -429,31 +439,19 @@ impl Supervisor {
             return CoreHealth::idle();
         }
         let Ok(guard) = OPERATION.try_lock() else {
-            let health = CoreHealth {
-                wanted: true,
-                ready: false,
-                note: Some("核心异常，正在等待当前操作结束…".into()),
-            };
+            let health = CoreHealth::failing("核心异常，正在等待当前操作结束…");
             self.store_health(health.clone());
             return health;
         };
         if *guard {
-            let health = CoreHealth {
-                wanted: true,
-                ready: false,
-                note: Some("核心异常，应用正在退出…".into()),
-            };
+            let health = CoreHealth::failing("核心异常，应用正在退出…");
             self.store_health(health.clone());
             return health;
         }
         {
             let mut watch = self.health.lock().expect("supervisor health lock");
             if watch.recoveries >= MAX_RECOVERIES {
-                let health = CoreHealth {
-                    wanted: true,
-                    ready: false,
-                    note: Some("核心反复异常，已停止自动恢复。请手动连接。".into()),
-                };
+                let health = CoreHealth::failing("核心反复异常，已停止自动恢复。请手动连接。");
                 watch.last = health.clone();
                 return health;
             }
@@ -462,11 +460,7 @@ impl Supervisor {
                 .map(|at| now.duration_since(at) < RECOVER_INTERVAL)
                 .unwrap_or(false)
             {
-                let health = CoreHealth {
-                    wanted: true,
-                    ready: false,
-                    note: Some("核心异常，等待自动重试…".into()),
-                };
+                let health = CoreHealth::failing("核心异常，等待自动重试…");
                 watch.last = health.clone();
                 return health;
             }
@@ -480,14 +474,10 @@ impl Supervisor {
             match controller::reload(strategy.mixed_port) {
                 Ok(()) => {
                     controller::restore_selections(strategy.mixed_port, strategy);
-                    if self.check_ready(strategy) {
+                    if let Some(proxy_now) = self.probe_now(strategy) {
                         drop(guard);
-                        self.mark_ready();
-                        return CoreHealth {
-                            wanted: true,
-                            ready: true,
-                            note: Some("核心已重新加载。".into()),
-                        };
+                        self.mark_ready(proxy_now.clone());
+                        return CoreHealth::recovered(proxy_now, "核心已重新加载。");
                     }
                     log::info("supervisor", "health reload still unready, reconnect");
                 }
@@ -498,27 +488,17 @@ impl Supervisor {
         }
         log::info("supervisor", format!("health reconnect #{n}"));
         let health = match self.connect_inner(strategy) {
-            Ok(()) if self.check_ready(strategy) => {
-                drop(guard);
-                self.mark_ready();
-                return CoreHealth {
-                    wanted: true,
-                    ready: true,
-                    note: Some("核心已重新连接。".into()),
-                };
+            Ok(()) => {
+                if let Some(proxy_now) = self.probe_now(strategy) {
+                    drop(guard);
+                    self.mark_ready(proxy_now.clone());
+                    return CoreHealth::recovered(proxy_now, "核心已重新连接。");
+                }
+                CoreHealth::failing("核心异常，正在重新连接…")
             }
-            Ok(()) => CoreHealth {
-                wanted: true,
-                ready: false,
-                note: Some("核心异常，正在重新连接…".into()),
-            },
             Err(err) => {
                 log::warn("supervisor", format!("health reconnect failed: {err:#}"));
-                CoreHealth {
-                    wanted: true,
-                    ready: false,
-                    note: Some("核心重连失败，稍后会再试。".into()),
-                }
+                CoreHealth::failing("核心重连失败，稍后会再试。")
             }
         };
         drop(guard);

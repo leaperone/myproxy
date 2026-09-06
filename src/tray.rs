@@ -147,12 +147,7 @@ fn menu_face() -> MenuFace {
         };
     }
     let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
-    let now = strategy
-        .groups
-        .iter()
-        .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
-        .map(|group| group.selected.as_str())
-        .filter(|name| !name.is_empty());
+    let now = (!health.proxy_now.is_empty()).then_some(health.proxy_now.as_str());
     let mode = if strategy.system_extension {
         "系统接管"
     } else if strategy.tun {
