@@ -16,6 +16,7 @@
 
 ## 进行中
 - 交付前检查、提交和预检。
+- 运行中切换系统接管与 TUN 时，应用完成状态会保留“已关闭另一模式”的反馈。
 
 ## 修改文件
 - `src/ui.rs`
@@ -29,6 +30,7 @@
 | `cargo check --quiet` | 通过；仅有既有 Objective-C `cargo-clippy` cfg 警告 | 通过 |
 | `cargo test --quiet` | 11 个测试通过 | 通过 |
 | `git diff --check` | 无空白错误 | 通过 |
+| `cargo build --quiet` | 构建通过 | 通过 |
 | `cargo fmt --all -- --check` | 当前 toolchain 未安装 rustfmt 组件 | 未执行 |
 | macOS Tab/VoiceOver/窗口现场检查 | 当前环境未运行 GUI | 待现场验收 |
 

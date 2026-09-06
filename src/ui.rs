@@ -1114,6 +1114,7 @@ pub struct AppView {
     applied: Strategy,
     catalog: Catalog,
     status: String,
+    pending_apply_note: Option<String>,
     connected: bool,
     wanted: bool,
     busy: bool,
@@ -1368,6 +1369,7 @@ impl AppView {
         let this = Self {
             page: initial_page(),
             status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
+            pending_apply_note: None,
             connected: false,
             wanted,
             busy: false,
@@ -1528,6 +1530,7 @@ impl AppView {
         }
         let strategy = self.strategy.clone();
         let supervisor = self.supervisor.clone();
+        let apply_note = self.pending_apply_note.take();
         self.busy = true;
         self.status = "正在应用策略…".into();
         cx.notify();
@@ -1549,7 +1552,7 @@ impl AppView {
                         if this.strategy == strategy {
                             this.mark_applied();
                         }
-                        this.status = format!(
+                        let summary = format!(
                             "已编译 {} 个节点，排除 {}。{}Mixed {}。",
                             this.catalog.nodes.len(),
                             this.catalog.excluded.len(),
@@ -1560,6 +1563,10 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        this.status = apply_note
+                            .as_deref()
+                            .map(|note| format!("{note} {summary}"))
+                            .unwrap_or(summary);
                         if this.connected {
                             this.refresh_live(cx);
                         }
@@ -3527,7 +3534,10 @@ impl AppView {
             self.strategy.tun = false;
         }
         if self.wanted {
-            self.persist_and_apply(cx);
+            self.pending_apply_note = disabled_tun.then(|| "已开启系统接管，并关闭 TUN。".into());
+            if !self.persist_and_apply(cx) {
+                self.pending_apply_note = None;
+            }
         } else if self.persist() {
             self.status = if on {
                 if disabled_tun {
@@ -3548,7 +3558,11 @@ impl AppView {
             self.strategy.system_extension = false;
         }
         if self.wanted {
-            self.persist_and_apply(cx);
+            self.pending_apply_note = disabled_system_extension
+                .then(|| "已开启 TUN，并关闭系统接管。".into());
+            if !self.persist_and_apply(cx) {
+                self.pending_apply_note = None;
+            }
         } else if self.persist() {
             self.status = if on {
                 if disabled_system_extension {
