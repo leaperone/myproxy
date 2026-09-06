@@ -1220,7 +1220,7 @@ impl AppView {
                 }
             });
         });
-        Self {
+        let this = Self {
             page: initial_page(),
             status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
             connected,
@@ -1258,7 +1258,27 @@ impl AppView {
             traffic_prev: None,
             pending_port_input: None,
             pending_filter_input: None,
+        };
+        if crate::onboard::should_prompt() {
+            cx.defer_in(window, |_this, window, cx| {
+                let entity = cx.entity();
+                crate::onboard::open(window, cx, move |result, cx| {
+                    entity.update(cx, |this, cx| {
+                        match result {
+                            Ok(path) => {
+                                this.cli_installed = true;
+                                this.status = format!("命令行工具已安装：{}", path.display());
+                            }
+                            Err(error) => {
+                                this.status = format!("命令行工具安装失败：{error}");
+                            }
+                        }
+                        cx.notify();
+                    });
+                });
+            });
         }
+        this
     }
 
     fn set_appearance(
