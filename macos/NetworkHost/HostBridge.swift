@@ -30,6 +30,7 @@ private actor HostController {
 
     private let systemExtension = AppleSystemExtensionController()
     private let transparentProxy = AppleTransparentProxyManager()
+    private let dnsProxy = AppleDNSProxyManager()
     private var lastEndpoints: [MihomoRouteProxyEndpoint] = []
     private var lastSocksPort: UInt16?
     private var lastUsername: String?
@@ -41,9 +42,11 @@ private actor HostController {
             from: Data(json.utf8)
         )
         let endpoints = try routeEndpoints(from: request)
-        let configuration = try providerConfiguration(
+        let activationIdentifier = UUID()
+        let configurations = try providerConfigurations(
             from: request,
-            endpoints: endpoints
+            endpoints: endpoints,
+            activationIdentifier: activationIdentifier
         )
         let outcome = try await systemExtension.activate()
         if case .requiresReboot = outcome {
@@ -57,36 +60,73 @@ private actor HostController {
         if canLiveUpdate {
             do {
                 try await transparentProxy.configureAndApplyRunning(
-                    configuration,
+                    configurations.transparent,
                     revision: request.revision
                 )
+                try await transparentProxy.prepareDNS(
+                    revision: request.revision,
+                    activationIdentifier: activationIdentifier,
+                    bootstrap: configurations.dnsBootstrap
+                )
+                do {
+                    try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
+                } catch {
+                    try? await dnsProxy.disable()
+                    try? await transparentProxy.stop()
+                    throw error
+                }
                 remember(request, endpoints: endpoints)
                 return .running
             } catch {
+                try? await dnsProxy.disable()
                 try? await transparentProxy.stop()
-                let restart = try providerConfiguration(
-                    from: request,
-                    endpoints: endpoints
-                )
-                try await transparentProxy.configure(restart)
+                try await transparentProxy.configure(configurations.transparent)
                 try await transparentProxy.start()
+                try await transparentProxy.prepareDNS(
+                    revision: request.revision,
+                    activationIdentifier: activationIdentifier,
+                    bootstrap: configurations.dnsBootstrap
+                )
+                do {
+                    try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
+                } catch {
+                    try? await dnsProxy.disable()
+                    try? await transparentProxy.stop()
+                    throw error
+                }
                 remember(request, endpoints: endpoints)
                 return .running
             }
         }
+        try? await dnsProxy.disable()
         try? await transparentProxy.stop()
-        try await transparentProxy.configure(configuration)
+        try await transparentProxy.configure(configurations.transparent)
         try await transparentProxy.start()
+        do {
+            try await transparentProxy.prepareDNS(
+                revision: request.revision,
+                activationIdentifier: activationIdentifier,
+                bootstrap: configurations.dnsBootstrap
+            )
+            try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
+        } catch {
+            try? await dnsProxy.disable()
+            try? await transparentProxy.stop()
+            throw error
+        }
         remember(request, endpoints: endpoints)
         return .running
     }
 
     func disable() async throws {
-        try await transparentProxy.stop()
+        var firstError: Error?
+        do { try await dnsProxy.disable() } catch { firstError = error }
+        do { try await transparentProxy.stop() } catch { if firstError == nil { firstError = error } }
         lastEndpoints = []
         lastSocksPort = nil
         lastUsername = nil
         lastPassword = nil
+        if let firstError { throw firstError }
     }
 
     private func remember(
@@ -113,18 +153,32 @@ private func preservesRouteEndpoints(
     }
 }
 
-private func providerConfiguration(
+private struct HostProviderConfigurations: @unchecked Sendable {
+    let transparent: [String: NSObject]
+    let dnsBootstrap: Data
+}
+
+private func providerConfigurations(
     from request: HostEnableRequest,
-    endpoints: [MihomoRouteProxyEndpoint]
-) throws -> [String: NSObject] {
+    endpoints: [MihomoRouteProxyEndpoint],
+    activationIdentifier: UUID
+) throws -> HostProviderConfigurations {
     let snapshot = try captureSnapshot(from: request)
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
     let encodedSnapshot = try encoder.encode(snapshot)
     let catalog = try MihomoRouteProxyCatalog.encode(endpoints)
-    return [
+    let bootstrap = try DNSProxyBootstrapConfiguration(
+        revision: request.revision,
+        activationIdentifier: activationIdentifier,
+        profileRulesProxy: endpoints[0],
+        routeProxyEndpoints: endpoints,
+        encodedCaptureSnapshot: encodedSnapshot
+    ).encoded()
+    let transparent: [String: NSObject] = [
         "revision": NSNumber(value: request.revision),
-        "activationIdentifier": UUID().uuidString as NSString,
+        "activationIdentifier": activationIdentifier.uuidString as NSString,
+        "dnsProxyBootstrap": bootstrap as NSData,
         "captureEnabled": NSNumber(value: true),
         "failOpen": NSNumber(value: true),
         "captureConfigurationSnapshot": encodedSnapshot as NSData,
@@ -134,6 +188,7 @@ private func providerConfiguration(
         "mihomoSOCKSUsername": request.username as NSString,
         "mihomoSOCKSPassword": request.password as NSString,
     ]
+    return HostProviderConfigurations(transparent: transparent, dnsBootstrap: bootstrap)
 }
 
 private func captureSnapshot(

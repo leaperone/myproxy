@@ -54,6 +54,12 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
 
     if strategy.system_extension {
         insert_network_extension_listeners(&mut root, strategy);
+        // The DNS proxy provider captures system resolver flows at the
+        // Network Extension boundary.  Keep Mihomo's DNS engine available
+        // for those relays (and for proxy-server name resolution), but leave
+        // packet-level hijacking to the DNS provider; `dns-hijack` only makes
+        // sense on the TUN/utun path.
+        insert_dns(&mut root, false);
     } else if strategy.tun {
         insert_tun_intercept(&mut root);
     }
@@ -174,19 +180,11 @@ fn yaml_strings(items: &[&str]) -> serde_yaml::Value {
     )
 }
 
-fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
-    let mut tun = serde_yaml::Mapping::new();
-    tun.insert("enable".into(), true.into());
-    tun.insert("stack".into(), "system".into());
-    tun.insert("auto-route".into(), true.into());
-    tun.insert("strict-route".into(), true.into());
-    tun.insert("auto-detect-interface".into(), true.into());
-    tun.insert(
-        "dns-hijack".into(),
-        yaml_strings(&["any:53", "tcp://any:53"]),
-    );
-    root.insert("tun".into(), serde_yaml::Value::Mapping(tun));
-
+/// Configure Mihomo's DNS engine.  TUN additionally asks Mihomo to hijack
+/// packets sent to arbitrary resolvers; the Network Extension DNS provider
+/// performs that interception on the system resolver path, so SE omits the
+/// `dns-hijack` option while sharing the resolver configuration.
+fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     let mut dns = serde_yaml::Mapping::new();
     dns.insert("enable".into(), true.into());
     dns.insert("listen".into(), "127.0.0.1:1053".into());
@@ -207,6 +205,28 @@ fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
     );
     root.insert("dns".into(), serde_yaml::Value::Mapping(dns));
+
+    if hijack {
+        // `dns-hijack` belongs to the TUN mapping, rather than `dns`.
+        if let Some(serde_yaml::Value::Mapping(tun)) = root.get_mut("tun") {
+            tun.insert(
+                "dns-hijack".into(),
+                yaml_strings(&["any:53", "tcp://any:53"]),
+            );
+        }
+    }
+}
+
+fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
+    let mut tun = serde_yaml::Mapping::new();
+    tun.insert("enable".into(), true.into());
+    tun.insert("stack".into(), "system".into());
+    tun.insert("auto-route".into(), true.into());
+    tun.insert("strict-route".into(), true.into());
+    tun.insert("auto-detect-interface".into(), true.into());
+    root.insert("tun".into(), serde_yaml::Value::Mapping(tun));
+
+    insert_dns(root, true);
 
     let mut http = serde_yaml::Mapping::new();
     http.insert(
@@ -425,5 +445,45 @@ mod tests {
         assert!(!unmatched_is_direct(&strategy));
         strategy.unmatched_via = "default".into();
         assert_eq!(unmatched_target(&strategy), "Default");
+    }
+
+    #[test]
+    fn system_extension_dns_engine_has_no_packet_hijack() {
+        let mut root = serde_yaml::Mapping::new();
+        insert_dns(&mut root, false);
+
+        let dns = root
+            .get("dns")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("DNS mapping");
+        assert_eq!(dns.get("enable"), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(
+            dns.get("listen"),
+            Some(&serde_yaml::Value::String("127.0.0.1:1053".into()))
+        );
+        assert!(!dns.contains_key("dns-hijack"));
+        assert!(!root.contains_key("tun"));
+    }
+
+    #[test]
+    fn tun_dns_engine_hijacks_udp_and_tcp_port_53() {
+        let mut root = serde_yaml::Mapping::new();
+        insert_tun_intercept(&mut root);
+
+        let tun = root
+            .get("tun")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("TUN mapping");
+        let hijack = tun
+            .get("dns-hijack")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("DNS hijack list");
+        assert_eq!(
+            hijack,
+            &vec![
+                serde_yaml::Value::String("any:53".into()),
+                serde_yaml::Value::String("tcp://any:53".into()),
+            ]
+        );
     }
 }
