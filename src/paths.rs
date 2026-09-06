@@ -27,6 +27,10 @@ pub fn pid_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mihomo.pid"))
 }
 
+pub fn wanted_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("core.wanted"))
+}
+
 pub fn mihomo_log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mihomo.log"))
 }

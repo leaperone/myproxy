@@ -118,7 +118,19 @@ impl TrayKeepAlive {
 }
 
 fn menu_face() -> MenuFace {
-    if !Supervisor::shared().is_running() {
+    let strategy = match Strategy::load() {
+        Ok(strategy) => strategy,
+        Err(_) => {
+            return MenuFace {
+                connected: false,
+                status: "未连接".into(),
+                action: "连接".into(),
+                tooltip: "myproxy · 未连接".into(),
+            };
+        }
+    };
+    let health = Supervisor::shared().observe(&strategy);
+    if !health.wanted {
         return MenuFace {
             connected: false,
             status: "未连接".into(),
@@ -126,33 +138,35 @@ fn menu_face() -> MenuFace {
             tooltip: "myproxy · 未连接".into(),
         };
     }
-    let (status, tooltip) = match Strategy::load() {
-        Ok(strategy) => {
-            let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
-            let now = strategy
-                .groups
-                .iter()
-                .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
-                .map(|group| group.selected.as_str())
-                .filter(|name| !name.is_empty());
-            let mode = if strategy.system_extension {
-                "系统接管"
-            } else if strategy.tun {
-                "TUN"
-            } else {
-                "Mixed"
-            };
-            let status = match now {
-                Some(now) => format!("已连接 · {mode} · {now}"),
-                None => format!("已连接 · {mode}"),
-            };
-            let tooltip = match now {
-                Some(now) => format!("myproxy · 已连接 · {endpoint} · {now}"),
-                None => format!("myproxy · 已连接 · {endpoint}"),
-            };
-            (status, tooltip)
-        }
-        Err(_) => ("已连接".into(), "myproxy · 已连接".into()),
+    if !health.ready {
+        return MenuFace {
+            connected: true,
+            status: health.note.unwrap_or_else(|| "核心异常".into()),
+            action: "断开".into(),
+            tooltip: "myproxy · 核心异常".into(),
+        };
+    }
+    let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
+    let now = strategy
+        .groups
+        .iter()
+        .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
+        .map(|group| group.selected.as_str())
+        .filter(|name| !name.is_empty());
+    let mode = if strategy.system_extension {
+        "系统接管"
+    } else if strategy.tun {
+        "TUN"
+    } else {
+        "Mixed"
+    };
+    let status = match now {
+        Some(now) => format!("已连接 · {mode} · {now}"),
+        None => format!("已连接 · {mode}"),
+    };
+    let tooltip = match now {
+        Some(now) => format!("myproxy · 已连接 · {endpoint} · {now}"),
+        None => format!("myproxy · 已连接 · {endpoint}"),
     };
     MenuFace {
         connected: true,
