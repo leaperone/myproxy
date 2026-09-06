@@ -51,6 +51,66 @@ actor AppleTransparentProxyManager {
         try await waitForConnection(manager.connection, target: .connected)
     }
 
+    func isConnected() async -> Bool {
+        do {
+            try await reload()
+            return manager?.connection.status == .connected
+        } catch {
+            return false
+        }
+    }
+
+    func applyRunningConfiguration(
+        _ configuration: [String: NSObject],
+        revision: UInt64
+    ) async throws {
+        let quiesced = try await send(
+            HostProviderControlRequest(
+                command: "quiesce",
+                revision: revision,
+                captureEnabled: false,
+                failOpen: true,
+                captureConfigurationSnapshot: nil,
+                mihomoRouteProxyCatalog: nil,
+                mihomoSOCKSHost: nil,
+                mihomoSOCKSPort: nil,
+                mihomoSOCKSUsername: nil,
+                mihomoSOCKSPassword: nil
+            )
+        )
+        guard quiesced.accepted, quiesced.revision == revision else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy,
+                message: quiesced.message ?? "Provider refused to quiesce for a live update"
+            )
+        }
+
+        let applied = try await send(
+            HostProviderControlRequest(
+                command: "applyConfiguration",
+                revision: revision,
+                captureEnabled: true,
+                failOpen: true,
+                captureConfigurationSnapshot: data(
+                    configuration["captureConfigurationSnapshot"]
+                ),
+                mihomoRouteProxyCatalog: data(
+                    configuration["mihomoRouteProxyCatalog"]
+                ),
+                mihomoSOCKSHost: configuration["mihomoSOCKSHost"] as? String,
+                mihomoSOCKSPort: uint16(configuration["mihomoSOCKSPort"]),
+                mihomoSOCKSUsername: configuration["mihomoSOCKSUsername"] as? String,
+                mihomoSOCKSPassword: configuration["mihomoSOCKSPassword"] as? String
+            )
+        )
+        guard applied.accepted, applied.revision == revision, applied.captureEnabled else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy,
+                message: applied.message ?? "Provider refused the live capture snapshot"
+            )
+        }
+    }
+
     func stop() async throws {
         let loadedManager: NETransparentProxyManager?
         if let manager {
@@ -168,4 +228,103 @@ actor AppleTransparentProxyManager {
             message: "Timed out waiting for transparent proxy status \(target.rawValue)"
         )
     }
+
+    private func send(
+        _ request: HostProviderControlRequest
+    ) async throws -> HostProviderControlResponse {
+        try await reload()
+        guard let manager else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy,
+                message: "No myproxy transparent proxy configuration exists"
+            )
+        }
+        guard let session = manager.connection as? NETunnelProviderSession else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy,
+                message: "Transparent proxy session is not available"
+            )
+        }
+        let payload = try JSONEncoder().encode(request)
+        let responseData: Data = try await withCheckedThrowingContinuation { continuation in
+            do {
+                try session.sendProviderMessage(payload) { response in
+                    guard let response else {
+                        continuation.resume(
+                            throwing: NetworkExtensionControlFailure(
+                                operation: .configureTransparentProxy,
+                                message: "Provider returned an empty control response"
+                            )
+                        )
+                        return
+                    }
+                    continuation.resume(returning: response)
+                }
+            } catch {
+                continuation.resume(
+                    throwing: NetworkExtensionControlFailure(
+                        operation: .configureTransparentProxy,
+                        underlying: error
+                    )
+                )
+            }
+        }
+        do {
+            return try JSONDecoder().decode(
+                HostProviderControlResponse.self,
+                from: responseData
+            )
+        } catch {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy,
+                message: "Provider returned an invalid control response"
+            )
+        }
+    }
+
+    private func data(_ value: Any?) -> Data? {
+        switch value {
+        case let value as Data:
+            value
+        case let value as NSData:
+            value as Data
+        default:
+            nil
+        }
+    }
+
+    private func uint16(_ value: Any?) -> UInt16? {
+        switch value {
+        case let value as UInt16 where value > 0:
+            value
+        case let value as Int where (1 ... Int(UInt16.max)).contains(value):
+            UInt16(value)
+        case let value as NSNumber where (1 ... Int(UInt16.max)).contains(value.intValue):
+            UInt16(value.intValue)
+        default:
+            nil
+        }
+    }
+}
+
+private struct HostProviderControlRequest: Encodable, Sendable {
+    let protocolVersion = 3
+    let command: String
+    let revision: UInt64?
+    let captureEnabled: Bool?
+    let failOpen: Bool?
+    let captureConfigurationSnapshot: Data?
+    let mihomoRouteProxyCatalog: Data?
+    let mihomoSOCKSHost: String?
+    let mihomoSOCKSPort: UInt16?
+    let mihomoSOCKSUsername: String?
+    let mihomoSOCKSPassword: String?
+}
+
+private struct HostProviderControlResponse: Decodable, Sendable {
+    let accepted: Bool
+    let revision: UInt64
+    let running: Bool
+    let captureEnabled: Bool
+    let message: String?
 }

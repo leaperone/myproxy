@@ -30,36 +30,90 @@ private actor HostController {
 
     private let systemExtension = AppleSystemExtensionController()
     private let transparentProxy = AppleTransparentProxyManager()
+    private var lastEndpoints: [MihomoRouteProxyEndpoint] = []
+    private var lastSocksPort: UInt16?
+    private var lastUsername: String?
+    private var lastPassword: String?
 
     func enable(json: String) async throws -> HostEnableOutcome {
         let request = try JSONDecoder().decode(
             HostEnableRequest.self,
             from: Data(json.utf8)
         )
-        let configuration = try providerConfiguration(from: request)
+        let endpoints = try routeEndpoints(from: request)
+        let configuration = try providerConfiguration(
+            from: request,
+            endpoints: endpoints
+        )
         let outcome = try await systemExtension.activate()
         if case .requiresReboot = outcome {
             return .requiresReboot
         }
+        let canLiveUpdate = await transparentProxy.isConnected()
+            && lastSocksPort == request.socksPort
+            && lastUsername == request.username
+            && lastPassword == request.password
+            && preservesRouteEndpoints(lastEndpoints, endpoints)
+        if canLiveUpdate {
+            do {
+                try await transparentProxy.configure(configuration)
+                try await transparentProxy.applyRunningConfiguration(
+                    configuration,
+                    revision: request.revision
+                )
+                remember(request, endpoints: endpoints)
+                return .running
+            } catch {
+                // Port-preserving live apply failed; tear down and start clean.
+            }
+        }
         try? await transparentProxy.stop()
         try await transparentProxy.configure(configuration)
         try await transparentProxy.start()
+        remember(request, endpoints: endpoints)
         return .running
     }
 
     func disable() async throws {
         try await transparentProxy.stop()
+        lastEndpoints = []
+        lastSocksPort = nil
+        lastUsername = nil
+        lastPassword = nil
+    }
+
+    private func remember(
+        _ request: HostEnableRequest,
+        endpoints: [MihomoRouteProxyEndpoint]
+    ) {
+        lastEndpoints = endpoints
+        lastSocksPort = request.socksPort
+        lastUsername = request.username
+        lastPassword = request.password
+    }
+}
+
+private func preservesRouteEndpoints(
+    _ previous: [MihomoRouteProxyEndpoint],
+    _ next: [MihomoRouteProxyEndpoint]
+) -> Bool {
+    previous.allSatisfy { old in
+        next.contains { candidate in
+            candidate.route == old.route
+                && candidate.host == old.host
+                && candidate.port == old.port
+        }
     }
 }
 
 private func providerConfiguration(
-    from request: HostEnableRequest
+    from request: HostEnableRequest,
+    endpoints: [MihomoRouteProxyEndpoint]
 ) throws -> [String: NSObject] {
     let snapshot = try captureSnapshot(from: request)
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
     let encodedSnapshot = try encoder.encode(snapshot)
-    let endpoints = try routeEndpoints(from: request)
     let catalog = try MihomoRouteProxyCatalog.encode(endpoints)
     return [
         "revision": NSNumber(value: request.revision),
@@ -80,15 +134,14 @@ private func captureSnapshot(
 ) throws -> CaptureConfigurationSnapshot {
     var rules: [CaptureRule] = []
     for (index, rule) in request.processRules.enumerated() {
-        guard let pattern = try? ApplicationIdentifierPatternMatcher(pattern: rule.pattern) else {
-            continue
-        }
+        let sources = sourceMatchers(from: rule.pattern)
+        guard !sources.isEmpty else { continue }
         rules.append(
             try CaptureRule(
                 id: "process-\(index)",
                 enabled: true,
                 priority: (index + 1) * 10,
-                sources: [.applicationIdentifierPattern(pattern)],
+                sources: sources,
                 destinations: [],
                 protocols: [],
                 portRanges: [],
@@ -111,6 +164,69 @@ private func captureSnapshot(
         )
     )
     return try CaptureConfigurationSnapshot(revision: request.revision, rules: rules)
+}
+
+private func sourceMatchers(from raw: String) -> [SourceMatcher] {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return [] }
+
+    var sources: [SourceMatcher] = []
+    if let path = executablePath(from: trimmed) {
+        sources.append(.executable(ExecutableSourceMatcher(canonicalPath: path)))
+    }
+
+    var seen = Set<String>()
+    for candidate in identifierCandidates(trimmed) {
+        let key = candidate.lowercased()
+        guard seen.insert(key).inserted else { continue }
+        guard let pattern = try? ApplicationIdentifierPatternMatcher(pattern: candidate) else {
+            continue
+        }
+        sources.append(.applicationIdentifierPattern(pattern))
+    }
+    return sources
+}
+
+/// Proxifier-style Application values: process name, bundle id, `Foo.app`,
+/// or an absolute Mach-O path. A `.app` bundle directory is not an executable.
+private func executablePath(from raw: String) -> String? {
+    guard raw.hasPrefix("/"), raw.count > 1 else { return nil }
+    guard !raw.lowercased().hasSuffix(".app") else { return nil }
+    guard !raw.contains(where: { $0 == "\0" || $0 == "\n" || $0 == "\r" }) else { return nil }
+    return raw
+}
+
+private func identifierCandidates(_ raw: String) -> [String] {
+    var values: [String] = []
+    func add(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard !values.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) else {
+            return
+        }
+        values.append(trimmed)
+    }
+
+    add(raw)
+    if raw.contains("/") {
+        let url = URL(fileURLWithPath: raw)
+        add(url.lastPathComponent)
+        var current = url
+        for _ in 0..<8 {
+            if current.pathExtension.lowercased() == "app" {
+                add(current.deletingPathExtension().lastPathComponent)
+                break
+            }
+            let parent = current.deletingLastPathComponent()
+            if parent.path == current.path || parent.path == "/" {
+                break
+            }
+            current = parent
+        }
+    } else if raw.lowercased().hasSuffix(".app") {
+        add(String(raw.dropLast(4)))
+    }
+    return values
 }
 
 private func captureAction(via: String) -> CaptureAction {
