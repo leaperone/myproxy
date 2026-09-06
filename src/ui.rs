@@ -2136,7 +2136,9 @@ impl AppView {
                                 Button::new("apply")
                                     .small()
                                     .disabled(busy)
-                                    .label(if self.external_change_pending {
+                                    .label(if busy {
+                                        "处理中…"
+                                    } else if self.external_change_pending {
                                         "覆盖并应用"
                                     } else {
                                         "应用"
@@ -2207,7 +2209,11 @@ impl AppView {
                 div()
                     .id("status")
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(if self.status.contains("失败") {
+                        theme.warning
+                    } else {
+                        theme.muted_foreground
+                    })
                     .child(self.status.clone()),
             )
             .child(match self.page {
