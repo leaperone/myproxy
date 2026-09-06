@@ -1,0 +1,5 @@
+- [x] 完成调用链探索：host → transparent manager → provider prepareDNS → DNS manager。
+- [x] 完成 mihomo SE/TUN DNS 编译分支与单测。
+- [x] 完成 host DNS manager、bootstrap 复用、启停顺序及失败回滚。
+- [x] Swift host/extension 构建、cargo test、cargo check、git diff --check 通过。
+- [x] 完成最终审查、planning check、commit/push/PR/preflight。

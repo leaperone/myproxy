@@ -76,6 +76,8 @@ actor AppleTransparentProxyManager {
             HostProviderControlRequest(
                 command: "quiesce",
                 revision: revision,
+                activationIdentifier: nil,
+                dnsProxyBootstrap: nil,
                 captureEnabled: false,
                 failOpen: true,
                 captureConfigurationSnapshot: nil,
@@ -97,6 +99,8 @@ actor AppleTransparentProxyManager {
             HostProviderControlRequest(
                 command: "applyConfiguration",
                 revision: revision,
+                activationIdentifier: uuid(configuration["activationIdentifier"]),
+                dnsProxyBootstrap: data(configuration["dnsProxyBootstrap"]),
                 captureEnabled: true,
                 failOpen: true,
                 captureConfigurationSnapshot: data(
@@ -115,6 +119,35 @@ actor AppleTransparentProxyManager {
             throw NetworkExtensionControlFailure(
                 operation: .configureTransparentProxy,
                 message: applied.message ?? "Provider refused the live capture snapshot"
+            )
+        }
+    }
+
+    func prepareDNS(
+        revision: UInt64,
+        activationIdentifier: UUID,
+        bootstrap: Data
+    ) async throws {
+        let response = try await send(
+            HostProviderControlRequest(
+                command: "prepareDNS",
+                revision: revision,
+                activationIdentifier: activationIdentifier,
+                dnsProxyBootstrap: bootstrap,
+                captureEnabled: nil,
+                failOpen: nil,
+                captureConfigurationSnapshot: nil,
+                mihomoRouteProxyCatalog: nil,
+                mihomoSOCKSHost: nil,
+                mihomoSOCKSPort: nil,
+                mihomoSOCKSUsername: nil,
+                mihomoSOCKSPassword: nil
+            )
+        )
+        guard response.accepted, response.revision == revision else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureDNSProxy,
+                message: response.message ?? "Transparent provider refused DNS preparation"
             )
         }
     }
@@ -313,12 +346,27 @@ actor AppleTransparentProxyManager {
             nil
         }
     }
+
+    private func uuid(_ value: Any?) -> UUID? {
+        switch value {
+        case let value as UUID:
+            value
+        case let value as String:
+            UUID(uuidString: value)
+        case let value as NSString:
+            UUID(uuidString: value as String)
+        default:
+            nil
+        }
+    }
 }
 
 private struct HostProviderControlRequest: Encodable, Sendable {
     let protocolVersion = 3
     let command: String
     let revision: UInt64?
+    let activationIdentifier: UUID?
+    let dnsProxyBootstrap: Data?
     let captureEnabled: Bool?
     let failOpen: Bool?
     let captureConfigurationSnapshot: Data?
