@@ -19,7 +19,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::controller::{self, LiveGroup, LiveReach, PublishedLive, TrafficSnapshot};
+use myproxy::controller::{
+    self, LiveGroup, LiveNeed, LiveReach, PublishedLive, TrafficSnapshot, TrafficTotals,
+};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::Supervisor;
@@ -1001,6 +1003,12 @@ fn via_menu(
     menu
 }
 
+enum LivePoll {
+    Down,
+    PingOk,
+    Ready(Result<controller::LiveSnapshot, String>),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overview,
@@ -1020,11 +1028,6 @@ fn initial_page() -> Page {
         "settings" => Page::Settings,
         _ => Page::Overview,
     }
-}
-
-enum LivePoll {
-    Down,
-    Ready(Result<controller::LiveSnapshot, String>),
 }
 
 pub struct AppView {
@@ -1067,6 +1070,8 @@ pub struct AppView {
     live_epoch: u64,
     delays: HashMap<String, u32>,
     delaying: HashSet<String>,
+    window_active: bool,
+    log_generation: u64,
 }
 
 impl AppView {
@@ -1103,18 +1108,14 @@ impl AppView {
                         if this.live_inflight {
                             return 200;
                         }
-                        let base = if this.page == Page::Connections {
-                            500
-                        } else {
-                            1500
-                        };
+                        let base = this.live_poll_ms();
                         if fail_streak == 0 {
                             base
                         } else {
                             base.saturating_mul(1 << fail_streak.min(2)).min(3000)
                         }
                     })
-                    .unwrap_or(1500);
+                    .unwrap_or(2500);
                 cx.background_executor()
                     .timer(Duration::from_millis(wait_ms))
                     .await;
@@ -1129,20 +1130,28 @@ impl AppView {
                             this.strategy.mixed_port,
                             this.supervisor.clone(),
                             this.live_epoch,
+                            this.live_need(),
                         ))
                     })
                     .ok()
                     .flatten();
-                if let Some((port, supervisor, epoch)) = request {
+                if let Some((port, supervisor, epoch, need)) = request {
                     let outcome = cx
                         .background_executor()
                         .spawn(async move {
                             if !supervisor.is_running() {
                                 return LivePoll::Down;
                             }
-                            LivePoll::Ready(
-                                controller::fetch_live(port).map_err(|err| err.to_string()),
-                            )
+                            match need {
+                                Some(need) => LivePoll::Ready(
+                                    controller::fetch_live(port, need)
+                                        .map_err(|err| err.to_string()),
+                                ),
+                                None => match controller::ping(port) {
+                                    Ok(()) => LivePoll::PingOk,
+                                    Err(err) => LivePoll::Ready(Err(err.to_string())),
+                                },
+                            }
                         })
                         .await;
                     fail_streak = match &outcome {
@@ -1220,7 +1229,11 @@ impl AppView {
                             }
                         }
                         if this.page == Page::Settings && log::developer() {
-                            dirty = true;
+                            let generation = log::generation();
+                            if generation != this.log_generation {
+                                this.log_generation = generation;
+                                dirty = true;
+                            }
                         }
                         if dirty {
                             cx.notify();
@@ -1297,6 +1310,8 @@ impl AppView {
             live_epoch: 0,
             delays: HashMap::new(),
             delaying: HashSet::new(),
+            window_active: true,
+            log_generation: log::generation(),
             pending_port_input: None,
             pending_filter_input: None,
         };
@@ -1516,6 +1531,28 @@ impl AppView {
         dirty
     }
 
+    fn live_poll_ms(&self) -> u64 {
+        if !self.window_active {
+            return 4000;
+        }
+        match self.page {
+            Page::Connections => 500,
+            Page::Overview | Page::Groups => 1500,
+            _ => 2500,
+        }
+    }
+
+    fn live_need(&self) -> Option<LiveNeed> {
+        if !self.window_active {
+            return None;
+        }
+        match self.page {
+            Page::Connections => Some(LiveNeed::Rows),
+            Page::Overview | Page::Groups => Some(LiveNeed::Totals),
+            _ => None,
+        }
+    }
+
     fn publish_session(&self) {
         let reach = if !self.connected {
             LiveReach::Down
@@ -1543,11 +1580,27 @@ impl AppView {
                 self.clear_live();
                 self.publish_session();
             }
+            LivePoll::PingOk => {
+                self.connected = true;
+                self.live_ok = true;
+                self.live_error = None;
+                self.traffic_error = None;
+                self.proxy_error = None;
+                self.publish_session();
+            }
             LivePoll::Ready(Ok(snap)) => {
                 self.connected = true;
                 self.live_ok = true;
                 self.live_error = None;
-                self.apply_traffic(Ok(snap.traffic));
+                if snap.fetched_rows {
+                    self.apply_traffic(Ok(snap.traffic));
+                } else {
+                    self.apply_totals(Ok(TrafficTotals {
+                        upload_total: snap.traffic.upload_total,
+                        download_total: snap.traffic.download_total,
+                        connection_count: snap.traffic.connection_count,
+                    }));
+                }
                 self.apply_proxies(Ok(snap.groups));
                 self.publish_session();
             }
@@ -1631,6 +1684,13 @@ impl AppView {
             };
         }
         self.live_now("PROXY")
+            .or_else(|| {
+                self.proxy_groups
+                    .iter()
+                    .find(|group| group.name.eq_ignore_ascii_case("default"))
+                    .map(|group| group.now.as_str())
+                    .filter(|now| !now.is_empty())
+            })
             .map(str::to_string)
             .or_else(|| {
                 self.strategy
@@ -1645,7 +1705,7 @@ impl AppView {
             .unwrap_or_else(|| "—".into())
     }
 
-    fn apply_proxies(&mut self, result: Result<Vec<LiveGroup>, String>) {
+    fn apply_proxies(&mut self, result: Result<Vec<LiveGroup>, String>) -> bool {
         match result {
             Ok(mut groups) => {
                 for group in &mut groups {
@@ -1655,12 +1715,17 @@ impl AppView {
                         }
                     }
                 }
+                let changed = self.proxy_groups != groups || self.proxy_error.is_some();
                 self.proxy_groups = groups;
                 self.proxy_error = None;
+                changed
             }
             Err(err) => {
                 log::debug("ui", format!("proxies poll failed: {err}"));
-                self.proxy_error = Some("暂时读不到节点组状态。".into());
+                let msg = "暂时读不到节点组状态。";
+                let changed = self.proxy_error.as_deref() != Some(msg);
+                self.proxy_error = Some(msg.into());
+                changed
             }
         }
     }
@@ -1680,13 +1745,18 @@ impl AppView {
             self.publish_session();
             return;
         }
+        let Some(need) = self.live_need() else {
+            return;
+        };
         let port = self.strategy.mixed_port;
         let epoch = self.live_epoch;
         self.live_inflight = true;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { controller::fetch_live(port).map_err(|err| err.to_string()) })
+                .spawn(async move {
+                    controller::fetch_live(port, need).map_err(|err| err.to_string())
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.live_inflight = false;
@@ -1698,29 +1768,68 @@ impl AppView {
         .detach();
     }
 
-    fn apply_traffic(&mut self, result: Result<TrafficSnapshot, String>) {
+    fn note_totals(&mut self, upload_total: u64, download_total: u64) -> bool {
+        let now = Instant::now();
+        let mut rate_changed = false;
+        if let Some((prev_at, prev_up, prev_down)) = self.traffic_prev {
+            let dt = now.duration_since(prev_at).as_secs_f64();
+            if dt >= 0.2 {
+                let up = ((upload_total.saturating_sub(prev_up)) as f64 / dt) as u64;
+                let down = ((download_total.saturating_sub(prev_down)) as f64 / dt) as u64;
+                rate_changed = self.traffic_up != up
+                    || self.traffic_down != down
+                    || !self.traffic_has_rate;
+                self.traffic_up = up;
+                self.traffic_down = down;
+                self.traffic_has_rate = true;
+                self.traffic_prev = Some((now, upload_total, download_total));
+            }
+        } else {
+            self.traffic_prev = Some((now, upload_total, download_total));
+        }
+        rate_changed
+    }
+
+    fn apply_traffic(&mut self, result: Result<TrafficSnapshot, String>) -> bool {
         match result {
             Ok(snap) => {
-                let now = Instant::now();
-                if let Some((prev_at, prev_up, prev_down)) = self.traffic_prev {
-                    let dt = now.duration_since(prev_at).as_secs_f64();
-                    if dt >= 0.2 {
-                        self.traffic_up =
-                            ((snap.upload_total.saturating_sub(prev_up)) as f64 / dt) as u64;
-                        self.traffic_down =
-                            ((snap.download_total.saturating_sub(prev_down)) as f64 / dt) as u64;
-                        self.traffic_has_rate = true;
-                        self.traffic_prev = Some((now, snap.upload_total, snap.download_total));
-                    }
-                } else {
-                    self.traffic_prev = Some((now, snap.upload_total, snap.download_total));
-                }
+                let rate_changed = self.note_totals(snap.upload_total, snap.download_total);
+                let changed = self.traffic != snap || self.traffic_error.is_some() || rate_changed;
                 self.traffic = snap;
                 self.traffic_error = None;
+                changed
             }
             Err(err) => {
                 log::debug("ui", format!("connections poll failed: {err}"));
-                self.traffic_error = Some("暂时读不到核心连接。".into());
+                let msg = "暂时读不到核心连接。";
+                let changed = self.traffic_error.as_deref() != Some(msg);
+                self.traffic_error = Some(msg.into());
+                changed
+            }
+        }
+    }
+
+    fn apply_totals(&mut self, result: Result<TrafficTotals, String>) -> bool {
+        match result {
+            Ok(totals) => {
+                let rate_changed = self.note_totals(totals.upload_total, totals.download_total);
+                let changed = self.traffic.upload_total != totals.upload_total
+                    || self.traffic.download_total != totals.download_total
+                    || self.traffic.connection_count != totals.connection_count
+                    || self.traffic_error.is_some()
+                    || rate_changed;
+                self.traffic.upload_total = totals.upload_total;
+                self.traffic.download_total = totals.download_total;
+                self.traffic.connection_count = totals.connection_count;
+                self.traffic_error = None;
+                changed
+            }
+            Err(err) => {
+                log::debug("ui", format!("connections poll failed: {err}"));
+                let msg = "暂时读不到核心连接。";
+                let changed = self.traffic_error.as_deref() != Some(msg);
+                self.traffic_error = Some(msg.into());
+                changed
             }
         }
     }
@@ -1734,6 +1843,11 @@ impl AppView {
         move |_, _, app| {
             entity.update(app, |this, cx| {
                 this.page = page;
+                if this.connected
+                    && matches!(page, Page::Connections | Page::Overview | Page::Groups)
+                {
+                    this.refresh_live(cx);
+                }
                 cx.notify();
             });
         }
@@ -2214,6 +2328,13 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = window.is_window_active();
+        if active && !self.window_active && self.connected {
+            self.window_active = true;
+            self.refresh_live(cx);
+        } else {
+            self.window_active = active;
+        }
         if let Some(value) = self.pending_port_input.take() {
             self.port_input
                 .update(cx, |input, cx| input.set_value(value, window, cx));
@@ -2406,7 +2527,7 @@ impl AppView {
             "—".into()
         });
         let conns = self.live_metric(if self.session_healthy() {
-            self.traffic.connections.len().to_string()
+            self.traffic.connection_count.to_string()
         } else {
             "—".into()
         });
@@ -2538,7 +2659,7 @@ impl AppView {
             "—".into()
         });
         let count = self.live_metric(if healthy {
-            self.traffic.connections.len().to_string()
+            self.traffic.connection_count.to_string()
         } else {
             "—".into()
         });
@@ -2671,7 +2792,24 @@ impl AppView {
                         .child(connection_header_row(theme))
                         .children(self.traffic.connections.iter().map(|conn| {
                             render_connection_row(entity.clone(), theme, conn)
-                        })),
+                        }))
+                        .when(
+                            self.traffic.connection_count > self.traffic.connections.len(),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .px_3()
+                                        .py_2()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child(format!(
+                                            "仅列出流量最高的 {} 条，共 {} 条。",
+                                            self.traffic.connections.len(),
+                                            self.traffic.connection_count
+                                        )),
+                                )
+                            },
+                        ),
                 )
             })
     }

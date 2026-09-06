@@ -22,17 +22,24 @@ pub struct EnableRequest {
     pub group_ports: Vec<GroupPort>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRule {
     pub pattern: String,
     pub via: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GroupPort {
     pub name: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureFace {
+    socks_port: u16,
+    process_rules: Vec<ProcessRule>,
+    group_ports: Vec<GroupPort>,
 }
 
 struct Session {
@@ -42,9 +49,11 @@ struct Session {
     socks_port: u16,
     group_ports: BTreeMap<String, u16>,
     next_port: u16,
+    last_face: Option<CaptureFace>,
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+static LAST_ENABLE: Mutex<Option<CaptureFace>> = Mutex::new(None);
 
 pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
     let socks_port = compile::network_extension_socks_port(strategy.mixed_port);
@@ -62,8 +71,8 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
             controller,
             &BTreeMap::new(),
         ),
+        last_face: None,
     });
-    session.revision = session.revision.saturating_add(1);
     if session.socks_port != socks_port {
         session.socks_port = socks_port;
         session.group_ports.clear();
@@ -117,6 +126,16 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
         group_ports.push(GroupPort { name, port });
     }
 
+    let face = CaptureFace {
+        socks_port,
+        process_rules: process_rules.clone(),
+        group_ports: group_ports.clone(),
+    };
+    if session.last_face.as_ref() != Some(&face) {
+        session.revision = session.revision.saturating_add(1);
+        session.last_face = Some(face);
+    }
+
     EnableRequest {
         revision: session.revision,
         socks_port,
@@ -148,10 +167,24 @@ fn next_listener_port(
 
 pub fn enable_async(strategy: &Strategy) {
     let request = inbound_plan(strategy);
+    let face = CaptureFace {
+        socks_port: request.socks_port,
+        process_rules: request.process_rules.clone(),
+        group_ports: request.group_ports.clone(),
+    };
+    {
+        let mut last = LAST_ENABLE.lock().expect("ne last enable");
+        if last.as_ref() == Some(&face) {
+            log::debug("ne", "skip unchanged capture plan");
+            return;
+        }
+        *last = Some(face);
+    }
     thread::Builder::new()
         .name("myproxy-ne".into())
         .spawn(move || {
             if let Err(err) = enable_blocking(&request) {
+                *LAST_ENABLE.lock().expect("ne last enable") = None;
                 log::error("ne", format!("{err:#}"));
             }
         })
@@ -159,6 +192,7 @@ pub fn enable_async(strategy: &Strategy) {
 }
 
 pub fn disable_async() {
+    *LAST_ENABLE.lock().expect("ne last enable") = None;
     thread::Builder::new()
         .name("myproxy-ne-stop".into())
         .spawn(|| {
