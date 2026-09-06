@@ -1,20 +1,23 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::button::{
-    Button, ButtonGroup, ButtonVariants as _, Toggle, ToggleGroup, ToggleVariants as _,
+    Button, ButtonGroup, ButtonVariant, ButtonVariants as _, Toggle, ToggleGroup,
+    ToggleVariants as _,
 };
 use gpui_kit::component::dialog::{Cancel, Confirm, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarItem,
 };
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Selectable, Sizable, StyledExt,
-    Theme, TitleBar, WindowExt,
+    h_flex, v_flex, ActiveTheme, Collapsible, Disableable, IconName, Root, Selectable, Sizable,
+    StyledExt, Theme, TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -101,6 +104,63 @@ const REGION_PRESETS: &[(&str, &[&str])] = &[
     ("HK", &["hk", "港"]),
     ("TW", &["tw", "台"]),
 ];
+
+#[derive(Clone)]
+struct NavItem {
+    label: SharedString,
+    icon: IconName,
+    active: bool,
+    handler: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+}
+
+impl NavItem {
+    fn new(
+        label: &'static str,
+        icon: IconName,
+        active: bool,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            icon,
+            active,
+            handler: Rc::new(handler),
+        }
+    }
+}
+
+impl Collapsible for NavItem {
+    fn is_collapsed(&self) -> bool {
+        false
+    }
+
+    fn collapsed(self, _collapsed: bool) -> Self {
+        self
+    }
+}
+
+impl SidebarItem for NavItem {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> impl IntoElement {
+        let mut button = Button::new(id)
+            .w_full()
+            .small()
+            .ghost()
+            .justify_start()
+            .gap_2()
+            .icon(self.icon)
+            .label(self.label)
+            .on_click(move |event, window, cx| (self.handler)(event, window, cx));
+        if self.active {
+            button = button.selected(true);
+        }
+        button
+    }
+}
 
 struct GroupEditor {
     parent: Entity<AppView>,
@@ -397,7 +457,13 @@ impl Render for GroupEditor {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().w(px(160.)).child(Input::new(&self.name)))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .w(px(160.))
+                            .child(div().text_xs().text_color(muted_fg).child("组名"))
+                            .child(Input::new(&self.name)),
+                    )
                     .child({
                         let entity = entity.clone();
                         let mut group = ButtonGroup::new("group-mode")
@@ -791,7 +857,13 @@ impl Render for RuleSetEditor {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().flex_1().child(Input::new(&self.name)))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .child(div().text_xs().text_color(muted_fg).child("项目名"))
+                            .child(Input::new(&self.name)),
+                    )
                     .child({
                         let entity = entity.clone();
                         Button::new("rule-via")
@@ -850,7 +922,13 @@ impl Render for RuleSetEditor {
                             });
                         })
                     })
-                    .child(div().flex_1().child(Input::new(&self.match_input)))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .child(div().text_xs().text_color(muted_fg).child("匹配值"))
+                            .child(Input::new(&self.match_input)),
+                    )
                     .child({
                         let entity = entity.clone();
                         Button::new("add-matcher")
@@ -1036,6 +1114,7 @@ pub struct AppView {
     applied: Strategy,
     catalog: Catalog,
     status: String,
+    pending_apply_note: Option<String>,
     connected: bool,
     wanted: bool,
     busy: bool,
@@ -1290,6 +1369,7 @@ impl AppView {
         let this = Self {
             page: initial_page(),
             status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
+            pending_apply_note: None,
             connected: false,
             wanted,
             busy: false,
@@ -1450,6 +1530,7 @@ impl AppView {
         }
         let strategy = self.strategy.clone();
         let supervisor = self.supervisor.clone();
+        let apply_note = self.pending_apply_note.take();
         self.busy = true;
         self.status = "正在应用策略…".into();
         cx.notify();
@@ -1471,7 +1552,7 @@ impl AppView {
                         if this.strategy == strategy {
                             this.mark_applied();
                         }
-                        this.status = format!(
+                        let summary = format!(
                             "已编译 {} 个节点，排除 {}。{}Mixed {}。",
                             this.catalog.nodes.len(),
                             this.catalog.excluded.len(),
@@ -1482,6 +1563,10 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        this.status = apply_note
+                            .as_deref()
+                            .map(|note| format!("{note} {summary}"))
+                            .unwrap_or(summary);
                         if this.connected {
                             this.refresh_live(cx);
                         }
@@ -1844,11 +1929,8 @@ impl AppView {
         page: Page,
         label: &'static str,
         icon: IconName,
-    ) -> SidebarMenuItem {
-        SidebarMenuItem::new(label)
-            .icon(icon)
-            .active(self.page == page)
-            .on_click(self.select_page(cx, page))
+    ) -> NavItem {
+        NavItem::new(label, icon, self.page == page, self.select_page(cx, page))
     }
 
     fn on_apply(&self, cx: &mut Context<Self>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
@@ -2145,6 +2227,39 @@ impl AppView {
         self.persist_and_apply(cx);
     }
 
+    fn confirm_destructive(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        title: String,
+        description: String,
+        action: impl Fn(Entity<Self>, &mut Window, &mut App) + 'static,
+    ) {
+        let parent = cx.entity();
+        let action = Rc::new(action);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let action = action.clone();
+            alert
+                .title(title.clone())
+                .description(description.clone())
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("确认")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("取消")
+                        .show_cancel(true)
+                        .on_ok({
+                            let parent = parent.clone();
+                            move |_, window, cx| {
+                                action(parent.clone(), window, cx);
+                                true
+                            }
+                        }),
+                )
+        });
+    }
+
     fn move_selected_rule(&mut self, id: &str, delta: i32, cx: &mut Context<Self>) {
         if !self.strategy.move_rule(id, delta) {
             return;
@@ -2153,6 +2268,23 @@ impl AppView {
     }
 
     fn remove_selected_rule(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rule) = self.strategy.rule_sets.iter().find(|rule| rule.id == id) else {
+            return;
+        };
+        let rule_id = id.to_string();
+        let name = rule.name.clone();
+        self.confirm_destructive(
+            window,
+            cx,
+            "删除规则？".into(),
+            format!("将删除规则「{name}」，此操作不可撤销。"),
+            move |parent, window, cx| {
+                parent.update(cx, |this, cx| this.delete_rule_now(&rule_id, window, cx));
+            },
+        );
+    }
+
+    fn delete_rule_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let editing = self.rule_edit_id.as_deref() == Some(id);
         if !self.strategy.remove_rule(id) {
             return;
@@ -2165,6 +2297,34 @@ impl AppView {
             }
             self.status = "已删除规则。".into();
         }
+    }
+
+    fn delete_group_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let close_modal = self.group_edit_id.as_deref() == Some(id);
+        self.strategy.remove_group(id);
+        if self.persist_and_apply(cx) {
+            if close_modal {
+                self.group_modal_open = false;
+                self.group_edit_id = None;
+                window.close_dialog(cx);
+            }
+            self.status = "已删除节点组。".into();
+            cx.notify();
+        }
+    }
+
+    fn close_all_connections_now(&mut self, cx: &mut Context<Self>) {
+        let port = self.strategy.mixed_port;
+        self.traffic.connections.clear();
+        self.status = "已关闭全部连接。".into();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = controller::close_all(port) {
+                    log::debug("ui", format!("close all failed: {err:#}"));
+                }
+            })
+            .detach();
+        cx.notify();
     }
 
     fn group_now<'a>(&'a self, group: &'a Group) -> &'a str {
@@ -2397,7 +2557,7 @@ impl AppView {
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(status_dot(theme, connected && !warn_live))
+                        .child(status_dot_state(theme, connected, warn_live))
                         .child(
                             div()
                                 .text_xs()
@@ -2429,6 +2589,7 @@ impl AppView {
 
     fn sidebar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         Sidebar::new("nav")
+            .collapsible(false)
             .w(px(216.))
             .header(
                 SidebarHeader::new().child(
@@ -2444,20 +2605,16 @@ impl AppView {
                 ),
             )
             .child(
-                SidebarGroup::new("会话").child(
-                    SidebarMenu::new()
-                        .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
-                        .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
-                        .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
-                        .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
-                        .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
-                ),
+                SidebarGroup::new("会话")
+                    .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
+                    .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
+                    .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
+                    .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
+                    .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
             )
             .child(
-                SidebarGroup::new("系统").child(
-                    SidebarMenu::new()
-                        .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
-                ),
+                SidebarGroup::new("系统")
+                    .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
             )
             .footer(
                 SidebarFooter::new().child(
@@ -2465,7 +2622,7 @@ impl AppView {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(format!(
-                            "{} nodes · {} excluded",
+                            "{} 个节点 · {} 个已排除",
                             self.catalog.nodes.len(),
                             self.catalog.excluded.len()
                         )),
@@ -2485,6 +2642,7 @@ impl AppView {
             .child(
                 div()
                     .id("status")
+                    .role(Role::Status)
                     .text_xs()
                     .text_color(if self.status.contains("失败") || self.status.contains("异常") || self.status.contains("无响应") {
                         theme.warning
@@ -2620,6 +2778,7 @@ impl AppView {
             .child(
                 h_flex()
                     .gap_3()
+                    .flex_wrap()
                     .child(metric(
                         theme,
                         "状态",
@@ -2643,7 +2802,7 @@ impl AppView {
                         theme,
                         "节点",
                         &format!(
-                            "{} kept / {} excluded",
+                            "{} 个保留 / {} 个已排除",
                             self.catalog.nodes.len(),
                             self.catalog.excluded.len()
                         ),
@@ -2729,6 +2888,7 @@ impl AppView {
             .child(
                 h_flex()
                     .gap_3()
+                    .flex_wrap()
                     .child(metric(
                         theme,
                         "状态",
@@ -2807,26 +2967,24 @@ impl AppView {
                                                 .small()
                                                 .danger()
                                                 .label("关闭全部")
-                                                .on_click(move |_, _, app| {
+                                                .accessibility_label(format!(
+                                                    "关闭全部 {} 条连接",
+                                                    self.traffic.connections.len()
+                                                ))
+                                                .on_click(move |_, window, app| {
                                                     entity.update(app, |this, cx| {
-                                                        let port = this.strategy.mixed_port;
-                                                        this.traffic.connections.clear();
-                                                        this.status = "已关闭全部连接。".into();
-                                                        cx.background_executor()
-                                                            .spawn(async move {
-                                                                if let Err(err) =
-                                                                    controller::close_all(port)
-                                                                {
-                                                                    log::debug(
-                                                                        "ui",
-                                                                        format!(
-                                                                            "close all failed: {err:#}"
-                                                                        ),
-                                                                    );
-                                                                }
-                                                            })
-                                                            .detach();
-                                                        cx.notify();
+                                                        let count = this.traffic.connections.len();
+                                                        this.confirm_destructive(
+                                                            window,
+                                                            cx,
+                                                            "关闭全部连接？".into(),
+                                                            format!("将终止当前显示的 {count} 条连接。"),
+                                                            move |parent, _, cx| {
+                                                                parent.update(cx, |this, cx| {
+                                                                    this.close_all_connections_now(cx);
+                                                                });
+                                                            },
+                                                        );
                                                     });
                                                 })
                                         }),
@@ -2869,9 +3027,10 @@ impl AppView {
                 this.child(
                     v_flex()
                         .id("connection-list")
+                        .role(Role::Table)
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_scroll()
+                        .overflow_scroll()
                         .gap_1()
                         .child(connection_header_row(
                             entity.clone(),
@@ -2930,8 +3089,21 @@ impl AppView {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().w(px(160.)).child(Input::new(&self.name_input)))
-                    .child(div().flex_1().child(Input::new(&self.url_input)))
+                    .flex_wrap()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .w(px(160.))
+                            .child(div().text_xs().text_color(theme.muted_foreground).child("订阅名"))
+                            .child(Input::new(&self.name_input)),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .child(div().text_xs().text_color(theme.muted_foreground).child("订阅 URL"))
+                            .child(Input::new(&self.url_input)),
+                    )
                     .child({
                         let entity = entity.clone();
                         Button::new("add-sub").primary().label("添加").on_click(
@@ -2970,6 +3142,7 @@ impl AppView {
             })
             .children(self.strategy.subscriptions.iter().map(|sub| {
                 let id = sub.id.clone();
+                let subscription_name = sub.name.clone();
                 let entity = entity.clone();
                 panel(
                     theme,
@@ -2979,6 +3152,10 @@ impl AppView {
                         .justify_between()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_x_hidden()
+                                .text_ellipsis()
                                 .text_xs()
                                 .font_family(theme.mono_font_family.clone())
                                 .text_color(theme.muted_foreground)
@@ -2989,11 +3166,26 @@ impl AppView {
                                 .small()
                                 .danger()
                                 .label("删除")
-                                .on_click(move |_, _, app| {
+                                .accessibility_label(format!("删除订阅 {}", subscription_name))
+                                .on_click(move |_, window, app| {
+                                    let subscription_id = id.clone();
                                     entity.update(app, |this, cx| {
-                                        this.strategy.remove_subscription(&id);
-                                        this.persist();
-                                        cx.notify();
+                                        this.confirm_destructive(
+                                            window,
+                                            cx,
+                                            "删除订阅？".into(),
+                                            format!(
+                                                "将删除订阅「{subscription_name}」及其目录节点。"
+                                            ),
+                                            move |parent, _, cx| {
+                                                parent.update(cx, |this, cx| {
+                                                    this.strategy.remove_subscription(&subscription_id);
+                                                    this.persist();
+                                                    this.status = "已删除订阅。".into();
+                                                    cx.notify();
+                                                });
+                                            },
+                                        );
                                     });
                                 }),
                         ),
@@ -3003,7 +3195,7 @@ impl AppView {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("excluded {} ({}) — {}", ex.name, ex.subscription, ex.reason))
+                    .child(format!("已排除 {}（{}）— {}", ex.name, ex.subscription, ex.reason))
             }))
     }
 
@@ -3258,6 +3450,8 @@ impl AppView {
                         .gap_4()
                         .child(
                             v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .gap(px(2.))
                                 .child(div().text_sm().child("安装 myproxyctl"))
                                 .child(
@@ -3310,6 +3504,8 @@ impl AppView {
                         .gap_4()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child("官方 Agent skill，复制后交给 Cursor / Codex。"),
@@ -3326,21 +3522,29 @@ impl AppView {
                                         cx.notify();
                                     });
                                 })
-                        }),
+                        })
                 ),
         )
     }
 
     fn set_system_extension(&mut self, on: bool, cx: &mut Context<Self>) {
+        let disabled_tun = on && self.strategy.tun;
         self.strategy.system_extension = on;
         if on {
             self.strategy.tun = false;
         }
         if self.wanted {
-            self.persist_and_apply(cx);
+            self.pending_apply_note = disabled_tun.then(|| "已开启系统接管，并关闭 TUN。".into());
+            if !self.persist_and_apply(cx) {
+                self.pending_apply_note = None;
+            }
         } else if self.persist() {
             self.status = if on {
-                "已记录。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
+                if disabled_tun {
+                    "已开启系统接管，并关闭 TUN。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
+                } else {
+                    "已记录。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
+                }
             } else {
                 "已关闭系统接管。".into()
             };
@@ -3348,15 +3552,24 @@ impl AppView {
     }
 
     fn set_tun(&mut self, on: bool, cx: &mut Context<Self>) {
+        let disabled_system_extension = on && self.strategy.system_extension;
         self.strategy.tun = on;
         if on {
             self.strategy.system_extension = false;
         }
         if self.wanted {
-            self.persist_and_apply(cx);
+            self.pending_apply_note = disabled_system_extension
+                .then(|| "已开启 TUN，并关闭系统接管。".into());
+            if !self.persist_and_apply(cx) {
+                self.pending_apply_note = None;
+            }
         } else if self.persist() {
             self.status = if on {
-                "已记录。下次连接走 TUN；首次会要管理员密码。".into()
+                if disabled_system_extension {
+                    "已开启 TUN，并关闭系统接管。下次连接走 TUN；首次会要管理员密码。".into()
+                } else {
+                    "已记录。下次连接走 TUN；首次会要管理员密码。".into()
+                }
             } else {
                 "已关闭 TUN。".into()
             };
@@ -3479,6 +3692,8 @@ impl AppView {
                         .gap_4()
                         .child(
                             v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .gap(px(2.))
                                 .child(div().text_sm().child("拦截本机应用"))
                                 .child(
@@ -3489,15 +3704,12 @@ impl AppView {
                                 ),
                         )
                         .child({
-                            let mut toggle = Button::new("se-toggle").small();
-                            toggle = if on {
-                                toggle.danger().label("关闭")
-                            } else {
-                                toggle.primary().label("开启")
-                            };
-                            toggle.disabled(self.busy).on_click({
-                                let entity = entity.clone();
-                                move |_, _, app| {
+                            let entity = entity.clone();
+                            Switch::new("se-toggle")
+                                .checked(on)
+                                .disabled(self.busy)
+                                .accessibility_label("系统接管")
+                                .on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
                                         this.set_system_extension(
                                             !this.strategy.system_extension,
@@ -3505,8 +3717,7 @@ impl AppView {
                                         );
                                         cx.notify();
                                     });
-                                }
-                            })
+                                })
                         }),
                 )
                 .child(
@@ -3527,6 +3738,8 @@ impl AppView {
                         .gap_4()
                         .child(
                             v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .gap(px(2.))
                                 .child(div().text_sm().child("TUN"))
                                 .child(
@@ -3538,18 +3751,16 @@ impl AppView {
                         )
                         .child({
                             let entity = entity.clone();
-                            let mut toggle = Button::new("tun-toggle").small();
-                            toggle = if tun_on {
-                                toggle.danger().label("关闭")
-                            } else {
-                                toggle.primary().label("开启")
-                            };
-                            toggle.disabled(self.busy).on_click(move |_, _, app| {
-                                entity.update(app, |this, cx| {
-                                    this.set_tun(!this.strategy.tun, cx);
-                                    cx.notify();
-                                });
-                            })
+                            Switch::new("tun-toggle")
+                                .checked(tun_on)
+                                .disabled(self.busy)
+                                .accessibility_label("TUN")
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.set_tun(!this.strategy.tun, cx);
+                                        cx.notify();
+                                    });
+                                })
                         }),
                 ),
         )
@@ -3651,6 +3862,8 @@ impl AppView {
             .gap_4()
             .child(
                 v_flex()
+                    .flex_1()
+                    .min_w(px(0.))
                     .gap(px(2.))
                     .child(div().text_sm().child(title))
                     .child(
@@ -3660,17 +3873,15 @@ impl AppView {
                             .child(hint),
                     ),
             )
-            .child({
-                let mut toggle = Button::new(id).small();
-                toggle = if on {
-                    toggle.label("关闭")
-                } else {
-                    toggle.primary().label("开启")
-                };
-                toggle.disabled(self.busy).on_click(move |_, _, app| {
-                    entity.update(app, |this, cx| apply(this, cx));
-                })
-            })
+            .child(
+                Switch::new(id)
+                    .checked(on)
+                    .disabled(self.busy)
+                    .accessibility_label(title)
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| apply(this, cx));
+                    }),
+            )
     }
 
     fn appearance_row(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -3729,6 +3940,10 @@ impl AppView {
                 .gap_2()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_x_hidden()
+                        .text_ellipsis()
                         .text_sm()
                         .child(format!("当前版本 {version}")),
                 )
@@ -4069,6 +4284,7 @@ fn render_group_card(
     let id = group.id.clone();
     let del_id = group.id.clone();
     let group_name = group.name.clone();
+    let group_title = group.name.clone();
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
     let shown = members.iter().take(36).cloned().collect::<Vec<_>>();
@@ -4101,6 +4317,10 @@ fn render_group_card(
                 .justify_between()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_x_hidden()
+                        .text_ellipsis()
                         .text_sm()
                         .font_semibold()
                         .child(format!(
@@ -4113,6 +4333,20 @@ fn render_group_card(
                 .child(
                     h_flex()
                         .gap_1()
+                        .child({
+                            let entity = entity.clone();
+                            let edit_id = id.clone();
+                            Button::new(SharedString::from(format!("edit-group-{edit_id}")))
+                                .small()
+                                .label("编辑")
+                                .on_click(move |_, window, app| {
+                                    app.stop_propagation();
+                                    entity.update(app, |this, cx| {
+                                        this.open_group_dialog(Some(&edit_id), window, cx);
+                                        cx.notify();
+                                    });
+                                })
+                        })
                         .child({
                             let entity = entity.clone();
                             let name = group_name.clone();
@@ -4133,25 +4367,26 @@ fn render_group_card(
                                 .small()
                                 .danger()
                                 .label("删除")
+                                .accessibility_label(format!("删除节点组 {}", group_title))
                                 .on_click(move |_, window, app| {
                                     app.stop_propagation();
-                                    let close_modal = entity
-                                        .read(app)
-                                        .group_edit_id
-                                        .as_deref()
-                                        == Some(del_id.as_str());
                                     entity.update(app, |this, cx| {
-                                        if close_modal {
-                                            this.group_modal_open = false;
-                                            this.group_edit_id = None;
-                                        }
-                                        this.strategy.remove_group(&del_id);
-                                        this.persist_and_apply(cx);
-                                        cx.notify();
+                                        let group_id = del_id.clone();
+                                        let group_title = group_name.clone();
+                                        this.confirm_destructive(
+                                            window,
+                                            cx,
+                                            "删除节点组？".into(),
+                                            format!(
+                                                "将删除节点组「{group_title}」，引用它的规则可能需要重新选择走向。"
+                                            ),
+                                            move |parent, window, cx| {
+                                                parent.update(cx, |this, cx| {
+                                                    this.delete_group_now(&group_id, window, cx);
+                                                });
+                                            },
+                                        );
                                     });
-                                    if close_modal {
-                                        window.close_dialog(app);
-                                    }
                                 })
                         }),
                 ),
@@ -4230,6 +4465,7 @@ fn connection_header_row(
     let muted_fg = theme.muted_foreground;
     h_flex()
         .w_full()
+        .min_w(px(812.))
         .items_center()
         .px_3()
         .py_1()
@@ -4399,6 +4635,7 @@ fn render_connection_row(
     h_flex()
         .id(SharedString::from(format!("conn-{id}")))
         .w_full()
+        .min_w(px(812.))
         .items_center()
         .px_3()
         .py_2()
@@ -4430,6 +4667,10 @@ fn render_connection_row(
                 .small()
                 .danger()
                 .label("关闭")
+                .accessibility_label(format!(
+                    "关闭 {} 到 {} 的连接",
+                    conn.process, conn.destination
+                ))
                 .on_click(move |_, _, app| {
                     let id = id.clone();
                     entity.update(app, |this, cx| {
@@ -4584,6 +4825,10 @@ fn render_rule_set_card(
                         )
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_x_hidden()
+                                .text_ellipsis()
                                 .text_sm()
                                 .font_semibold()
                                 .child(set.name.clone()),
@@ -4591,18 +4836,37 @@ fn render_rule_set_card(
                         .child(pill(theme, &via_label(&via), accent)),
                 )
                 .child({
-                    let entity = entity.clone();
+                    let edit_entity = entity.clone();
+                    let edit_id = id.clone();
                     let del_id = id.clone();
-                    Button::new(SharedString::from(format!("del-rule-{del_id}")))
-                        .small()
-                        .danger()
-                        .label("删除")
-                        .on_click(move |_, window, app| {
-                            app.stop_propagation();
-                            entity.update(app, |this, cx| {
-                                this.remove_selected_rule(&del_id, window, cx);
-                                cx.notify();
-                            });
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new(SharedString::from(format!("edit-rule-{edit_id}")))
+                                .small()
+                                .label("编辑")
+                                .on_click(move |_, window, app| {
+                                    app.stop_propagation();
+                                    edit_entity.update(app, |this, cx| {
+                                        this.open_rule_dialog(Some(&edit_id), window, cx);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child({
+                            let del_entity = entity.clone();
+                            Button::new(SharedString::from(format!("del-rule-{del_id}")))
+                                .small()
+                                .danger()
+                                .label("删除")
+                                .accessibility_label(format!("删除规则 {}", set.name))
+                                .on_click(move |_, window, app| {
+                                    app.stop_propagation();
+                                    del_entity.update(app, |this, cx| {
+                                        this.remove_selected_rule(&del_id, window, cx);
+                                        cx.notify();
+                                    });
+                                })
                         })
                 }),
         )
@@ -4650,6 +4914,7 @@ fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
 fn metric(theme: &Theme, label: &str, value: &str) -> impl IntoElement {
     v_flex()
         .flex_1()
+        .min_w(px(136.))
         .p_4()
         .gap_1()
         .rounded(theme.radius)
@@ -4689,10 +4954,16 @@ fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
 }
 
 fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
+    status_dot_state(theme, on, false)
+}
+
+fn status_dot_state(theme: &Theme, on: bool, warning: bool) -> impl IntoElement {
     div()
         .size_2()
         .rounded_full()
-        .bg(if on {
+        .bg(if warning {
+            theme.warning
+        } else if on {
             theme.success
         } else {
             theme.muted_foreground
