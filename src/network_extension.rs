@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::thread;
 
@@ -38,45 +39,46 @@ struct Session {
     revision: u64,
     username: String,
     password: String,
+    socks_port: u16,
+    group_ports: BTreeMap<String, u16>,
+    next_port: u16,
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 
 pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
-    let mut session = SESSION.lock().expect("ne session");
-    let next = match session.as_mut() {
-        Some(existing) => {
-            existing.revision = existing.revision.saturating_add(1);
-            existing.revision
-        }
-        None => {
-            *session = Some(Session {
-                revision: 1,
-                username: format!("ne-{}", Uuid::new_v4().simple()),
-                password: Uuid::new_v4().simple().to_string(),
-            });
-            1
-        }
-    };
-    let creds = session.as_ref().expect("session");
     let socks_port = compile::network_extension_socks_port(strategy.mixed_port);
-    let mut process_rules = Vec::new();
-    let mut group_ports = Vec::new();
-    let mut next_port = socks_port.saturating_add(1);
     let controller = compile::controller_port(strategy.mixed_port);
+    let mut session = SESSION.lock().expect("ne session");
+    let session = session.get_or_insert_with(|| Session {
+        revision: 0,
+        username: format!("ne-{}", Uuid::new_v4().simple()),
+        password: Uuid::new_v4().simple().to_string(),
+        socks_port,
+        group_ports: BTreeMap::new(),
+        next_port: next_listener_port(
+            socks_port.saturating_add(1),
+            socks_port,
+            controller,
+            &BTreeMap::new(),
+        ),
+    });
+    session.revision = session.revision.saturating_add(1);
+    if session.socks_port != socks_port {
+        session.socks_port = socks_port;
+        session.group_ports.clear();
+        session.next_port = next_listener_port(
+            socks_port.saturating_add(1),
+            socks_port,
+            controller,
+            &BTreeMap::new(),
+        );
+    }
+
+    let mut process_rules = Vec::new();
+    let mut needed = Vec::new();
     for set in &strategy.rule_sets {
         let via = compile::via_target(&set.via, strategy);
-        let needs_group = !matches!(via.as_str(), "DIRECT" | "REJECT");
-        if needs_group && !group_ports.iter().any(|g: &GroupPort| g.name == via) {
-            if next_port == controller {
-                next_port = next_port.saturating_add(1);
-            }
-            group_ports.push(GroupPort {
-                name: via.clone(),
-                port: next_port,
-            });
-            next_port = next_port.saturating_add(1);
-        }
         for matcher in &set.matchers {
             if matcher.kind != "app" {
                 continue;
@@ -85,19 +87,62 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
             if pattern.is_empty() {
                 continue;
             }
+            if !matches!(via.as_str(), "DIRECT" | "REJECT")
+                && !needed.iter().any(|name| name == &via)
+            {
+                needed.push(via.clone());
+            }
             process_rules.push(ProcessRule {
                 pattern: pattern.to_string(),
                 via: via.clone(),
             });
         }
     }
+
+    let mut group_ports = Vec::new();
+    for name in needed {
+        let port = if let Some(port) = session.group_ports.get(&name).copied() {
+            port
+        } else {
+            let port = next_listener_port(
+                session.next_port,
+                session.socks_port,
+                controller,
+                &session.group_ports,
+            );
+            session.group_ports.insert(name.clone(), port);
+            session.next_port = port.saturating_add(1);
+            port
+        };
+        group_ports.push(GroupPort { name, port });
+    }
+
     EnableRequest {
-        revision: next,
+        revision: session.revision,
         socks_port,
-        username: creds.username.clone(),
-        password: creds.password.clone(),
+        username: session.username.clone(),
+        password: session.password.clone(),
         process_rules,
         group_ports,
+    }
+}
+
+fn next_listener_port(
+    start: u16,
+    socks_port: u16,
+    controller: u16,
+    used: &BTreeMap<String, u16>,
+) -> u16 {
+    let mut port = start.max(1);
+    loop {
+        if port != socks_port && port != controller && !used.values().any(|used| *used == port) {
+            return port;
+        }
+        let next = port.saturating_add(1);
+        if next == port {
+            return port;
+        }
+        port = next;
     }
 }
 
@@ -150,6 +195,9 @@ fn enable_blocking(request: &EnableRequest) -> Result<()> {
                 request.group_ports.len()
             ),
         );
+        for rule in &request.process_rules {
+            log::info("ne", format!("capture {} via {}", rule.pattern, rule.via));
+        }
         let mut error = std::ptr::null_mut();
         let rc = unsafe { ffi::myproxy_ne_enable(c_string(&json).as_ptr(), &mut error) };
         let message = take_error(error);
