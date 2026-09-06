@@ -16,6 +16,17 @@ use ui::AppView;
 
 fn main() {
     myproxy::log::init();
+    let _instance_guard = match myproxy::instance::InstanceGuard::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            myproxy::log::info("main", "another myproxy instance is already running");
+            return;
+        }
+        Err(err) => {
+            myproxy::log::error("main", format!("acquire instance lock failed: {err}"));
+            return;
+        }
+    };
     myproxy::log::info("main", "myproxy start");
     let strategy = Strategy::load().unwrap_or_else(|err| {
         myproxy::log::error("main", format!("load strategy failed: {err:#}"));

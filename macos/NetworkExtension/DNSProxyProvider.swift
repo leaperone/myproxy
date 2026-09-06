@@ -58,10 +58,26 @@ enum DNSRelayRoutingPolicy {
         if isTrustedMyproxyComponent {
             return .directTrustedComponent
         }
-        if destination.address.ipAddress?.isLocalNetwork == true {
+        if destination.address.ipAddress?.isLocalNetwork == true
+            || isLocalResolverDomain(destination.address.domain) {
             return .directLocalResolver
         }
         return .mihomo(.profileRules)
+    }
+
+    private static func isLocalResolverDomain(_ domain: String?) -> Bool {
+        guard let domain else { return false }
+        let normalized = domain
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        return normalized == "localhost"
+            || normalized == "local"
+            || normalized == "localdomain"
+            || normalized.hasSuffix(".local")
+            || normalized.hasSuffix(".lan")
+            || normalized.hasSuffix(".localdomain")
+            || normalized.hasSuffix(".home.arpa")
     }
 }
 
