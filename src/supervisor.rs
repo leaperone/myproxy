@@ -281,7 +281,7 @@ impl Supervisor {
         }
         let now = Instant::now();
         {
-            let watch = self.health.lock().expect("supervisor health lock");
+            let mut watch = self.health.lock().expect("supervisor health lock");
             if let Some(last_check) = watch.last_check {
                 if now.duration_since(last_check) < HEALTH_INTERVAL {
                     let mut health = watch.last.clone();
@@ -289,6 +289,7 @@ impl Supervisor {
                     return health;
                 }
             }
+            watch.last_check = Some(now);
         }
         if !self.check_ready(strategy) {
             return self.note_failure(strategy, now);
@@ -447,6 +448,28 @@ impl Supervisor {
         }
         {
             let mut watch = self.health.lock().expect("supervisor health lock");
+            if watch.recoveries >= MAX_RECOVERIES {
+                let health = CoreHealth {
+                    wanted: true,
+                    ready: false,
+                    note: Some("核心反复异常，已停止自动恢复。请手动连接。".into()),
+                };
+                watch.last = health.clone();
+                return health;
+            }
+            if watch
+                .last_recover
+                .map(|at| now.duration_since(at) < RECOVER_INTERVAL)
+                .unwrap_or(false)
+            {
+                let health = CoreHealth {
+                    wanted: true,
+                    ready: false,
+                    note: Some("核心异常，等待自动重试…".into()),
+                };
+                watch.last = health.clone();
+                return health;
+            }
             watch.last_recover = Some(now);
             watch.recoveries = watch.recoveries.saturating_add(1);
             watch.fails = 0;
