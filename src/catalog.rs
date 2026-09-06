@@ -13,7 +13,6 @@ use crate::strategy::Strategy;
 
 const SUBSCRIPTION_CURL_MAX_TIME: &str = "8";
 const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "3";
-const SUBSCRIPTION_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
@@ -177,25 +176,11 @@ fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
 }
 
 fn fetch_http_body(name: &str, url: &str) -> Result<String> {
-    // ureq 2 is HTTP/1.1 only and has no Happy Eyeballs. Cloudflare AAAA
-    // records that blackhole (Cunoe) hit the 30s read timeout whenever IPv6
-    // is tried first. Prefer curl --ipv4 on macOS; fall back to ureq.
-    match fetch_http_body_curl_ipv4(url) {
-        Ok(body) => Ok(body),
-        Err(err) => {
-            log::warn(
-                "catalog",
-                format!("{name} IPv4 curl failed ({err:#}), trying default HTTP"),
-            );
-            ureq::get(url)
-                .timeout(SUBSCRIPTION_HTTP_TIMEOUT)
-                .set("User-Agent", "clash.meta")
-                .call()
-                .with_context(|| format!("GET {name}"))?
-                .into_string()
-                .with_context(|| format!("read {name}"))
-        }
-    }
+    // curl is available on macOS and lets us force IPv4. Do not fall back to
+    // a second HTTP client here: a broken DNS/IPv6 path would otherwise pay
+    // the full timeout twice for every subscription and make Apply appear
+    // hung. The previous catalog remains available to the caller.
+    fetch_http_body_curl_ipv4(url).with_context(|| format!("GET {name} via IPv4 curl"))
 }
 
 fn fetch_http_body_curl_ipv4(url: &str) -> Result<String> {

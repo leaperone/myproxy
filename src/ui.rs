@@ -1118,6 +1118,8 @@ pub struct AppView {
     connected: bool,
     wanted: bool,
     busy: bool,
+    busy_since: Option<Instant>,
+    busy_status: String,
     cli_installed: bool,
     external_change_pending: bool,
     strategy_stamp: Option<SystemTime>,
@@ -1273,6 +1275,19 @@ impl AppView {
                     .update(cx, |this, cx| {
                         let started = Instant::now();
                         let mut dirty = false;
+                        if let Some(busy_since) = this.busy_since {
+                            let elapsed = busy_since.elapsed().as_secs();
+                            if elapsed >= 3 {
+                                let status = format!(
+                                    "{}（已等待 {} 秒）",
+                                    this.busy_status, elapsed
+                                );
+                                if this.status != status {
+                                    this.status = status;
+                                    dirty = true;
+                                }
+                            }
+                        }
                         if !this.busy && !this.wanted && this.connected {
                             this.connected = false;
                             this.clear_live();
@@ -1373,6 +1388,8 @@ impl AppView {
             connected: false,
             wanted,
             busy: false,
+            busy_since: None,
+            busy_status: String::new(),
             cli_installed: myproxy::cli_install::is_installed(),
             external_change_pending: false,
             strategy_stamp: initial_strategy_stamp,
@@ -1540,6 +1557,8 @@ impl AppView {
         } else {
             "正在应用策略…".into()
         };
+        self.busy_since = Some(Instant::now());
+        self.busy_status = self.status.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let apply_strategy = strategy.clone();
@@ -1556,6 +1575,8 @@ impl AppView {
                 .await;
             this.update(cx, |this, cx| {
                 this.busy = false;
+                this.busy_since = None;
+                this.busy_status.clear();
                 match result {
                     Ok(cat) => {
                         this.catalog = cat;
@@ -1573,10 +1594,22 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
+                        let failed = this
+                            .catalog
+                            .excluded
+                            .iter()
+                            .filter(|item| item.reason.starts_with("fetch failed:"))
+                            .map(|item| item.subscription.as_str())
+                            .collect::<std::collections::HashSet<_>>();
+                        let cache_note = if !refresh_catalog || failed.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {} 个订阅刷新失败，已使用缓存。", failed.len())
+                        };
                         this.status = apply_note
                             .as_deref()
-                            .map(|note| format!("{note} {summary}"))
-                            .unwrap_or(summary);
+                            .map(|note| format!("{note} {summary}{cache_note}"))
+                            .unwrap_or_else(|| format!("{summary}{cache_note}"));
                         if this.connected {
                             this.refresh_live(cx);
                         }
