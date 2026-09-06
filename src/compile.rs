@@ -300,7 +300,7 @@ pub fn via_target(via: &str, strategy: &Strategy) -> String {
     }
 }
 
-fn default_group(strategy: &Strategy) -> &str {
+pub fn default_group(strategy: &Strategy) -> &str {
     strategy
         .groups
         .iter()

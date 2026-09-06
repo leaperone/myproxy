@@ -22,7 +22,7 @@ use myproxy::catalog::{self, Catalog};
 use myproxy::controller::{self, LiveGroup, TrafficSnapshot};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
-use myproxy::supervisor::Supervisor;
+use myproxy::supervisor::{CoreHealth, Supervisor};
 use myproxy::updates::{self, UpdateChannel};
 
 use crate::appearance::Appearance;
@@ -1030,6 +1030,7 @@ pub struct AppView {
     catalog: Catalog,
     status: String,
     connected: bool,
+    wanted: bool,
     busy: bool,
     cli_installed: bool,
     external_change_pending: bool,
@@ -1087,19 +1088,50 @@ impl AppView {
         let initial_strategy_stamp = strategy_path.as_deref().and_then(file_stamp);
         cx.spawn(async move |this, cx| {
             let mut catalog_stamp = catalog_path.as_deref().and_then(file_stamp);
+            let mut first = true;
             loop {
-                let wait_ms = this
+                if !first {
+                    let wait_ms = this
+                        .update(cx, |this, _| {
+                            if this.page == Page::Connections {
+                                500
+                            } else {
+                                1500
+                            }
+                        })
+                        .unwrap_or(1500);
+                    cx.background_executor()
+                        .timer(Duration::from_millis(wait_ms))
+                        .await;
+                }
+                first = false;
+
+                let health_strategy = this
                     .update(cx, |this, _| {
-                        if this.page == Page::Connections {
-                            500
+                        if this.busy {
+                            None
                         } else {
-                            1500
+                            Some((this.supervisor.clone(), this.strategy.clone()))
                         }
                     })
-                    .unwrap_or(1500);
-                cx.background_executor()
-                    .timer(Duration::from_millis(wait_ms))
-                    .await;
+                    .ok()
+                    .flatten();
+                if let Some((supervisor, strategy)) = health_strategy {
+                    let health = cx
+                        .background_executor()
+                        .spawn(async move { supervisor.observe(&strategy) })
+                        .await;
+                    if this
+                        .update(cx, |this, cx| {
+                            if this.apply_health(health) {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
 
                 let fetch_port = this
                     .update(cx, |this, cx| {
@@ -1164,15 +1196,10 @@ impl AppView {
                     .update(cx, |this, cx| {
                         let started = Instant::now();
                         let mut dirty = false;
-                        if !this.busy {
-                            let connected = this.supervisor.is_running();
-                            if connected != this.connected {
-                                this.connected = connected;
-                                if !connected {
-                                    this.clear_live();
-                                }
-                                dirty = true;
-                            }
+                        if !this.busy && !this.wanted && this.connected {
+                            this.connected = false;
+                            this.clear_live();
+                            dirty = true;
                         }
                         let editing = this.group_modal_open || this.rule_modal_open;
                         if !this.busy {
@@ -1248,7 +1275,7 @@ impl AppView {
         .detach();
 
         let supervisor = Supervisor::shared();
-        let connected = supervisor.is_running();
+        let wanted = supervisor.wanted();
         let entity = cx.entity();
         let appearance_observer = window.observe_window_appearance(move |window, cx| {
             entity.update(cx, |this, cx| {
@@ -1261,7 +1288,8 @@ impl AppView {
         let this = Self {
             page: initial_page(),
             status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
-            connected,
+            connected: false,
+            wanted,
             busy: false,
             cli_installed: myproxy::cli_install::is_installed(),
             external_change_pending: false,
@@ -1497,6 +1525,50 @@ impl AppView {
         dirty
     }
 
+    fn apply_health(&mut self, health: CoreHealth) -> bool {
+        let mut dirty = false;
+        if self.wanted != health.wanted {
+            self.wanted = health.wanted;
+            dirty = true;
+        }
+        let became_ready = health.ready && !self.connected;
+        if self.connected != health.ready {
+            self.connected = health.ready;
+            if !health.ready {
+                self.clear_live();
+            }
+            dirty = true;
+        }
+        if let Some(note) = health.note {
+            if self.status != note {
+                self.status = note;
+                dirty = true;
+            }
+        } else if became_ready {
+            self.status = format!(
+                "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
+                if self.strategy.system_extension {
+                    "系统接管 · "
+                } else {
+                    ""
+                },
+                self.strategy.mixed_port
+            );
+            dirty = true;
+        }
+        dirty
+    }
+
+    fn connected_label(&self) -> &'static str {
+        if self.connected {
+            "已连接"
+        } else if self.wanted {
+            "核心异常"
+        } else {
+            "未连接"
+        }
+    }
+
     fn clear_live(&mut self) -> bool {
         let dirty = self.clear_traffic()
             || !self.proxy_groups.is_empty()
@@ -1663,7 +1735,7 @@ impl AppView {
             cx.notify();
             return;
         }
-        let connect = !self.connected;
+        let connect = !self.wanted;
         if connect && !self.persist() {
             cx.notify();
             return;
@@ -1699,23 +1771,29 @@ impl AppView {
                 this.busy = false;
                 match result {
                     Ok(Some(catalog)) => {
-                        this.connected = true;
+                        this.wanted = true;
                         this.catalog = catalog;
                         if this.strategy == strategy {
                             this.mark_applied();
                         }
-                        this.status = format!(
-                            "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
-                            if this.strategy.system_extension {
-                                "系统接管 · "
-                            } else {
-                                ""
-                            },
-                            this.strategy.mixed_port
-                        );
-                        this.refresh_live(cx);
+                        this.apply_health(this.supervisor.last_health());
+                        if this.connected {
+                            this.status = format!(
+                                "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
+                                if this.strategy.system_extension {
+                                    "系统接管 · "
+                                } else {
+                                    ""
+                                },
+                                this.strategy.mixed_port
+                            );
+                            this.refresh_live(cx);
+                        } else if this.status.starts_with("正在连接") {
+                            this.status = "核心已启动，正在确认是否可用…".into();
+                        }
                     }
                     Ok(None) => {
+                        this.wanted = false;
                         this.connected = false;
                         this.clear_live();
                         this.status = "已断开。".into();
@@ -2123,6 +2201,8 @@ impl AppView {
             )
         } else if connected {
             "已连接".into()
+        } else if self.wanted {
+            "核心异常".into()
         } else {
             "未连接".into()
         };
@@ -2257,11 +2337,12 @@ impl AppView {
 
     fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
+        let wanted = self.wanted;
         let busy = self.busy;
         let mut connect = Button::new("hero-connect").large();
         connect = if busy {
-            connect.label(if connected { "正在断开…" } else { "正在连接…" })
-        } else if connected {
+            connect.label(if wanted { "正在断开…" } else { "正在连接…" })
+        } else if wanted {
             connect.danger().label("断开")
         } else {
             connect.primary().label("连接")
@@ -2294,7 +2375,15 @@ impl AppView {
                     .map(|group| group.selected.clone())
                     .filter(|name| !name.is_empty())
             })
-            .unwrap_or_else(|| if connected { "—".into() } else { "未连接".into() });
+            .unwrap_or_else(|| {
+                if connected {
+                    "—".into()
+                } else if wanted {
+                    "异常".into()
+                } else {
+                    "未连接".into()
+                }
+            });
         v_flex()
             .gap_4()
             .child(page_title(
@@ -2329,7 +2418,7 @@ impl AppView {
                                         div()
                                             .text_lg()
                                             .font_semibold()
-                                            .child(if connected { "已连接" } else { "未连接" }),
+                                            .child(self.connected_label()),
                                     ),
                             )
                             .child(
@@ -2348,6 +2437,8 @@ impl AppView {
                                                 self.strategy.mixed_port
                                             )
                                         }
+                                    } else if wanted {
+                                        "核心还不能用。正在自动确认，必要时会重新加载或重连。".into()
                                     } else if self.strategy.system_extension {
                                         "下次连接会请求系统扩展。请在系统设置 › 通用 › 登录项与扩展 › 网络扩展 里允许 myproxy。".into()
                                     } else {
@@ -2370,7 +2461,7 @@ impl AppView {
                     .child(metric(
                         theme,
                         "状态",
-                        if connected { "已连接" } else { "空闲" },
+                        self.connected_label(),
                     ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
@@ -2439,7 +2530,7 @@ impl AppView {
                     .child(metric(
                         theme,
                         "状态",
-                        if connected { "已连接" } else { "未连接" },
+                        self.connected_label(),
                     ))
                     .child(metric(theme, "Mixed 端口", &mixed))
                     .child(metric(theme, "上传", &up))
@@ -2492,10 +2583,16 @@ impl AppView {
                     )
                 },
             )
-            .when(!connected, |this| {
+            .when(!connected && !self.wanted, |this| {
                 this.child(empty_hint(
                     theme,
                     "核心未连接。点右上角「连接」后，这里会显示经过 Mixed 端口的连接。",
+                ))
+            })
+            .when(!connected && self.wanted, |this| {
+                this.child(empty_hint(
+                    theme,
+                    "核心异常，正在自动检查。恢复后这里会列出经过 Mixed 的连接。",
                 ))
             })
             .when(
@@ -2950,7 +3047,7 @@ impl AppView {
         if on {
             self.strategy.tun = false;
         }
-        if self.connected {
+        if self.wanted {
             self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
@@ -2966,7 +3063,7 @@ impl AppView {
         if on {
             self.strategy.system_extension = false;
         }
-        if self.connected {
+        if self.wanted {
             self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {

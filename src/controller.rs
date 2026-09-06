@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -170,6 +170,24 @@ pub fn close_all(mixed_port: u16) -> Result<()> {
         .call()
         .with_context(|| format!("DELETE connections :{}", controller_port(mixed_port)))?;
     Ok(())
+}
+
+pub fn probe(mixed_port: u16, group_name: &str) -> Result<String> {
+    let groups = fetch_proxies(mixed_port)?;
+    let group = groups
+        .iter()
+        .find(|group| group.name == group_name)
+        .or_else(|| groups.iter().find(|group| group.name == "PROXY"))
+        .or_else(|| {
+            groups
+                .iter()
+                .find(|group| group.name.eq_ignore_ascii_case("default"))
+        });
+    match group {
+        Some(group) if !group.now.trim().is_empty() => Ok(group.now.clone()),
+        Some(group) => bail!("group {} has no now", group.name),
+        None => bail!("proxy group missing"),
+    }
 }
 
 pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
