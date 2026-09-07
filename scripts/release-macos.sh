@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Package myproxy.app, zip it for Sparkle, and refresh appcast.xml.
-# Prod retains previous stable zips for deltas; Nightly publishes full archives.
+# Both channels keep recent same-channel zips so generate_appcast can emit deltas.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -75,13 +75,15 @@ fi
 
 ditto -c -k --keepParent "$app" "$zip_path"
 
-# Prod deltas only use published Prod archives; Nightly ships full archives.
-# ponytail: add Nightly deltas when daily download size warrants retaining a cache.
-if [[ "$channel" == "prod" ]] && command -v gh >/dev/null && gh repo view >/dev/null 2>&1; then
+# Same-channel archives only. The Nightly pointer tag has no zip.
+if command -v gh >/dev/null && gh repo view >/dev/null 2>&1; then
   while read -r old_tag; do
-    [[ -n "$old_tag" && "$old_tag" != "$tag" ]] || continue
+    [[ -n "$old_tag" ]] || continue
     gh release download "$old_tag" --pattern 'myproxy-*.sparkle.zip' --dir "$archives" --clobber 2>/dev/null || true
-  done < <(gh release list --exclude-drafts --exclude-pre-releases --limit 6 --json tagName --jq '.[].tagName' 2>/dev/null || true)
+  done < <(
+    gh release list --exclude-drafts --limit 30 --json tagName,isPrerelease 2>/dev/null \
+      | python3 scripts/sparkle_previous_tags.py "$channel" "$tag" || true
+  )
 fi
 
 cp "$zip_path" "$archives/$zip_name"

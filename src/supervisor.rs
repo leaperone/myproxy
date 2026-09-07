@@ -96,6 +96,7 @@ pub struct Supervisor {
     running_tun: Mutex<bool>,
     running_se: Mutex<bool>,
     running_mixed_port: Mutex<Option<u16>>,
+    update_proxy_hook: Mutex<Option<fn(Option<u16>)>>,
     health: Mutex<HealthWatch>,
 }
 
@@ -159,6 +160,7 @@ impl Default for Supervisor {
             running_tun: Mutex::new(false),
             running_se: Mutex::new(false),
             running_mixed_port: Mutex::new(None),
+            update_proxy_hook: Mutex::new(None),
             health: Mutex::new(HealthWatch::default()),
         }
     }
@@ -170,11 +172,29 @@ impl Supervisor {
         INSTANCE.get_or_init(|| Arc::new(Self::default())).clone()
     }
 
+    pub fn set_update_proxy_hook(&self, hook: fn(Option<u16>)) {
+        *self.update_proxy_hook.lock().expect("update proxy hook") = Some(hook);
+    }
+
+    pub fn update_download_port(&self) -> Option<u16> {
+        if !self.is_running() {
+            return None;
+        }
+        *self.running_mixed_port.lock().expect("supervisor lock")
+    }
+
+    fn remember_mixed_port(&self, port: Option<u16>) {
+        *self.running_mixed_port.lock().expect("supervisor lock") = port;
+        if let Some(hook) = *self.update_proxy_hook.lock().expect("update proxy hook") {
+            hook(port);
+        }
+    }
+
     pub fn adopt_running(&self, tun: bool, system_extension: bool, mixed_port: u16) {
         if pid_file_alive(Some(mixed_port)) {
             *self.running_tun.lock().expect("supervisor lock") = tun;
             *self.running_se.lock().expect("supervisor lock") = system_extension;
-            *self.running_mixed_port.lock().expect("supervisor lock") = Some(mixed_port);
+            self.remember_mixed_port(Some(mixed_port));
             set_wanted(true);
         }
     }
@@ -305,7 +325,7 @@ impl Supervisor {
         *self.child.lock().expect("supervisor lock") = Some(child);
         *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
         *self.running_se.lock().expect("supervisor lock") = strategy.system_extension;
-        *self.running_mixed_port.lock().expect("supervisor lock") = Some(strategy.mixed_port);
+        self.remember_mixed_port(Some(strategy.mixed_port));
         self.health
             .lock()
             .expect("supervisor health lock")
@@ -443,7 +463,7 @@ impl Supervisor {
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
         *self.running_se.lock().expect("supervisor lock") = false;
-        *self.running_mixed_port.lock().expect("supervisor lock") = None;
+        self.remember_mixed_port(None);
         if stopped || child_pid.is_some() {
             log::info("supervisor", "disconnect");
         }
@@ -459,7 +479,7 @@ impl Supervisor {
                     _ => {
                         let pid = child.id();
                         *slot = None;
-                        *self.running_mixed_port.lock().expect("supervisor lock") = None;
+                        self.remember_mixed_port(None);
                         if let Ok(path) = paths::pid_path() {
                             let matches = fs::read_to_string(&path)
                                 .map(|value| value.trim() == pid.to_string())
@@ -877,6 +897,22 @@ mod tests {
             Some(7890),
             &strategy,
         ));
+    }
+
+    #[test]
+    fn mixed_port_notifies_update_proxy_hook() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static PORT: AtomicU16 = AtomicU16::new(1);
+        fn hook(port: Option<u16>) {
+            PORT.store(port.unwrap_or(0), Ordering::SeqCst);
+        }
+        let supervisor = Supervisor::default();
+        supervisor.set_update_proxy_hook(hook);
+        supervisor.remember_mixed_port(Some(7891));
+        assert_eq!(PORT.load(Ordering::SeqCst), 7891);
+        supervisor.remember_mixed_port(None);
+        assert_eq!(PORT.load(Ordering::SeqCst), 0);
+        assert_eq!(supervisor.update_download_port(), None);
     }
 
     #[test]

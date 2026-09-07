@@ -3812,8 +3812,12 @@ impl AppView {
         let version = updates::VERSION;
         let channel = self.strategy.update_channel.unwrap_or_default();
         let hint = match channel {
-            UpdateChannel::Prod => "仅接收正式版本。切回后，会在发布比当前版本更新的正式版时更新。",
-            UpdateChannel::Nightly => "接收 main 分支的每日构建，可能包含尚未稳定的改动。",
+            UpdateChannel::Prod => {
+                "仅接收正式版本。切回后，会在发布比当前版本更新的正式版时更新。相邻正式版走增量包。"
+            }
+            UpdateChannel::Nightly => {
+                "接收 main 分支的每日构建，可能包含尚未稳定的改动。相邻 Nightly 走增量包。"
+            }
         };
         panel(
             theme,
@@ -3874,6 +3878,12 @@ impl AppView {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(hint),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("已连接时，检查更新与下载走 Mixed；未连接则直连。"),
                 )
                 .when(!crate::sparkle::available(), |this| {
                     this.child(
