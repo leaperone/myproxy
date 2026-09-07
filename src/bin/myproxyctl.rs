@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use myproxy::catalog;
 use myproxy::paths;
-use myproxy::strategy::{self, Matcher, Strategy};
+use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Parser)]
@@ -32,7 +32,20 @@ enum Commands {
     Extension {
         state: String,
     },
-    /// Traffic that matches no rule (`MATCH`): `direct` or a group name.
+    /// Mixed inbound routing: `rule`, `proxy`, `global`, or `direct`.
+    MixedMode {
+        mode: Option<String>,
+    },
+    /// System Extension inbound routing: `rule`, `proxy`, `global`, or `direct`.
+    ExtensionMode {
+        mode: Option<String>,
+    },
+    /// Rule-page fallback: `allowlist`, `gfwlist`, or `group` plus optional via.
+    Routing {
+        profile: Option<String>,
+        via: Option<String>,
+    },
+    /// Compat for unmatched traffic: `direct` → allowlist, a group name → group.
     Unmatched {
         /// `direct`, `group` (the default group), or a group name such as `default` / `PROXY`.
         via: Option<String>,
@@ -163,6 +176,9 @@ fn run(cli: Cli) -> Result<()> {
                 "port",
                 "tun",
                 "extension",
+                "mixed-mode",
+                "extension-mode",
+                "routing",
                 "unmatched",
                 "filter",
                 "subscription",
@@ -212,8 +228,11 @@ fn run(cli: Cli) -> Result<()> {
             let unmatched = myproxy::compile::unmatched_target(&strategy);
             let status = serde_json::json!({
                 "mixed_port": strategy.mixed_port,
+                "mixed_mode": strategy.mixed_mode.as_str(),
                 "tun": strategy.tun,
                 "extension": strategy.system_extension,
+                "extension_mode": strategy.extension_mode.as_str(),
+                "routing": strategy.routing_profile.as_str(),
                 "unmatched": unmatched,
                 "unmatched_via": strategy.unmatched_via,
                 "subscriptions": strategy.subscriptions.len(),
@@ -223,19 +242,29 @@ fn run(cli: Cli) -> Result<()> {
                 "rules": strategy.rule_sets.len(),
                 "strategy": paths::strategy_path()?.display().to_string(),
             });
-            emit(json, status,
+            emit(
+                json,
+                status,
                 format!(
-                "mixed-port {}  tun {}  extension {}  unmatched {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
-                strategy.mixed_port,
-                if strategy.tun { "on" } else { "off" },
-                if strategy.system_extension { "on" } else { "off" },
-                unmatched,
-                strategy.subscriptions.len(),
-                catalog.nodes.len(),
-                catalog.excluded.len(),
-                strategy.groups.len(),
-                strategy.rule_sets.len()
-            ));
+                    "mixed-port {}  mixed-mode {}  tun {}  extension {}  extension-mode {}  routing {}  unmatched {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
+                    strategy.mixed_port,
+                    strategy.mixed_mode.as_str(),
+                    if strategy.tun { "on" } else { "off" },
+                    if strategy.system_extension {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    strategy.extension_mode.as_str(),
+                    strategy.routing_profile.as_str(),
+                    unmatched,
+                    strategy.subscriptions.len(),
+                    catalog.nodes.len(),
+                    catalog.excluded.len(),
+                    strategy.groups.len(),
+                    strategy.rule_sets.len()
+                ),
+            );
             if !json {
                 println!("strategy {}", paths::strategy_path()?.display());
             }
@@ -244,11 +273,7 @@ fn run(cli: Cli) -> Result<()> {
             myproxy::log::debug("ctl", "apply");
             let strategy = Strategy::load()?;
             let supervisor = Supervisor::default();
-            supervisor.adopt_running(
-                strategy.tun,
-                strategy.system_extension,
-                strategy.mixed_port,
-            );
+            supervisor.adopt_running(strategy.tun, strategy.system_extension, strategy.mixed_port);
             let catalog = supervisor.apply(&strategy)?;
             emit(
                 json,
@@ -342,6 +367,65 @@ fn run(cli: Cli) -> Result<()> {
                 format!("extension {}", if on { "on" } else { "off" }),
             );
         }
+        Commands::MixedMode { mode } => {
+            let mut strategy = Strategy::load()?;
+            if let Some(mode) = mode {
+                strategy.mixed_mode = InboundMode::parse(&mode)?;
+                strategy.save()?;
+            }
+            emit(
+                json,
+                serde_json::json!({"mixed_mode": strategy.mixed_mode.as_str()}),
+                format!("mixed-mode {}", strategy.mixed_mode.as_str()),
+            );
+        }
+        Commands::ExtensionMode { mode } => {
+            let mut strategy = Strategy::load()?;
+            if let Some(mode) = mode {
+                strategy.extension_mode = InboundMode::parse(&mode)?;
+                strategy.save()?;
+            }
+            emit(
+                json,
+                serde_json::json!({"extension_mode": strategy.extension_mode.as_str()}),
+                format!("extension-mode {}", strategy.extension_mode.as_str()),
+            );
+        }
+        Commands::Routing { profile, via } => {
+            let mut strategy = Strategy::load()?;
+            if let Some(profile) = profile {
+                let profile = RoutingProfile::parse(&profile)?;
+                strategy.set_routing_profile(profile);
+                if profile == RoutingProfile::Group {
+                    if let Some(via) = via.as_deref() {
+                        let via = via.trim();
+                        if via.is_empty() {
+                            bail!("routing group <via>");
+                        }
+                        strategy.unmatched_via = if via.eq_ignore_ascii_case("group") {
+                            myproxy::compile::default_group(&strategy).to_string()
+                        } else {
+                            via.to_string()
+                        };
+                    }
+                }
+                strategy.save()?;
+            }
+            let unmatched = myproxy::compile::unmatched_target(&strategy);
+            emit(
+                json,
+                serde_json::json!({
+                    "routing": strategy.routing_profile.as_str(),
+                    "unmatched": unmatched,
+                    "unmatched_via": strategy.unmatched_via,
+                }),
+                format!(
+                    "routing {} unmatched {}",
+                    strategy.routing_profile.as_str(),
+                    unmatched
+                ),
+            );
+        }
         Commands::Unmatched { via } => {
             let mut strategy = Strategy::load()?;
             if let Some(via) = via {
@@ -350,10 +434,15 @@ fn run(cli: Cli) -> Result<()> {
                     bail!("unmatched direct|<group>");
                 }
                 if via.eq_ignore_ascii_case("direct") {
+                    strategy.set_routing_profile(RoutingProfile::Allowlist);
                     strategy.unmatched_via = "DIRECT".into();
                 } else if via.eq_ignore_ascii_case("group") {
+                    strategy.set_routing_profile(RoutingProfile::Group);
                     strategy.unmatched_via = myproxy::compile::default_group(&strategy).to_string();
+                } else if via.eq_ignore_ascii_case("gfwlist") || via.eq_ignore_ascii_case("gfw") {
+                    strategy.set_routing_profile(RoutingProfile::Gfwlist);
                 } else {
+                    strategy.set_routing_profile(RoutingProfile::Group);
                     strategy.unmatched_via = via.to_string();
                 }
                 strategy.save()?;
@@ -362,11 +451,16 @@ fn run(cli: Cli) -> Result<()> {
             emit(
                 json,
                 serde_json::json!({
+                    "routing": strategy.routing_profile.as_str(),
                     "unmatched": unmatched,
                     "unmatched_via": strategy.unmatched_via,
                     "direct": myproxy::compile::unmatched_is_direct(&strategy),
                 }),
-                format!("unmatched {unmatched}"),
+                format!(
+                    "routing {} unmatched {}",
+                    strategy.routing_profile.as_str(),
+                    unmatched
+                ),
             );
         }
         Commands::Filter { set } => {

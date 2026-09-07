@@ -1,9 +1,9 @@
 mod appearance;
 mod onboard;
 mod sparkle;
-mod ui;
 #[cfg(target_os = "macos")]
 mod tray;
+mod ui;
 
 use gpui_kit::component::{Root, TitleBar};
 use gpui_kit::*;

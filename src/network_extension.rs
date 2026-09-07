@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::compile;
 use crate::log;
 use crate::login_item;
-use crate::strategy::Strategy;
+use crate::strategy::{InboundMode, Strategy};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,25 +90,27 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
 
     let mut process_rules = Vec::new();
     let mut needed = Vec::new();
-    for set in &strategy.rule_sets {
-        let via = compile::via_target(&set.via, strategy);
-        for matcher in &set.matchers {
-            if matcher.kind != "app" {
-                continue;
+    if strategy.extension_mode == InboundMode::Rule {
+        for set in &strategy.rule_sets {
+            let via = compile::via_target(&set.via, strategy);
+            for matcher in &set.matchers {
+                if matcher.kind != "app" {
+                    continue;
+                }
+                let pattern = matcher.value.trim();
+                if pattern.is_empty() {
+                    continue;
+                }
+                if !matches!(via.as_str(), "DIRECT" | "REJECT")
+                    && !needed.iter().any(|name| name == &via)
+                {
+                    needed.push(via.clone());
+                }
+                process_rules.push(ProcessRule {
+                    pattern: pattern.to_string(),
+                    via: via.clone(),
+                });
             }
-            let pattern = matcher.value.trim();
-            if pattern.is_empty() {
-                continue;
-            }
-            if !matches!(via.as_str(), "DIRECT" | "REJECT")
-                && !needed.iter().any(|name| name == &via)
-            {
-                needed.push(via.clone());
-            }
-            process_rules.push(ProcessRule {
-                pattern: pattern.to_string(),
-                via: via.clone(),
-            });
         }
     }
 
@@ -185,13 +187,17 @@ pub fn enable_async(strategy: &Strategy) {
         *last = Some(face);
     }
     let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
-    *LAST_ENABLE_REVISION.lock().expect("ne last enable revision") = Some(revision);
+    *LAST_ENABLE_REVISION
+        .lock()
+        .expect("ne last enable revision") = Some(revision);
     thread::Builder::new()
         .name("myproxy-ne".into())
         .spawn(move || {
             let _operation = OPERATION_LOCK.lock().expect("ne operation");
             if OPERATION_REVISION.load(Ordering::SeqCst) != revision {
-                let mut last_revision = LAST_ENABLE_REVISION.lock().expect("ne last enable revision");
+                let mut last_revision = LAST_ENABLE_REVISION
+                    .lock()
+                    .expect("ne last enable revision");
                 if *last_revision == Some(revision) {
                     *last_revision = None;
                     *LAST_ENABLE.lock().expect("ne last enable") = None;
@@ -201,7 +207,9 @@ pub fn enable_async(strategy: &Strategy) {
             if let Err(err) = enable_blocking(&request) {
                 if OPERATION_REVISION.load(Ordering::SeqCst) == revision {
                     *LAST_ENABLE.lock().expect("ne last enable") = None;
-                    *LAST_ENABLE_REVISION.lock().expect("ne last enable revision") = None;
+                    *LAST_ENABLE_REVISION
+                        .lock()
+                        .expect("ne last enable revision") = None;
                 }
                 log::error("ne", format!("{err:#}"));
             }
@@ -211,7 +219,9 @@ pub fn enable_async(strategy: &Strategy) {
 
 pub fn disable_async() {
     *LAST_ENABLE.lock().expect("ne last enable") = None;
-    *LAST_ENABLE_REVISION.lock().expect("ne last enable revision") = None;
+    *LAST_ENABLE_REVISION
+        .lock()
+        .expect("ne last enable revision") = None;
     let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
     thread::Builder::new()
         .name("myproxy-ne-stop".into())
@@ -320,11 +330,40 @@ mod ffi {
     use std::os::raw::c_char;
 
     unsafe extern "C" {
-        pub fn myproxy_ne_enable(
-            json: *const c_char,
-            error_out: *mut *mut c_char,
-        ) -> i32;
+        pub fn myproxy_ne_enable(json: *const c_char, error_out: *mut *mut c_char) -> i32;
         pub fn myproxy_ne_disable(error_out: *mut *mut c_char) -> i32;
         pub fn myproxy_ne_free_string(value: *mut c_char);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::{InboundMode, Strategy};
+
+    #[test]
+    fn rule_mode_pins_app_matchers() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        let plan = inbound_plan(&strategy);
+        assert!(
+            !plan.process_rules.is_empty(),
+            "rule mode should keep process pins"
+        );
+        assert!(
+            !plan.group_ports.is_empty(),
+            "rule mode should keep group SOCKS"
+        );
+    }
+
+    #[test]
+    fn non_rule_mode_clears_process_pins() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Global;
+        let plan = inbound_plan(&strategy);
+        assert!(plan.process_rules.is_empty());
+        assert!(plan.group_ports.is_empty());
     }
 }

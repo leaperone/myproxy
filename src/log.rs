@@ -67,13 +67,9 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
 impl State {
     fn open() -> Self {
         let path = paths::app_log_path().ok();
-        let file = path.as_ref().and_then(|path| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok()
-        });
+        let file = path
+            .as_ref()
+            .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok());
         Self {
             developer: env_forced(),
             lines: VecDeque::with_capacity(RING),
@@ -96,11 +92,7 @@ impl State {
         self.file = None;
         let backup = path.with_extension("log.1");
         let _ = std::fs::rename(path, &backup);
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok();
+        self.file = OpenOptions::new().create(true).append(true).open(path).ok();
     }
 }
 
@@ -183,10 +175,7 @@ fn emit(level: Level, target: &str, msg: &str) {
     let h = ts / 3600;
     let m = (ts % 3600) / 60;
     let s = ts % 60;
-    let line = format!(
-        "{h:02}:{m:02}:{s:02}Z {} {target} {msg}",
-        level.as_str()
-    );
+    let line = format!("{h:02}:{m:02}:{s:02}Z {} {target} {msg}", level.as_str());
     if level.to_stderr(developer) {
         eprintln!("myproxy {line}");
     }

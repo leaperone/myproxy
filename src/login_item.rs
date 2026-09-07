@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 /// `Some` when this process is `*.app/Contents/MacOS/<bin>`.
 pub fn app_bundle_path() -> Option<PathBuf> {
@@ -74,10 +74,7 @@ fn smapp_set(enable: bool) -> Result<()> {
             }
             let status: isize = msg_send![service, status];
             if status == REQUIRES_APPROVAL {
-                crate::log::warn(
-                    "login",
-                    "login item waiting for System Settings approval",
-                );
+                crate::log::warn("login", "login item waiting for System Settings approval");
             }
         } else if status != NOT_REGISTERED && status != NOT_FOUND {
             let mut err: *mut Object = std::ptr::null_mut();

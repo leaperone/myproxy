@@ -184,9 +184,9 @@ pub fn open(
             .footer(
                 DialogFooter::new()
                     .child(
-                        Button::new("onboard-later").label("稍后").on_click(
-                            |_, window, cx| window.dispatch_action(Box::new(Cancel), cx),
-                        ),
+                        Button::new("onboard-later")
+                            .label("稍后")
+                            .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx)),
                     )
                     .child({
                         let view = view.clone();
@@ -205,10 +205,7 @@ pub fn open(
                             .primary()
                             .label("安装 myproxyctl")
                             .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(Confirm { secondary: false }),
-                                    cx,
-                                )
+                                window.dispatch_action(Box::new(Confirm { secondary: false }), cx)
                             }),
                     ),
             )

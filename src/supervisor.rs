@@ -139,7 +139,10 @@ fn acquire_operation_with_timeout(timeout: Duration) -> Result<OperationGuard> {
     loop {
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
-            return Ok(OperationGuard { _state: state, file });
+            return Ok(OperationGuard {
+                _state: state,
+                file,
+            });
         }
         if Instant::now() >= deadline {
             bail!("另一个核心操作正在进行中，请稍后重试");
@@ -192,7 +195,12 @@ impl Supervisor {
         if !is_wanted() {
             return CoreHealth::idle();
         }
-        let mut health = self.health.lock().expect("supervisor health lock").last.clone();
+        let mut health = self
+            .health
+            .lock()
+            .expect("supervisor health lock")
+            .last
+            .clone();
         health.wanted = true;
         health
     }
@@ -233,7 +241,7 @@ impl Supervisor {
                 bin.display()
             );
         }
-        let status = Command::new(&bin)
+        let status = mihomo_command(&bin)?
             .arg("-t")
             .arg("-f")
             .arg(&yaml)
@@ -249,7 +257,7 @@ impl Supervisor {
         }
 
         let log_file = File::create(paths::mihomo_log_path()?).context("mihomo.log")?;
-        let mut child = Command::new(&bin)
+        let mut child = mihomo_command(&bin)?
             .arg("-f")
             .arg(&yaml)
             .stdin(Stdio::null())
@@ -344,24 +352,15 @@ impl Supervisor {
         let was_tun = *self.running_tun.lock().expect("supervisor lock");
         let was_se = *self.running_se.lock().expect("supervisor lock");
         let was_port = *self.running_mixed_port.lock().expect("supervisor lock");
-        let needs_reconnect = needs_reconnect(
-            running,
-            is_wanted(),
-            was_tun,
-            was_se,
-            was_port,
-            strategy,
-        );
+        let needs_reconnect =
+            needs_reconnect(running, is_wanted(), was_tun, was_se, was_port, strategy);
         if needs_reconnect {
             if running {
                 log::info(
                     "supervisor",
                     format!(
                         "apply requires reconnect: port {:?}→{} tun {was_tun}→{} se {was_se}→{}",
-                        was_port,
-                        strategy.mixed_port,
-                        strategy.tun,
-                        strategy.system_extension
+                        was_port, strategy.mixed_port, strategy.tun, strategy.system_extension
                     ),
                 );
             }
@@ -371,7 +370,10 @@ impl Supervisor {
             compile::compile(strategy, &catalog)?;
             if running {
                 if let Err(err) = controller::reload(strategy.mixed_port) {
-                    log::warn("supervisor", format!("controller reload failed, restarting core: {err:#}"));
+                    log::warn(
+                        "supervisor",
+                        format!("controller reload failed, restarting core: {err:#}"),
+                    );
                     self.disconnect_inner()?;
                     self.start_with_catalog(strategy, &catalog)?;
                     return Ok(catalog);
@@ -447,7 +449,10 @@ impl Supervisor {
                             wait_for_pid_exit(pid);
                             stopped = true;
                         } else {
-                            log::warn("supervisor", "ignoring stale mihomo pid without a listening port");
+                            log::warn(
+                                "supervisor",
+                                "ignoring stale mihomo pid without a listening port",
+                            );
                         }
                     }
                 }
@@ -593,7 +598,11 @@ impl Supervisor {
             watch.recoveries = watch.recoveries.saturating_add(1);
             watch.fails = 0;
         }
-        let n = self.health.lock().expect("supervisor health lock").recoveries;
+        let n = self
+            .health
+            .lock()
+            .expect("supervisor health lock")
+            .recoveries;
         if self.is_running() {
             log::info("supervisor", format!("health reload #{n}"));
             match controller::reload(strategy.mixed_port) {
@@ -801,6 +810,12 @@ fn ensure_tun_privileges(bin: &Path) -> Result<()> {
         log::info("supervisor", "mihomo is setuid root");
         Ok(())
     }
+}
+
+fn mihomo_command(bin: &Path) -> Result<Command> {
+    let mut command = Command::new(bin);
+    command.arg("-d").arg(paths::data_dir()?);
+    Ok(command)
 }
 
 fn mihomo_has_tun_privs(bin: &Path) -> bool {

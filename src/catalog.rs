@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
