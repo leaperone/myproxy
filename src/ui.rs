@@ -1,30 +1,25 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::button::{
-    Button, ButtonGroup, ButtonVariant, ButtonVariants as _, Toggle, ToggleGroup,
-    ToggleVariants as _,
+    Button, ButtonGroup, ButtonVariants as _, Toggle, ToggleGroup, ToggleVariants as _,
 };
 use gpui_kit::component::dialog::{Cancel, Confirm, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarItem,
+    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Collapsible, Disableable, Icon, IconName, Root, Selectable, Sizable,
-    StyledExt, Theme, TitleBar, WindowExt,
+    h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Selectable, Sizable, StyledExt,
+    Theme, TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
-use myproxy::controller::{
-    self, ConnectionColumn, ConnectionFilters, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals,
-};
+use myproxy::controller::{self, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals};
 use myproxy::log;
 use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
 use myproxy::supervisor::{CoreHealth, Supervisor};
@@ -104,63 +99,6 @@ const REGION_PRESETS: &[(&str, &[&str])] = &[
     ("HK", &["hk", "港"]),
     ("TW", &["tw", "台"]),
 ];
-
-#[derive(Clone)]
-struct NavItem {
-    label: SharedString,
-    icon: IconName,
-    active: bool,
-    handler: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
-}
-
-impl NavItem {
-    fn new(
-        label: &'static str,
-        icon: IconName,
-        active: bool,
-        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        Self {
-            label: label.into(),
-            icon,
-            active,
-            handler: Rc::new(handler),
-        }
-    }
-}
-
-impl Collapsible for NavItem {
-    fn is_collapsed(&self) -> bool {
-        false
-    }
-
-    fn collapsed(self, _collapsed: bool) -> Self {
-        self
-    }
-}
-
-impl SidebarItem for NavItem {
-    fn render(
-        self,
-        id: impl Into<ElementId>,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> impl IntoElement {
-        let mut button = Button::new(id)
-            .w_full()
-            .small()
-            .ghost()
-            .justify_start()
-            .gap_2()
-            .icon(self.icon)
-            .label(self.label)
-            .on_click(move |event, window, cx| (self.handler)(event, window, cx));
-        if self.active {
-            button = button.selected(true);
-        }
-        button
-    }
-}
 
 struct GroupEditor {
     parent: Entity<AppView>,
@@ -457,13 +395,7 @@ impl Render for GroupEditor {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .w(px(160.))
-                            .child(div().text_xs().text_color(muted_fg).child("组名"))
-                            .child(Input::new(&self.name)),
-                    )
+                    .child(div().w(px(160.)).child(Input::new(&self.name)))
                     .child({
                         let entity = entity.clone();
                         let mut group = ButtonGroup::new("group-mode")
@@ -857,13 +789,7 @@ impl Render for RuleSetEditor {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .flex_1()
-                            .child(div().text_xs().text_color(muted_fg).child("项目名"))
-                            .child(Input::new(&self.name)),
-                    )
+                    .child(div().flex_1().child(Input::new(&self.name)))
                     .child({
                         let entity = entity.clone();
                         Button::new("rule-via")
@@ -922,13 +848,7 @@ impl Render for RuleSetEditor {
                             });
                         })
                     })
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .flex_1()
-                            .child(div().text_xs().text_color(muted_fg).child("匹配值"))
-                            .child(Input::new(&self.match_input)),
-                    )
+                    .child(div().flex_1().child(Input::new(&self.match_input)))
                     .child({
                         let entity = entity.clone();
                         Button::new("add-matcher")
@@ -1109,17 +1029,15 @@ fn initial_page() -> Page {
 
 pub struct AppView {
     page: Page,
+    sidebar_compact: bool,
     strategy: Strategy,
     saved: Strategy,
     applied: Strategy,
     catalog: Catalog,
     status: String,
-    pending_apply_note: Option<String>,
     connected: bool,
     wanted: bool,
     busy: bool,
-    busy_since: Option<Instant>,
-    busy_status: String,
     cli_installed: bool,
     external_change_pending: bool,
     strategy_stamp: Option<SystemTime>,
@@ -1149,7 +1067,6 @@ pub struct AppView {
     delaying: HashSet<String>,
     window_active: bool,
     log_generation: u64,
-    connection_filters: ConnectionFilters,
 }
 
 impl AppView {
@@ -1275,19 +1192,6 @@ impl AppView {
                     .update(cx, |this, cx| {
                         let started = Instant::now();
                         let mut dirty = false;
-                        if let Some(busy_since) = this.busy_since {
-                            let elapsed = busy_since.elapsed().as_secs();
-                            if elapsed >= 3 {
-                                let status = format!(
-                                    "{}（已等待 {} 秒）",
-                                    this.busy_status, elapsed
-                                );
-                                if this.status != status {
-                                    this.status = status;
-                                    dirty = true;
-                                }
-                            }
-                        }
                         if !this.busy && !this.wanted && this.connected {
                             this.connected = false;
                             this.clear_live();
@@ -1383,13 +1287,11 @@ impl AppView {
         });
         let this = Self {
             page: initial_page(),
+            sidebar_compact: false,
             status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
-            pending_apply_note: None,
             connected: false,
             wanted,
             busy: false,
-            busy_since: None,
-            busy_status: String::new(),
             cli_installed: myproxy::cli_install::is_installed(),
             external_change_pending: false,
             strategy_stamp: initial_strategy_stamp,
@@ -1429,7 +1331,6 @@ impl AppView {
             log_generation: log::generation(),
             pending_port_input: None,
             pending_filter_input: None,
-            connection_filters: ConnectionFilters::default(),
         };
         if crate::onboard::should_prompt() {
             cx.defer_in(window, |_this, window, cx| {
@@ -1547,43 +1448,28 @@ impl AppView {
         }
         let strategy = self.strategy.clone();
         let supervisor = self.supervisor.clone();
-        let refresh_catalog = self.catalog.nodes.is_empty()
-            || self.applied.subscriptions != strategy.subscriptions
-            || self.applied.exclude_filter != strategy.exclude_filter;
-        let apply_note = self.pending_apply_note.take();
         self.busy = true;
-        self.status = if refresh_catalog {
-            "正在刷新订阅并应用策略…".into()
-        } else {
-            "正在应用策略…".into()
-        };
-        self.busy_since = Some(Instant::now());
-        self.busy_status = self.status.clone();
+        self.status = "正在应用策略…".into();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let apply_strategy = strategy.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let result = if refresh_catalog {
-                        supervisor.apply(&apply_strategy)
-                    } else {
-                        supervisor.apply_cached(&apply_strategy)
-                    };
-                    result.map_err(|err| err.to_string())
+                    supervisor
+                        .apply(&apply_strategy)
+                        .map_err(|err| err.to_string())
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.busy = false;
-                this.busy_since = None;
-                this.busy_status.clear();
                 match result {
                     Ok(cat) => {
                         this.catalog = cat;
                         if this.strategy == strategy {
                             this.mark_applied();
                         }
-                        let summary = format!(
+                        this.status = format!(
                             "已编译 {} 个节点，排除 {}。{}Mixed {}。",
                             this.catalog.nodes.len(),
                             this.catalog.excluded.len(),
@@ -1594,22 +1480,6 @@ impl AppView {
                             },
                             this.strategy.mixed_port
                         );
-                        let failed = this
-                            .catalog
-                            .excluded
-                            .iter()
-                            .filter(|item| item.reason.starts_with("fetch failed:"))
-                            .map(|item| item.subscription.as_str())
-                            .collect::<std::collections::HashSet<_>>();
-                        let cache_note = if !refresh_catalog || failed.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {} 个订阅刷新失败，已使用缓存。", failed.len())
-                        };
-                        this.status = apply_note
-                            .as_deref()
-                            .map(|note| format!("{note} {summary}{cache_note}"))
-                            .unwrap_or_else(|| format!("{summary}{cache_note}"));
                         if this.connected {
                             this.refresh_live(cx);
                         }
@@ -1972,8 +1842,11 @@ impl AppView {
         page: Page,
         label: &'static str,
         icon: IconName,
-    ) -> NavItem {
-        NavItem::new(label, icon, self.page == page, self.select_page(cx, page))
+    ) -> SidebarMenuItem {
+        SidebarMenuItem::new(label)
+            .icon(icon)
+            .active(self.page == page)
+            .on_click(self.select_page(cx, page))
     }
 
     fn on_apply(&self, cx: &mut Context<Self>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
@@ -2270,39 +2143,6 @@ impl AppView {
         self.persist_and_apply(cx);
     }
 
-    fn confirm_destructive(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        title: String,
-        description: String,
-        action: impl Fn(Entity<Self>, &mut Window, &mut App) + 'static,
-    ) {
-        let parent = cx.entity();
-        let action = Rc::new(action);
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let action = action.clone();
-            alert
-                .title(title.clone())
-                .description(description.clone())
-                .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("确认")
-                        .ok_variant(ButtonVariant::Danger)
-                        .cancel_text("取消")
-                        .show_cancel(true)
-                        .on_ok({
-                            let parent = parent.clone();
-                            move |_, window, cx| {
-                                action(parent.clone(), window, cx);
-                                true
-                            }
-                        }),
-                )
-        });
-    }
-
     fn move_selected_rule(&mut self, id: &str, delta: i32, cx: &mut Context<Self>) {
         if !self.strategy.move_rule(id, delta) {
             return;
@@ -2311,23 +2151,6 @@ impl AppView {
     }
 
     fn remove_selected_rule(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(rule) = self.strategy.rule_sets.iter().find(|rule| rule.id == id) else {
-            return;
-        };
-        let rule_id = id.to_string();
-        let name = rule.name.clone();
-        self.confirm_destructive(
-            window,
-            cx,
-            "删除规则？".into(),
-            format!("将删除规则「{name}」，此操作不可撤销。"),
-            move |parent, window, cx| {
-                parent.update(cx, |this, cx| this.delete_rule_now(&rule_id, window, cx));
-            },
-        );
-    }
-
-    fn delete_rule_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let editing = self.rule_edit_id.as_deref() == Some(id);
         if !self.strategy.remove_rule(id) {
             return;
@@ -2340,34 +2163,6 @@ impl AppView {
             }
             self.status = "已删除规则。".into();
         }
-    }
-
-    fn delete_group_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let close_modal = self.group_edit_id.as_deref() == Some(id);
-        self.strategy.remove_group(id);
-        if self.persist_and_apply(cx) {
-            if close_modal {
-                self.group_modal_open = false;
-                self.group_edit_id = None;
-                window.close_dialog(cx);
-            }
-            self.status = "已删除节点组。".into();
-            cx.notify();
-        }
-    }
-
-    fn close_all_connections_now(&mut self, cx: &mut Context<Self>) {
-        let port = self.strategy.mixed_port;
-        self.traffic.connections.clear();
-        self.status = "已关闭全部连接。".into();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(err) = controller::close_all(port) {
-                    log::debug("ui", format!("close all failed: {err:#}"));
-                }
-            })
-            .detach();
-        cx.notify();
     }
 
     fn group_now<'a>(&'a self, group: &'a Group) -> &'a str {
@@ -2600,7 +2395,7 @@ impl AppView {
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(status_dot_state(theme, connected, warn_live))
+                        .child(status_dot(theme, connected && !warn_live))
                         .child(
                             div()
                                 .text_xs()
@@ -2631,142 +2426,63 @@ impl AppView {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        let warn_live = !self.busy
-            && (self.wanted && !self.connected
-                || self.traffic_error.is_some()
-                || self.proxy_error.is_some());
-        let live = !self.busy && self.connected && !warn_live;
-        let live_label = if self.busy {
-            "处理中…"
-        } else if live {
-            "已连接"
-        } else if self.wanted {
-            "连接异常"
-        } else {
-            "未连接"
-        };
         Sidebar::new("nav")
-            .collapsible(false)
-            .w(px(232.))
+            .w(px(216.))
+            .collapsible(true)
+            .collapsed(self.sidebar_compact)
             .header(
-                SidebarHeader::new().p_2().child(
+                SidebarHeader::new().child(
                     v_flex()
+                        .gap(px(2.))
+                        .child(div().text_sm().font_semibold().child("控制"))
                         .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .size_7()
-                                        .rounded(px(8.))
-                                        .bg(theme.sidebar_accent)
-                                        .text_color(theme.sidebar_accent_foreground)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(Icon::new(IconName::Cpu).size_4()),
-                                )
-                                .child(
-                                    v_flex()
-                                        .gap(px(1.))
-                                        .child(div().text_sm().font_semibold().child("myproxy"))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child("代理控制台 · strategy.json"),
-                                        ),
-                                ),
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("strategy.json"),
                         )
                         .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .px_2()
-                                .py(px(5.))
-                                .rounded(px(6.))
-                                .bg(theme.background.opacity(0.35))
-                                .child(
-                                    div()
-                                        .size_2()
-                                        .rounded_full()
-                                        .bg(if live {
-                                            theme.success
-                                        } else if warn_live {
-                                            theme.warning
-                                        } else {
-                                            theme.muted_foreground
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(if live {
-                                            theme.success
-                                        } else if warn_live {
-                                            theme.warning
-                                        } else {
-                                            theme.muted_foreground
-                                        })
-                                        .child(live_label),
-                                ),
+                            Button::new("toggle-sidebar")
+                                .ghost()
+                                .icon(if self.sidebar_compact { IconName::PanelLeftOpen } else { IconName::PanelLeft })
+                                .on_click({
+                                    let entity = cx.entity();
+                                    move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            this.sidebar_compact = !this.sidebar_compact;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
                         ),
                 ),
             )
             .child(
-                SidebarGroup::new("监控")
-                    .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
-                    .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network)),
+                SidebarGroup::new("会话").child(
+                    SidebarMenu::new()
+                        .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
+                        .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
+                        .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
+                        .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
+                        .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
+                ),
             )
             .child(
-                SidebarGroup::new("配置")
-                    .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
-                    .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
-                    .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
-            )
-            .child(
-                SidebarGroup::new("系统")
-                    .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
+                SidebarGroup::new("系统").child(
+                    SidebarMenu::new()
+                        .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
+                ),
             )
             .footer(
                 SidebarFooter::new().child(
-                    v_flex()
-                        .w_full()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("节点库"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .child(self.catalog.nodes.len().to_string()),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("已排除"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .child(self.catalog.excluded.len().to_string()),
-                                ),
-                        ),
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "{} nodes · {} excluded",
+                            self.catalog.nodes.len(),
+                            self.catalog.excluded.len()
+                        )),
                 ),
             )
     }
@@ -2783,7 +2499,6 @@ impl AppView {
             .child(
                 div()
                     .id("status")
-                    .role(Role::Status)
                     .text_xs()
                     .text_color(if self.status.contains("失败") || self.status.contains("异常") || self.status.contains("无响应") {
                         theme.warning
@@ -2919,7 +2634,6 @@ impl AppView {
             .child(
                 h_flex()
                     .gap_3()
-                    .flex_wrap()
                     .child(metric(
                         theme,
                         "状态",
@@ -2943,7 +2657,7 @@ impl AppView {
                         theme,
                         "节点",
                         &format!(
-                            "{} 个保留 / {} 个已排除",
+                            "{} kept / {} excluded",
                             self.catalog.nodes.len(),
                             self.catalog.excluded.len()
                         ),
@@ -2993,24 +2707,6 @@ impl AppView {
             "—".into()
         };
         let mixed = format!("127.0.0.1:{}", self.strategy.mixed_port);
-        let filtered = controller::filter_connections(
-            &self.traffic.connections,
-            &self.connection_filters,
-        );
-        let filter_note = if !connected || self.traffic.connections.is_empty() {
-            String::new()
-        } else if filtered.len() == self.traffic.connections.len()
-            && self.connection_filters.show_direct
-            && !self.connection_filters.has_column_filter()
-        {
-            String::new()
-        } else {
-            format!(
-                "显示 {} / {} 条",
-                filtered.len(),
-                self.traffic.connections.len()
-            )
-        };
         v_flex()
             .id("connections-page")
             .flex_1()
@@ -3029,7 +2725,6 @@ impl AppView {
             .child(
                 h_flex()
                     .gap_3()
-                    .flex_wrap()
                     .child(metric(
                         theme,
                         "状态",
@@ -3048,7 +2743,6 @@ impl AppView {
                         h_flex()
                             .items_center()
                             .justify_between()
-                            .gap_2()
                             .child(
                                 div()
                                     .text_xs()
@@ -3057,79 +2751,36 @@ impl AppView {
                                     } else {
                                         muted_fg
                                     })
-                                    .child(
-                                        self.traffic_error
-                                            .clone()
-                                            .unwrap_or(filter_note),
-                                    ),
+                                    .child(self.traffic_error.clone().unwrap_or_default()),
                             )
                             .when(connected && !self.traffic.connections.is_empty(), |this| {
-                                this.child(
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .child({
-                                            let entity = entity.clone();
-                                            Toggle::new("show-direct-connections")
-                                                .small()
-                                                .outline()
-                                                .label("显示直连")
-                                                .checked(self.connection_filters.show_direct)
-                                                .on_click(move |checked, _, app| {
-                                                    let show = *checked;
-                                                    entity.update(app, |this, cx| {
-                                                        this.connection_filters.show_direct = show;
-                                                        cx.notify();
-                                                    });
-                                                })
+                                this.child({
+                                    let entity = entity.clone();
+                                    Button::new("close-all-connections")
+                                        .small()
+                                        .danger()
+                                        .label("关闭全部")
+                                        .on_click(move |_, _, app| {
+                                            entity.update(app, |this, cx| {
+                                                let port = this.strategy.mixed_port;
+                                                this.traffic.connections.clear();
+                                                this.status = "已关闭全部连接。".into();
+                                                cx.background_executor()
+                                                    .spawn(async move {
+                                                        if let Err(err) =
+                                                            controller::close_all(port)
+                                                        {
+                                                            log::debug(
+                                                                "ui",
+                                                                format!("close all failed: {err:#}"),
+                                                            );
+                                                        }
+                                                    })
+                                                    .detach();
+                                                cx.notify();
+                                            });
                                         })
-                                        .when(
-                                            self.connection_filters.has_column_filter(),
-                                            |this| {
-                                                this.child({
-                                                    let entity = entity.clone();
-                                                    Button::new("clear-connection-filters")
-                                                        .small()
-                                                        .ghost()
-                                                        .label("清除筛选")
-                                                        .on_click(move |_, _, app| {
-                                                            entity.update(app, |this, cx| {
-                                                                this.connection_filters
-                                                                    .clear_columns();
-                                                                cx.notify();
-                                                            });
-                                                        })
-                                                })
-                                            },
-                                        )
-                                        .child({
-                                            let entity = entity.clone();
-                                            Button::new("close-all-connections")
-                                                .small()
-                                                .danger()
-                                                .label("关闭全部")
-                                                .accessibility_label(format!(
-                                                    "关闭全部 {} 条连接",
-                                                    self.traffic.connections.len()
-                                                ))
-                                                .on_click(move |_, window, app| {
-                                                    entity.update(app, |this, cx| {
-                                                        let count = this.traffic.connections.len();
-                                                        this.confirm_destructive(
-                                                            window,
-                                                            cx,
-                                                            "关闭全部连接？".into(),
-                                                            format!("将终止当前显示的 {count} 条连接。"),
-                                                            move |parent, _, cx| {
-                                                                parent.update(cx, |this, cx| {
-                                                                    this.close_all_connections_now(cx);
-                                                                });
-                                                            },
-                                                        );
-                                                    });
-                                                })
-                                        }),
-                                )
+                                })
                             }),
                     )
                 },
@@ -3168,32 +2819,12 @@ impl AppView {
                 this.child(
                     v_flex()
                         .id("connection-list")
-                        .role(Role::Table)
                         .flex_1()
                         .min_h_0()
-                        .overflow_scroll()
+                        .overflow_y_scroll()
                         .gap_1()
-                        .child(connection_header_row(
-                            entity.clone(),
-                            theme,
-                            &self.traffic.connections,
-                            &self.connection_filters,
-                        ))
-                        .when(filtered.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(if self.connection_filters.show_direct {
-                                        "没有符合筛选的连接。"
-                                    } else {
-                                        "没有符合筛选的连接。打开「显示直连」可查看直连。"
-                                    }),
-                            )
-                        })
-                        .children(filtered.into_iter().map(|conn| {
+                        .child(connection_header_row(theme))
+                        .children(self.traffic.connections.iter().map(|conn| {
                             render_connection_row(entity.clone(), theme, conn)
                         }))
                         .when(
@@ -3230,21 +2861,8 @@ impl AppView {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .flex_wrap()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .w(px(160.))
-                            .child(div().text_xs().text_color(theme.muted_foreground).child("订阅名"))
-                            .child(Input::new(&self.name_input)),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .flex_1()
-                            .child(div().text_xs().text_color(theme.muted_foreground).child("订阅 URL"))
-                            .child(Input::new(&self.url_input)),
-                    )
+                    .child(div().w(px(160.)).child(Input::new(&self.name_input)))
+                    .child(div().flex_1().child(Input::new(&self.url_input)))
                     .child({
                         let entity = entity.clone();
                         Button::new("add-sub").primary().label("添加").on_click(
@@ -3283,7 +2901,6 @@ impl AppView {
             })
             .children(self.strategy.subscriptions.iter().map(|sub| {
                 let id = sub.id.clone();
-                let subscription_name = sub.name.clone();
                 let entity = entity.clone();
                 panel(
                     theme,
@@ -3293,10 +2910,6 @@ impl AppView {
                         .justify_between()
                         .child(
                             div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .overflow_x_hidden()
-                                .text_ellipsis()
                                 .text_xs()
                                 .font_family(theme.mono_font_family.clone())
                                 .text_color(theme.muted_foreground)
@@ -3307,26 +2920,11 @@ impl AppView {
                                 .small()
                                 .danger()
                                 .label("删除")
-                                .accessibility_label(format!("删除订阅 {}", subscription_name))
-                                .on_click(move |_, window, app| {
-                                    let subscription_id = id.clone();
+                                .on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
-                                        this.confirm_destructive(
-                                            window,
-                                            cx,
-                                            "删除订阅？".into(),
-                                            format!(
-                                                "将删除订阅「{subscription_name}」及其目录节点。"
-                                            ),
-                                            move |parent, _, cx| {
-                                                parent.update(cx, |this, cx| {
-                                                    this.strategy.remove_subscription(&subscription_id);
-                                                    this.persist();
-                                                    this.status = "已删除订阅。".into();
-                                                    cx.notify();
-                                                });
-                                            },
-                                        );
+                                        this.strategy.remove_subscription(&id);
+                                        this.persist();
+                                        cx.notify();
                                     });
                                 }),
                         ),
@@ -3336,7 +2934,7 @@ impl AppView {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("已排除 {}（{}）— {}", ex.name, ex.subscription, ex.reason))
+                    .child(format!("excluded {} ({}) — {}", ex.name, ex.subscription, ex.reason))
             }))
     }
 
@@ -3591,8 +3189,6 @@ impl AppView {
                         .gap_4()
                         .child(
                             v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
                                 .gap(px(2.))
                                 .child(div().text_sm().child("安装 myproxyctl"))
                                 .child(
@@ -3645,8 +3241,6 @@ impl AppView {
                         .gap_4()
                         .child(
                             div()
-                                .flex_1()
-                                .min_w(px(0.))
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child("官方 Agent skill，复制后交给 Cursor / Codex。"),
@@ -3663,29 +3257,21 @@ impl AppView {
                                         cx.notify();
                                     });
                                 })
-                        })
+                        }),
                 ),
         )
     }
 
     fn set_system_extension(&mut self, on: bool, cx: &mut Context<Self>) {
-        let disabled_tun = on && self.strategy.tun;
         self.strategy.system_extension = on;
         if on {
             self.strategy.tun = false;
         }
         if self.wanted {
-            self.pending_apply_note = disabled_tun.then(|| "已开启系统接管，并关闭 TUN。".into());
-            if !self.persist_and_apply(cx) {
-                self.pending_apply_note = None;
-            }
+            self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
-                if disabled_tun {
-                    "已开启系统接管，并关闭 TUN。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
-                } else {
-                    "已记录。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
-                }
+                "已记录。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
             } else {
                 "已关闭系统接管。".into()
             };
@@ -3693,24 +3279,15 @@ impl AppView {
     }
 
     fn set_tun(&mut self, on: bool, cx: &mut Context<Self>) {
-        let disabled_system_extension = on && self.strategy.system_extension;
         self.strategy.tun = on;
         if on {
             self.strategy.system_extension = false;
         }
         if self.wanted {
-            self.pending_apply_note = disabled_system_extension
-                .then(|| "已开启 TUN，并关闭系统接管。".into());
-            if !self.persist_and_apply(cx) {
-                self.pending_apply_note = None;
-            }
+            self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
-                if disabled_system_extension {
-                    "已开启 TUN，并关闭系统接管。下次连接走 TUN；首次会要管理员密码。".into()
-                } else {
-                    "已记录。下次连接走 TUN；首次会要管理员密码。".into()
-                }
+                "已记录。下次连接走 TUN；首次会要管理员密码。".into()
             } else {
                 "已关闭 TUN。".into()
             };
@@ -3833,8 +3410,6 @@ impl AppView {
                         .gap_4()
                         .child(
                             v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
                                 .gap(px(2.))
                                 .child(div().text_sm().child("拦截本机应用"))
                                 .child(
@@ -3845,12 +3420,15 @@ impl AppView {
                                 ),
                         )
                         .child({
-                            let entity = entity.clone();
-                            Switch::new("se-toggle")
-                                .checked(on)
-                                .disabled(self.busy)
-                                .accessibility_label("系统接管")
-                                .on_click(move |_, _, app| {
+                            let mut toggle = Button::new("se-toggle").small();
+                            toggle = if on {
+                                toggle.danger().label("关闭")
+                            } else {
+                                toggle.primary().label("开启")
+                            };
+                            toggle.disabled(self.busy).on_click({
+                                let entity = entity.clone();
+                                move |_, _, app| {
                                     entity.update(app, |this, cx| {
                                         this.set_system_extension(
                                             !this.strategy.system_extension,
@@ -3858,7 +3436,8 @@ impl AppView {
                                         );
                                         cx.notify();
                                     });
-                                })
+                                }
+                            })
                         }),
                 )
                 .child(
@@ -3879,8 +3458,6 @@ impl AppView {
                         .gap_4()
                         .child(
                             v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
                                 .gap(px(2.))
                                 .child(div().text_sm().child("TUN"))
                                 .child(
@@ -3892,16 +3469,18 @@ impl AppView {
                         )
                         .child({
                             let entity = entity.clone();
-                            Switch::new("tun-toggle")
-                                .checked(tun_on)
-                                .disabled(self.busy)
-                                .accessibility_label("TUN")
-                                .on_click(move |_, _, app| {
-                                    entity.update(app, |this, cx| {
-                                        this.set_tun(!this.strategy.tun, cx);
-                                        cx.notify();
-                                    });
-                                })
+                            let mut toggle = Button::new("tun-toggle").small();
+                            toggle = if tun_on {
+                                toggle.danger().label("关闭")
+                            } else {
+                                toggle.primary().label("开启")
+                            };
+                            toggle.disabled(self.busy).on_click(move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    this.set_tun(!this.strategy.tun, cx);
+                                    cx.notify();
+                                });
+                            })
                         }),
                 ),
         )
@@ -4003,8 +3582,6 @@ impl AppView {
             .gap_4()
             .child(
                 v_flex()
-                    .flex_1()
-                    .min_w(px(0.))
                     .gap(px(2.))
                     .child(div().text_sm().child(title))
                     .child(
@@ -4014,15 +3591,17 @@ impl AppView {
                             .child(hint),
                     ),
             )
-            .child(
-                Switch::new(id)
-                    .checked(on)
-                    .disabled(self.busy)
-                    .accessibility_label(title)
-                    .on_click(move |_, _, app| {
-                        entity.update(app, |this, cx| apply(this, cx));
-                    }),
-            )
+            .child({
+                let mut toggle = Button::new(id).small();
+                toggle = if on {
+                    toggle.label("关闭")
+                } else {
+                    toggle.primary().label("开启")
+                };
+                toggle.disabled(self.busy).on_click(move |_, _, app| {
+                    entity.update(app, |this, cx| apply(this, cx));
+                })
+            })
     }
 
     fn appearance_row(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -4081,10 +3660,6 @@ impl AppView {
                 .gap_2()
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_x_hidden()
-                        .text_ellipsis()
                         .text_sm()
                         .child(format!("当前版本 {version}")),
                 )
@@ -4425,7 +4000,6 @@ fn render_group_card(
     let id = group.id.clone();
     let del_id = group.id.clone();
     let group_name = group.name.clone();
-    let group_title = group.name.clone();
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
     let shown = members.iter().take(36).cloned().collect::<Vec<_>>();
@@ -4458,10 +4032,6 @@ fn render_group_card(
                 .justify_between()
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_x_hidden()
-                        .text_ellipsis()
                         .text_sm()
                         .font_semibold()
                         .child(format!(
@@ -4474,20 +4044,6 @@ fn render_group_card(
                 .child(
                     h_flex()
                         .gap_1()
-                        .child({
-                            let entity = entity.clone();
-                            let edit_id = id.clone();
-                            Button::new(SharedString::from(format!("edit-group-{edit_id}")))
-                                .small()
-                                .label("编辑")
-                                .on_click(move |_, window, app| {
-                                    app.stop_propagation();
-                                    entity.update(app, |this, cx| {
-                                        this.open_group_dialog(Some(&edit_id), window, cx);
-                                        cx.notify();
-                                    });
-                                })
-                        })
                         .child({
                             let entity = entity.clone();
                             let name = group_name.clone();
@@ -4508,26 +4064,25 @@ fn render_group_card(
                                 .small()
                                 .danger()
                                 .label("删除")
-                                .accessibility_label(format!("删除节点组 {}", group_title))
                                 .on_click(move |_, window, app| {
                                     app.stop_propagation();
+                                    let close_modal = entity
+                                        .read(app)
+                                        .group_edit_id
+                                        .as_deref()
+                                        == Some(del_id.as_str());
                                     entity.update(app, |this, cx| {
-                                        let group_id = del_id.clone();
-                                        let group_title = group_name.clone();
-                                        this.confirm_destructive(
-                                            window,
-                                            cx,
-                                            "删除节点组？".into(),
-                                            format!(
-                                                "将删除节点组「{group_title}」，引用它的规则可能需要重新选择走向。"
-                                            ),
-                                            move |parent, window, cx| {
-                                                parent.update(cx, |this, cx| {
-                                                    this.delete_group_now(&group_id, window, cx);
-                                                });
-                                            },
-                                        );
+                                        if close_modal {
+                                            this.group_modal_open = false;
+                                            this.group_edit_id = None;
+                                        }
+                                        this.strategy.remove_group(&del_id);
+                                        this.persist_and_apply(cx);
+                                        cx.notify();
                                     });
+                                    if close_modal {
+                                        window.close_dialog(app);
+                                    }
                                 })
                         }),
                 ),
@@ -4597,139 +4152,22 @@ fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn connection_header_row(
-    entity: Entity<AppView>,
-    theme: &Theme,
-    connections: &[controller::LiveConnection],
-    filters: &ConnectionFilters,
-) -> impl IntoElement {
+fn connection_header_row(theme: &Theme) -> impl IntoElement {
     let muted_fg = theme.muted_foreground;
     h_flex()
         .w_full()
-        .min_w(px(812.))
         .items_center()
         .px_3()
         .py_1()
         .gap_2()
-        .child(connection_filter_header(
-            entity.clone(),
-            theme,
-            "conn-filter-process",
-            Some(px(108.)),
-            ConnectionColumn::Process,
-            "进程",
-            controller::connection_column_values(connections, filters, ConnectionColumn::Process),
-            filters.process.clone(),
-        ))
-        .child(connection_filter_header(
-            entity.clone(),
-            theme,
-            "conn-filter-destination",
-            None,
-            ConnectionColumn::Destination,
-            "目标",
-            controller::connection_column_values(
-                connections,
-                filters,
-                ConnectionColumn::Destination,
-            ),
-            filters.destination.clone(),
-        ))
-        .child(connection_filter_header(
-            entity.clone(),
-            theme,
-            "conn-filter-network",
-            Some(px(64.)),
-            ConnectionColumn::Network,
-            "协议",
-            controller::connection_column_values(connections, filters, ConnectionColumn::Network),
-            filters.network.clone(),
-        ))
-        .child(connection_filter_header(
-            entity,
-            theme,
-            "conn-filter-chain",
-            Some(px(168.)),
-            ConnectionColumn::Chain,
-            "走向",
-            controller::connection_column_values(connections, filters, ConnectionColumn::Chain),
-            filters.chain.clone(),
-        ))
+        .child(connection_col(px(108.), "进程", muted_fg, None))
+        .child(connection_col_flex("目标", muted_fg, None))
+        .child(connection_col(px(52.), "协议", muted_fg, None))
+        .child(connection_col(px(168.), "走向", muted_fg, None))
         .child(connection_col(px(72.), "上传", muted_fg, None))
         .child(connection_col(px(72.), "下载", muted_fg, None))
         .child(connection_col(px(80.), "时长", muted_fg, None))
         .child(div().w(px(56.)))
-}
-
-fn connection_filter_header(
-    entity: Entity<AppView>,
-    theme: &Theme,
-    id: &'static str,
-    width: Option<Pixels>,
-    column: ConnectionColumn,
-    title: &'static str,
-    mut values: Vec<String>,
-    current: Option<String>,
-) -> impl IntoElement {
-    if let Some(current) = &current {
-        if !values.iter().any(|value| value == current) {
-            values.insert(0, current.clone());
-        }
-    }
-    let active = current.is_some();
-    let color = if active {
-        theme.accent
-    } else {
-        theme.muted_foreground
-    };
-    let button = Button::new(id)
-        .text()
-        .small()
-        .label(title)
-        .icon(IconName::ChevronDown)
-        .text_color(color)
-        .dropdown_menu({
-            let entity = entity.clone();
-            let current = current.clone();
-            move |menu, _, _| {
-                let mut menu = menu.scrollable(true).min_w(px(168.));
-                let clear_entity = entity.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("全部")
-                        .checked(current.is_none())
-                        .on_click(move |_, _, app| {
-                            clear_entity.update(app, |this, cx| {
-                                this.connection_filters.set_column(column, None);
-                                cx.notify();
-                            });
-                        }),
-                );
-                if !values.is_empty() {
-                    menu = menu.separator();
-                }
-                for value in &values {
-                    let checked = current.as_deref() == Some(value.as_str());
-                    let pick_entity = entity.clone();
-                    let picked = value.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(value.clone())
-                            .checked(checked)
-                            .on_click(move |_, _, app| {
-                                pick_entity.update(app, |this, cx| {
-                                    this.connection_filters
-                                        .set_column(column, Some(picked.clone()));
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
-                menu
-            }
-        });
-    div()
-        .when_some(width, |this, width| this.w(width).min_w(width))
-        .when(width.is_none(), |this| this.flex_1().min_w(px(96.)))
-        .child(button)
 }
 
 fn connection_col(
@@ -4776,7 +4214,6 @@ fn render_connection_row(
     h_flex()
         .id(SharedString::from(format!("conn-{id}")))
         .w_full()
-        .min_w(px(812.))
         .items_center()
         .px_3()
         .py_2()
@@ -4792,7 +4229,7 @@ fn render_connection_row(
             muted_fg,
             Some(mono.clone()),
         ))
-        .child(connection_col(px(64.), conn.network.clone(), muted_fg, None))
+        .child(connection_col(px(52.), conn.network.clone(), muted_fg, None))
         .child(connection_col(px(168.), conn.chain.clone(), fg, None))
         .child(connection_col(px(72.), up, muted_fg, Some(mono.clone())))
         .child(connection_col(px(72.), down, muted_fg, Some(mono)))
@@ -4808,10 +4245,6 @@ fn render_connection_row(
                 .small()
                 .danger()
                 .label("关闭")
-                .accessibility_label(format!(
-                    "关闭 {} 到 {} 的连接",
-                    conn.process, conn.destination
-                ))
                 .on_click(move |_, _, app| {
                     let id = id.clone();
                     entity.update(app, |this, cx| {
@@ -4966,10 +4399,6 @@ fn render_rule_set_card(
                         )
                         .child(
                             div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .overflow_x_hidden()
-                                .text_ellipsis()
                                 .text_sm()
                                 .font_semibold()
                                 .child(set.name.clone()),
@@ -4977,37 +4406,18 @@ fn render_rule_set_card(
                         .child(pill(theme, &via_label(&via), accent)),
                 )
                 .child({
-                    let edit_entity = entity.clone();
-                    let edit_id = id.clone();
+                    let entity = entity.clone();
                     let del_id = id.clone();
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new(SharedString::from(format!("edit-rule-{edit_id}")))
-                                .small()
-                                .label("编辑")
-                                .on_click(move |_, window, app| {
-                                    app.stop_propagation();
-                                    edit_entity.update(app, |this, cx| {
-                                        this.open_rule_dialog(Some(&edit_id), window, cx);
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                        .child({
-                            let del_entity = entity.clone();
-                            Button::new(SharedString::from(format!("del-rule-{del_id}")))
-                                .small()
-                                .danger()
-                                .label("删除")
-                                .accessibility_label(format!("删除规则 {}", set.name))
-                                .on_click(move |_, window, app| {
-                                    app.stop_propagation();
-                                    del_entity.update(app, |this, cx| {
-                                        this.remove_selected_rule(&del_id, window, cx);
-                                        cx.notify();
-                                    });
-                                })
+                    Button::new(SharedString::from(format!("del-rule-{del_id}")))
+                        .small()
+                        .danger()
+                        .label("删除")
+                        .on_click(move |_, window, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.remove_selected_rule(&del_id, window, cx);
+                                cx.notify();
+                            });
                         })
                 }),
         )
@@ -5055,7 +4465,6 @@ fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
 fn metric(theme: &Theme, label: &str, value: &str) -> impl IntoElement {
     v_flex()
         .flex_1()
-        .min_w(px(136.))
         .p_4()
         .gap_1()
         .rounded(theme.radius)
@@ -5095,16 +4504,10 @@ fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
 }
 
 fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
-    status_dot_state(theme, on, false)
-}
-
-fn status_dot_state(theme: &Theme, on: bool, warning: bool) -> impl IntoElement {
     div()
         .size_2()
         .rounded_full()
-        .bg(if warning {
-            theme.warning
-        } else if on {
+        .bg(if on {
             theme.success
         } else {
             theme.muted_foreground
