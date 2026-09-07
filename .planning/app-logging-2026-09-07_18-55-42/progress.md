@@ -2,7 +2,7 @@
 
 - 任务 ID：`app-logging-2026-09-07_18-55-42`
 - 创建时间：`2026-09-07_18-55-42`
-- 当前状态：`in_progress`
+- 当前状态：`complete`
 
 ## 已完成
 
@@ -12,10 +12,11 @@
 - Shared `AppLog.swift`；Host 生命周期 info/warn/error
 - NE provider 不写用户日志（sandbox）
 - `cargo check` / `cargo build` 通过
+- PR #51；preflight 构建与 merge-probe 通过
 
 ## 进行中
 
-- 交付：commit / PR / preflight
+- 无
 
 ## 修改文件
 
