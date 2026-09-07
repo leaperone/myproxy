@@ -9,7 +9,8 @@ fn main() {
             "prod"
         } else {
             "dev"
-        }.into()
+        }
+        .into()
     });
     assert!(
         matches!(channel.as_str(), "prod" | "nightly" | "dev"),
@@ -59,10 +60,7 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
-    println!(
-        "cargo:rustc-link-arg=-Wl,-rpath,{}",
-        sparkle_dir.display()
-    );
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", sparkle_dir.display());
 }
 
 fn compile_network_host(manifest: &PathBuf) {

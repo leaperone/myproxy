@@ -41,10 +41,7 @@ pub fn install(cx: &mut App) {
         cx.background_executor()
             .timer(Duration::from_millis(1000))
             .await;
-        let face = cx
-            .background_executor()
-            .spawn(async { menu_face() })
-            .await;
+        let face = cx.background_executor().spawn(async { menu_face() }).await;
         let displayed = last.lock().expect("tray menu face").clone();
         let face_changed = displayed != face;
         let mut clicks = Vec::new();

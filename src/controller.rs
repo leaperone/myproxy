@@ -340,7 +340,10 @@ pub fn fetch(mixed_port: u16) -> Result<TrafficSnapshot> {
     }
     log::debug(
         "controller",
-        format!("connections n={connection_count} shown={}", connections.len()),
+        format!(
+            "connections n={connection_count} shown={}",
+            connections.len()
+        ),
     );
     Ok(TrafficSnapshot {
         connections,
@@ -489,7 +492,8 @@ pub fn test_group_delay(mixed_port: u16, group: &str) -> Result<HashMap<String, 
     match authorized_get(&url, Duration::from_secs(8)) {
         Ok(body) => parse_delay_map(&body),
         Err(_) => {
-            let url = format!("http://127.0.0.1:{port}/proxies/{encoded}/delay?url={probe}&timeout=5000");
+            let url =
+                format!("http://127.0.0.1:{port}/proxies/{encoded}/delay?url={probe}&timeout=5000");
             let body = authorized_get(&url, Duration::from_secs(8))
                 .with_context(|| format!("GET delay {group} :{port}"))?;
             parse_delay_map(&body)
