@@ -41,7 +41,7 @@ scripts/release-macos.sh          # zip + appcast into dist/
 cargo run --bin myproxyctl -- capabilities
 ```
 
-Rust 1.98+ (`rust-toolchain.toml`). Subscription URLs are never written to `myproxy.log`.
+Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy.log`; 设置 → 日志 shows the tail. Subscription URLs are never written.
 
 ## CLI
 

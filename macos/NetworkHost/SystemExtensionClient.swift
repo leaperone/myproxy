@@ -1,5 +1,6 @@
 @preconcurrency import Foundation
 @preconcurrency import SystemExtensions
+import MyproxyNetworkShared
 
 protocol SystemExtensionControlling: Sendable {
     func activate() async throws -> SystemExtensionRequestOutcome
@@ -77,7 +78,9 @@ private final class SystemExtensionRequestRunner: NSObject,
         .replace
     }
 
-    func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {}
+    func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
+        AppLog.warn("ne-host", "system extension waiting for user approval")
+    }
 
     func request(
         _ request: OSSystemExtensionRequest,
@@ -101,6 +104,7 @@ private final class SystemExtensionRequestRunner: NSObject,
     }
 
     func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
+        AppLog.error("ne-host", "system extension request failed: \(error.localizedDescription)")
         finish(
             .failure(
                 NetworkExtensionControlFailure(
