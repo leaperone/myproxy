@@ -34,6 +34,8 @@ const DEFAULT_DIRECT_RULES: &[&str] = &[
     "IP-CIDR6,ff00::/8,DIRECT,no-resolve",
 ];
 
+pub const DNS_LISTEN_PORT: u16 = 1053;
+
 pub fn controller_port(mixed_port: u16) -> u16 {
     mixed_port.saturating_add(107)
 }
@@ -228,7 +230,10 @@ fn yaml_strings(items: &[&str]) -> serde_yaml::Value {
 fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     let mut dns = serde_yaml::Mapping::new();
     dns.insert("enable".into(), true.into());
-    dns.insert("listen".into(), "127.0.0.1:1053".into());
+    dns.insert(
+        "listen".into(),
+        format!("127.0.0.1:{DNS_LISTEN_PORT}").into(),
+    );
     dns.insert("ipv6".into(), true.into());
     dns.insert("enhanced-mode".into(), "fake-ip".into());
     dns.insert("fake-ip-range".into(), "198.18.0.1/16".into());
@@ -610,7 +615,9 @@ mod tests {
         assert_eq!(dns.get("enable"), Some(&serde_yaml::Value::Bool(true)));
         assert_eq!(
             dns.get("listen"),
-            Some(&serde_yaml::Value::String("127.0.0.1:1053".into()))
+            Some(&serde_yaml::Value::String(format!(
+                "127.0.0.1:{DNS_LISTEN_PORT}"
+            )))
         );
         assert!(!dns.contains_key("dns-hijack"));
         assert!(!root.contains_key("tun"));

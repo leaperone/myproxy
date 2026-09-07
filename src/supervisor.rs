@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -225,7 +226,7 @@ impl Supervisor {
                 strategy.mixed_port, strategy.tun, strategy.system_extension
             ),
         );
-        self.disconnect_inner()?;
+        self.disconnect_inner(Some(strategy.mixed_port))?;
         let catalog = catalog::refresh(strategy)?;
         self.start_with_catalog(strategy, &catalog)
     }
@@ -364,7 +365,7 @@ impl Supervisor {
                     ),
                 );
             }
-            self.disconnect_inner()?;
+            self.disconnect_inner(Some(strategy.mixed_port))?;
             self.start_with_catalog(strategy, &catalog)?;
         } else {
             compile::compile(strategy, &catalog)?;
@@ -374,7 +375,7 @@ impl Supervisor {
                         "supervisor",
                         format!("controller reload failed, restarting core: {err:#}"),
                     );
-                    self.disconnect_inner()?;
+                    self.disconnect_inner(Some(strategy.mixed_port))?;
                     self.start_with_catalog(strategy, &catalog)?;
                     return Ok(catalog);
                 }
@@ -392,7 +393,7 @@ impl Supervisor {
         set_wanted(false);
         self.reset_health();
         let _operation = acquire_operation()?;
-        self.disconnect_inner()
+        self.disconnect_inner(None)
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -400,7 +401,7 @@ impl Supervisor {
         self.reset_health();
         let mut operation = acquire_operation()?;
         *operation._state = true;
-        self.disconnect_inner()
+        self.disconnect_inner(None)
     }
 
     pub fn observe(&self, strategy: &Strategy) -> CoreHealth {
@@ -427,44 +428,23 @@ impl Supervisor {
         CoreHealth::ready(proxy_now)
     }
 
-    fn disconnect_inner(&self) -> Result<()> {
+    fn disconnect_inner(&self, mixed_port: Option<u16>) -> Result<()> {
         crate::network_extension::disable_async();
-        let mut stopped = false;
+        let port = mixed_port.or(*self.running_mixed_port.lock().expect("supervisor lock"));
         let child = self.child.lock().expect("supervisor lock").take();
-        let child_pid = child.as_ref().map(Child::id);
+        let child_pid = child.as_ref().map(|child| child.id() as i32);
         if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
-            stopped = true;
         }
-        if child_pid.is_none() {
-            if let Ok(path) = paths::pid_path() {
-                if let Ok(pid) = fs::read_to_string(&path) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        let port = *self.running_mixed_port.lock().expect("supervisor lock");
-                        if port.map(mixed_listening).unwrap_or(false) {
-                            unsafe {
-                                libc::kill(pid, libc::SIGTERM);
-                            }
-                            wait_for_pid_exit(pid);
-                            stopped = true;
-                        } else {
-                            log::warn(
-                                "supervisor",
-                                "ignoring stale mihomo pid without a listening port",
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        let stopped = reclaim_owned_mihomo(port, child_pid);
         if let Ok(path) = paths::pid_path() {
             let _ = fs::remove_file(path);
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
         *self.running_se.lock().expect("supervisor lock") = false;
         *self.running_mixed_port.lock().expect("supervisor lock") = None;
-        if stopped {
+        if stopped || child_pid.is_some() {
             log::info("supervisor", "disconnect");
         }
         Ok(())
@@ -670,6 +650,149 @@ fn mixed_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(80)).is_ok()
 }
 
+fn owned_listen_ports(mixed_port: u16) -> [u16; 4] {
+    [
+        mixed_port,
+        compile::network_extension_socks_port(mixed_port),
+        compile::controller_port(mixed_port),
+        compile::DNS_LISTEN_PORT,
+    ]
+}
+
+fn reclaim_owned_mihomo(mixed_port: Option<u16>, already_stopped: Option<i32>) -> bool {
+    let mut pids = BTreeSet::new();
+    if let Some(pid) = read_pid_file() {
+        pids.insert(pid);
+    }
+    pids.extend(pids_named_mihomo());
+    if let Some(port) = mixed_port {
+        for owned in owned_listen_ports(port) {
+            pids.extend(pids_listening_tcp(owned));
+            if owned == compile::DNS_LISTEN_PORT {
+                pids.extend(pids_bound_udp(owned));
+            }
+        }
+    }
+    let mut stopped = already_stopped.is_some();
+    for pid in pids {
+        if already_stopped == Some(pid) || !is_our_mihomo_pid(pid) {
+            continue;
+        }
+        log::info("supervisor", format!("stopping leftover mihomo pid {pid}"));
+        terminate_pid(pid);
+        stopped = true;
+    }
+    if let Some(port) = mixed_port {
+        wait_for_port_free(port);
+    }
+    stopped
+}
+
+fn read_pid_file() -> Option<i32> {
+    let path = paths::pid_path().ok()?;
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn terminate_pid(pid: i32) {
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    wait_for_pid_exit(pid);
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        wait_for_pid_exit(pid);
+    }
+}
+
+fn wait_for_port_free(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while mixed_listening(port) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn parse_pid_lines(bytes: &[u8]) -> Vec<i32> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .filter(|pid| *pid > 1)
+        .collect()
+}
+
+fn pids_from_lsof(args: &[&str]) -> Vec<i32> {
+    let Ok(output) = Command::new("lsof").args(args).output() else {
+        return Vec::new();
+    };
+    parse_pid_lines(&output.stdout)
+}
+
+fn pids_listening_tcp(port: u16) -> Vec<i32> {
+    let spec = format!("-iTCP:{port}");
+    pids_from_lsof(&["-nP", &spec, "-sTCP:LISTEN", "-t"])
+}
+
+fn pids_bound_udp(port: u16) -> Vec<i32> {
+    let spec = format!("-iUDP:{port}");
+    pids_from_lsof(&["-nP", &spec, "-t"])
+}
+
+fn pids_named_mihomo() -> Vec<i32> {
+    let Ok(output) = Command::new("pgrep").arg("-x").arg("mihomo").output() else {
+        return Vec::new();
+    };
+    parse_pid_lines(&output.stdout)
+}
+
+fn is_our_mihomo_exe(exe: &Path) -> bool {
+    if exe.file_name().and_then(|name| name.to_str()) != Some("mihomo") {
+        return false;
+    }
+    let bundled = paths::bundled_mihomo();
+    if exe == bundled {
+        return true;
+    }
+    if let (Ok(exe), Ok(bundled)) = (fs::canonicalize(exe), fs::canonicalize(&bundled)) {
+        if exe == bundled {
+            return true;
+        }
+    }
+    exe.components()
+        .any(|component| component.as_os_str() == "myproxy.app")
+}
+
+fn is_our_mihomo_pid(pid: i32) -> bool {
+    process_exe(pid)
+        .map(|exe| is_our_mihomo_exe(&exe))
+        .unwrap_or(false)
+}
+
+fn process_exe(pid: i32) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn proc_pidpath(pid: i32, buffer: *mut libc::c_void, buffersize: u32) -> i32;
+        }
+        let mut buf = [0u8; 4096];
+        let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if n <= 0 {
+            return None;
+        }
+        let path = std::str::from_utf8(&buf[..n as usize]).ok()?;
+        Some(PathBuf::from(path))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 fn needs_reconnect(
     running: bool,
     wanted: bool,
@@ -775,6 +898,26 @@ mod tests {
             None,
             &strategy,
         ));
+    }
+
+    #[test]
+    fn bundled_app_mihomo_is_ours() {
+        assert!(is_our_mihomo_exe(Path::new(
+            "/Applications/myproxy.app/Contents/MacOS/mihomo"
+        )));
+        assert!(!is_our_mihomo_exe(Path::new("/opt/homebrew/bin/mihomo")));
+        assert!(!is_our_mihomo_exe(Path::new(
+            "/Applications/myproxy.app/Contents/MacOS/myproxy"
+        )));
+    }
+
+    #[test]
+    fn owned_listen_ports_cover_mixed_controller_ne_and_dns() {
+        let ports = owned_listen_ports(7891);
+        assert_eq!(ports[0], 7891);
+        assert_eq!(ports[1], compile::network_extension_socks_port(7891));
+        assert_eq!(ports[2], compile::controller_port(7891));
+        assert_eq!(ports[3], compile::DNS_LISTEN_PORT);
     }
 }
 
