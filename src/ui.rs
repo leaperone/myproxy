@@ -18,6 +18,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use gpui_kit::KeyDownEvent;
 use myproxy::catalog::{self, Catalog};
 use myproxy::controller::{self, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals};
 use myproxy::log;
@@ -2328,6 +2329,18 @@ impl Render for AppView {
                             .id("shell")
                             .flex_1()
                             .overflow_hidden()
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if event.keystroke.key.eq_ignore_ascii_case("b")
+                                    && event.keystroke.modifiers.platform
+                                    && !event.keystroke.modifiers.control
+                                    && !event.keystroke.modifiers.alt
+                                    && !event.keystroke.modifiers.shift
+                                {
+                                    this.sidebar_compact = !this.sidebar_compact;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }))
                             .child(self.sidebar(cx, &theme))
                             .child(self.page_view(cx, &theme)),
                     ),
