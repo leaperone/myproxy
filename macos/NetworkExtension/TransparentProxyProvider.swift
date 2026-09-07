@@ -33,12 +33,10 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         guard flowDecisionCoordinator.validates(configuration: configuration ?? [:]) else {
             runtime.start(configuration: nil)
             flowDecisionCoordinator.quiesce()
-            AppLog.error("ne-ext", "transparent proxy invalid bootstrap")
             completionHandler(Self.invalidBootstrapConfigurationError())
             return
         }
 
-        AppLog.info("ne-ext", "transparent proxy start")
         runtime.start(configuration: configuration)
         flowDecisionCoordinator.load(configuration: configuration)
         Self.prepareDNSRegistry(from: configuration)
@@ -46,12 +44,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         let flowDecisionCoordinator = flowDecisionCoordinator
         let completion = ProxyStartCompletion(completionHandler)
         setTunnelNetworkSettings(Self.transparentProxyNetworkSettings()) { error in
-            if let error {
+            if error != nil {
                 flowDecisionCoordinator.quiesce()
                 runtime.stop()
-                AppLog.error("ne-ext", "transparent proxy start failed: \(error.localizedDescription)")
-            } else {
-                AppLog.info("ne-ext", "transparent proxy running")
             }
             completion.call(error)
         }
@@ -61,7 +56,6 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         with reason: NEProviderStopReason,
         completionHandler: @escaping () -> Void
     ) {
-        AppLog.info("ne-ext", "transparent proxy stop reason=\(reason.rawValue)")
         tcpRelays.cancelAll()
         udpSessions.cancelAll()
         runtime.stop()

@@ -26,7 +26,7 @@
 |---|---|
 | 文件尾作 `recent()` 真相源 | NE 行只在文件里；`myproxyctl log` 已这么做 |
 | `stamp()` = generation + 文件长度 | 设置页轮询才能看到 NE 新行 |
-| Shared `AppLog.swift` | Host 与 NE 都链 NetworkShared |
+| Shared `AppLog.swift` 仅 Host 使用 | NE sandbox 的 Application Support 不是用户目录 |
 
 ## 风险与边界
 

@@ -9,8 +9,9 @@
 - 只读确认：Rust 已有分级；设置页日志藏在开发者开关后；Swift 不写 `myproxy.log`
 - `log.rs`：格式化、换行清洗、flock、文件尾、`stamp()`、单测
 - 设置页「日志」面板始终可见；开发者开关只控制 debug/trace
-- Shared `AppLog.swift`；Host / NE 生命周期 info/warn/error
-- Host 与 Network Extension 已编译通过
+- Shared `AppLog.swift`；Host 生命周期 info/warn/error
+- NE provider 不写用户日志（sandbox）
+- `cargo check` / `cargo build` 通过
 
 ## 进行中
 
