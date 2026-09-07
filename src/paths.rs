@@ -23,6 +23,12 @@ pub fn runtime_yaml_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("runtime.yaml"))
 }
 
+pub fn ruleset_dir() -> Result<PathBuf> {
+    let dir = data_dir()?.join("ruleset");
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    Ok(dir)
+}
+
 pub fn pid_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mihomo.pid"))
 }

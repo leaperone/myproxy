@@ -5,7 +5,11 @@ use anyhow::{Context, Result};
 use crate::catalog::{self, Catalog};
 use crate::log;
 use crate::paths;
-use crate::strategy::Strategy;
+use crate::strategy::{InboundMode, RoutingProfile, Strategy};
+
+const GFW_PROVIDER: &str = "gfw";
+const GFW_RULESET_PATH: &str = "./ruleset/gfw.yaml";
+const GFW_LIST_URL: &str = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt";
 
 pub const CONTROLLER_SECRET: &str = "myproxy-local";
 
@@ -38,8 +42,35 @@ pub fn controller_port(mixed_port: u16) -> u16 {
 }
 
 pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
+    let root = compile_root(strategy, catalog);
+    let compiled = root
+        .get("rules")
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|rules| rules.len())
+        .unwrap_or(0);
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))?;
+    let path = paths::runtime_yaml_path()?;
+    fs::write(&path, &yaml).with_context(|| format!("write {}", path.display()))?;
+    log::info(
+        "compile",
+        format!(
+            "runtime.yaml nodes={} groups={} rule_sets={} compiled_rules={} tun={} se={} mixed={} extension={} routing={}",
+            catalog.nodes.len(),
+            strategy.groups.len(),
+            strategy.rule_sets.len(),
+            compiled,
+            strategy.tun,
+            strategy.system_extension,
+            strategy.mixed_mode.as_str(),
+            strategy.extension_mode.as_str(),
+            strategy.routing_profile.as_str()
+        ),
+    );
+    Ok(yaml)
+}
+
+fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
     let mut root = serde_yaml::Mapping::new();
-    root.insert("mixed-port".into(), strategy.mixed_port.into());
     root.insert("allow-lan".into(), false.into());
     root.insert("bind-address".into(), "127.0.0.1".into());
     root.insert("mode".into(), "rule".into());
@@ -51,9 +82,9 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
         format!("127.0.0.1:{}", controller_port(strategy.mixed_port)).into(),
     );
     root.insert("secret".into(), CONTROLLER_SECRET.into());
+    insert_inbound_listeners(&mut root, strategy);
 
     if strategy.system_extension {
-        insert_network_extension_listeners(&mut root, strategy);
         // The DNS proxy provider captures system resolver flows at the
         // Network Extension boundary.  Keep Mihomo's DNS engine available
         // for those relays (and for proxy-server name resolution), but leave
@@ -95,6 +126,7 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
         groups.push(serde_yaml::Value::Mapping(item));
     }
     root.insert("proxy-groups".into(), serde_yaml::Value::Sequence(groups));
+    insert_rule_providers(&mut root, strategy);
 
     let mut rules = Vec::new();
     append_default_direct_rules(&mut rules);
@@ -144,31 +176,42 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
             }
         }
     }
+    if strategy.routing_profile == RoutingProfile::Gfwlist {
+        rules.push(format!(
+            "RULE-SET,{GFW_PROVIDER},{}",
+            default_group(strategy)
+        ));
+    }
     rules.push(format!("MATCH,{}", unmatched_target(strategy)));
-    let compiled = rules.len();
     let rules: Vec<serde_yaml::Value> = rules.into_iter().map(serde_yaml::Value::String).collect();
     root.insert("rules".into(), serde_yaml::Value::Sequence(rules));
-
-    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))?;
-    let path = paths::runtime_yaml_path()?;
-    fs::write(&path, &yaml).with_context(|| format!("write {}", path.display()))?;
-    log::info(
-        "compile",
-        format!(
-            "runtime.yaml nodes={} groups={} rule_sets={} compiled_rules={} tun={} se={}",
-            catalog.nodes.len(),
-            strategy.groups.len(),
-            strategy.rule_sets.len(),
-            compiled,
-            strategy.tun,
-            strategy.system_extension
-        ),
-    );
-    Ok(yaml)
+    root
 }
 
 fn append_default_direct_rules(rules: &mut Vec<String>) {
     rules.extend(DEFAULT_DIRECT_RULES.iter().map(|rule| (*rule).to_string()));
+}
+
+fn insert_rule_providers(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
+    if strategy.routing_profile != RoutingProfile::Gfwlist {
+        return;
+    }
+    if let Err(err) = paths::ruleset_dir() {
+        log::warn("compile", format!("ruleset dir: {err:#}"));
+    }
+    let mut provider = serde_yaml::Mapping::new();
+    provider.insert("type".into(), "http".into());
+    provider.insert("behavior".into(), "domain".into());
+    provider.insert("url".into(), GFW_LIST_URL.into());
+    provider.insert("path".into(), GFW_RULESET_PATH.into());
+    provider.insert("interval".into(), 86400.into());
+    provider.insert("proxy".into(), "DIRECT".into());
+    let mut providers = serde_yaml::Mapping::new();
+    providers.insert(GFW_PROVIDER.into(), serde_yaml::Value::Mapping(provider));
+    root.insert(
+        "rule-providers".into(),
+        serde_yaml::Value::Mapping(providers),
+    );
 }
 
 fn yaml_strings(items: &[&str]) -> serde_yaml::Value {
@@ -269,14 +312,44 @@ pub fn network_extension_socks_port(mixed_port: u16) -> u16 {
     }
 }
 
-fn insert_network_extension_listeners(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
-    let plan = crate::network_extension::inbound_plan(strategy);
+pub fn inbound_proxy(mode: InboundMode, strategy: &Strategy) -> Option<String> {
+    match mode {
+        InboundMode::Rule => None,
+        InboundMode::Proxy => Some(default_group(strategy).to_string()),
+        InboundMode::Global => Some("GLOBAL".into()),
+        InboundMode::Direct => Some("DIRECT".into()),
+    }
+}
+
+fn insert_inbound_listeners(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
     let mut listeners = Vec::new();
+    push_mixed_listener(&mut listeners, strategy);
+    if strategy.system_extension {
+        append_network_extension_listeners(&mut listeners, strategy);
+    }
+    root.insert("listeners".into(), serde_yaml::Value::Sequence(listeners));
+}
+
+fn push_mixed_listener(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strategy) {
+    let mut item = serde_yaml::Mapping::new();
+    item.insert("name".into(), "myproxy-mixed".into());
+    item.insert("type".into(), "mixed".into());
+    item.insert("listen".into(), "127.0.0.1".into());
+    item.insert("port".into(), strategy.mixed_port.into());
+    if let Some(proxy) = inbound_proxy(strategy.mixed_mode, strategy) {
+        item.insert("proxy".into(), proxy.into());
+    }
+    listeners.push(serde_yaml::Value::Mapping(item));
+}
+
+fn append_network_extension_listeners(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strategy) {
+    let plan = crate::network_extension::inbound_plan(strategy);
+    let outbound = inbound_proxy(strategy.extension_mode, strategy);
     push_socks_pair(
-        &mut listeners,
+        listeners,
         "myproxy-network-extension-socks",
         plan.socks_port,
-        None,
+        outbound.as_deref(),
         &plan.username,
         &plan.password,
     );
@@ -287,7 +360,7 @@ fn insert_network_extension_listeners(root: &mut serde_yaml::Mapping, strategy: 
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect::<String>();
         push_socks_pair(
-            &mut listeners,
+            listeners,
             &format!("myproxy-network-extension-socks-route-{suffix}"),
             group.port,
             Some(group.name.as_str()),
@@ -295,7 +368,6 @@ fn insert_network_extension_listeners(root: &mut serde_yaml::Mapping, strategy: 
             &plan.password,
         );
     }
-    root.insert("listeners".into(), serde_yaml::Value::Sequence(listeners));
 }
 
 fn push_socks_pair(
@@ -359,11 +431,16 @@ fn resolve_group_target(via: &str, strategy: &Strategy) -> String {
 }
 
 pub fn unmatched_target(strategy: &Strategy) -> String {
-    let via = strategy.unmatched_via.trim();
-    if via.is_empty() {
-        "DIRECT".into()
-    } else {
-        via_target(via, strategy)
+    match strategy.routing_profile {
+        RoutingProfile::Allowlist | RoutingProfile::Gfwlist => "DIRECT".into(),
+        RoutingProfile::Group => {
+            let via = strategy.unmatched_via.trim();
+            if via.is_empty() {
+                "DIRECT".into()
+            } else {
+                via_target(via, strategy)
+            }
+        }
     }
 }
 
@@ -384,7 +461,8 @@ pub fn default_group(strategy: &Strategy) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strategy::{Group, Strategy};
+    use crate::catalog::Catalog;
+    use crate::strategy::{Group, InboundMode, RoutingProfile, Strategy};
 
     fn strategy_with_groups(names: &[&str]) -> Strategy {
         let mut strategy = Strategy::default();
@@ -437,6 +515,7 @@ mod tests {
     #[test]
     fn unmatched_target_can_be_direct_or_a_named_group() {
         let mut strategy = strategy_with_groups(&["Default", "AI Proxy"]);
+        strategy.routing_profile = RoutingProfile::Group;
         strategy.unmatched_via = "DIRECT".into();
         assert_eq!(unmatched_target(&strategy), "DIRECT");
         assert!(unmatched_is_direct(&strategy));
@@ -445,6 +524,75 @@ mod tests {
         assert!(!unmatched_is_direct(&strategy));
         strategy.unmatched_via = "default".into();
         assert_eq!(unmatched_target(&strategy), "Default");
+    }
+
+    fn rule_strings(root: &serde_yaml::Mapping) -> Vec<&str> {
+        root.get("rules")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("rules")
+            .iter()
+            .map(|item| item.as_str().expect("rule"))
+            .collect()
+    }
+
+    #[test]
+    fn allowlist_has_no_rule_provider() {
+        let strategy = Strategy::default();
+        let root = compiled(&strategy);
+        assert!(!root.contains_key("rule-providers"));
+        let rules = rule_strings(&root);
+        assert!(rules
+            .iter()
+            .any(|rule| rule.starts_with("DOMAIN-SUFFIX,telegram.org,")));
+        assert!(!rules.iter().any(|rule| rule.starts_with("RULE-SET,")));
+        assert_eq!(rules.last().copied(), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn gfwlist_emits_provider_and_rule_set_before_match() {
+        let mut strategy = Strategy::default();
+        strategy.routing_profile = RoutingProfile::Gfwlist;
+        strategy.unmatched_via = "PROXY".into();
+        let root = compiled(&strategy);
+        let provider = root
+            .get("rule-providers")
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|providers| providers.get("gfw"))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("gfw provider");
+        assert_eq!(
+            provider.get("type").and_then(serde_yaml::Value::as_str),
+            Some("http")
+        );
+        assert_eq!(
+            provider.get("behavior").and_then(serde_yaml::Value::as_str),
+            Some("domain")
+        );
+        assert_eq!(
+            provider.get("proxy").and_then(serde_yaml::Value::as_str),
+            Some("DIRECT")
+        );
+        let rules = rule_strings(&root);
+        let suffix = rules
+            .iter()
+            .position(|rule| rule.starts_with("DOMAIN-SUFFIX,telegram.org,"))
+            .expect("user suffix");
+        let set = rules
+            .iter()
+            .position(|rule| *rule == "RULE-SET,gfw,PROXY")
+            .expect("gfw rule-set");
+        assert!(suffix < set);
+        assert_eq!(rules.last().copied(), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn group_profile_has_no_provider_and_matches_group() {
+        let mut strategy = Strategy::default();
+        strategy.routing_profile = RoutingProfile::Group;
+        strategy.unmatched_via = "Telegram".into();
+        let root = compiled(&strategy);
+        assert!(!root.contains_key("rule-providers"));
+        assert_eq!(rule_strings(&root).last().copied(), Some("MATCH,Telegram"));
     }
 
     #[test]
@@ -485,5 +633,185 @@ mod tests {
                 serde_yaml::Value::String("tcp://any:53".into()),
             ]
         );
+    }
+
+    fn compiled(strategy: &Strategy) -> serde_yaml::Mapping {
+        compile_root(strategy, &Catalog::default())
+    }
+
+    fn listeners(root: &serde_yaml::Mapping) -> Vec<&serde_yaml::Mapping> {
+        root.get("listeners")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("listeners")
+            .iter()
+            .map(|item| item.as_mapping().expect("listener map"))
+            .collect()
+    }
+
+    fn listener_name(item: &serde_yaml::Mapping) -> &str {
+        item.get("name")
+            .and_then(serde_yaml::Value::as_str)
+            .expect("listener name")
+    }
+
+    fn mixed_listener(root: &serde_yaml::Mapping) -> &serde_yaml::Mapping {
+        listeners(root)
+            .into_iter()
+            .find(|item| listener_name(item) == "myproxy-mixed")
+            .expect("myproxy-mixed")
+    }
+
+    fn proxy_field(item: &serde_yaml::Mapping) -> Option<&str> {
+        item.get("proxy").and_then(serde_yaml::Value::as_str)
+    }
+
+    #[test]
+    fn inbound_proxy_maps_four_modes() {
+        let strategy = strategy_with_groups(&["PROXY", "Telegram"]);
+        assert_eq!(inbound_proxy(InboundMode::Rule, &strategy), None);
+        assert_eq!(
+            inbound_proxy(InboundMode::Proxy, &strategy).as_deref(),
+            Some("PROXY")
+        );
+        assert_eq!(
+            inbound_proxy(InboundMode::Global, &strategy).as_deref(),
+            Some("GLOBAL")
+        );
+        assert_eq!(
+            inbound_proxy(InboundMode::Direct, &strategy).as_deref(),
+            Some("DIRECT")
+        );
+    }
+
+    #[test]
+    fn compile_emits_mixed_listener_without_top_level_mixed_port() {
+        let strategy = Strategy::default();
+        let root = compiled(&strategy);
+        assert!(!root.contains_key("mixed-port"));
+        let mixed = mixed_listener(&root);
+        assert_eq!(
+            mixed.get("type").and_then(serde_yaml::Value::as_str),
+            Some("mixed")
+        );
+        assert_eq!(
+            mixed.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            mixed.get("port").and_then(serde_yaml::Value::as_u64),
+            Some(u64::from(strategy.mixed_port))
+        );
+        assert_eq!(proxy_field(mixed), None);
+    }
+
+    #[test]
+    fn mixed_modes_set_listener_proxy() {
+        let cases = [
+            (InboundMode::Rule, None),
+            (InboundMode::Proxy, Some("PROXY")),
+            (InboundMode::Global, Some("GLOBAL")),
+            (InboundMode::Direct, Some("DIRECT")),
+        ];
+        for (mode, expected) in cases {
+            let mut strategy = Strategy::default();
+            strategy.mixed_mode = mode;
+            let root = compiled(&strategy);
+            assert_eq!(
+                proxy_field(mixed_listener(&root)),
+                expected,
+                "mixed mode {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_extension_rule_keeps_group_socks() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        let root = compiled(&strategy);
+        let names: Vec<&str> = listeners(&root).into_iter().map(listener_name).collect();
+        assert!(names.contains(&"myproxy-mixed"));
+        assert!(names
+            .iter()
+            .any(|name| name.starts_with("myproxy-network-extension-socks-ipv")));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("myproxy-network-extension-socks-route-")),
+            "rule mode should pin process groups: {names:?}"
+        );
+        let default_socks = listeners(&root)
+            .into_iter()
+            .find(|item| listener_name(item) == "myproxy-network-extension-socks-ipv4")
+            .expect("default se socks");
+        assert_eq!(proxy_field(default_socks), None);
+    }
+
+    #[test]
+    fn system_extension_non_rule_only_default_socks_with_proxy() {
+        let cases = [
+            (InboundMode::Proxy, Some("PROXY")),
+            (InboundMode::Global, Some("GLOBAL")),
+            (InboundMode::Direct, Some("DIRECT")),
+        ];
+        for (mode, expected) in cases {
+            let mut strategy = Strategy::default();
+            strategy.system_extension = true;
+            strategy.extension_mode = mode;
+            let root = compiled(&strategy);
+            let names: Vec<&str> = listeners(&root).into_iter().map(listener_name).collect();
+            assert!(names.contains(&"myproxy-mixed"), "{mode:?}");
+            assert!(
+                names
+                    .iter()
+                    .any(|name| *name == "myproxy-network-extension-socks-ipv4"),
+                "{mode:?} names={names:?}"
+            );
+            assert!(
+                names
+                    .iter()
+                    .all(|name| !name.starts_with("myproxy-network-extension-socks-route-")),
+                "{mode:?} should not emit group socks: {names:?}"
+            );
+            let default_socks = listeners(&root)
+                .into_iter()
+                .find(|item| listener_name(item) == "myproxy-network-extension-socks-ipv4")
+                .expect("default se socks");
+            assert_eq!(proxy_field(default_socks), expected, "se mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn gfwlist_runtime_passes_mihomo_test() {
+        let bin = crate::paths::bundled_mihomo();
+        if !bin.is_file() {
+            return;
+        }
+        let mut strategy = Strategy::default();
+        strategy.routing_profile = RoutingProfile::Gfwlist;
+        let root = compiled(&strategy);
+        let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(root)).expect("yaml");
+        let dir = std::env::temp_dir().join(format!(
+            "myproxy-gfw-t-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("ruleset")).expect("ruleset dir");
+        let yaml_path = dir.join("runtime.yaml");
+        std::fs::write(&yaml_path, yaml).expect("write runtime");
+        let status = std::process::Command::new(&bin)
+            .arg("-d")
+            .arg(&dir)
+            .arg("-t")
+            .arg("-f")
+            .arg(&yaml_path)
+            .status()
+            .expect("mihomo -t");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "mihomo -t failed: {status}");
     }
 }

@@ -8,12 +8,11 @@ use uuid::Uuid;
 use crate::log;
 use crate::paths;
 
-pub const DEFAULT_EXCLUDE: &str =
-    r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
+pub const DEFAULT_EXCLUDE: &str = r"(?i)(流量|剩余|到期|官网|重置|过期|剩余流量|套餐到期|过期时间)";
 
 pub const DEFAULT_MIXED_PORT: u16 = 7890;
 
-pub const STRATEGY_SCHEMA: u32 = 5;
+pub const STRATEGY_SCHEMA: u32 = 7;
 
 pub const TELEGRAM_GROUP: &str = "Telegram";
 
@@ -62,6 +61,88 @@ fn telegram_matchers() -> Vec<Matcher> {
     matchers
 }
 
+/// Per-inbound routing mode. Mixed and System Extension each have their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InboundMode {
+    #[default]
+    Rule,
+    Proxy,
+    Global,
+    Direct,
+}
+
+impl InboundMode {
+    pub const ALL: [Self; 4] = [Self::Rule, Self::Proxy, Self::Global, Self::Direct];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::Proxy => "proxy",
+            Self::Global => "global",
+            Self::Direct => "direct",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rule => "按规则",
+            Self::Proxy => "默认组",
+            Self::Global => "全局",
+            Self::Direct => "直连",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "rule" => Ok(Self::Rule),
+            "proxy" => Ok(Self::Proxy),
+            "global" => Ok(Self::Global),
+            "direct" => Ok(Self::Direct),
+            _ => anyhow::bail!("mode must be rule, proxy, global, or direct"),
+        }
+    }
+}
+
+/// Fallback policy after user rules. GFWList is a whole-set install, not matchers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingProfile {
+    #[default]
+    Allowlist,
+    Gfwlist,
+    Group,
+}
+
+impl RoutingProfile {
+    pub const ALL: [Self; 3] = [Self::Allowlist, Self::Gfwlist, Self::Group];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowlist => "allowlist",
+            Self::Gfwlist => "gfwlist",
+            Self::Group => "group",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Allowlist => "正面清单",
+            Self::Gfwlist => "GFWList",
+            Self::Group => "未匹配走组",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "allowlist" | "direct" => Ok(Self::Allowlist),
+            "gfwlist" | "gfw" => Ok(Self::Gfwlist),
+            "group" => Ok(Self::Group),
+            _ => anyhow::bail!("routing must be allowlist, gfwlist, or group"),
+        }
+    }
+}
+
 fn telegram_rule_set() -> RuleSet {
     RuleSet {
         id: Uuid::new_v4().to_string(),
@@ -90,6 +171,12 @@ pub struct Strategy {
     /// When true, activate MClash-style System Extension intercept (NETransparentProxyProvider).
     #[serde(default)]
     pub system_extension: bool,
+    /// How Mixed inbound traffic is routed. Independent of `extension_mode`.
+    #[serde(default)]
+    pub mixed_mode: InboundMode,
+    /// How System Extension inbound traffic is routed. Independent of `mixed_mode`.
+    #[serde(default)]
+    pub extension_mode: InboundMode,
     /// Register a macOS login item when running from a bundled `.app`.
     #[serde(default)]
     pub launch_at_login: bool,
@@ -104,6 +191,8 @@ pub struct Strategy {
     pub connect_on_launch: bool,
     /// Unmatched traffic (`MATCH`). Empty and `DIRECT` are whitelist
     /// (positive list only). Any other value is a group name.
+    #[serde(default)]
+    pub routing_profile: RoutingProfile,
     #[serde(default)]
     pub unmatched_via: String,
     #[serde(default)]
@@ -201,10 +290,13 @@ impl Default for Strategy {
             update_channel: None,
             tun: false,
             system_extension: false,
+            mixed_mode: InboundMode::Rule,
+            extension_mode: InboundMode::Rule,
             launch_at_login: false,
             silent_launch: false,
             lite_mode: false,
             connect_on_launch: false,
+            routing_profile: RoutingProfile::Allowlist,
             unmatched_via: "DIRECT".into(),
             subscriptions: Vec::new(),
             groups: vec![
@@ -226,8 +318,7 @@ impl Strategy {
             log::info("strategy", "created default strategy.json");
             return Ok(strategy);
         }
-        let data = fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let data = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let mut strategy: Self = serde_json::from_str(&data).context("parse strategy.json")?;
         if strategy.migrate() {
             if let Err(err) = strategy.save() {
@@ -289,8 +380,39 @@ impl Strategy {
         if self.schema < 5 {
             self.ensure_telegram_routing();
         }
+        if self.schema < 7 {
+            self.migrate_routing_profile();
+        }
         self.schema = STRATEGY_SCHEMA;
         true
+    }
+
+    fn migrate_routing_profile(&mut self) {
+        let via = self.unmatched_via.trim();
+        self.routing_profile = if via.is_empty() || via.eq_ignore_ascii_case("direct") {
+            RoutingProfile::Allowlist
+        } else {
+            RoutingProfile::Group
+        };
+    }
+
+    pub fn set_routing_profile(&mut self, profile: RoutingProfile) {
+        self.routing_profile = profile;
+        if profile == RoutingProfile::Group {
+            let via = self.unmatched_via.trim();
+            if via.is_empty() || via.eq_ignore_ascii_case("direct") {
+                self.unmatched_via = self.default_group_name().to_string();
+            }
+        }
+    }
+
+    pub fn default_group_name(&self) -> &str {
+        self.groups
+            .iter()
+            .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
+            .or_else(|| self.groups.first())
+            .map(|group| group.name.as_str())
+            .unwrap_or("DIRECT")
     }
 
     fn ensure_telegram_routing(&mut self) -> bool {
@@ -570,7 +692,10 @@ pub fn join_list(parts: &[String]) -> String {
 }
 
 fn split_legacy_filter(raw: &str) -> Vec<String> {
-    let trimmed = raw.trim().trim_start_matches("(?i)").trim_start_matches("(?-i)");
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("(?i)")
+        .trim_start_matches("(?-i)");
     trimmed
         .split('|')
         .map(|part| {
@@ -791,4 +916,74 @@ pub fn load_from(path: &Path) -> Result<Strategy> {
     let mut strategy: Strategy = serde_json::from_str(&data)?;
     strategy.migrate();
     Ok(strategy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_inbound_modes_default_to_rule() {
+        let json = r#"{
+            "schema": 5,
+            "exclude_filter": "",
+            "subscriptions": [],
+            "groups": [],
+            "rule_sets": []
+        }"#;
+        let mut strategy: Strategy = serde_json::from_str(json).expect("parse schema 5");
+        assert_eq!(strategy.mixed_mode, InboundMode::Rule);
+        assert_eq!(strategy.extension_mode, InboundMode::Rule);
+        assert!(strategy.migrate());
+        assert_eq!(strategy.schema, STRATEGY_SCHEMA);
+        assert_eq!(strategy.mixed_mode, InboundMode::Rule);
+        assert_eq!(strategy.extension_mode, InboundMode::Rule);
+        assert_eq!(strategy.routing_profile, RoutingProfile::Allowlist);
+    }
+
+    #[test]
+    fn missing_routing_profile_defaults_to_allowlist() {
+        let json = r#"{
+            "schema": 6,
+            "exclude_filter": "",
+            "subscriptions": [],
+            "groups": [],
+            "rule_sets": []
+        }"#;
+        let mut strategy: Strategy = serde_json::from_str(json).expect("parse schema 6");
+        assert_eq!(strategy.routing_profile, RoutingProfile::Allowlist);
+        assert!(strategy.migrate());
+        assert_eq!(strategy.schema, STRATEGY_SCHEMA);
+        assert_eq!(strategy.routing_profile, RoutingProfile::Allowlist);
+    }
+
+    #[test]
+    fn unmatched_group_migrates_to_group_profile() {
+        let json = r#"{
+            "schema": 6,
+            "exclude_filter": "",
+            "unmatched_via": "PROXY",
+            "subscriptions": [],
+            "groups": [],
+            "rule_sets": []
+        }"#;
+        let mut strategy: Strategy = serde_json::from_str(json).expect("parse schema 6");
+        assert!(strategy.migrate());
+        assert_eq!(strategy.schema, STRATEGY_SCHEMA);
+        assert_eq!(strategy.routing_profile, RoutingProfile::Group);
+        assert_eq!(strategy.unmatched_via, "PROXY");
+    }
+
+    #[test]
+    fn inbound_mode_roundtrips_json() {
+        let mut strategy = Strategy::default();
+        strategy.mixed_mode = InboundMode::Global;
+        strategy.extension_mode = InboundMode::Direct;
+        let json = serde_json::to_string(&strategy).expect("serialize");
+        let parsed: Strategy = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.mixed_mode, InboundMode::Global);
+        assert_eq!(parsed.extension_mode, InboundMode::Direct);
+        assert!(json.contains("\"mixed_mode\":\"global\""));
+        assert!(json.contains("\"extension_mode\":\"direct\""));
+    }
 }

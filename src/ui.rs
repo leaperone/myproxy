@@ -21,7 +21,9 @@ use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
 use myproxy::controller::{self, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals};
 use myproxy::log;
-use myproxy::strategy::{join_list, parse_list, Group, Matcher, RuleSet, Strategy};
+use myproxy::strategy::{
+    join_list, parse_list, Group, InboundMode, Matcher, RoutingProfile, RuleSet, Strategy,
+};
 use myproxy::supervisor::{CoreHealth, Supervisor};
 use myproxy::updates::{self, UpdateChannel};
 
@@ -398,10 +400,7 @@ impl Render for GroupEditor {
                     .child(div().w(px(160.)).child(Input::new(&self.name)))
                     .child({
                         let entity = entity.clone();
-                        let mut group = ButtonGroup::new("group-mode")
-                            .compact()
-                            .outline()
-                            .small();
+                        let mut group = ButtonGroup::new("group-mode").compact().outline().small();
                         group = group
                             .child(
                                 Button::new("group-mode-match")
@@ -434,10 +433,7 @@ impl Render for GroupEditor {
                     .child(div().text_xs().text_color(muted_fg).child("策略"))
                     .child({
                         let entity = entity.clone();
-                        let mut group = ButtonGroup::new("group-kind")
-                            .compact()
-                            .outline()
-                            .small();
+                        let mut group = ButtonGroup::new("group-kind").compact().outline().small();
                         group = group
                             .child(
                                 Button::new("group-kind-select")
@@ -520,7 +516,8 @@ impl Render for GroupEditor {
                             .label(*label)
                             .on_click(move |_, window, app| {
                                 entity.update(app, |this, cx| {
-                                    let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+                                    let refs: Vec<&str> =
+                                        tokens.iter().map(String::as_str).collect();
                                     this.append_contains(&refs, window, cx);
                                     cx.notify();
                                 });
@@ -544,17 +541,12 @@ impl Render for GroupEditor {
                     &excludes,
                 ))
             })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(format!(
-                        "预览 · {} 个节点 · {} · {}",
-                        members.len(),
-                        draft.kind_setting_label(),
-                        draft.policy_label()
-                    )),
-            )
+            .child(div().text_xs().text_color(muted_fg).child(format!(
+                "预览 · {} 个节点 · {} · {}",
+                members.len(),
+                draft.kind_setting_label(),
+                draft.policy_label()
+            )))
             .child(
                 v_flex()
                     .id("group-preview")
@@ -565,28 +557,30 @@ impl Render for GroupEditor {
                     .border_color(border)
                     .bg(group_box)
                     .when(members.is_empty() && self.blocked.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .p_3()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(if parent.catalog.nodes.is_empty() {
-                                    "目录是空的。先到订阅页 Apply。".to_string()
-                                } else {
-                                    "没有成员。放宽条件，或钉住节点。".to_string()
-                                }),
-                        )
+                        this.child(div().p_3().text_xs().text_color(muted_fg).child(
+                            if parent.catalog.nodes.is_empty() {
+                                "目录是空的。先到订阅页 Apply。".to_string()
+                            } else {
+                                "没有成员。放宽条件，或钉住节点。".to_string()
+                            },
+                        ))
                     })
-                    .children(members.iter().take(PREVIEW_LIMIT).enumerate().map(|(ix, name)| {
-                        render_member_row(
-                            entity.clone(),
-                            &theme,
-                            name,
-                            self.include.iter().any(|n| n == name),
-                            false,
-                            (self.kind == "fallback").then_some(ix + 1),
-                        )
-                    }))
+                    .children(
+                        members
+                            .iter()
+                            .take(PREVIEW_LIMIT)
+                            .enumerate()
+                            .map(|(ix, name)| {
+                                render_member_row(
+                                    entity.clone(),
+                                    &theme,
+                                    name,
+                                    self.include.iter().any(|n| n == name),
+                                    false,
+                                    (self.kind == "fallback").then_some(ix + 1),
+                                )
+                            }),
+                    )
                     .when(extra > 0, |this| {
                         this.child(
                             div()
@@ -649,9 +643,8 @@ impl RuleSetEditor {
                 .placeholder("项目名，例如 Cursor")
                 .default_value(name)
         });
-        let match_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(draft_kind.placeholder())
-        });
+        let match_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(draft_kind.placeholder()));
         Self {
             parent,
             edit_id: existing.as_ref().map(|s| s.id.clone()),
@@ -817,10 +810,7 @@ impl Render for RuleSetEditor {
                     .items_center()
                     .child({
                         let entity = entity.clone();
-                        let mut group = ButtonGroup::new("rule-kind")
-                            .compact()
-                            .outline()
-                            .small();
+                        let mut group = ButtonGroup::new("rule-kind").compact().outline().small();
                         for kind in RuleDraftKind::ALL {
                             group = group.child(
                                 Button::new(SharedString::from(format!(
@@ -851,14 +841,13 @@ impl Render for RuleSetEditor {
                     .child(div().flex_1().child(Input::new(&self.match_input)))
                     .child({
                         let entity = entity.clone();
-                        Button::new("add-matcher")
-                            .small()
-                            .label("加入")
-                            .on_click(move |_, window, app| {
+                        Button::new("add-matcher").small().label("加入").on_click(
+                            move |_, window, app| {
                                 entity.update(app, |this, cx| {
                                     this.add_matchers(window, cx);
                                 });
-                            })
+                            },
+                        )
                     }),
             )
             .child(
@@ -868,16 +857,13 @@ impl Render for RuleSetEditor {
                     .child("逗号分隔可一次加入多条。走向可是节点组，或目录里的某个节点。"),
             )
             .when(self.matchers.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child("还没有匹配项。"),
-                )
+                this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
             })
             .child(
-                h_flex().gap_1().flex_wrap().children(self.matchers.iter().enumerate().map(
-                    |(index, matcher)| {
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(self.matchers.iter().enumerate().map(|(index, matcher)| {
                         let entity = entity.clone();
                         let id = SharedString::from(format!(
                             "matcher-{}-{}-{index}",
@@ -898,8 +884,7 @@ impl Render for RuleSetEditor {
                                     cx.notify();
                                 });
                             })
-                    },
-                )),
+                    })),
             )
     }
 }
@@ -919,10 +904,7 @@ fn via_label(via: &str) -> String {
     match via.to_ascii_lowercase().as_str() {
         "direct" => "直连".into(),
         "reject" => "拒绝".into(),
-        _ => via
-            .strip_prefix("node:")
-            .unwrap_or(via)
-            .to_string(),
+        _ => via.strip_prefix("node:").unwrap_or(via).to_string(),
     }
 }
 
@@ -940,7 +922,10 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
         },
     ];
     for group in &strategy.groups {
-        if out.iter().any(|c| c.value.eq_ignore_ascii_case(&group.name)) {
+        if out
+            .iter()
+            .any(|c| c.value.eq_ignore_ascii_case(&group.name))
+        {
             continue;
         }
         out.push(ViaChoice {
@@ -1296,9 +1281,7 @@ impl AppView {
             external_change_pending: false,
             strategy_stamp: initial_strategy_stamp,
             supervisor,
-            url_input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("https://…/clash.yaml")
-            }),
+            url_input: cx.new(|cx| InputState::new(window, cx).placeholder("https://…/clash.yaml")),
             name_input: cx.new(|cx| InputState::new(window, cx).placeholder("订阅名")),
             group_modal_open: false,
             group_edit_id: None,
@@ -1407,7 +1390,9 @@ impl AppView {
         };
         if !overwrite_external && (self.external_change_pending || disk != self.saved) {
             self.external_change_pending = true;
-            self.status = "检测到外部策略变更。点击「覆盖并应用」保留本地配置，或重新打开窗口放弃本地修改。".into();
+            self.status =
+                "检测到外部策略变更。点击「覆盖并应用」保留本地配置，或重新打开窗口放弃本地修改。"
+                    .into();
             return false;
         }
         match self.strategy.save() {
@@ -1608,9 +1593,10 @@ impl AppView {
         }
         match self.page {
             Page::Connections => Some(LivePageJob::Rows(self.strategy.mixed_port)),
-            Page::Overview | Page::Groups => {
-                Some(LivePageJob::Snapshot(self.strategy.mixed_port, LiveNeed::Totals))
-            }
+            Page::Overview | Page::Groups => Some(LivePageJob::Snapshot(
+                self.strategy.mixed_port,
+                LiveNeed::Totals,
+            )),
             _ => None,
         }
     }
@@ -1718,34 +1704,32 @@ impl AppView {
         let Some(job) = self.live_page_job() else {
             return;
         };
-        cx.spawn(async move |this, cx| {
-            match job {
-                LivePageJob::Rows(port) => {
-                    let traffic = cx
-                        .background_executor()
-                        .spawn(async move { controller::fetch(port).map_err(|err| err.to_string()) })
-                        .await;
-                    this.update(cx, |this, cx| {
-                        if this.apply_traffic(traffic) {
-                            cx.notify();
-                        }
+        cx.spawn(async move |this, cx| match job {
+            LivePageJob::Rows(port) => {
+                let traffic = cx
+                    .background_executor()
+                    .spawn(async move { controller::fetch(port).map_err(|err| err.to_string()) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.apply_traffic(traffic) {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            LivePageJob::Snapshot(port, need) => {
+                let snap = cx
+                    .background_executor()
+                    .spawn(async move {
+                        controller::fetch_live(port, need).map_err(|err| err.to_string())
                     })
-                    .ok();
-                }
-                LivePageJob::Snapshot(port, need) => {
-                    let snap = cx
-                        .background_executor()
-                        .spawn(async move {
-                            controller::fetch_live(port, need).map_err(|err| err.to_string())
-                        })
-                        .await;
-                    this.update(cx, |this, cx| {
-                        if this.apply_live_snapshot(snap) {
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                }
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.apply_live_snapshot(snap) {
+                        cx.notify();
+                    }
+                })
+                .ok();
             }
         })
         .detach();
@@ -1759,9 +1743,8 @@ impl AppView {
             if dt >= 0.2 {
                 let up = ((upload_total.saturating_sub(prev_up)) as f64 / dt) as u64;
                 let down = ((download_total.saturating_sub(prev_down)) as f64 / dt) as u64;
-                rate_changed = self.traffic_up != up
-                    || self.traffic_down != down
-                    || !self.traffic_has_rate;
+                rate_changed =
+                    self.traffic_up != up || self.traffic_down != down || !self.traffic_has_rate;
                 self.traffic_up = up;
                 self.traffic_down = down;
                 self.traffic_has_rate = true;
@@ -1849,7 +1832,10 @@ impl AppView {
             .on_click(self.select_page(cx, page))
     }
 
-    fn on_apply(&self, cx: &mut Context<Self>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    fn on_apply(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
         let entity = cx.entity();
         move |_, _, app| {
             entity.update(app, |this, cx| {
@@ -1968,7 +1954,8 @@ impl AppView {
 
     fn open_rule_dialog(&mut self, id: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         window.close_all_dialogs(cx);
-        let existing = id.and_then(|id| self.strategy.rule_sets.iter().find(|s| s.id == id).cloned());
+        let existing =
+            id.and_then(|id| self.strategy.rule_sets.iter().find(|s| s.id == id).cloned());
         if id.is_some() && existing.is_none() {
             self.status = "找不到这条规则。".into();
             return;
@@ -1987,7 +1974,8 @@ impl AppView {
         );
         let parent = cx.entity();
         let fallback_via = default_via(&self.strategy);
-        let editor = cx.new(|cx| RuleSetEditor::new(parent.clone(), existing, fallback_via, window, cx));
+        let editor =
+            cx.new(|cx| RuleSetEditor::new(parent.clone(), existing, fallback_via, window, cx));
         let editing = id.is_some();
         window.open_dialog(cx, move |dialog, window, _| {
             let ok_label = if editing { "保存" } else { "添加" };
@@ -2030,10 +2018,8 @@ impl AppView {
                                 .primary()
                                 .label(ok_label)
                                 .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(Confirm { secondary: false }),
-                                        cx,
-                                    )
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
                                 }),
                         ),
                 )
@@ -2114,10 +2100,8 @@ impl AppView {
                                 .primary()
                                 .label(ok_label)
                                 .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(Confirm { secondary: false }),
-                                        cx,
-                                    )
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
                                 }),
                         ),
                 )
@@ -2183,7 +2167,11 @@ impl AppView {
             .iter()
             .find(|live| live.name == group.name)
         {
-            return live.members.iter().map(|member| member.name.clone()).collect();
+            return live
+                .members
+                .iter()
+                .map(|member| member.name.clone())
+                .collect();
         }
         catalog::resolve_group_members(group, &self.catalog)
     }
@@ -2354,7 +2342,10 @@ impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
         let busy = self.busy;
-        let warn_live = !busy && (self.wanted && !connected || self.traffic_error.is_some() || self.proxy_error.is_some());
+        let warn_live = !busy
+            && (self.wanted && !connected
+                || self.traffic_error.is_some()
+                || self.proxy_error.is_some());
         let live_label = if busy {
             self.status.clone()
         } else if connected && self.traffic_has_rate {
@@ -2389,7 +2380,9 @@ impl AppView {
                         .gap_2()
                         .items_center()
                         .child(div().text_sm().font_semibold().child("myproxy"))
-                        .children(updates::build_badge().map(|label| pill(theme, label, theme.warning))),
+                        .children(
+                            updates::build_badge().map(|label| pill(theme, label, theme.warning)),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -2500,11 +2493,16 @@ impl AppView {
                 div()
                     .id("status")
                     .text_xs()
-                    .text_color(if self.status.contains("失败") || self.status.contains("异常") || self.status.contains("无响应") {
-                        theme.warning
-                    } else {
-                        theme.muted_foreground
-                    })
+                    .text_color(
+                        if self.status.contains("失败")
+                            || self.status.contains("异常")
+                            || self.status.contains("无响应")
+                        {
+                            theme.warning
+                        } else {
+                            theme.muted_foreground
+                        },
+                    )
                     .child(self.status.clone()),
             )
             .child(match self.page {
@@ -2532,7 +2530,11 @@ impl AppView {
         let busy = self.busy;
         let mut connect = Button::new("hero-connect").large();
         connect = if busy {
-            connect.label(if wanted { "正在断开…" } else { "正在连接…" })
+            connect.label(if wanted {
+                "正在断开…"
+            } else {
+                "正在连接…"
+            })
         } else if wanted {
             connect.danger().label("断开")
         } else {
@@ -2565,11 +2567,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "总览",
-                if self.strategy.system_extension {
-                    "系统接管已打开。应用不用自己填代理。请在系统设置里允许扩展。"
-                } else {
-                    "未打开系统接管时，只有自己填了代理的应用会进规则。"
-                },
+                &self.inbound_modes_subtitle(),
             ))
             .child(
                 h_flex()
@@ -2736,8 +2734,7 @@ impl AppView {
                     .child(metric(theme, "连接数", &count)),
             )
             .when(
-                self.traffic_error.is_some()
-                    || (connected && !self.traffic.connections.is_empty()),
+                self.traffic_error.is_some() || (connected && !self.traffic.connections.is_empty()),
                 |this| {
                     this.child(
                         h_flex()
@@ -2831,16 +2828,13 @@ impl AppView {
                             self.traffic.connection_count > self.traffic.connections.len(),
                             |this| {
                                 this.child(
-                                    div()
-                                        .px_3()
-                                        .py_2()
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .child(format!(
+                                    div().px_3().py_2().text_xs().text_color(muted_fg).child(
+                                        format!(
                                             "仅列出流量最高的 {} 条，共 {} 条。",
                                             self.traffic.connections.len(),
                                             self.traffic.connection_count
-                                        )),
+                                        ),
+                                    ),
                                 )
                             },
                         ),
@@ -3025,8 +3019,9 @@ impl AppView {
             .child(page_title(
                 theme,
                 "规则",
-                "一个项目收一组进程和域名，整组走同一个节点组或节点。自上而下第一条命中。",
+                "先选分流预设，再写自己的规则。自上而下第一条命中；规则集整包装卸，不拆进下面的表。",
             ))
+            .child(self.routing_panel(cx, theme))
             .child(
                 h_flex()
                     .gap_2()
@@ -3058,7 +3053,7 @@ impl AppView {
             .when(self.strategy.rule_sets.is_empty(), |this| {
                 this.child(empty_hint(
                     theme,
-                    "还没有规则。添加一个项目，把 Cursor、GitHub 这类收进去，再选走向。未匹配的流量按设置里的模式走直连或默认组。",
+                    "还没有规则。添加一个项目，把 Cursor、GitHub 这类收进去，再选走向。未命中的流量按本页分流预设走。",
                 ))
             })
             .when(
@@ -3097,7 +3092,6 @@ impl AppView {
                 "打开系统接管后，应用不用自己填代理。第一次会请你在系统设置里允许 myproxy。",
             ))
             .child(self.system_extension_panel(cx, theme))
-            .child(self.unmatched_panel(cx, theme))
             .child(panel(
                 theme,
                 "外观",
@@ -3118,6 +3112,7 @@ impl AppView {
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .flex_wrap()
                             .child(div().text_sm().child("127.0.0.1"))
                             .child(div().w(px(100.)).child(Input::new(&self.port_input)))
                             .child({
@@ -3140,7 +3135,13 @@ impl AppView {
                                         });
                                     },
                                 )
-                            }),
+                            })
+                            .child(self.inbound_mode_buttons(
+                                cx,
+                                "mixed-mode",
+                                self.strategy.mixed_mode,
+                                Self::set_mixed_mode,
+                            )),
                     ),
             ))
             .child(self.updates_panel(cx, theme))
@@ -3211,7 +3212,8 @@ impl AppView {
                                     match myproxy::cli_install::install() {
                                         Ok(path) => {
                                             this.cli_installed = true;
-                                            this.status = format!("命令行工具已安装：{}", path.display());
+                                            this.status =
+                                                format!("命令行工具已安装：{}", path.display());
                                         }
                                         Err(error) => {
                                             this.status = format!("命令行工具安装失败：{error:#}");
@@ -3262,6 +3264,64 @@ impl AppView {
         )
     }
 
+    fn inbound_modes_subtitle(&self) -> String {
+        format!(
+            "Mixed {} · 接管 {}",
+            self.strategy.mixed_mode.label(),
+            self.strategy.extension_mode.label()
+        )
+    }
+
+    fn inbound_mode_buttons(
+        &self,
+        cx: &mut Context<Self>,
+        id_prefix: &str,
+        current: InboundMode,
+        set: fn(&mut Self, InboundMode, &mut Context<Self>),
+    ) -> impl IntoElement {
+        let entity = cx.entity();
+        h_flex()
+            .gap_1()
+            .flex_wrap()
+            .children(InboundMode::ALL.into_iter().map(move |mode| {
+                let entity = entity.clone();
+                let mut btn =
+                    Button::new(SharedString::from(format!("{id_prefix}-{}", mode.as_str())))
+                        .small();
+                btn = if current == mode {
+                    btn.primary().label(mode.label())
+                } else {
+                    btn.label(mode.label())
+                };
+                btn.disabled(self.busy).on_click(move |_, _, app| {
+                    entity.update(app, |this, cx| {
+                        set(this, mode, cx);
+                        cx.notify();
+                    });
+                })
+            }))
+    }
+
+    fn set_mixed_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
+        self.strategy.mixed_mode = mode;
+        self.persist_inbound_mode(cx, format!("已将 Mixed 设为{}。", mode.label()));
+    }
+
+    fn set_extension_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
+        self.strategy.extension_mode = mode;
+        self.persist_inbound_mode(cx, format!("已将系统接管设为{}。", mode.label()));
+    }
+
+    fn persist_inbound_mode(&mut self, cx: &mut Context<Self>, note: String) {
+        if self.wanted {
+            if self.persist_and_apply(cx) {
+                self.status = note;
+            }
+        } else if self.persist() {
+            self.status = format!("{note}下次连接或应用后生效。");
+        }
+    }
+
     fn set_system_extension(&mut self, on: bool, cx: &mut Context<Self>) {
         self.strategy.system_extension = on;
         if on {
@@ -3294,74 +3354,53 @@ impl AppView {
         }
     }
 
-    fn unmatched_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+    fn routing_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
-        let direct = myproxy::compile::unmatched_is_direct(&self.strategy);
-        let current = myproxy::compile::unmatched_target(&self.strategy);
+        let current = self.strategy.routing_profile;
+        let unmatched = myproxy::compile::unmatched_target(&self.strategy);
         panel(
             theme,
-            "未匹配流量",
+            "分流",
             v_flex()
                 .gap_3()
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("对不上规则的流量走这里。默认直连是正面清单；默认走组是现在的全局代理。"),
+                        .child("自己的规则始终优先。GFWList 整包装上或卸下，不写进下面的规则表。"),
                 )
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .children({
-                            let entity_direct = entity.clone();
-                            let entity_group = entity.clone();
-                            let mut direct_btn = Button::new("unmatched-direct").small();
-                            direct_btn = if direct {
-                                direct_btn.primary().label("默认直连")
+                    h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().map(
+                        |profile| {
+                            let entity = entity.clone();
+                            let mut btn = Button::new(SharedString::from(format!(
+                                "routing-{}",
+                                profile.as_str()
+                            )))
+                            .small();
+                            btn = if current == profile {
+                                btn.primary().label(profile.label())
                             } else {
-                                direct_btn.label("默认直连")
+                                btn.label(profile.label())
                             };
-                            let mut group_btn = Button::new("unmatched-group").small();
-                            group_btn = if !direct {
-                                group_btn.primary().label("默认走组")
-                            } else {
-                                group_btn.label("默认走组")
-                            };
-                            [
-                                direct_btn
-                                    .disabled(self.busy)
-                                    .on_click(move |_, _, app| {
-                                        entity_direct.update(app, |this, cx| {
-                                            this.strategy.unmatched_via = "DIRECT".into();
-                                            this.persist();
-                                            cx.notify();
-                                        });
-                                    })
-                                    .into_any_element(),
-                                group_btn
-                                    .disabled(self.busy)
-                                    .on_click(move |_, _, app| {
-                                        entity_group.update(app, |this, cx| {
-                                            this.strategy.unmatched_via =
-                                                myproxy::compile::default_group(&this.strategy)
-                                                    .to_string();
-                                            this.persist();
-                                            cx.notify();
-                                        });
-                                    })
-                                    .into_any_element(),
-                            ]
-                        }),
+                            btn.disabled(self.busy).on_click(move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    this.set_routing_profile(profile, cx);
+                                    cx.notify();
+                                });
+                            })
+                        },
+                    )),
                 )
-                .when(!direct, |this| {
+                .when(current == RoutingProfile::Group, |this| {
                     this.child(
                         h_flex().gap_1().flex_wrap().children(
                             self.strategy.groups.iter().map(|group| {
                                 let name = group.name.clone();
-                                let selected = current == name;
+                                let selected = unmatched == name;
                                 let entity = entity.clone();
                                 let mut btn = Button::new(SharedString::from(format!(
-                                    "unmatched-via-{name}"
+                                    "routing-via-{name}"
                                 )))
                                 .small();
                                 btn = if selected {
@@ -3371,8 +3410,12 @@ impl AppView {
                                 };
                                 btn.disabled(self.busy).on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
+                                        this.strategy.routing_profile = RoutingProfile::Group;
                                         this.strategy.unmatched_via = name.clone();
-                                        this.persist();
+                                        this.persist_inbound_mode(
+                                            cx,
+                                            format!("未匹配走 {name}。"),
+                                        );
                                         cx.notify();
                                     });
                                 })
@@ -3384,13 +3427,24 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(if direct {
-                            "未匹配走 DIRECT。GitHub、Safari 这些规则仍按各自走向。".to_string()
-                        } else {
-                            format!("未匹配走 {current}。连接或应用后生效。")
+                        .child(match current {
+                            RoutingProfile::Allowlist => {
+                                "未命中直连。Telegram 和其他自己的规则仍按各自走向。".to_string()
+                            }
+                            RoutingProfile::Gfwlist => {
+                                "已装 Loyalsoldier GFWList，列表内走默认组，其余直连。换回正面清单即卸下。".to_string()
+                            }
+                            RoutingProfile::Group => {
+                                format!("未命中走 {unmatched}。连接或应用后生效。")
+                            }
                         }),
                 ),
         )
+    }
+
+    fn set_routing_profile(&mut self, profile: RoutingProfile, cx: &mut Context<Self>) {
+        self.strategy.set_routing_profile(profile);
+        self.persist_inbound_mode(cx, format!("已将分流设为{}。", profile.label()));
     }
 
     fn system_extension_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -3450,6 +3504,12 @@ impl AppView {
                             "关闭时，只有自己填了代理的应用会进规则。"
                         }),
                 )
+                .child(self.inbound_mode_buttons(
+                    cx,
+                    "extension-mode",
+                    self.strategy.extension_mode,
+                    Self::set_extension_mode,
+                ))
                 .child(
                     h_flex()
                         .w_full()
@@ -3503,7 +3563,8 @@ impl AppView {
                     self.strategy.launch_at_login,
                     |this, cx| {
                         this.strategy.launch_at_login = !this.strategy.launch_at_login;
-                        let sync_err = myproxy::login_item::sync(this.strategy.launch_at_login).err();
+                        let sync_err =
+                            myproxy::login_item::sync(this.strategy.launch_at_login).err();
                         this.persist();
                         if let Some(err) = sync_err {
                             log::warn("login", format!("{err:#}"));
@@ -3513,12 +3574,9 @@ impl AppView {
                     },
                 ))
                 .when(!bundled, |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("当前不是 .app，登录项不会注册。安装到 /Applications/myproxy.app 后生效。"),
-                    )
+                    this.child(div().text_xs().text_color(theme.muted_foreground).child(
+                        "当前不是 .app，登录项不会注册。安装到 /Applications/myproxy.app 后生效。",
+                    ))
                 })
                 .child(self.flag_row(
                     entity.clone(),
@@ -3675,14 +3733,18 @@ impl AppView {
                                 .compact()
                                 .outline()
                                 .small()
-                                .child(Button::new("update-prod")
-                                    .label(UpdateChannel::Prod.label())
-                                    .selected(channel == UpdateChannel::Prod)
-                                    .disabled(self.busy))
-                                .child(Button::new("update-nightly")
-                                    .label(UpdateChannel::Nightly.label())
-                                    .selected(channel == UpdateChannel::Nightly)
-                                    .disabled(self.busy))
+                                .child(
+                                    Button::new("update-prod")
+                                        .label(UpdateChannel::Prod.label())
+                                        .selected(channel == UpdateChannel::Prod)
+                                        .disabled(self.busy),
+                                )
+                                .child(
+                                    Button::new("update-nightly")
+                                        .label(UpdateChannel::Nightly.label())
+                                        .selected(channel == UpdateChannel::Nightly)
+                                        .disabled(self.busy),
+                                )
                                 .on_click(move |indices, _, app| {
                                     let next = match indices.first() {
                                         Some(0) => UpdateChannel::Prod,
@@ -3693,7 +3755,8 @@ impl AppView {
                                         let previous = this.strategy.update_channel;
                                         this.strategy.update_channel = Some(next);
                                         if this.persist() {
-                                            this.status = format!("更新通道已切换为{}。", next.label());
+                                            this.status =
+                                                format!("更新通道已切换为{}。", next.label());
                                         } else {
                                             this.strategy.update_channel = previous;
                                         }
@@ -3709,8 +3772,12 @@ impl AppView {
                         .child(hint),
                 )
                 .when(!crate::sparkle::available(), |this| {
-                    this.child(div().text_xs().text_color(theme.muted_foreground)
-                        .child("此开发构建不支持应用内更新。安装发布版后可按所选通道更新。"))
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("此开发构建不支持应用内更新。安装发布版后可按所选通道更新。"),
+                    )
                 })
                 .child({
                     let entity = entity.clone();
@@ -3829,27 +3896,30 @@ fn chip_row(
     field: ChipField,
     tokens: &[String],
 ) -> impl IntoElement {
-    h_flex().gap_1().flex_wrap().children(tokens.iter().map(|token| {
-        let entity = entity.clone();
-        let token = token.clone();
-        let id = SharedString::from(format!("{prefix}-{token}"));
-        Button::new(id)
-            .small()
-            .label(format!("{token} ×"))
-            .on_click(move |_, window, app| {
-                entity.update(app, |this, cx| {
-                    match field {
-                        ChipField::Contains => {
-                            GroupEditor::remove_token(&this.contains, &token, window, cx);
+    h_flex()
+        .gap_1()
+        .flex_wrap()
+        .children(tokens.iter().map(|token| {
+            let entity = entity.clone();
+            let token = token.clone();
+            let id = SharedString::from(format!("{prefix}-{token}"));
+            Button::new(id)
+                .small()
+                .label(format!("{token} ×"))
+                .on_click(move |_, window, app| {
+                    entity.update(app, |this, cx| {
+                        match field {
+                            ChipField::Contains => {
+                                GroupEditor::remove_token(&this.contains, &token, window, cx);
+                            }
+                            ChipField::Excludes => {
+                                GroupEditor::remove_token(&this.excludes, &token, window, cx);
+                            }
                         }
-                        ChipField::Excludes => {
-                            GroupEditor::remove_token(&this.excludes, &token, window, cx);
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-    }))
+                        cx.notify();
+                    });
+                })
+        }))
 }
 
 fn render_member_row(
@@ -3888,7 +3958,9 @@ fn render_member_row(
                 .child(name.to_string()),
         )
         .when(pinned, |this| this.child(pill(theme, "钉住", accent)))
-        .when(blocked, |this| this.child(pill(theme, "排除", theme.warning)))
+        .when(blocked, |this| {
+            this.child(pill(theme, "排除", theme.warning))
+        })
         .when(pinned, |this| {
             let up_entity = entity.clone();
             let up_name = name_owned.clone();
@@ -4138,7 +4210,9 @@ fn render_group_card(
 }
 
 fn file_stamp(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
@@ -4336,26 +4410,22 @@ fn render_rule_set_card(
                         });
                     }))
                     .separator()
-                    .item(
-                        PopupMenuItem::new("上移")
-                            .disabled(!can_up)
-                            .on_click(move |_, _, app| {
-                                up_entity.update(app, |this, cx| {
-                                    this.move_selected_rule(&up_id, -1, cx);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new("下移")
-                            .disabled(!can_down)
-                            .on_click(move |_, _, app| {
-                                down_entity.update(app, |this, cx| {
-                                    this.move_selected_rule(&down_id, 1, cx);
-                                    cx.notify();
-                                });
-                            }),
-                    )
+                    .item(PopupMenuItem::new("上移").disabled(!can_up).on_click(
+                        move |_, _, app| {
+                            up_entity.update(app, |this, cx| {
+                                this.move_selected_rule(&up_id, -1, cx);
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new("下移").disabled(!can_down).on_click(
+                        move |_, _, app| {
+                            down_entity.update(app, |this, cx| {
+                                this.move_selected_rule(&down_id, 1, cx);
+                                cx.notify();
+                            });
+                        },
+                    ))
                     .separator()
                     .submenu("改为走向", window, cx, {
                         let entity = entity.clone();
@@ -4440,12 +4510,7 @@ fn render_rule_set_card(
                     )
                 })
                 .when(set.matchers.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child("没有匹配项"),
-                    )
+                    this.child(div().text_xs().text_color(muted_fg).child("没有匹配项"))
                 }),
         )
 }
