@@ -10,7 +10,7 @@ use gpui_kit::component::dialog::{Cancel, Confirm, DialogButtonProps, DialogFoot
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    Sidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
 };
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Selectable, Sizable, StyledExt,
@@ -2429,17 +2429,7 @@ impl AppView {
                         .w_full()
                         .items_center()
                         .justify_between()
-                        .child(
-                            v_flex()
-                                .gap(px(2.))
-                                .child(div().text_sm().font_semibold().child("控制"))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("strategy.json"),
-                                ),
-                        )
+                        .child(div().text_sm().font_semibold().child("控制"))
                         .child(
                             Button::new("toggle-sidebar")
                                 .ghost()
@@ -2475,18 +2465,6 @@ impl AppView {
                 SidebarGroup::new("系统").child(
                     SidebarMenu::new()
                         .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
-                ),
-            )
-            .footer(
-                SidebarFooter::new().child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!(
-                            "{} nodes · {} excluded",
-                            self.catalog.nodes.len(),
-                            self.catalog.excluded.len()
-                        )),
                 ),
             )
     }
