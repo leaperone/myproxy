@@ -14,6 +14,8 @@ use myproxy::supervisor::Supervisor;
 
 use ui::AppView;
 
+gpui_kit::actions!(app, [About, CheckForUpdates, Quit]);
+
 fn main() {
     myproxy::log::init();
     let _instance_guard = match myproxy::instance::InstanceGuard::acquire() {
@@ -58,6 +60,7 @@ fn main() {
     app.on_reopen(show_main_window);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        install_app_menu(cx);
         appearance::apply_saved(None, cx);
         #[cfg(target_os = "macos")]
         {
@@ -106,6 +109,47 @@ fn open_main_window(cx: &mut App) {
         cx.new(|cx| Root::new(view, window, cx))
     })
     .expect("failed to open window");
+}
+
+fn install_app_menu(cx: &mut App) {
+    cx.on_action(|_: &About, _cx| show_about());
+    cx.on_action(|_: &CheckForUpdates, _cx| sparkle::check());
+    cx.on_action(|_: &Quit, cx| quit_app(cx));
+    cx.set_menus([Menu::new("MyProxy").items([
+        MenuItem::action("About MyProxy", About),
+        MenuItem::action("Check for Updates…", CheckForUpdates).disabled(!sparkle::available()),
+        MenuItem::separator(),
+        MenuItem::action("Quit MyProxy", Quit),
+    ])]);
+}
+
+pub(crate) fn show_about() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc::runtime::Object;
+        use objc::{class, msg_send, sel, sel_impl};
+        unsafe {
+            let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let _: () = msg_send![app, orderFrontStandardAboutPanel: std::ptr::null_mut::<Object>()];
+        }
+    }
+}
+
+pub(crate) fn quit_app(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = Supervisor::shared().shutdown() {
+                    myproxy::log::error("main", format!("shutdown failed: {err:#}"));
+                }
+            })
+            .await;
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
 }
 
 pub(crate) fn show_main_window(cx: &mut App) {

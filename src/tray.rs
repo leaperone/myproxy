@@ -186,12 +186,12 @@ fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
 fn handle_menu_event(event: MenuEvent, cx: &mut App, displayed_connected: bool) {
     match event.id.as_ref() {
         "open" => crate::show_main_window(cx),
-        "about" => crate::show_main_window(cx),
+        "about" => crate::show_about(),
         "toggle" if displayed_connected => disconnect_async(cx),
         "toggle" => connect(cx),
         "apply" => apply(cx),
         "updates" => crate::sparkle::check(),
-        "quit" => disconnect_and_quit(cx),
+        "quit" => crate::quit_app(cx),
         _ => {}
     }
 }
@@ -223,20 +223,6 @@ fn disconnect_async(cx: &mut App) {
             disconnect();
         })
         .detach();
-}
-
-fn disconnect_and_quit(cx: &mut App) {
-    cx.spawn(async move |cx| {
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(err) = Supervisor::shared().shutdown() {
-                    myproxy::log::error("tray", format!("shutdown failed: {err:#}"));
-                }
-            })
-            .await;
-        cx.update(|cx| cx.quit());
-    })
-    .detach();
 }
 
 fn apply(cx: &mut App) {
