@@ -78,6 +78,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
     let toggle = MenuItem::with_id("toggle", "连接", true, None);
     let open = MenuItem::with_id("open", "打开窗口", true, None);
     let apply = MenuItem::with_id("apply", "更新配置", true, None);
+    let about = MenuItem::with_id("about", "关于 myproxy", true, None);
     let updates = MenuItem::with_id("updates", "检查更新", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let menu = Menu::new();
@@ -88,6 +89,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&apply)?;
     menu.append(&updates)?;
+    menu.append(&about)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
     let tray = TrayIconBuilder::new()
@@ -95,7 +97,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
         .with_icon(template_icon())
         .with_icon_as_template(true)
         .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
+        .with_menu_on_left_click(true)
         .build()?;
     Ok(TrayKeepAlive {
         tray,
@@ -177,12 +179,14 @@ fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
     else {
         return;
     };
-    crate::show_main_window(cx);
+    // Left click is handled by tray-icon itself and opens the menu.
+    let _ = cx;
 }
 
 fn handle_menu_event(event: MenuEvent, cx: &mut App, displayed_connected: bool) {
     match event.id.as_ref() {
         "open" => crate::show_main_window(cx),
+        "about" => crate::show_main_window(cx),
         "toggle" if displayed_connected => disconnect_async(cx),
         "toggle" => connect(cx),
         "apply" => apply(cx),
