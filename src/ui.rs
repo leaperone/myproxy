@@ -2331,6 +2331,7 @@ impl Render for AppView {
                     .child(
                         h_flex()
                             .id("shell")
+                            .key_context("shell")
                             .flex_1()
                             .overflow_hidden()
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
