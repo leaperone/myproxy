@@ -1254,10 +1254,10 @@ impl AppView {
                                 }
                             }
                         }
-                        if this.page == Page::Settings && log::developer() {
-                            let generation = log::generation();
-                            if generation != this.log_generation {
-                                this.log_generation = generation;
+                        if this.page == Page::Settings {
+                            let stamp = log::stamp();
+                            if stamp != this.log_generation {
+                                this.log_generation = stamp;
                                 dirty = true;
                             }
                         }
@@ -1329,7 +1329,7 @@ impl AppView {
             delays: HashMap::new(),
             delaying: HashSet::new(),
             window_active: true,
-            log_generation: log::generation(),
+            log_generation: log::stamp(),
             pending_port_input: None,
             pending_filter_input: None,
             connection_filters: ConnectionFilters::default(),
@@ -3275,6 +3275,7 @@ impl AppView {
             ))
             .child(self.startup_panel(cx, theme))
             .child(self.cli_install_panel(cx, theme))
+            .child(self.logs_panel(theme))
             .child(self.developer_panel(cx, theme))
     }
 
@@ -3913,12 +3914,81 @@ impl AppView {
         )
     }
 
-    fn developer_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        let entity = cx.entity();
-        let on = self.strategy.developer_mode || log::env_forced();
+    fn logs_panel(&self, theme: &Theme) -> impl IntoElement {
         let log_path = log::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(无法创建日志文件)".into());
+        panel(
+            theme,
+            "日志",
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Info、Warning、Error 始终写入同一文件。Debug / Trace 仅开发者模式或 MYPROXY_DEV=1。不记录订阅 URL。"),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(theme.muted_foreground)
+                                .child(log_path),
+                        )
+                        .child({
+                            Button::new("reveal-log")
+                                .small()
+                                .label("在 Finder 中显示")
+                                .on_click(move |_, _, _| {
+                                    if let Some(path) = log::path() {
+                                        let _ = std::process::Command::new("open")
+                                            .arg("-R")
+                                            .arg(path)
+                                            .spawn();
+                                    }
+                                })
+                        }),
+                )
+                .child(
+                    v_flex()
+                        .id("app-log")
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .p_3()
+                        .gap_1()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.group_box)
+                        .children(log::recent(80).into_iter().map(|line| {
+                            let color = match log::Level::from_line(&line) {
+                                Some(log::Level::Error) | Some(log::Level::Warn) => {
+                                    Some(theme.warning)
+                                }
+                                Some(log::Level::Debug) | Some(log::Level::Trace) => {
+                                    Some(theme.muted_foreground)
+                                }
+                                _ => None,
+                            };
+                            div()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .when_some(color, |this, color| this.text_color(color))
+                                .child(line)
+                        })),
+                ),
+        )
+    }
+
+    fn developer_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let on = self.strategy.developer_mode || log::env_forced();
         panel(
             theme,
             "开发者",
@@ -3928,71 +3998,24 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("error/warn/info 始终写入日志文件；debug/trace 仅开发者模式。不记录订阅 URL。MYPROXY_DEV=1 也会打开。"),
+                        .child("打开后，Debug / Trace 也会写入上方日志。MYPROXY_DEV=1 同样生效。"),
                 )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child({
-                            let entity = entity.clone();
-                            let mut toggle = Button::new("dev-mode").small();
-                            toggle = if on {
-                                toggle.danger().label("关闭开发者模式")
-                            } else {
-                                toggle.primary().label("开启开发者模式")
-                            };
-                            toggle.on_click(move |_, _, app| {
-                                entity.update(app, |this, cx| {
-                                    this.strategy.developer_mode = !this.strategy.developer_mode;
-                                    log::set_developer(this.strategy.developer_mode);
-                                    this.persist();
-                                    cx.notify();
-                                });
-                            })
-                        })
-                        .when(on, |this| {
-                            this.child({
-                                Button::new("reveal-log")
-                                    .small()
-                                    .label("在 Finder 中显示")
-                                    .on_click(move |_, _, _| {
-                                        if let Some(path) = log::path() {
-                                            let _ = std::process::Command::new("open")
-                                                .arg("-R")
-                                                .arg(path)
-                                                .spawn();
-                                        }
-                                    })
-                            })
-                        }),
-                )
-                .when(on, |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.muted_foreground)
-                            .child(log_path),
-                    )
-                    .child(
-                        v_flex()
-                            .id("dev-log")
-                            .max_h(px(240.))
-                            .overflow_y_scroll()
-                            .p_3()
-                            .gap_1()
-                            .rounded(theme.radius)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.group_box)
-                            .children(log::recent(80).into_iter().map(|line| {
-                                div()
-                                    .text_xs()
-                                    .font_family(theme.mono_font_family.clone())
-                                    .child(line)
-                            })),
-                    )
+                .child({
+                    let entity = entity.clone();
+                    let mut toggle = Button::new("dev-mode").small();
+                    toggle = if on {
+                        toggle.danger().label("关闭开发者模式")
+                    } else {
+                        toggle.primary().label("开启开发者模式")
+                    };
+                    toggle.on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.strategy.developer_mode = !this.strategy.developer_mode;
+                            log::set_developer(this.strategy.developer_mode);
+                            this.persist();
+                            cx.notify();
+                        });
+                    })
                 }),
         )
     }

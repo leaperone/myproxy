@@ -56,8 +56,13 @@ private actor HostController {
             endpoints: endpoints,
             activationIdentifier: activationIdentifier
         )
+        AppLog.info(
+            "ne-host",
+            "enable revision=\(request.revision) socks=\(request.socksPort) rules=\(request.processRules.count)"
+        )
         let outcome = try await systemExtension.activate()
         if case .requiresReboot = outcome {
+            AppLog.warn("ne-host", "system extension requires reboot")
             return .requiresReboot
         }
         let canLiveUpdate = await transparentProxy.isConnected()
@@ -84,6 +89,7 @@ private actor HostController {
                     throw error
                 }
                 remember(request, endpoints: endpoints)
+                AppLog.info("ne-host", "system extension running")
                 return .running
             } catch {
                 try? await dnsProxy.disable()
@@ -103,6 +109,7 @@ private actor HostController {
                     throw error
                 }
                 remember(request, endpoints: endpoints)
+                AppLog.info("ne-host", "system extension running")
                 return .running
             }
         }
@@ -123,10 +130,12 @@ private actor HostController {
             throw error
         }
         remember(request, endpoints: endpoints)
+        AppLog.info("ne-host", "system extension running")
         return .running
     }
 
     func disable() async throws {
+        AppLog.info("ne-host", "disable")
         var firstError: Error?
         do { try await dnsProxy.disable() } catch { firstError = error }
         do { try await transparentProxy.stop() } catch { if firstError == nil { firstError = error } }
@@ -567,6 +576,7 @@ public func myproxy_ne_enable(
             return 2
         }
     } catch {
+        AppLog.error("ne-host", "enable failed: \(error.localizedDescription)")
         errorOut?.pointee = duplicateString(error.localizedDescription)
         return -1
     }
@@ -583,6 +593,7 @@ public func myproxy_ne_disable(
         }
         return 0
     } catch {
+        AppLog.error("ne-host", "disable failed: \(error.localizedDescription)")
         errorOut?.pointee = duplicateString(error.localizedDescription)
         return -1
     }

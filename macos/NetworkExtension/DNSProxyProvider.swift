@@ -192,6 +192,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             dnsProxyProviderLogger.notice(
                 "Accepted DNS bootstrap revision=\(bootstrap.revision, privacy: .public) schema=\(bootstrap.schemaVersion, privacy: .public) source=\(deliveredBootstrap == nil ? "provider-registry" : "provider-options", privacy: .public) payloadBytes=\(deliveredPayload?.count ?? 0, privacy: .public)"
             )
+            AppLog.info(
+                "ne-dns",
+                "dns proxy start revision=\(bootstrap.revision)"
+            )
             startBackendStartupProbe(
                 probe,
                 proxy: dataPlane.proxy,
@@ -205,6 +209,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                 runtime.stop()
                 dnsProxyProviderLogger.error(
                     "DNS runtime reporter startup failed errorType=\(String(describing: type(of: error)), privacy: .public)"
+                )
+                AppLog.error(
+                    "ne-dns",
+                    "dns proxy start failed: \(error.localizedDescription)"
                 )
                 startCompletion.call(error)
             }
@@ -242,6 +250,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                 self.backendProbeQueue.async {
                     currentReporter.markStartupFailed(.backendUnavailable)
                     runtime.stop()
+                    AppLog.error(
+                        "ne-dns",
+                        "dns proxy backend unavailable: \(error.localizedDescription)"
+                    )
                     startCompletion.call(error)
                 }
                 self.backendProbeLock.unlock()
@@ -251,6 +263,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                 try currentReporter.markRunning()
                 self.activeBackendProbe = nil
                 self.pendingStartCompletion = nil
+                AppLog.info("ne-dns", "dns proxy running")
                 self.backendProbeQueue.async { [weak self] in
                     self?.startPeriodicBackendProbe()
                     startCompletion.call(nil)
@@ -296,6 +309,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             dnsProxyProviderLogger.error(
                 "Rejected DNS bootstrap reason=\(reason.rawValue, privacy: .public)"
             )
+            AppLog.error("ne-dns", "dns proxy rejected bootstrap reason=\(reason.rawValue)")
             startCompletion.call(error)
         }
         backendProbeLock.unlock()
@@ -305,6 +319,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         with reason: NEProviderStopReason,
         completionHandler: @escaping () -> Void
     ) {
+        AppLog.info("ne-dns", "dns proxy stop reason=\(reason.rawValue)")
         let stopCompletion = DNSProxyLifecycleCompletion { _ in
             completionHandler()
         }
