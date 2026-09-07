@@ -2425,19 +2425,30 @@ impl AppView {
             .collapsed(self.sidebar_compact)
             .header(
                 SidebarHeader::new().child(
-                    v_flex()
-                        .gap(px(2.))
-                        .child(div().text_sm().font_semibold().child("控制"))
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("strategy.json"),
+                            v_flex()
+                                .gap(px(2.))
+                                .child(div().text_sm().font_semibold().child("控制"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("strategy.json"),
+                                ),
                         )
                         .child(
                             Button::new("toggle-sidebar")
                                 .ghost()
-                                .icon(if self.sidebar_compact { IconName::PanelLeftOpen } else { IconName::PanelLeft })
+                                .small()
+                                .icon(if self.sidebar_compact {
+                                    IconName::PanelLeftOpen
+                                } else {
+                                    IconName::PanelLeft
+                                })
                                 .on_click({
                                     let entity = cx.entity();
                                     move |_, _, app| {
