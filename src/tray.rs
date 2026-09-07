@@ -78,7 +78,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
     let toggle = MenuItem::with_id("toggle", "连接", true, None);
     let open = MenuItem::with_id("open", "打开窗口", true, None);
     let apply = MenuItem::with_id("apply", "更新配置", true, None);
-    let about = MenuItem::with_id("about", "关于 myproxy", true, None);
+    let about = MenuItem::with_id("about", "关于 MyProxy", true, None);
     let updates = MenuItem::with_id("updates", "检查更新", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let menu = Menu::new();
@@ -93,7 +93,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
     let tray = TrayIconBuilder::new()
-        .with_tooltip("myproxy")
+        .with_tooltip("MyProxy")
         .with_icon(template_icon())
         .with_icon_as_template(true)
         .with_menu(Box::new(menu))
@@ -124,7 +124,7 @@ fn menu_face() -> MenuFace {
                 connected: false,
                 status: "未连接".into(),
                 action: "连接".into(),
-                tooltip: "myproxy · 未连接".into(),
+                tooltip: "MyProxy · 未连接".into(),
             };
         }
     };
@@ -134,7 +134,7 @@ fn menu_face() -> MenuFace {
             connected: false,
             status: "未连接".into(),
             action: "连接".into(),
-            tooltip: "myproxy · 未连接".into(),
+                tooltip: "MyProxy · 未连接".into(),
         };
     }
     if !health.ready {
@@ -142,7 +142,7 @@ fn menu_face() -> MenuFace {
             connected: true,
             status: health.note.unwrap_or_else(|| "核心异常".into()),
             action: "断开".into(),
-            tooltip: "myproxy · 核心异常".into(),
+            tooltip: "MyProxy · 核心异常".into(),
         };
     }
     let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
@@ -159,8 +159,8 @@ fn menu_face() -> MenuFace {
         None => format!("已连接 · {mode}"),
     };
     let tooltip = match now {
-        Some(now) => format!("myproxy · 已连接 · {endpoint} · {now}"),
-        None => format!("myproxy · 已连接 · {endpoint}"),
+        Some(now) => format!("MyProxy · 已连接 · {endpoint} · {now}"),
+        None => format!("MyProxy · 已连接 · {endpoint}"),
     };
     MenuFace {
         connected: true,

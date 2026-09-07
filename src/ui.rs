@@ -2392,7 +2392,7 @@ impl AppView {
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(div().text_sm().font_semibold().child("myproxy"))
+                        .child(div().text_sm().font_semibold().child("MyProxy"))
                         .children(
                             updates::build_badge().map(|label| pill(theme, label, theme.warning)),
                         ),
