@@ -19,7 +19,7 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 | Prod | `https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml` | Push a `vMAJOR.MINOR.PATCH` tag, or run Release with channel `prod` and that existing tag. |
 | Nightly | `https://github.com/leaperone/myproxy/releases/download/nightly/appcast.xml` | Builds `main` daily at 18:00 UTC, or run Release with channel `nightly`. |
 
-Nightly builds are GitHub prereleases with immutable build tags and full archives. The `nightly` prerelease points to the latest Nightly feed. Prod generates deltas only from previous Prod archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow.
+Nightly builds are GitHub prereleases with immutable build tags. The `nightly` prerelease points to the latest Nightly feed. Both channels generate Sparkle deltas from recent same-channel archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow. While the core is connected, Check for Updates and archive/delta downloads use Mixed as an HTTP proxy.
 
 `Cargo.toml` holds the next target release version. Since `v0.0.3` is already released, `main` now targets `0.0.4`: Prod uses `v0.0.4`, while Nightly uses `v0.0.4-nightly.20260905.42.1` (UTC date, Release run number, attempt). The app displays the same version without the `v` prefix; the source commit is recorded in release notes. When a Prod release is ready, tag its matching commit, then advance `main` to the next target version. Nightly tags do not trigger the Prod workflow.
 
