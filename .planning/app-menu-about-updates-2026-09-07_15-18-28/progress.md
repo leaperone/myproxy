@@ -11,7 +11,7 @@
 
 ## 进行中
 
-- 交付：commit / PR。
+- preflight / squash merge。
 
 ## 已验证
 
