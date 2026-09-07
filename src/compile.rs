@@ -36,6 +36,15 @@ const DEFAULT_DIRECT_RULES: &[&str] = &[
 
 pub const DNS_LISTEN_PORT: u16 = 1053;
 
+/// Health-check URL for fallback / url-test groups.
+const AUTO_GROUP_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
+/// Seconds between member probes. 300 left a dead `now` selected for minutes.
+const AUTO_GROUP_PROBE_INTERVAL_SECS: i64 = 30;
+/// Probe budget in milliseconds so a hung outbound fails the check quickly.
+const AUTO_GROUP_PROBE_TIMEOUT_MS: i64 = 3000;
+/// Mark a member down after this many failed probes, then use the next alive one.
+const AUTO_GROUP_MAX_FAILED_TIMES: i64 = 2;
+
 pub fn controller_port(mixed_port: u16) -> u16 {
     mixed_port.saturating_add(107)
 }
@@ -116,8 +125,7 @@ fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
         };
         item.insert("type".into(), kind.into());
         if kind == "url-test" || kind == "fallback" {
-            item.insert("url".into(), "https://www.gstatic.com/generate_204".into());
-            item.insert("interval".into(), 300.into());
+            insert_auto_group_probe(&mut item);
         }
         let proxies: Vec<serde_yaml::Value> =
             members.into_iter().map(serde_yaml::Value::String).collect();
@@ -211,6 +219,17 @@ fn insert_rule_providers(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
     root.insert(
         "rule-providers".into(),
         serde_yaml::Value::Mapping(providers),
+    );
+}
+
+fn insert_auto_group_probe(item: &mut serde_yaml::Mapping) {
+    item.insert("url".into(), AUTO_GROUP_PROBE_URL.into());
+    item.insert("interval".into(), AUTO_GROUP_PROBE_INTERVAL_SECS.into());
+    item.insert("timeout".into(), AUTO_GROUP_PROBE_TIMEOUT_MS.into());
+    item.insert("lazy".into(), false.into());
+    item.insert(
+        "max-failed-times".into(),
+        AUTO_GROUP_MAX_FAILED_TIMES.into(),
     );
 }
 
@@ -601,6 +620,84 @@ mod tests {
         let root = compiled(&strategy);
         assert!(!root.contains_key("rule-providers"));
         assert_eq!(rule_strings(&root).last().copied(), Some("MATCH,Telegram"));
+    }
+
+    #[test]
+    fn fallback_and_url_test_probe_next_member_not_direct() {
+        let mut strategy = Strategy::default();
+        strategy.groups = vec![
+            Group::all_nodes("Default".into(), "fallback".into()),
+            Group::all_nodes("Auto".into(), "url-test".into()),
+            Group::all_nodes("Manual".into(), "select".into()),
+        ];
+        let catalog = Catalog {
+            nodes: vec![crate::catalog::Node {
+                name: "n1".into(),
+                subscription: "s".into(),
+                raw: serde_yaml::Mapping::from_iter([
+                    ("name".into(), serde_yaml::Value::String("n1".into())),
+                    ("type".into(), serde_yaml::Value::String("ss".into())),
+                ])
+                .into(),
+            }],
+            ..Catalog::default()
+        };
+        let root = compile_root(&strategy, &catalog);
+        let groups = root
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("proxy-groups");
+        let mut seen_auto = 0;
+        for group in groups {
+            let item = group.as_mapping().expect("group map");
+            let name = item
+                .get("name")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("name");
+            let kind = item
+                .get("type")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("type");
+            if name == "Manual" {
+                assert_eq!(kind, "select");
+                assert!(!item.contains_key("url"));
+                continue;
+            }
+            assert!(kind == "fallback" || kind == "url-test", "{name} {kind}");
+            assert_eq!(
+                item.get("url").and_then(serde_yaml::Value::as_str),
+                Some(AUTO_GROUP_PROBE_URL)
+            );
+            assert_eq!(
+                item.get("interval").and_then(serde_yaml::Value::as_i64),
+                Some(AUTO_GROUP_PROBE_INTERVAL_SECS)
+            );
+            assert_eq!(
+                item.get("timeout").and_then(serde_yaml::Value::as_i64),
+                Some(AUTO_GROUP_PROBE_TIMEOUT_MS)
+            );
+            assert_eq!(
+                item.get("lazy").and_then(serde_yaml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                item.get("max-failed-times")
+                    .and_then(serde_yaml::Value::as_i64),
+                Some(AUTO_GROUP_MAX_FAILED_TIMES)
+            );
+            let members = item
+                .get("proxies")
+                .and_then(serde_yaml::Value::as_sequence)
+                .expect("members");
+            assert!(
+                !members
+                    .iter()
+                    .any(|member| member.as_str() == Some("DIRECT")),
+                "{name} must not degrade to DIRECT"
+            );
+            seen_auto += 1;
+        }
+        assert_eq!(seen_auto, 2);
     }
 
     #[test]
