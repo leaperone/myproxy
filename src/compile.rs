@@ -3,13 +3,10 @@ use std::fs;
 use anyhow::{Context, Result};
 
 use crate::catalog::{self, Catalog};
+use crate::gfw;
 use crate::log;
 use crate::paths;
 use crate::strategy::{InboundMode, RoutingProfile, Strategy};
-
-const GFW_PROVIDER: &str = "gfw";
-const GFW_RULESET_PATH: &str = "./ruleset/gfw.yaml";
-const GFW_LIST_URL: &str = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt";
 
 pub const CONTROLLER_SECRET: &str = "myproxy-local";
 
@@ -178,7 +175,8 @@ fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
     }
     if strategy.routing_profile == RoutingProfile::Gfwlist {
         rules.push(format!(
-            "RULE-SET,{GFW_PROVIDER},{}",
+            "RULE-SET,{},{}",
+            gfw::PROVIDER,
             default_group(strategy)
         ));
     }
@@ -202,12 +200,12 @@ fn insert_rule_providers(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
     let mut provider = serde_yaml::Mapping::new();
     provider.insert("type".into(), "http".into());
     provider.insert("behavior".into(), "domain".into());
-    provider.insert("url".into(), GFW_LIST_URL.into());
-    provider.insert("path".into(), GFW_RULESET_PATH.into());
+    provider.insert("url".into(), gfw::LIST_URL.into());
+    provider.insert("path".into(), gfw::RULESET_REL.into());
     provider.insert("interval".into(), 86400.into());
     provider.insert("proxy".into(), "DIRECT".into());
     let mut providers = serde_yaml::Mapping::new();
-    providers.insert(GFW_PROVIDER.into(), serde_yaml::Value::Mapping(provider));
+    providers.insert(gfw::PROVIDER.into(), serde_yaml::Value::Mapping(provider));
     root.insert(
         "rule-providers".into(),
         serde_yaml::Value::Mapping(providers),
@@ -401,6 +399,9 @@ fn push_socks_pair(
 
 pub fn via_target(via: &str, strategy: &Strategy) -> String {
     let via = via.trim();
+    if let Some(group) = gfw::gfw_group(via) {
+        return via_target(group, strategy);
+    }
     match via.to_ascii_lowercase().as_str() {
         "direct" => "DIRECT".into(),
         "reject" => "REJECT".into(),
@@ -497,6 +498,8 @@ mod tests {
         assert_eq!(via_target("REJECT", &strategy), "REJECT");
         assert_eq!(via_target("ai proxy", &strategy), "AI Proxy");
         assert_eq!(via_target("node:Some Node", &strategy), "Some Node");
+        assert_eq!(via_target("gfw:Default", &strategy), "Default");
+        assert_eq!(via_target("gfwlist:AI Proxy", &strategy), "AI Proxy");
     }
 
     #[test]

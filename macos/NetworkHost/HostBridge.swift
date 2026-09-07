@@ -12,11 +12,19 @@ private struct HostEnableRequest: Decodable, Sendable {
         let port: UInt16
     }
 
+    struct DestRule: Decodable, Sendable {
+        let kind: String
+        let value: String
+        let via: String
+    }
+
     let revision: UInt64
     let socksPort: UInt16
     let username: String
     let password: String
     let processRules: [ProcessRule]
+    let destRules: [DestRule]
+    let gfwDomains: [String]
     let groupPorts: [GroupPort]
 }
 
@@ -195,22 +203,111 @@ private func captureSnapshot(
     from request: HostEnableRequest
 ) throws -> CaptureConfigurationSnapshot {
     var rules: [CaptureRule] = []
+    var priority = 10
+    let gfwDestinations = gfwDestinationMatchers(request.gfwDomains)
     for (index, rule) in request.processRules.enumerated() {
         let sources = sourceMatchers(from: rule.pattern)
         guard !sources.isEmpty else { continue }
-        rules.append(
-            try CaptureRule(
-                id: "process-\(index)",
-                enabled: true,
-                priority: (index + 1) * 10,
-                sources: sources,
-                destinations: [],
-                protocols: [],
-                portRanges: [],
-                action: captureAction(via: rule.via),
-                unavailableFallback: .direct
+        if let group = gfwGroup(via: rule.via) {
+            if !gfwDestinations.isEmpty {
+                rules.append(
+                    try CaptureRule(
+                        id: "process-gfw-\(index)",
+                        enabled: true,
+                        priority: priority,
+                        sources: sources,
+                        destinations: gfwDestinations,
+                        protocols: [],
+                        portRanges: [],
+                        action: captureAction(via: group),
+                        unavailableFallback: .direct
+                    )
+                )
+            }
+            rules.append(
+                try CaptureRule(
+                    id: "process-gfw-rest-\(index)",
+                    enabled: true,
+                    priority: priority + 1,
+                    sources: sources,
+                    destinations: [],
+                    protocols: [],
+                    portRanges: [],
+                    action: .direct,
+                    unavailableFallback: .direct
+                )
             )
-        )
+        } else {
+            rules.append(
+                try CaptureRule(
+                    id: "process-\(index)",
+                    enabled: true,
+                    priority: priority,
+                    sources: sources,
+                    destinations: [],
+                    protocols: [],
+                    portRanges: [],
+                    action: captureAction(via: rule.via),
+                    unavailableFallback: .direct
+                )
+            )
+        }
+        priority += 10
+    }
+    for (index, rule) in request.destRules.enumerated() {
+        let destinations = destinationMatchers(kind: rule.kind, value: rule.value)
+        guard !destinations.isEmpty else { continue }
+        if let group = gfwGroup(via: rule.via) {
+            let hits = request.gfwDomains.compactMap { domain -> DestinationMatcher? in
+                guard domainMatches(kind: rule.kind, value: rule.value, domain: domain) else {
+                    return nil
+                }
+                return try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: domain))
+            }
+            if !hits.isEmpty {
+                rules.append(
+                    try CaptureRule(
+                        id: "dest-gfw-\(index)",
+                        enabled: true,
+                        priority: priority,
+                        sources: [],
+                        destinations: hits,
+                        protocols: [],
+                        portRanges: [],
+                        action: captureAction(via: group),
+                        unavailableFallback: .direct
+                    )
+                )
+            }
+            rules.append(
+                try CaptureRule(
+                    id: "dest-gfw-rest-\(index)",
+                    enabled: true,
+                    priority: priority + 1,
+                    sources: [],
+                    destinations: destinations,
+                    protocols: [],
+                    portRanges: [],
+                    action: .direct,
+                    unavailableFallback: .direct
+                )
+            )
+        } else {
+            rules.append(
+                try CaptureRule(
+                    id: "dest-\(index)",
+                    enabled: true,
+                    priority: priority,
+                    sources: [],
+                    destinations: destinations,
+                    protocols: [],
+                    portRanges: [],
+                    action: captureAction(via: rule.via),
+                    unavailableFallback: .direct
+                )
+            )
+        }
+        priority += 10
     }
     rules.append(
         try CaptureRule(
@@ -226,6 +323,67 @@ private func captureSnapshot(
         )
     )
     return try CaptureConfigurationSnapshot(revision: request.revision, rules: rules)
+}
+
+private func gfwGroup(via: String) -> String? {
+    let trimmed = via.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = trimmed.lowercased()
+    for prefix in ["gfw:", "gfwlist:"] where lower.hasPrefix(prefix) {
+        let group = trimmed.dropFirst(prefix.count)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return group.isEmpty ? nil : group
+    }
+    return nil
+}
+
+private func gfwDestinationMatchers(_ domains: [String]) -> [DestinationMatcher] {
+    domains.compactMap { domain in
+        try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: domain))
+    }
+}
+
+private func destinationMatchers(kind: String, value: String) -> [DestinationMatcher] {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return [] }
+    switch kind {
+    case "suffix":
+        let host = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        return (try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: host))).map { [$0] } ?? []
+    case "domain":
+        if trimmed.hasPrefix("*.") {
+            let host = String(trimmed.dropFirst(2))
+            return (try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: host))).map { [$0] } ?? []
+        }
+        return (try? DestinationMatcher.host(HostMatcher(kind: .exact, value: trimmed))).map { [$0] } ?? []
+    case "keyword":
+        return (try? DestinationMatcher.hostPattern(HostPatternMatcher(pattern: "*\(trimmed)*")))
+            .map { [$0] } ?? []
+    case "cidr":
+        return (try? DestinationMatcher.network(IPNetwork(trimmed))).map { [$0] } ?? []
+    default:
+        return []
+    }
+}
+
+private func domainMatches(kind: String, value: String, domain: String) -> Bool {
+    let domain = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let value = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !domain.isEmpty, !value.isEmpty else { return false }
+    switch kind {
+    case "keyword":
+        return domain.contains(value)
+    case "suffix":
+        let suffix = value.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        return domain == suffix || domain.hasSuffix(".\(suffix)")
+    case "domain":
+        if value.hasPrefix("*.") {
+            let suffix = String(value.dropFirst(2))
+            return domain == suffix || domain.hasSuffix(".\(suffix)")
+        }
+        return domain == value || domain.hasSuffix(".\(value)")
+    default:
+        return false
+    }
 }
 
 private func sourceMatchers(from raw: String) -> [SourceMatcher] {

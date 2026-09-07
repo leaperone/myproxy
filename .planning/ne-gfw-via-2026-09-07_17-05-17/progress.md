@@ -6,21 +6,24 @@
 
 ## 已完成
 
-- [待填写]
+- `via=gfw:<组>`、NE dest 规则、规则编辑器 GFWList 走向
+- `cargo test`：gfw 解析、via_target、inbound_plan、gfwlist compile
 
 ## 进行中
 
-- [待填写]
+- 交付：commit / PR / preflight
 
 ## 修改文件
 
-- [待填写]
+- `src/gfw.rs`、`src/compile.rs`、`src/network_extension.rs`、`src/strategy.rs`、`src/ui.rs`、`src/lib.rs`
+- `macos/NetworkHost/HostBridge.swift`
+- `AGENTS.md`、`.cursor/AGENTS.md`
 
 ## 验证结果
 
 | 检查 | 结果 | 状态 |
 |---|---|---|
-| | | |
+| cargo test gfw / via_target / network_extension / gfwlist | 通过 | pass |
 
 ## 错误与恢复
 

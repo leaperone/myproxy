@@ -706,7 +706,7 @@ impl RuleSetEditor {
             return false;
         }
         if next.via.is_empty() {
-            self.notice = "选走向：直连、拒绝、节点组，或一个节点。".into();
+            self.notice = "选走向：直连、拒绝、节点组、GFWList，或一个节点。".into();
             cx.notify();
             return false;
         }
@@ -857,7 +857,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("逗号分隔可一次加入多条。走向可是节点组，或目录里的某个节点。"),
+                    .child("逗号分隔可一次加入多条。走向可是直连、节点组、GFWList → 组，或某个节点。系统接管下 GFWList 在本机判断。"),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
@@ -904,6 +904,9 @@ fn default_via(strategy: &Strategy) -> String {
 
 fn via_label(via: &str) -> String {
     let via = via.trim();
+    if let Some(group) = myproxy::gfw::gfw_group(via) {
+        return format!("GFWList → {}", via_label(group));
+    }
     match via.to_ascii_lowercase().as_str() {
         "direct" => "直连".into(),
         "reject" => "拒绝".into(),
@@ -937,6 +940,17 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
             section: 1,
         });
     }
+    for group in &strategy.groups {
+        let value = format!("gfw:{}", group.name);
+        if out.iter().any(|c| c.value.eq_ignore_ascii_case(&value)) {
+            continue;
+        }
+        out.push(ViaChoice {
+            value,
+            label: format!("GFWList → {}", group.name),
+            section: 2,
+        });
+    }
     for node in &catalog.nodes {
         let value = if strategy.groups.iter().any(|g| g.name == node.name) {
             format!("node:{}", node.name)
@@ -949,7 +963,7 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
         out.push(ViaChoice {
             value,
             label: node.name.clone(),
-            section: 2,
+            section: 3,
         });
     }
     if let Some(via) = extra.map(str::trim).filter(|s| !s.is_empty()) {
@@ -957,7 +971,7 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
             out.push(ViaChoice {
                 value: via.to_string(),
                 label: via_label(via),
-                section: 2,
+                section: 3,
             });
         }
     }
