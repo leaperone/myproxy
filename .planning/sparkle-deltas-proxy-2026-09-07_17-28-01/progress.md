@@ -12,7 +12,7 @@
 
 ## 进行中
 
-- commit / PR / preflight
+- preflight 审查修复后重新核验
 
 ## 修改文件
 

@@ -34,6 +34,7 @@
 - `mixed_mode=direct` 时经 Mixed 的 GitHub 仍直连，可能被墙
 - 启动自动检查可能早于 `connect_on_launch`；连接后 hook 再同步
 - 主仓 dirty Mixed 调试不得进入本分支
+- `defaultSessionConfiguration` 是进程级注入；已排除 127.0.0.1 / localhost，避免回环走 Mixed
 
 ## 参考指针
 
