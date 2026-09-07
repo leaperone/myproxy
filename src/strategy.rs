@@ -442,7 +442,8 @@ impl Strategy {
             let set = &mut self.rule_sets[index];
             let keep_via = set.via.eq_ignore_ascii_case("direct")
                 || set.via.eq_ignore_ascii_case("reject")
-                || set.via == TELEGRAM_GROUP;
+                || set.via == TELEGRAM_GROUP
+                || crate::gfw::gfw_group(&set.via).is_some();
             if !keep_via {
                 set.via = TELEGRAM_GROUP.into();
                 changed = true;

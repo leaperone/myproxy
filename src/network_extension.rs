@@ -8,6 +8,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::compile;
+use crate::gfw;
 use crate::log;
 use crate::login_item;
 use crate::strategy::{InboundMode, Strategy};
@@ -20,6 +21,8 @@ pub struct EnableRequest {
     pub username: String,
     pub password: String,
     pub process_rules: Vec<ProcessRule>,
+    pub dest_rules: Vec<DestRule>,
+    pub gfw_domains: Vec<String>,
     pub group_ports: Vec<GroupPort>,
 }
 
@@ -27,6 +30,14 @@ pub struct EnableRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRule {
     pub pattern: String,
+    pub via: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DestRule {
+    pub kind: String,
+    pub value: String,
     pub via: String,
 }
 
@@ -40,6 +51,8 @@ pub struct GroupPort {
 struct CaptureFace {
     socks_port: u16,
     process_rules: Vec<ProcessRule>,
+    dest_rules: Vec<DestRule>,
+    gfw_domains: Vec<String>,
     group_ports: Vec<GroupPort>,
 }
 
@@ -89,30 +102,51 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
     }
 
     let mut process_rules = Vec::new();
+    let mut dest_rules = Vec::new();
     let mut needed = Vec::new();
+    let mut wants_gfw = false;
     if strategy.extension_mode == InboundMode::Rule {
         for set in &strategy.rule_sets {
-            let via = compile::via_target(&set.via, strategy);
+            let via = set.via.trim().to_string();
+            if via.is_empty() {
+                continue;
+            }
+            let capture_via = if let Some(group) = gfw::gfw_group(&via) {
+                wants_gfw = true;
+                format!("gfw:{}", compile::via_target(group, strategy))
+            } else {
+                via.clone()
+            };
+            if let Some(name) = pin_group(&capture_via, strategy) {
+                if !needed.iter().any(|existing| existing == &name) {
+                    needed.push(name);
+                }
+            }
             for matcher in &set.matchers {
-                if matcher.kind != "app" {
+                let value = matcher.value.trim();
+                if value.is_empty() {
                     continue;
                 }
-                let pattern = matcher.value.trim();
-                if pattern.is_empty() {
-                    continue;
+                match matcher.kind.as_str() {
+                    "app" => process_rules.push(ProcessRule {
+                        pattern: value.to_string(),
+                        via: capture_via.clone(),
+                    }),
+                    "domain" | "suffix" | "keyword" | "cidr" => dest_rules.push(DestRule {
+                        kind: matcher.kind.clone(),
+                        value: value.to_string(),
+                        via: capture_via.clone(),
+                    }),
+                    _ => {}
                 }
-                if !matches!(via.as_str(), "DIRECT" | "REJECT")
-                    && !needed.iter().any(|name| name == &via)
-                {
-                    needed.push(via.clone());
-                }
-                process_rules.push(ProcessRule {
-                    pattern: pattern.to_string(),
-                    via: via.clone(),
-                });
             }
         }
     }
+    let gfw_domains = if wants_gfw {
+        gfw::ensure_domains()
+    } else {
+        Vec::new()
+    };
 
     let mut group_ports = Vec::new();
     for name in needed {
@@ -135,6 +169,8 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
     let face = CaptureFace {
         socks_port,
         process_rules: process_rules.clone(),
+        dest_rules: dest_rules.clone(),
+        gfw_domains: gfw_domains.clone(),
         group_ports: group_ports.clone(),
     };
     if session.last_face.as_ref() != Some(&face) {
@@ -148,7 +184,18 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
         username: session.username.clone(),
         password: session.password.clone(),
         process_rules,
+        dest_rules,
+        gfw_domains,
         group_ports,
+    }
+}
+
+fn pin_group(via: &str, strategy: &Strategy) -> Option<String> {
+    let target = compile::via_target(via, strategy);
+    if matches!(target.as_str(), "DIRECT" | "REJECT") {
+        None
+    } else {
+        Some(target)
     }
 }
 
@@ -176,6 +223,8 @@ pub fn enable_async(strategy: &Strategy) {
     let face = CaptureFace {
         socks_port: request.socks_port,
         process_rules: request.process_rules.clone(),
+        dest_rules: request.dest_rules.clone(),
+        gfw_domains: request.gfw_domains.clone(),
         group_ports: request.group_ports.clone(),
     };
     {
@@ -256,15 +305,23 @@ fn enable_blocking(request: &EnableRequest) -> Result<()> {
         log::info(
             "ne",
             format!(
-                "enable revision={} socks={} process_rules={} group_routes={}",
+                "enable revision={} socks={} process_rules={} dest_rules={} gfw={} group_routes={}",
                 request.revision,
                 request.socks_port,
                 request.process_rules.len(),
+                request.dest_rules.len(),
+                request.gfw_domains.len(),
                 request.group_ports.len()
             ),
         );
         for rule in &request.process_rules {
-            log::info("ne", format!("capture {} via {}", rule.pattern, rule.via));
+            log::info("ne", format!("capture app {} via {}", rule.pattern, rule.via));
+        }
+        for rule in &request.dest_rules {
+            log::info(
+                "ne",
+                format!("capture {} {} via {}", rule.kind, rule.value, rule.via),
+            );
         }
         let mut error = std::ptr::null_mut();
         let rc = unsafe { ffi::myproxy_ne_enable(c_string(&json).as_ptr(), &mut error) };
@@ -352,8 +409,34 @@ mod tests {
             "rule mode should keep process pins"
         );
         assert!(
+            !plan.dest_rules.is_empty(),
+            "rule mode should keep domain pins"
+        );
+        assert!(
             !plan.group_ports.is_empty(),
             "rule mode should keep group SOCKS"
+        );
+        assert!(plan.gfw_domains.is_empty());
+    }
+
+    #[test]
+    fn gfw_via_requests_group_and_keeps_prefix() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        if let Some(set) = strategy.rule_sets.first_mut() {
+            set.via = "gfw:Default".into();
+            set.matchers = vec![crate::strategy::Matcher {
+                kind: "app".into(),
+                value: "Chrome".into(),
+            }];
+        }
+        let plan = inbound_plan(&strategy);
+        assert_eq!(plan.process_rules[0].via, "gfw:PROXY");
+        assert!(
+            plan.group_ports.iter().any(|port| port.name == "PROXY"),
+            "gfw via should allocate the unwrapped group SOCKS: {:?}",
+            plan.group_ports
         );
     }
 
