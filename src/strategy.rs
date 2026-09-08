@@ -16,6 +16,9 @@ pub const STRATEGY_SCHEMA: u32 = 7;
 
 pub const TELEGRAM_GROUP: &str = "Telegram";
 
+/// Mihomo's built-in selector. Mixed/SE「全局」pins inbound to this name.
+pub const GLOBAL_GROUP: &str = "GLOBAL";
+
 /// HTTP(S) hosts Telegram's web stack uses. These never match raw MTProto.
 pub const TELEGRAM_SUFFIXES: &[&str] = &[
     "telegram.org",
@@ -177,6 +180,9 @@ pub struct Strategy {
     /// How System Extension inbound traffic is routed. Independent of `mixed_mode`.
     #[serde(default)]
     pub extension_mode: InboundMode,
+    /// Current member of mihomo's built-in GLOBAL selector. Restored on apply.
+    #[serde(default)]
+    pub global_selected: String,
     /// Register a macOS login item when running from a bundled `.app`.
     #[serde(default)]
     pub launch_at_login: bool,
@@ -292,6 +298,7 @@ impl Default for Strategy {
             system_extension: false,
             mixed_mode: InboundMode::Rule,
             extension_mode: InboundMode::Rule,
+            global_selected: String::new(),
             launch_at_login: false,
             silent_launch: false,
             lite_mode: false,
@@ -404,6 +411,31 @@ impl Strategy {
                 self.unmatched_via = self.default_group_name().to_string();
             }
         }
+    }
+
+    pub fn uses_global(&self) -> bool {
+        self.mixed_mode == InboundMode::Global || self.extension_mode == InboundMode::Global
+    }
+
+    /// Empty GLOBAL pick becomes the default group so「全局」is not silently DIRECT.
+    pub fn ensure_global_selected(&mut self) -> bool {
+        if !self.global_selected.trim().is_empty() {
+            return false;
+        }
+        self.global_selected = self.default_group_name().to_string();
+        true
+    }
+
+    pub fn set_global_selected(&mut self, node: String) -> bool {
+        let next = node.trim();
+        if next.is_empty() {
+            return false;
+        }
+        if self.global_selected == next {
+            return true;
+        }
+        self.global_selected = next.to_string();
+        true
     }
 
     pub fn default_group_name(&self) -> &str {
@@ -986,5 +1018,30 @@ mod tests {
         assert_eq!(parsed.extension_mode, InboundMode::Direct);
         assert!(json.contains("\"mixed_mode\":\"global\""));
         assert!(json.contains("\"extension_mode\":\"direct\""));
+    }
+
+    #[test]
+    fn missing_global_selected_defaults_empty() {
+        let json = r#"{
+            "schema": 7,
+            "exclude_filter": "",
+            "subscriptions": [],
+            "groups": [],
+            "rule_sets": []
+        }"#;
+        let strategy: Strategy = serde_json::from_str(json).expect("parse");
+        assert!(strategy.global_selected.is_empty());
+        assert!(!strategy.uses_global());
+    }
+
+    #[test]
+    fn ensure_global_selected_uses_default_group() {
+        let mut strategy = Strategy::default();
+        assert!(strategy.ensure_global_selected());
+        assert_eq!(strategy.global_selected, "PROXY");
+        assert!(!strategy.ensure_global_selected());
+        assert!(strategy.set_global_selected("DIRECT".into()));
+        assert_eq!(strategy.global_selected, "DIRECT");
+        assert!(!strategy.set_global_selected("  ".into()));
     }
 }

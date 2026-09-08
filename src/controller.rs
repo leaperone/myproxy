@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::compile::{controller_port, CONTROLLER_SECRET};
 use crate::log;
 use crate::paths;
-use crate::strategy::Strategy;
+use crate::strategy::{Strategy, GLOBAL_GROUP};
 
 const FETCH_TIMEOUT: Duration = Duration::from_millis(800);
 pub const UI_CONNECTION_CAP: usize = 200;
@@ -501,19 +501,29 @@ pub fn test_group_delay(mixed_port: u16, group: &str) -> Result<HashMap<String, 
     }
 }
 
+pub fn selection_restores(strategy: &Strategy) -> Vec<(&str, &str)> {
+    let mut out: Vec<(&str, &str)> = strategy
+        .groups
+        .iter()
+        .filter(|group| group.kind == "select")
+        .filter_map(|group| {
+            let pick = group.selected.trim();
+            (!pick.is_empty()).then_some((group.name.as_str(), pick))
+        })
+        .collect();
+    let global = strategy.global_selected.trim();
+    if !global.is_empty() {
+        out.push((GLOBAL_GROUP, global));
+    }
+    out
+}
+
 pub fn restore_selections(mixed_port: u16, strategy: &Strategy) {
-    for group in &strategy.groups {
-        if group.kind != "select" {
-            continue;
-        }
-        let pick = group.selected.trim();
-        if pick.is_empty() {
-            continue;
-        }
-        if let Err(err) = select_proxy(mixed_port, &group.name, pick) {
+    for (group, pick) in selection_restores(strategy) {
+        if let Err(err) = select_proxy(mixed_port, group, pick) {
             log::debug(
                 "controller",
-                format!("restore {} -> {}: {err:#}", group.name, pick),
+                format!("restore {group} -> {pick}: {err:#}"),
             );
         }
     }
@@ -808,6 +818,7 @@ fn unix_from_civil(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::{Strategy, GLOBAL_GROUP};
 
     fn conn(process: &str, destination: &str, network: &str, chain: &str) -> LiveConnection {
         LiveConnection {
@@ -865,6 +876,19 @@ mod tests {
 
         filters.set_column(ConnectionColumn::Process, None);
         assert_eq!(filter_connections(&rows, &filters).len(), 2);
+    }
+
+    #[test]
+    fn restore_includes_global_and_select_groups() {
+        let mut strategy = Strategy::default();
+        strategy.groups[0].selected = "HK".into();
+        strategy.global_selected = "DIRECT".into();
+        assert_eq!(
+            selection_restores(&strategy),
+            [("PROXY", "HK"), (GLOBAL_GROUP, "DIRECT")]
+        );
+        strategy.global_selected.clear();
+        assert_eq!(selection_restores(&strategy), [("PROXY", "HK")]);
     }
 
     #[test]

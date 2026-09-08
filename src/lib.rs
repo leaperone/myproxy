@@ -12,4 +12,6 @@ pub mod strategy;
 pub mod supervisor;
 pub mod updates;
 
-pub use strategy::{Group, InboundMode, Matcher, RoutingProfile, Rule, RuleSet, Strategy};
+pub use strategy::{
+    Group, InboundMode, Matcher, RoutingProfile, Rule, RuleSet, Strategy, GLOBAL_GROUP,
+};
