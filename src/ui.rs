@@ -2582,6 +2582,7 @@ impl AppView {
                                 } else {
                                     IconName::PanelLeft
                                 })
+                                .tooltip(if self.sidebar_compact { "展开侧栏" } else { "收起侧栏" })
                                 .on_click({
                                     let entity = cx.entity();
                                     move |_, _, app| {
@@ -4422,7 +4423,7 @@ fn render_group_card(
         .gap_2()
         .rounded(theme.radius)
         .border_1()
-        .border_color(theme.border)
+        .border_color(if selected { accent } else { theme.border })
         .bg(theme.group_box)
         .cursor_pointer()
         .when(selected, |this| this.bg(accent.opacity(0.14)))
