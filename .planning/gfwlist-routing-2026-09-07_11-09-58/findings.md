@@ -1,4 +1,0 @@
-- 当前 strategy schema 5 只有 rule_sets/Matcher，没有 rule-provider、gfwlist URL、缓存或刷新状态。
-- compile.rs 只生成内置 DIRECT、显式 rule_sets 和最后 MATCH；未命中默认 `unmatched_via = DIRECT`。
-- 本机 `cloud-vcc.com` 的 WebKit 请求已验证命中 `MATCH -> DIRECT`，说明普通未命中域名确实直连；Safari 主进程规则单独命中 Default。
-- 当前仓库默认规则语义为正向列表：不应把 GFWList 误解为“所有网站代理”。
