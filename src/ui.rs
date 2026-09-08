@@ -1590,7 +1590,18 @@ impl AppView {
     }
 
     fn is_dirty(&self) -> bool {
-        self.strategy != self.applied
+        let mut applied = self.applied.clone();
+        // An empty saved selection lets the core choose its default member.
+        // Only explicit selections must equal the observed runtime selection.
+        if self.strategy.global_selected.is_empty() {
+            applied.global_selected.clear();
+        }
+        for (intent, runtime) in self.strategy.groups.iter().zip(&mut applied.groups) {
+            if intent.selected.is_empty() {
+                runtime.selected.clear();
+            }
+        }
+        self.strategy != applied
     }
 
     fn mark_applied(&mut self) {
@@ -1628,7 +1639,7 @@ impl AppView {
         }
         if let Some(note) = health.note {
             if self.status != note {
-                self.status = format!("{note}正在应用…");
+                self.status = note;
                 dirty = true;
             }
         } else if became_ready {
@@ -1743,18 +1754,10 @@ impl AppView {
     }
 
     fn global_now(&self) -> String {
-        if let Some(now) = self.live_now(GLOBAL_GROUP) {
-            return now.to_string();
-        }
         if self.connected {
-            return "等待核心状态".into();
+            return self.live_now(GLOBAL_GROUP).unwrap_or_default().to_string();
         }
-        let pick = self.strategy.global_selected.trim();
-        if pick.is_empty() {
-            "—".into()
-        } else {
-            format!("{pick}（已保存）")
-        }
+        self.strategy.global_selected.trim().to_string()
     }
 
     fn global_members(&self, cx: &Context<Self>) -> Vec<(String, Option<u32>)> {
@@ -2887,7 +2890,7 @@ impl AppView {
             .child(
                 h_flex().gap_3().flex_wrap()
                     .child(metric(theme, "PROXY", &now))
-                    .child(metric(theme, "GLOBAL", &self.global_now()))
+                    .child(metric(theme, "GLOBAL", &global_selection_label(&self.global_now(), self.connected)))
                     .child(metric(
                         theme,
                         "系统接管",
@@ -3687,6 +3690,7 @@ impl AppView {
         id_prefix: &str,
     ) -> impl IntoElement {
         let now = self.global_now();
+        let now_label = global_selection_label(&now, self.connected);
         let entity = cx.entity();
         let muted_fg = theme.muted_foreground;
         let mut shortcuts: Vec<String> = vec!["DIRECT".into(), "REJECT".into()];
@@ -3698,9 +3702,9 @@ impl AppView {
         v_flex()
             .gap_1()
             .child(div().text_xs().text_color(muted_fg).child(if active {
-                format!("GLOBAL 当前 {now} · 点下方组或到节点组选节点")
+                format!("GLOBAL 当前 {now_label} · 点下方组或到节点组选节点")
             } else {
-                format!("内置 GLOBAL 当前 {now} · 仅「全局」模式整段走它")
+                format!("内置 GLOBAL 当前 {now_label} · 仅「全局」模式整段走它")
             }))
             .when(active, |this| {
                 this.child(h_flex().w_full().flex_wrap().gap_1().children(
@@ -4574,6 +4578,21 @@ fn render_member_row(
         })
 }
 
+fn global_selection_label(now: &str, connected: bool) -> String {
+    if now.is_empty() {
+        if connected {
+            "等待核心状态"
+        } else {
+            "未指定"
+        }
+        .into()
+    } else if connected {
+        now.to_string()
+    } else {
+        format!("{now}（已保存）")
+    }
+}
+
 fn format_delay(delay: Option<u32>) -> String {
     match delay {
         None => String::new(),
@@ -4812,6 +4831,7 @@ fn render_global_card(
     limit: usize,
     busy: bool,
 ) -> impl IntoElement {
+    let now_label = global_selection_label(now, connected);
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
@@ -4859,9 +4879,9 @@ fn render_global_card(
                 .text_xs()
                 .text_color(muted_fg)
                 .child(if inbound_global {
-                    format!("当前 {now}  ·  Mixed 或接管为全局时整段走这里")
+                    format!("当前 {now_label}  ·  Mixed 或接管为全局时整段走这里")
                 } else {
-                    format!("当前 {now}  ·  未开全局时只作备用，规则仍按组走")
+                    format!("当前 {now_label}  ·  未开全局时只作备用，规则仍按组走")
                 }),
         )
         .child(div().w_full().child(Input::new(query)))
