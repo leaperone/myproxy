@@ -115,7 +115,7 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
                 wants_gfw = true;
                 format!("gfw:{}", compile::via_target(group, strategy))
             } else {
-                via.clone()
+                compile::via_target(&via, strategy)
             };
             if let Some(name) = pin_group(&capture_via, strategy) {
                 if !needed.iter().any(|existing| existing == &name) {
@@ -128,10 +128,7 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
                     continue;
                 }
                 match matcher.kind.as_str() {
-                    "app" => process_rules.push(ProcessRule {
-                        pattern: value.to_string(),
-                        via: capture_via.clone(),
-                    }),
+                    "app" => push_app_patterns(&mut process_rules, value, &capture_via),
                     "domain" | "suffix" | "keyword" | "cidr" => dest_rules.push(DestRule {
                         kind: matcher.kind.clone(),
                         value: value.to_string(),
@@ -187,6 +184,35 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
         dest_rules,
         gfw_domains,
         group_ports,
+    }
+}
+
+fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, value: &str, via: &str) {
+    let pattern = value.trim();
+    if pattern.is_empty() {
+        return;
+    }
+    if !process_rules
+        .iter()
+        .any(|rule| rule.pattern == pattern && rule.via == via)
+    {
+        process_rules.push(ProcessRule {
+            pattern: pattern.to_string(),
+            via: via.to_string(),
+        });
+    }
+    if pattern.contains('*') || pattern.contains('?') {
+        return;
+    }
+    let wildcard = format!("{pattern}*");
+    if !process_rules
+        .iter()
+        .any(|rule| rule.pattern == wildcard && rule.via == via)
+    {
+        process_rules.push(ProcessRule {
+            pattern: wildcard,
+            via: via.to_string(),
+        });
     }
 }
 
@@ -436,6 +462,65 @@ mod tests {
         assert!(
             plan.group_ports.iter().any(|port| port.name == "PROXY"),
             "gfw via should allocate the unwrapped group SOCKS: {:?}",
+            plan.group_ports
+        );
+    }
+
+    #[test]
+    fn rule_mode_resolves_via_and_expands_app_helpers() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        strategy.groups = vec![
+            crate::strategy::Group::all_nodes("Default".into(), "select".into()),
+            crate::strategy::Group::all_nodes("AI Proxy".into(), "select".into()),
+        ];
+        if let Some(set) = strategy.rule_sets.first_mut() {
+            set.via = "default".into();
+            set.matchers = vec![crate::strategy::Matcher {
+                kind: "app".into(),
+                value: "T3 Code (Nightly)".into(),
+            }];
+        }
+        strategy.rule_sets.push(crate::strategy::RuleSet {
+            id: "cpa".into(),
+            name: "CPA".into(),
+            via: "AI Proxy".into(),
+            matchers: vec![crate::strategy::Matcher {
+                kind: "suffix".into(),
+                value: "cpa.leaper.one".into(),
+            }],
+        });
+        let plan = inbound_plan(&strategy);
+        assert!(
+            plan.process_rules
+                .iter()
+                .any(|rule| rule.pattern == "T3 Code (Nightly)" && rule.via == "Default"),
+            "resolved via should match the stored group name: {:?}",
+            plan.process_rules
+        );
+        assert!(
+            plan.process_rules
+                .iter()
+                .any(|rule| rule.pattern == "T3 Code (Nightly)*" && rule.via == "Default"),
+            "exact app pins should also capture Electron helpers: {:?}",
+            plan.process_rules
+        );
+        assert_eq!(
+            plan.dest_rules
+                .iter()
+                .find(|rule| rule.value == "cpa.leaper.one")
+                .map(|rule| rule.via.as_str()),
+            Some("AI Proxy")
+        );
+        assert!(
+            plan.group_ports.iter().any(|port| port.name == "Default"),
+            "{:?}",
+            plan.group_ports
+        );
+        assert!(
+            plan.group_ports.iter().any(|port| port.name == "AI Proxy"),
+            "{:?}",
             plan.group_ports
         );
     }

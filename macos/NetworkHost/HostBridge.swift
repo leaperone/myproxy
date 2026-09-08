@@ -229,7 +229,7 @@ private func captureSnapshot(
                         protocols: [],
                         portRanges: [],
                         action: captureAction(via: group),
-                        unavailableFallback: .direct
+                        unavailableFallback: captureFallback(via: group)
                     )
                 )
             }
@@ -257,7 +257,7 @@ private func captureSnapshot(
                     protocols: [],
                     portRanges: [],
                     action: captureAction(via: rule.via),
-                    unavailableFallback: .direct
+                    unavailableFallback: captureFallback(via: rule.via)
                 )
             )
         }
@@ -284,7 +284,7 @@ private func captureSnapshot(
                         protocols: [],
                         portRanges: [],
                         action: captureAction(via: group),
-                        unavailableFallback: .direct
+                        unavailableFallback: captureFallback(via: group)
                     )
                 )
             }
@@ -312,7 +312,7 @@ private func captureSnapshot(
                     protocols: [],
                     portRanges: [],
                     action: captureAction(via: rule.via),
-                    unavailableFallback: .direct
+                    unavailableFallback: captureFallback(via: rule.via)
                 )
             )
         }
@@ -470,6 +470,17 @@ private func captureAction(via: String) -> CaptureAction {
             return .mihomo(.profileRules)
         }
         return .mihomo(.group(name))
+    }
+}
+
+private func captureFallback(via: String) -> UnavailableFallback {
+    switch via.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "direct":
+        return .direct
+    case "reject":
+        return .reject
+    default:
+        return .profileRules
     }
 }
 

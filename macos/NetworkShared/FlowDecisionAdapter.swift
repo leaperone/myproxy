@@ -479,7 +479,7 @@ public struct FlowTrafficDecisionAdapter: Sendable {
                 )
             }
             let disposition: FlowTrafficDisposition = switch ruleDecision.unavailableFallback {
-            case .direct: .direct
+            case .direct, .profileRules: .direct
             case .reject: .reject
             }
             return FlowTrafficDecision(

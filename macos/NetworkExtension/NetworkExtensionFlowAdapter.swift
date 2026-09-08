@@ -38,20 +38,29 @@ enum MihomoRouteAvailabilityPolicy {
               case let .rule(cause) = decision.reason else {
             return decision
         }
-        let fallback: UnavailableFallback
+        let requestedFallback: UnavailableFallback
         if case let .matchedRule(identifier) = cause,
            let rule = rulesByIdentifier[identifier] {
-            fallback = rule.unavailableFallback
+            requestedFallback = rule.unavailableFallback
         } else {
-            fallback = .direct
+            requestedFallback = .direct
         }
-        let disposition: FlowTrafficDisposition = switch fallback {
-        case .direct: .direct
+        if requestedFallback != .reject,
+           route != .profileRules,
+           availableRoutes.contains(.profileRules) {
+            return FlowTrafficDecision(
+                disposition: .mihomo(.profileRules),
+                reason: .mihomoUnavailable(rule: cause, fallback: .profileRules),
+                ruleEvidence: decision.ruleEvidence
+            )
+        }
+        let disposition: FlowTrafficDisposition = switch requestedFallback {
+        case .direct, .profileRules: .direct
         case .reject: .reject
         }
         return FlowTrafficDecision(
             disposition: disposition,
-            reason: .mihomoUnavailable(rule: cause, fallback: fallback),
+            reason: .mihomoUnavailable(rule: cause, fallback: requestedFallback),
             ruleEvidence: decision.ruleEvidence
         )
     }
