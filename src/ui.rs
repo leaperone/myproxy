@@ -26,6 +26,7 @@ use myproxy::controller::{
 use myproxy::log;
 use myproxy::strategy::{
     join_list, parse_list, Group, InboundMode, Matcher, RoutingProfile, RuleSet, Strategy,
+    GLOBAL_GROUP,
 };
 use myproxy::supervisor::{CoreHealth, Supervisor};
 use myproxy::updates::{self, UpdateChannel};
@@ -1051,6 +1052,7 @@ pub struct AppView {
     rule_modal_open: bool,
     rule_edit_id: Option<String>,
     rule_query: Entity<InputState>,
+    global_query: Entity<InputState>,
     filter_input: Entity<InputState>,
     port_input: Entity<InputState>,
     pending_filter_input: Option<String>,
@@ -1306,6 +1308,7 @@ impl AppView {
             rule_modal_open: false,
             rule_edit_id: None,
             rule_query: cx.new(|cx| InputState::new(window, cx).placeholder("筛选规则…")),
+            global_query: cx.new(|cx| InputState::new(window, cx).placeholder("筛选 GLOBAL…")),
             filter_input: cx.new(|cx| {
                 InputState::new(window, cx).default_value(strategy.exclude_filter.clone())
             }),
@@ -1602,6 +1605,7 @@ impl AppView {
         match self.page {
             Page::Connections => 500,
             Page::Overview | Page::Groups => 1500,
+            Page::Settings if self.strategy.uses_global() => 1500,
             _ => 2500,
         }
     }
@@ -1613,6 +1617,10 @@ impl AppView {
         match self.page {
             Page::Connections => Some(LivePageJob::Rows(self.strategy.mixed_port)),
             Page::Overview | Page::Groups => Some(LivePageJob::Snapshot(
+                self.strategy.mixed_port,
+                LiveNeed::Totals,
+            )),
+            Page::Settings if self.strategy.uses_global() => Some(LivePageJob::Snapshot(
                 self.strategy.mixed_port,
                 LiveNeed::Totals,
             )),
@@ -1674,6 +1682,69 @@ impl AppView {
             .find(|group| group.name == name)
             .map(|group| group.now.as_str())
             .filter(|now| !now.is_empty())
+    }
+
+    fn global_now(&self) -> String {
+        if let Some(now) = self.live_now(GLOBAL_GROUP) {
+            return now.to_string();
+        }
+        let pick = self.strategy.global_selected.trim();
+        if pick.is_empty() {
+            "—".into()
+        } else {
+            pick.to_string()
+        }
+    }
+
+    fn global_members(&self, cx: &Context<Self>) -> Vec<(String, Option<u32>)> {
+        let query = self.global_query.read(cx).value().trim().to_lowercase();
+        let now = self.global_now();
+        let mut names: Vec<String> = if let Some(live) = self
+            .proxy_groups
+            .iter()
+            .find(|group| group.name == GLOBAL_GROUP)
+        {
+            live.members.iter().map(|member| member.name.clone()).collect()
+        } else {
+            let mut names = vec!["DIRECT".into(), "REJECT".into()];
+            for group in &self.strategy.groups {
+                if !names.iter().any(|name| name == &group.name) {
+                    names.push(group.name.clone());
+                }
+            }
+            for node in &self.catalog.nodes {
+                if !names.iter().any(|name| name == &node.name) {
+                    names.push(node.name.clone());
+                }
+            }
+            names
+        };
+        if !query.is_empty() {
+            names.retain(|name| name.to_lowercase().contains(&query));
+        }
+        names.sort_by(|a, b| {
+            let rank = |name: &str| {
+                if name == now {
+                    0
+                } else if name.eq_ignore_ascii_case("DIRECT") {
+                    1
+                } else if name.eq_ignore_ascii_case("REJECT") {
+                    2
+                } else if self.strategy.groups.iter().any(|group| group.name == name) {
+                    3
+                } else {
+                    4
+                }
+            };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+        names
+            .into_iter()
+            .map(|name| {
+                let delay = self.member_delay(&name);
+                (name, delay)
+            })
+            .collect()
     }
 
     fn overview_proxy_label(&self) -> String {
@@ -2205,6 +2276,46 @@ impl AppView {
         })
     }
 
+    fn select_global_member(&mut self, node: &str, cx: &mut Context<Self>) {
+        if !self.strategy.set_global_selected(node.to_string()) {
+            return;
+        }
+        self.applied.global_selected = self.strategy.global_selected.clone();
+        if let Some(live) = self
+            .proxy_groups
+            .iter_mut()
+            .find(|group| group.name == GLOBAL_GROUP)
+        {
+            live.now = node.to_string();
+        }
+        if self.persist() {
+            self.status = format!("GLOBAL 已切换到 {node}");
+        }
+        if self.connected {
+            let port = self.strategy.mixed_port;
+            let node = node.to_string();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        controller::select_proxy(port, GLOBAL_GROUP, &node)
+                            .map_err(|err| err.to_string())
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if let Err(err) = result {
+                        this.status = format!("GLOBAL 切换失败: {err}");
+                    }
+                    this.refresh_live(cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
     fn select_group_member(&mut self, group_id: &str, node: &str, cx: &mut Context<Self>) {
         if !self.strategy.set_group_selected(group_id, node.to_string()) {
             self.status = "只能在手动选择组里点选节点。".into();
@@ -2662,6 +2773,7 @@ impl AppView {
                     .child(metric(theme, "下载", &down))
                     .child(metric(theme, "连接数", &conns))
                     .child(metric(theme, "PROXY", &now))
+                    .child(metric(theme, "GLOBAL", &self.global_now()))
                     .child(metric(
                         theme,
                         "系统接管",
@@ -3044,7 +3156,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "节点组",
-                "点节点切换当前出口；点卡片空白处编辑匹配条件。来源 ∩ 名称含（或，支持 * ?）∪ 钉住 − 排除。",
+                "点节点切换当前出口；点卡片空白处编辑匹配条件。来源 ∩ 名称含（或，支持 * ?）∪ 钉住 − 排除。GLOBAL 是 mihomo 内置选择组，仅「全局」模式整段走它。",
             ))
             .child(
                 h_flex().child({
@@ -3060,6 +3172,21 @@ impl AppView {
                         })
                 }),
             )
+            .child({
+                let now = self.global_now();
+                let members = self.global_members(cx);
+                render_global_card(
+                    entity.clone(),
+                    theme,
+                    accent,
+                    &now,
+                    &members,
+                    self.delaying.contains(GLOBAL_GROUP),
+                    self.connected,
+                    self.strategy.uses_global(),
+                    &self.global_query,
+                )
+            })
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
             })
@@ -3246,7 +3373,13 @@ impl AppView {
                                 self.strategy.mixed_mode,
                                 Self::set_mixed_mode,
                             )),
-                    ),
+                    )
+                    .child(self.global_mode_row(
+                        cx,
+                        theme,
+                        self.strategy.mixed_mode == InboundMode::Global,
+                        "mixed",
+                    )),
             ))
             .child(self.updates_panel(cx, theme))
             .child(panel(
@@ -3370,11 +3503,69 @@ impl AppView {
     }
 
     fn inbound_modes_subtitle(&self) -> String {
-        format!(
+        let base = format!(
             "Mixed {} · 接管 {}",
             self.strategy.mixed_mode.label(),
             self.strategy.extension_mode.label()
-        )
+        );
+        if self.strategy.uses_global() {
+            format!("{base} · GLOBAL {}", self.global_now())
+        } else {
+            base
+        }
+    }
+
+    fn global_mode_row(
+        &self,
+        cx: &mut Context<Self>,
+        theme: &Theme,
+        active: bool,
+        id_prefix: &str,
+    ) -> impl IntoElement {
+        let now = self.global_now();
+        let entity = cx.entity();
+        let muted_fg = theme.muted_foreground;
+        let mut shortcuts: Vec<String> = vec!["DIRECT".into(), "REJECT".into()];
+        for group in &self.strategy.groups {
+            if !shortcuts.iter().any(|name| name == &group.name) {
+                shortcuts.push(group.name.clone());
+            }
+        }
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(if active {
+                        format!("GLOBAL 当前 {now} · 点下方组或到节点组选节点")
+                    } else {
+                        format!("内置 GLOBAL 当前 {now} · 仅「全局」模式整段走它")
+                    }),
+            )
+            .when(active, |this| {
+                this.child(
+                    h_flex().w_full().flex_wrap().gap_1().children(
+                        shortcuts.into_iter().map(|name| {
+                            let entity = entity.clone();
+                            let pick = name.clone();
+                            let mut button = Button::new(SharedString::from(format!(
+                                "{id_prefix}-global-{name}"
+                            )))
+                            .small()
+                            .label(name.clone());
+                            if name == now {
+                                button = button.primary();
+                            }
+                            button.disabled(self.busy).on_click(move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    this.select_global_member(&pick, cx);
+                                });
+                            })
+                        }),
+                    ),
+                )
+            })
     }
 
     fn inbound_mode_buttons(
@@ -3409,11 +3600,17 @@ impl AppView {
 
     fn set_mixed_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
         self.strategy.mixed_mode = mode;
+        if mode == InboundMode::Global {
+            self.strategy.ensure_global_selected();
+        }
         self.persist_inbound_mode(cx, format!("已将 Mixed 设为{}。", mode.label()));
     }
 
     fn set_extension_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
         self.strategy.extension_mode = mode;
+        if mode == InboundMode::Global {
+            self.strategy.ensure_global_selected();
+        }
         self.persist_inbound_mode(cx, format!("已将系统接管设为{}。", mode.label()));
     }
 
@@ -3614,6 +3811,12 @@ impl AppView {
                     "extension-mode",
                     self.strategy.extension_mode,
                     Self::set_extension_mode,
+                ))
+                .child(self.global_mode_row(
+                    cx,
+                    theme,
+                    self.strategy.extension_mode == InboundMode::Global,
+                    "extension",
                 ))
                 .child(
                     h_flex()
@@ -4342,6 +4545,117 @@ fn render_group_card(
                     .text_xs()
                     .text_color(muted_fg)
                     .child(format!("其余 {extra} 个在编辑窗查看")),
+            )
+        })
+}
+
+fn render_global_card(
+    entity: Entity<AppView>,
+    theme: &Theme,
+    accent: Hsla,
+    now: &str,
+    members: &[(String, Option<u32>)],
+    delaying: bool,
+    connected: bool,
+    inbound_global: bool,
+    query: &Entity<InputState>,
+) -> impl IntoElement {
+    let muted = theme.muted;
+    let muted_fg = theme.muted_foreground;
+    let shown = members.iter().take(36).cloned().collect::<Vec<_>>();
+    let extra = members.len().saturating_sub(shown.len());
+    let shown_empty = shown.is_empty();
+    v_flex()
+        .id("group-card-GLOBAL")
+        .p_4()
+        .gap_2()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.group_box)
+        .when(inbound_global, |this| this.bg(accent.opacity(0.10)))
+        .hover(move |style| style.bg(muted))
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child(format!(
+                            "GLOBAL  ·  内置选择  ·  {} 个成员",
+                            members.len()
+                        )),
+                )
+                .child({
+                    let entity = entity.clone();
+                    Button::new("delay-group-GLOBAL")
+                        .small()
+                        .label(if delaying { "测延迟…" } else { "测延迟" })
+                        .disabled(delaying || !connected)
+                        .on_click(move |_, _, app| {
+                            entity.update(app, |this, cx| {
+                                this.start_group_delay(GLOBAL_GROUP, cx);
+                            });
+                        })
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted_fg)
+                .child(if inbound_global {
+                    format!("当前 {now}  ·  Mixed 或接管为全局时整段走这里")
+                } else {
+                    format!("当前 {now}  ·  未开全局时只作备用，规则仍按组走")
+                }),
+        )
+        .child(div().w_full().child(Input::new(query)))
+        .when(!shown_empty, |this| {
+            this.child(
+                h_flex().w_full().flex_wrap().gap_1().children(
+                    shown.into_iter().map(|(name, delay)| {
+                        let delay_text = format_delay(delay);
+                        let label = if delay_text.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{name}  {delay_text}")
+                        };
+                        let is_now = name == now;
+                        let entity = entity.clone();
+                        let mut button = Button::new(SharedString::from(format!(
+                            "pick-GLOBAL-{name}"
+                        )))
+                        .small()
+                        .label(label);
+                        if is_now {
+                            button = button.primary();
+                        }
+                        button.on_click(move |_, _, app| {
+                            entity.update(app, |this, cx| {
+                                this.select_global_member(&name, cx);
+                            });
+                        })
+                    }),
+                ),
+            )
+        })
+        .when(extra > 0, |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(format!("其余 {extra} 个，用筛选缩小")),
+            )
+        })
+        .when(shown_empty, |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child("没有匹配的成员。"),
             )
         })
 }

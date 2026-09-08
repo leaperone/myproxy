@@ -1,8 +1,9 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use myproxy::catalog;
+use myproxy::controller;
 use myproxy::paths;
-use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy};
+use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy, GLOBAL_GROUP};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Parser)]
@@ -39,6 +40,10 @@ enum Commands {
     /// System Extension inbound routing: `rule`, `proxy`, `global`, or `direct`.
     ExtensionMode {
         mode: Option<String>,
+    },
+    /// Mihomo GLOBAL selector: omit to read, pass a member to switch.
+    Global {
+        name: Option<String>,
     },
     /// Rule-page fallback: `allowlist`, `gfwlist`, or `group` plus optional via.
     Routing {
@@ -178,6 +183,7 @@ fn run(cli: Cli) -> Result<()> {
                 "extension",
                 "mixed-mode",
                 "extension-mode",
+                "global",
                 "routing",
                 "unmatched",
                 "filter",
@@ -229,6 +235,7 @@ fn run(cli: Cli) -> Result<()> {
             let status = serde_json::json!({
                 "mixed_port": strategy.mixed_port,
                 "mixed_mode": strategy.mixed_mode.as_str(),
+                "global": strategy.global_selected.as_str(),
                 "tun": strategy.tun,
                 "extension": strategy.system_extension,
                 "extension_mode": strategy.extension_mode.as_str(),
@@ -246,9 +253,14 @@ fn run(cli: Cli) -> Result<()> {
                 json,
                 status,
                 format!(
-                    "mixed-port {}  mixed-mode {}  tun {}  extension {}  extension-mode {}  routing {}  unmatched {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
+                    "mixed-port {}  mixed-mode {}  global {}  tun {}  extension {}  extension-mode {}  routing {}  unmatched {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
                     strategy.mixed_port,
                     strategy.mixed_mode.as_str(),
+                    if strategy.global_selected.is_empty() {
+                        "—"
+                    } else {
+                        strategy.global_selected.as_str()
+                    },
                     if strategy.tun { "on" } else { "off" },
                     if strategy.system_extension {
                         "on"
@@ -371,11 +383,17 @@ fn run(cli: Cli) -> Result<()> {
             let mut strategy = Strategy::load()?;
             if let Some(mode) = mode {
                 strategy.mixed_mode = InboundMode::parse(&mode)?;
+                if strategy.mixed_mode == InboundMode::Global {
+                    strategy.ensure_global_selected();
+                }
                 strategy.save()?;
             }
             emit(
                 json,
-                serde_json::json!({"mixed_mode": strategy.mixed_mode.as_str()}),
+                serde_json::json!({
+                    "mixed_mode": strategy.mixed_mode.as_str(),
+                    "global": strategy.global_selected.as_str(),
+                }),
                 format!("mixed-mode {}", strategy.mixed_mode.as_str()),
             );
         }
@@ -383,12 +401,47 @@ fn run(cli: Cli) -> Result<()> {
             let mut strategy = Strategy::load()?;
             if let Some(mode) = mode {
                 strategy.extension_mode = InboundMode::parse(&mode)?;
+                if strategy.extension_mode == InboundMode::Global {
+                    strategy.ensure_global_selected();
+                }
                 strategy.save()?;
             }
             emit(
                 json,
-                serde_json::json!({"extension_mode": strategy.extension_mode.as_str()}),
+                serde_json::json!({
+                    "extension_mode": strategy.extension_mode.as_str(),
+                    "global": strategy.global_selected.as_str(),
+                }),
                 format!("extension-mode {}", strategy.extension_mode.as_str()),
+            );
+        }
+        Commands::Global { name } => {
+            let mut strategy = Strategy::load()?;
+            let mut live = false;
+            if let Some(name) = name {
+                let name = name.trim();
+                if name.is_empty() {
+                    bail!("global <node>");
+                }
+                strategy.set_global_selected(name.to_string());
+                strategy.save()?;
+                live = controller::select_proxy(strategy.mixed_port, GLOBAL_GROUP, name).is_ok();
+            }
+            emit(
+                json,
+                serde_json::json!({
+                    "global": strategy.global_selected.as_str(),
+                    "live": live,
+                    "mixed_mode": strategy.mixed_mode.as_str(),
+                    "extension_mode": strategy.extension_mode.as_str(),
+                }),
+                if strategy.global_selected.is_empty() {
+                    "global —".into()
+                } else if live {
+                    format!("global {} (live)", strategy.global_selected)
+                } else {
+                    format!("global {}", strategy.global_selected)
+                },
             );
         }
         Commands::Routing { profile, via } => {

@@ -15,7 +15,7 @@ use crate::compile;
 use crate::controller;
 use crate::log;
 use crate::paths;
-use crate::strategy::Strategy;
+use crate::strategy::{InboundMode, Strategy, GLOBAL_GROUP};
 
 const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
 const FAIL_BEFORE_RETRY: u32 = 3;
@@ -499,7 +499,12 @@ impl Supervisor {
         if !self.is_running() || !mixed_listening(strategy.mixed_port) {
             return None;
         }
-        controller::probe(strategy.mixed_port, compile::default_group(strategy)).ok()
+        let group = if strategy.mixed_mode == InboundMode::Global {
+            GLOBAL_GROUP
+        } else {
+            compile::default_group(strategy)
+        };
+        controller::probe(strategy.mixed_port, group).ok()
     }
 
     fn wait_ready(&self, strategy: &Strategy, timeout: Duration) -> bool {
