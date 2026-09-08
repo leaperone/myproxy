@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::log;
@@ -38,14 +38,36 @@ pub fn load_domains() -> Vec<String> {
 
 pub fn ensure_domains() -> Vec<String> {
     let domains = load_domains();
-    if !domains.is_empty() {
+    let fresh = list_path()
+        .ok()
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(24 * 60 * 60));
+    if !domains.is_empty() && fresh {
         return domains;
     }
-    if let Err(err) = fetch_list() {
-        log::warn("gfw", format!("fetch: {err:#}"));
-        return Vec::new();
+    match refresh_domains() {
+        Ok(refreshed) => refreshed,
+        Err(err) => {
+            if domains.is_empty() {
+                log::warn("gfw", format!("list unavailable: {err:#}"));
+            } else {
+                log::warn(
+                    "gfw",
+                    "refresh failed; retaining the last valid cached list",
+                );
+            }
+            domains
+        }
     }
-    load_domains()
+}
+
+/// Reused by explicit subscription/list refresh; a bad download never replaces
+/// the last valid file consumed by either the host or Mihomo rule provider.
+pub fn refresh_domains() -> Result<Vec<String>> {
+    fetch_list()?;
+    Ok(load_domains())
 }
 
 pub fn parse_payload(text: &str) -> Vec<String> {
@@ -102,7 +124,7 @@ pub fn domain_matches(kind: &str, value: &str, domain: &str) -> bool {
             if let Some(suffix) = value.strip_prefix("*.") {
                 suffix_match(suffix, &domain)
             } else {
-                domain == value || domain.ends_with(&format!(".{value}"))
+                domain == value
             }
         }
         _ => false,
@@ -118,9 +140,18 @@ fn normalize_entry(item: &str) -> Option<String> {
     let item = item.trim().trim_matches('\'').trim_matches('"');
     let item = item
         .trim_start_matches("+.")
-        .trim_start_matches('.')
+        .trim_matches('.')
         .to_ascii_lowercase();
-    if item.is_empty() || item.contains('/') || item.contains(':') {
+    if item.is_empty()
+        || item.len() > 253
+        || !item.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|ch| ch.is_alphanumeric() || ch == '-')
+        })
+    {
         return None;
     }
     Some(item)
@@ -134,7 +165,15 @@ fn fetch_list() -> Result<()> {
         .with_context(|| format!("GET {LIST_URL}"))?
         .into_string()
         .context("read gfw list")?;
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    if parse_payload(&body).is_empty() {
+        bail!("GFWList download contains no valid domains");
+    }
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temporary, body).context("write GFWList candidate")?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("publish GFWList candidate");
+    }
     log::info("gfw", format!("cached {}", path.display()));
     Ok(())
 }

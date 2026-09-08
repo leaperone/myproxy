@@ -1,5 +1,3 @@
-use std::fs;
-
 use anyhow::{Context, Result};
 
 use crate::catalog::{self, Catalog};
@@ -50,15 +48,28 @@ pub fn controller_port(mixed_port: u16) -> u16 {
 }
 
 pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
-    let root = compile_root(strategy, catalog);
+    let request = if strategy.system_extension {
+        Some(crate::network_extension::try_inbound_plan(strategy)?)
+    } else {
+        None
+    };
+    compile_with_inbound_plan(strategy, catalog, request.as_ref())
+}
+
+pub fn compile_with_inbound_plan(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    request: Option<&crate::network_extension::EnableRequest>,
+) -> Result<String> {
+    strategy.validate()?;
+    strategy.validate_catalog(catalog)?;
+    let root = try_compile_root(strategy, catalog, request)?;
     let compiled = root
         .get("rules")
         .and_then(serde_yaml::Value::as_sequence)
         .map(|rules| rules.len())
         .unwrap_or(0);
     let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))?;
-    let path = paths::runtime_yaml_path()?;
-    fs::write(&path, &yaml).with_context(|| format!("write {}", path.display()))?;
     log::info(
         "compile",
         format!(
@@ -77,7 +88,21 @@ pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     Ok(yaml)
 }
 
+#[cfg(test)]
 fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
+    let request = if strategy.system_extension {
+        Some(crate::network_extension::inbound_plan(strategy))
+    } else {
+        None
+    };
+    try_compile_root(strategy, catalog, request.as_ref()).expect("valid fixture inbound plan")
+}
+
+fn try_compile_root(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    request: Option<&crate::network_extension::EnableRequest>,
+) -> Result<serde_yaml::Mapping> {
     let mut root = serde_yaml::Mapping::new();
     root.insert("allow-lan".into(), false.into());
     root.insert("bind-address".into(), "127.0.0.1".into());
@@ -90,7 +115,7 @@ fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
         format!("127.0.0.1:{}", controller_port(strategy.mixed_port)).into(),
     );
     root.insert("secret".into(), CONTROLLER_SECRET.into());
-    insert_inbound_listeners(&mut root, strategy);
+    insert_inbound_listeners(&mut root, strategy, request)?;
 
     if strategy.system_extension {
         // The DNS proxy provider captures system resolver flows at the
@@ -112,9 +137,9 @@ fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
         if members.is_empty() {
             log::warn(
                 "compile",
-                format!("group {} empty, using DIRECT", group.name),
+                format!("group {} empty, using REJECT sentinel", group.name),
             );
-            members.push("DIRECT".into());
+            members.push("REJECT".into());
         }
         let mut item = serde_yaml::Mapping::new();
         item.insert("name".into(), group.name.clone().into());
@@ -163,8 +188,27 @@ fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
                     }
                 }
                 "app" => {
-                    if !strategy.system_extension {
-                        rules.push(format!("PROCESS-NAME,{},{}", matcher.value, target));
+                    let value = matcher.value.trim();
+                    let kind = if value.contains('/') {
+                        "PROCESS-PATH"
+                    } else {
+                        "PROCESS-NAME"
+                    };
+                    let condition = if value.contains(['*', '?']) {
+                        let pattern = regex::escape(value)
+                            .replace(r"\*", ".*")
+                            .replace(r"\?", ".");
+                        format!("{kind}-REGEX,^{pattern}$")
+                    } else {
+                        format!("{kind},{value}")
+                    };
+                    // A forwarded SE flow belongs to the provider process.
+                    // Keep process rules for Mixed/TUN without matching that
+                    // forwarding identity a second time on the private inlet.
+                    if strategy.system_extension {
+                        rules.push(format!("AND,((NOT,((IN-NAME,myproxy-network-extension-socks-ipv4/myproxy-network-extension-socks-ipv6))),({condition})),{target}"));
+                    } else {
+                        rules.push(format!("{condition},{target}"));
                     }
                 }
                 "cidr" => {
@@ -193,7 +237,7 @@ fn compile_root(strategy: &Strategy, catalog: &Catalog) -> serde_yaml::Mapping {
     rules.push(format!("MATCH,{}", unmatched_target(strategy)));
     let rules: Vec<serde_yaml::Value> = rules.into_iter().map(serde_yaml::Value::String).collect();
     root.insert("rules".into(), serde_yaml::Value::Sequence(rules));
-    root
+    Ok(root)
 }
 
 fn append_default_direct_rules(rules: &mut Vec<String>) {
@@ -343,13 +387,19 @@ pub fn inbound_proxy(mode: InboundMode, strategy: &Strategy) -> Option<String> {
     }
 }
 
-fn insert_inbound_listeners(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
+fn insert_inbound_listeners(
+    root: &mut serde_yaml::Mapping,
+    strategy: &Strategy,
+    request: Option<&crate::network_extension::EnableRequest>,
+) -> Result<()> {
     let mut listeners = Vec::new();
     push_mixed_listener(&mut listeners, strategy);
     if strategy.system_extension {
-        append_network_extension_listeners(&mut listeners, strategy);
+        let request = request.context("missing Network Extension listener plan")?;
+        append_network_extension_listeners(&mut listeners, strategy, request);
     }
     root.insert("listeners".into(), serde_yaml::Value::Sequence(listeners));
+    Ok(())
 }
 
 fn push_mixed_listener(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strategy) {
@@ -364,8 +414,11 @@ fn push_mixed_listener(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strate
     listeners.push(serde_yaml::Value::Mapping(item));
 }
 
-fn append_network_extension_listeners(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strategy) {
-    let plan = crate::network_extension::inbound_plan(strategy);
+fn append_network_extension_listeners(
+    listeners: &mut Vec<serde_yaml::Value>,
+    strategy: &Strategy,
+    plan: &crate::network_extension::EnableRequest,
+) {
     let outbound = inbound_proxy(strategy.extension_mode, strategy);
     push_socks_pair(
         listeners,
@@ -376,14 +429,9 @@ fn append_network_extension_listeners(listeners: &mut Vec<serde_yaml::Value>, st
         &plan.password,
     );
     for group in &plan.group_ports {
-        let suffix = group
-            .name
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>();
         push_socks_pair(
             listeners,
-            &format!("myproxy-network-extension-socks-route-{suffix}"),
+            &format!("myproxy-network-extension-socks-route-{}", group.port),
             group.port,
             Some(group.name.as_str()),
             &plan.username,
@@ -474,13 +522,7 @@ pub fn unmatched_is_direct(strategy: &Strategy) -> bool {
 }
 
 pub fn default_group(strategy: &Strategy) -> &str {
-    strategy
-        .groups
-        .iter()
-        .find(|group| group.name == "PROXY" || group.name.eq_ignore_ascii_case("default"))
-        .or_else(|| strategy.groups.first())
-        .map(|group| group.name.as_str())
-        .unwrap_or("DIRECT")
+    strategy.default_group_name()
 }
 
 #[cfg(test)]

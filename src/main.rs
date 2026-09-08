@@ -133,21 +133,36 @@ pub(crate) fn show_about() {
             if app.is_null() {
                 return;
             }
-            let _: () = msg_send![app, orderFrontStandardAboutPanel: std::ptr::null_mut::<Object>()];
+            let _: () =
+                msg_send![app, orderFrontStandardAboutPanel: std::ptr::null_mut::<Object>()];
         }
     }
 }
 
 pub(crate) fn quit_app(cx: &mut App) {
     cx.spawn(async move |cx| {
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(err) = Supervisor::shared().shutdown() {
-                    myproxy::log::error("main", format!("shutdown failed: {err:#}"));
-                }
-            })
+        let result = cx
+            .background_executor()
+            .spawn(async move { Supervisor::shared().shutdown() })
             .await;
-        cx.update(|cx| cx.quit());
+        cx.update(|cx| match result {
+            Ok(()) => cx.quit(),
+            Err(err) => {
+                myproxy::log::error("main", format!("shutdown failed: {err:#}"));
+                show_main_window(cx);
+                if let Some(handle) = cx.windows().first() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = window.prompt(
+                            PromptLevel::Critical,
+                            "尚未完成断开，应用保持运行",
+                            Some(&format!("{err:#}\n请检查设置中的接管状态，再重试退出。")),
+                            &["知道了"],
+                            cx,
+                        );
+                    });
+                }
+            }
+        });
     })
     .detach();
 }

@@ -45,17 +45,92 @@ impl Catalog {
             return Ok(Self::default());
         }
         let data = fs::read_to_string(&path)?;
-        serde_json::from_str(&data).context("parse catalog.json")
+        let catalog: Self = serde_json::from_str(&data).context("parse catalog.json")?;
+        catalog.validate()?;
+        Ok(catalog)
     }
 
     pub fn save(&self) -> Result<()> {
+        self.validate()?;
         let path = paths::catalog_path()?;
-        fs::write(path, serde_json::to_string_pretty(self)?)?;
+        paths::atomic_write(&path, serde_json::to_string_pretty(self)?.as_bytes())?;
         Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut names = HashMap::new();
+        for node in &self.nodes {
+            if node.name.trim().is_empty()
+                || node.name != node.name.trim()
+                || node.name.chars().any(|ch| ch == ',' || ch.is_control())
+                || crate::strategy::reserved_proxy_name(&node.name)
+            {
+                bail!("invalid node name in subscription {}", node.subscription);
+            }
+            if let Some(previous) = names.insert(&node.name, &node.subscription) {
+                bail!(
+                    "duplicate node name {} in subscriptions {} and {}",
+                    node.name,
+                    previous,
+                    node.subscription
+                );
+            }
+            if node.raw.get("name").and_then(serde_yaml::Value::as_str) != Some(node.name.as_str())
+            {
+                bail!(
+                    "catalog node name does not match proxy config in subscription {}",
+                    node.subscription
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn subscription_warning(&self, subscription: &str) -> Option<String> {
+        if !self.excluded.iter().any(|item| {
+            item.subscription == subscription && item.reason.starts_with("fetch failed:")
+        }) {
+            return None;
+        }
+        let cached = self
+            .nodes
+            .iter()
+            .filter(|node| node.subscription == subscription)
+            .count();
+        Some(if cached == 0 {
+            "刷新失败，无可用缓存节点".into()
+        } else {
+            format!("刷新失败，沿用 {cached} 个缓存节点")
+        })
+    }
+
+    pub fn refresh_warnings(&self) -> Vec<String> {
+        let mut subscriptions: Vec<_> = self.subscription_urls.keys().collect();
+        subscriptions.sort();
+        subscriptions
+            .into_iter()
+            .filter_map(|name| {
+                self.subscription_warning(name)
+                    .map(|message| format!("{name}: {message}"))
+            })
+            .collect()
+    }
+
+    pub fn matches_strategy(&self, strategy: &Strategy) -> bool {
+        if strategy.subscriptions.is_empty() && self.nodes.is_empty() {
+            return true;
+        }
+        self.exclude_filter == strategy.exclude_filter
+            && self.subscription_urls.len() == strategy.subscriptions.len()
+            && strategy
+                .subscriptions
+                .iter()
+                .all(|sub| self.subscription_urls.get(&sub.name) == Some(&sub.url))
     }
 }
 
 pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
+    strategy.validate()?;
     let exclude = Regex::new(&strategy.exclude_filter)
         .context("invalid exclude_filter regex")
         .inspect_err(|err| log::error("catalog", format!("{err:#}")))?;
@@ -74,10 +149,13 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
                 for raw in proxies {
                     let original = raw
                         .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unnamed")
+                        .and_then(serde_yaml::Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .with_context(|| {
+                            format!("subscription {} contains a proxy without a name", sub.name)
+                        })?
                         .to_string();
-                    if exclude.is_match(&original) {
+                    if !strategy.exclude_filter.is_empty() && exclude.is_match(&original) {
                         catalog.excluded.push(Excluded {
                             name: original,
                             subscription: sub.name.clone(),
@@ -258,6 +336,9 @@ pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) 
             );
             continue;
         }
+        if group.exclude.iter().any(|excluded| excluded == pin) {
+            continue;
+        }
         if !names.iter().any(|n| n == pin) {
             names.push(pin.clone());
         }
@@ -271,25 +352,7 @@ pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) 
 }
 
 pub fn count_group_members(group: &crate::strategy::Group, catalog: &Catalog) -> usize {
-    let mut count = catalog
-        .nodes
-        .iter()
-        .filter(|node| group_accepts(group, node))
-        .count();
-    for extra in &group.include {
-        let in_catalog = catalog.nodes.iter().any(|node| node.name == *extra);
-        if !in_catalog {
-            continue;
-        }
-        let already = catalog
-            .nodes
-            .iter()
-            .any(|node| &node.name == extra && group_accepts(group, node));
-        if !already {
-            count += 1;
-        }
-    }
-    count
+    resolve_group_members(group, catalog).len()
 }
 
 fn group_accepts(group: &crate::strategy::Group, node: &Node) -> bool {

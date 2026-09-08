@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::compile;
@@ -13,10 +13,11 @@ use crate::log;
 use crate::login_item;
 use crate::strategy::{InboundMode, Strategy};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnableRequest {
     pub revision: u64,
+    pub operation_revision: u64,
     pub socks_port: u16,
     pub username: String,
     pub password: String,
@@ -26,22 +27,24 @@ pub struct EnableRequest {
     pub group_ports: Vec<GroupPort>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRule {
+    pub order: u64,
     pub pattern: String,
     pub via: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DestRule {
+    pub order: u64,
     pub kind: String,
     pub value: String,
     pub via: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupPort {
     pub name: String,
     pub port: u16,
@@ -67,12 +70,253 @@ struct Session {
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
-static LAST_ENABLE: Mutex<Option<CaptureFace>> = Mutex::new(None);
-static LAST_ENABLE_REVISION: Mutex<Option<u64>> = Mutex::new(None);
 static OPERATION_REVISION: AtomicU64 = AtomicU64::new(0);
-static OPERATION_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Phase {
+    Unsupported,
+    Unbundled,
+    Disabled,
+    Requesting,
+    WaitingApproval,
+    RequiresReboot,
+    Running,
+    Stopping,
+    Failed,
+}
+
+impl Phase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unsupported => "当前系统不支持",
+            Self::Unbundled => "需要已签名应用",
+            Self::Disabled => "已关闭",
+            Self::Requesting => "正在启用",
+            Self::WaitingApproval => "等待系统授权",
+            Self::RequiresReboot => "需要重启系统",
+            Self::Running => "正在运行",
+            Self::Stopping => "正在关闭",
+            Self::Failed => "接管失败",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DnsPhase {
+    Unknown,
+    Disabled,
+    Waiting,
+    Running,
+    Stopping,
+    Failed,
+}
+
+impl DnsPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "状态未知",
+            Self::Disabled => "已关闭",
+            Self::Waiting => "等待运行报告",
+            Self::Running => "正在运行",
+            Self::Stopping => "正在关闭",
+            Self::Failed => "DNS 不可用",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatus {
+    pub phase: Phase,
+    pub dns_phase: DnsPhase,
+    #[serde(default)]
+    pub observed: bool,
+    pub desired_revision: u64,
+    pub applied_revision: Option<u64>,
+    pub message: Option<String>,
+    pub dns_message: Option<String>,
+}
+
+impl RuntimeStatus {
+    pub fn phase_label(&self) -> &'static str {
+        if self.observed {
+            self.phase.label()
+        } else {
+            "状态未知"
+        }
+    }
+
+    pub fn dns_label(&self) -> &'static str {
+        if self.observed {
+            self.dns_phase.label()
+        } else {
+            "状态未知"
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(self.phase, Phase::Requesting | Phase::Stopping)
+    }
+}
+
+fn unavailable_status() -> RuntimeStatus {
+    RuntimeStatus {
+        phase: if cfg!(target_os = "macos") {
+            Phase::Unbundled
+        } else {
+            Phase::Unsupported
+        },
+        dns_phase: DnsPhase::Unknown,
+        observed: true,
+        desired_revision: 0,
+        applied_revision: None,
+        message: None,
+        dns_message: None,
+    }
+}
+
+/// Reads a bounded in-memory host snapshot. The host refreshes its existing
+/// provider status channel at most once per two seconds without reconnecting.
+pub fn status() -> RuntimeStatus {
+    #[cfg(target_os = "macos")]
+    if login_item::is_bundled() {
+        let value = unsafe { ffi::myproxy_ne_status() };
+        if let Some(json) = take_error(value) {
+            if let Ok(status) = serde_json::from_str(&json) {
+                return status;
+            }
+        }
+        let mut status = unavailable_status();
+        status.phase = Phase::Failed;
+        status.message = Some("无法读取系统接管状态".into());
+        return status;
+    }
+    unavailable_status()
+}
+
+/// CLI callers keep the host task alive until it finishes or needs the user.
+/// WaitingApproval is a submitted request, never proof of an active provider.
+pub fn wait_for_settle(timeout: Duration) -> RuntimeStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = status();
+        if (!status.is_pending() && status.observed) || Instant::now() >= deadline {
+            return status;
+        }
+        wait_for_callbacks();
+    }
+}
+
+fn wait_for_callbacks() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        ffi::myproxy_ne_wait(100)
+    };
+    #[cfg(not(target_os = "macos"))]
+    std::thread::sleep(Duration::from_millis(100));
+}
+
+/// Shutdown is complete only after both native managers acknowledge disable.
+/// Unknown DNS state is not proof that macOS restored its resolver settings.
+pub fn wait_disabled(timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current = status();
+        if matches!(current.phase, Phase::Unsupported | Phase::Unbundled)
+            || (current.observed
+                && current.phase == Phase::Disabled
+                && current.dns_phase == DnsPhase::Disabled)
+        {
+            return Ok(());
+        }
+        if current.phase == Phase::Failed {
+            bail!(
+                "系统接管关闭失败：{}",
+                current.message.as_deref().unwrap_or(current.phase.label())
+            );
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "等待系统接管关闭超时：{}；DNS {}",
+                current.phase.label(),
+                current.dns_phase.label()
+            );
+        }
+        wait_for_callbacks();
+    }
+}
+
+/// A short-lived CLI cannot retain an authorization continuation after exit.
+/// Cancel only unfinished work, then finish its cleanup before returning.
+pub fn cancel_pending_for_cli() -> Result<bool> {
+    let current = status();
+    if !current.is_pending() && current.phase != Phase::WaitingApproval {
+        return Ok(false);
+    }
+    disable_async()?;
+    wait_disabled(Duration::from_secs(30))?;
+    Ok(true)
+}
+
+pub fn prepare(strategy: &Strategy) -> Result<()> {
+    if !strategy.system_extension {
+        return Ok(());
+    }
+    prepare_request(&try_inbound_plan(strategy)?)
+}
+
+pub fn prepare_request(request: &EnableRequest) -> Result<()> {
+    validate_request(request)?;
+    #[cfg(not(target_os = "macos"))]
+    bail!("System Extension is macOS-only");
+    #[cfg(target_os = "macos")]
+    {
+        if !login_item::is_bundled() {
+            bail!("系统接管需要包含 Network Extension 的已签名 .app");
+        }
+        let json = serde_json::to_string(request)?;
+        let mut error = std::ptr::null_mut();
+        let rc = unsafe { ffi::myproxy_ne_validate(c_string(&json).as_ptr(), &mut error) };
+        let message = take_error(error);
+        if rc != 0 {
+            bail!(
+                "{}",
+                message.unwrap_or_else(|| "系统接管配置校验失败".into())
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_request(request: &EnableRequest) -> Result<()> {
+    let needs_gfw = request
+        .process_rules
+        .iter()
+        .any(|rule| gfw::gfw_group(&rule.via).is_some())
+        || request
+            .dest_rules
+            .iter()
+            .any(|rule| gfw::gfw_group(&rule.via).is_some());
+    if request
+        .dest_rules
+        .iter()
+        .any(|rule| gfw::gfw_group(&rule.via).is_some() && rule.kind == "cidr")
+    {
+        bail!("GFWList 无法与网段规则求交，请改用节点组或域名条件");
+    }
+    if needs_gfw && request.gfw_domains.is_empty() {
+        bail!("GFWList 不可用，保留原接管配置；请刷新列表后重试");
+    }
+    Ok(())
+}
 
 pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
+    try_inbound_plan(strategy).expect("valid Network Extension listener plan")
+}
+
+pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
     let socks_port = compile::network_extension_socks_port(strategy.mixed_port);
     let controller = compile::controller_port(strategy.mixed_port);
     let mut session = SESSION.lock().expect("ne session");
@@ -82,27 +326,18 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
         password: Uuid::new_v4().simple().to_string(),
         socks_port,
         group_ports: BTreeMap::new(),
-        next_port: next_listener_port(
-            socks_port.saturating_add(1),
-            socks_port,
-            controller,
-            &BTreeMap::new(),
-        ),
+        next_port: socks_port.checked_add(1).unwrap_or(1),
         last_face: None,
     });
     if session.socks_port != socks_port {
         session.socks_port = socks_port;
         session.group_ports.clear();
-        session.next_port = next_listener_port(
-            socks_port.saturating_add(1),
-            socks_port,
-            controller,
-            &BTreeMap::new(),
-        );
+        session.next_port = socks_port.checked_add(1).unwrap_or(1);
     }
 
     let mut process_rules = Vec::new();
     let mut dest_rules = Vec::new();
+    let mut order = 0u64;
     let mut needed = Vec::new();
     let mut wants_gfw = false;
     if strategy.extension_mode == InboundMode::Rule {
@@ -128,14 +363,16 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
                     continue;
                 }
                 match matcher.kind.as_str() {
-                    "app" => push_app_patterns(&mut process_rules, value, &capture_via),
+                    "app" => push_app_patterns(&mut process_rules, order, value, &capture_via),
                     "domain" | "suffix" | "keyword" | "cidr" => dest_rules.push(DestRule {
+                        order,
                         kind: matcher.kind.clone(),
                         value: value.to_string(),
                         via: capture_via.clone(),
                     }),
                     _ => {}
                 }
+                order = order.saturating_add(1);
             }
         }
     }
@@ -154,10 +391,11 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
                 session.next_port,
                 session.socks_port,
                 controller,
+                strategy.mixed_port,
                 &session.group_ports,
-            );
+            )?;
             session.group_ports.insert(name.clone(), port);
-            session.next_port = port.saturating_add(1);
+            session.next_port = port.checked_add(1).unwrap_or(1024);
             port
         };
         group_ports.push(GroupPort { name, port });
@@ -175,8 +413,9 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
         session.last_face = Some(face);
     }
 
-    EnableRequest {
+    Ok(EnableRequest {
         revision: session.revision,
+        operation_revision: 0,
         socks_port,
         username: session.username.clone(),
         password: session.password.clone(),
@@ -184,10 +423,10 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
         dest_rules,
         gfw_domains,
         group_ports,
-    }
+    })
 }
 
-fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, value: &str, via: &str) {
+fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &str, via: &str) {
     let pattern = value.trim();
     if pattern.is_empty() {
         return;
@@ -197,6 +436,7 @@ fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, value: &str, via: &st
         .any(|rule| rule.pattern == pattern && rule.via == via)
     {
         process_rules.push(ProcessRule {
+            order,
             pattern: pattern.to_string(),
             via: via.to_string(),
         });
@@ -210,6 +450,7 @@ fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, value: &str, via: &st
         .any(|rule| rule.pattern == wildcard && rule.via == via)
     {
         process_rules.push(ProcessRule {
+            order,
             pattern: wildcard,
             via: via.to_string(),
         });
@@ -229,163 +470,79 @@ fn next_listener_port(
     start: u16,
     socks_port: u16,
     controller: u16,
+    mixed: u16,
     used: &BTreeMap<String, u16>,
-) -> u16 {
-    let mut port = start.max(1);
-    loop {
-        if port != socks_port && port != controller && !used.values().any(|used| *used == port) {
-            return port;
+) -> Result<u16> {
+    let mut port = start.max(1024);
+    for _ in 1024..=u16::MAX {
+        if ![socks_port, controller, mixed, compile::DNS_LISTEN_PORT].contains(&port)
+            && !used.values().any(|used| *used == port)
+        {
+            return Ok(port);
         }
-        let next = port.saturating_add(1);
-        if next == port {
-            return port;
-        }
-        port = next;
+        port = port.checked_add(1).unwrap_or(1024);
     }
+    bail!("没有可用的系统接管内部监听端口")
 }
 
-pub fn enable_async(strategy: &Strategy) {
-    let request = inbound_plan(strategy);
-    let face = CaptureFace {
-        socks_port: request.socks_port,
-        process_rules: request.process_rules.clone(),
-        dest_rules: request.dest_rules.clone(),
-        gfw_domains: request.gfw_domains.clone(),
-        group_ports: request.group_ports.clone(),
-    };
+pub fn enable_async(strategy: &Strategy) -> Result<()> {
+    enable_request_async(&try_inbound_plan(strategy)?)
+}
+
+/// Reuse the exact candidate/restored listener credentials and capture plan.
+/// Only the operation identity changes; a new process must never regenerate
+/// credentials for SOCKS listeners that are already running from saved YAML.
+pub fn enable_request_async(request: &EnableRequest) -> Result<()> {
+    validate_request(request)?;
+    #[cfg(not(target_os = "macos"))]
+    bail!("System Extension is macOS-only");
+    #[cfg(target_os = "macos")]
     {
-        let mut last = LAST_ENABLE.lock().expect("ne last enable");
-        if last.as_ref() == Some(&face) {
-            log::debug("ne", "skip unchanged capture plan");
-            return;
+        if !login_item::is_bundled() {
+            bail!("系统接管需要包含 Network Extension 的已签名 .app");
         }
-        *last = Some(face);
+        let mut request = request.clone();
+        request.operation_revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
+        let json = serde_json::to_string(&request)?;
+        let mut error = std::ptr::null_mut();
+        let rc = unsafe { ffi::myproxy_ne_enable(c_string(&json).as_ptr(), &mut error) };
+        let message = take_error(error);
+        if rc != 1 {
+            bail!(
+                "{}",
+                message.unwrap_or_else(|| "系统接管请求提交失败".into())
+            );
+        }
+        log::info(
+            "ne",
+            format!("submitted capture revision={}", request.revision),
+        );
+        Ok(())
     }
-    let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
-    *LAST_ENABLE_REVISION
-        .lock()
-        .expect("ne last enable revision") = Some(revision);
-    thread::Builder::new()
-        .name("myproxy-ne".into())
-        .spawn(move || {
-            let _operation = OPERATION_LOCK.lock().expect("ne operation");
-            if OPERATION_REVISION.load(Ordering::SeqCst) != revision {
-                let mut last_revision = LAST_ENABLE_REVISION
-                    .lock()
-                    .expect("ne last enable revision");
-                if *last_revision == Some(revision) {
-                    *last_revision = None;
-                    *LAST_ENABLE.lock().expect("ne last enable") = None;
-                }
-                return;
-            }
-            if let Err(err) = enable_blocking(&request) {
-                if OPERATION_REVISION.load(Ordering::SeqCst) == revision {
-                    *LAST_ENABLE.lock().expect("ne last enable") = None;
-                    *LAST_ENABLE_REVISION
-                        .lock()
-                        .expect("ne last enable revision") = None;
-                }
-                log::error("ne", format!("{err:#}"));
-            }
-        })
-        .ok();
 }
 
-pub fn disable_async() {
-    *LAST_ENABLE.lock().expect("ne last enable") = None;
-    *LAST_ENABLE_REVISION
-        .lock()
-        .expect("ne last enable revision") = None;
+pub fn disable_async() -> Result<()> {
     let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
-    thread::Builder::new()
-        .name("myproxy-ne-stop".into())
-        .spawn(move || {
-            let _operation = OPERATION_LOCK.lock().expect("ne operation");
-            if OPERATION_REVISION.load(Ordering::SeqCst) != revision {
-                return;
-            }
-            if let Err(err) = disable_blocking() {
-                log::error("ne", format!("{err:#}"));
-            }
-        })
-        .ok();
-}
-
-fn enable_blocking(request: &EnableRequest) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = request;
-        bail!("System Extension is macOS-only");
+        let _ = revision;
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
         if !login_item::is_bundled() {
-            log::warn(
-                "ne",
-                "system extension needs the bundled .app (Contents/Library/SystemExtensions)",
-            );
             return Ok(());
         }
-        let json = serde_json::to_string(request).expect("ne request json");
-        log::info(
-            "ne",
-            format!(
-                "enable revision={} socks={} process_rules={} dest_rules={} gfw={} group_routes={}",
-                request.revision,
-                request.socks_port,
-                request.process_rules.len(),
-                request.dest_rules.len(),
-                request.gfw_domains.len(),
-                request.group_ports.len()
-            ),
-        );
-        for rule in &request.process_rules {
-            log::info("ne", format!("capture app {} via {}", rule.pattern, rule.via));
-        }
-        for rule in &request.dest_rules {
-            log::info(
-                "ne",
-                format!("capture {} {} via {}", rule.kind, rule.value, rule.via),
-            );
-        }
         let mut error = std::ptr::null_mut();
-        let rc = unsafe { ffi::myproxy_ne_enable(c_string(&json).as_ptr(), &mut error) };
+        let rc = unsafe { ffi::myproxy_ne_disable(revision, &mut error) };
         let message = take_error(error);
-        match rc {
-            0 => {
-                log::info("ne", "system extension running");
-                Ok(())
-            }
-            2 => {
-                log::warn("ne", "system extension requires reboot");
-                Ok(())
-            }
-            _ => bail!(
-                "{}",
-                message.unwrap_or_else(|| "system extension enable failed".into())
-            ),
-        }
-    }
-}
-
-fn disable_blocking() -> Result<()> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Ok(());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut error = std::ptr::null_mut();
-        let rc = unsafe { ffi::myproxy_ne_disable(&mut error) };
-        let message = take_error(error);
-        if rc == 0 {
-            log::info("ne", "system extension stopped");
+        if rc == 1 {
+            log::info("ne", "submitted capture stop");
             Ok(())
         } else {
             bail!(
                 "{}",
-                message.unwrap_or_else(|| "system extension disable failed".into())
+                message.unwrap_or_else(|| "关闭系统接管请求提交失败".into())
             )
         }
     }
@@ -413,8 +570,11 @@ mod ffi {
     use std::os::raw::c_char;
 
     unsafe extern "C" {
+        pub fn myproxy_ne_validate(json: *const c_char, error_out: *mut *mut c_char) -> i32;
         pub fn myproxy_ne_enable(json: *const c_char, error_out: *mut *mut c_char) -> i32;
-        pub fn myproxy_ne_disable(error_out: *mut *mut c_char) -> i32;
+        pub fn myproxy_ne_disable(operation_revision: u64, error_out: *mut *mut c_char) -> i32;
+        pub fn myproxy_ne_status() -> *mut c_char;
+        pub fn myproxy_ne_wait(milliseconds: u32);
         pub fn myproxy_ne_free_string(value: *mut c_char);
     }
 }

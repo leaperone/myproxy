@@ -1,8 +1,10 @@
+import Darwin
 import Foundation
 import MyproxyNetworkShared
 
 private struct HostEnableRequest: Decodable, Sendable {
     struct ProcessRule: Decodable, Sendable {
+        let order: UInt64
         let pattern: String
         let via: String
     }
@@ -13,12 +15,14 @@ private struct HostEnableRequest: Decodable, Sendable {
     }
 
     struct DestRule: Decodable, Sendable {
+        let order: UInt64
         let kind: String
         let value: String
         let via: String
     }
 
     let revision: UInt64
+    let operationRevision: UInt64
     let socksPort: UInt16
     let username: String
     let password: String
@@ -28,9 +32,232 @@ private struct HostEnableRequest: Decodable, Sendable {
     let groupPorts: [GroupPort]
 }
 
-private enum HostEnableOutcome {
-    case running
-    case requiresReboot
+/// Shared by the GUI and installed CLI. Atomic replacement defines the latest
+/// intent; credentials and strategy contents never enter this file.
+private struct HostSharedIntent: Sendable {
+    let url: URL
+    let token: Data
+
+    static func issue() throws -> HostSharedIntent {
+        let url = try stateURL("network-extension.intent")
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let token = Data(UUID().uuidString.utf8)
+        try token.write(to: url, options: .atomic)
+        return HostSharedIntent(url: url, token: token)
+    }
+
+    var isCurrent: Bool {
+        (try? Data(contentsOf: url)) == token
+    }
+
+    func check() throws {
+        try Task.checkCancellation()
+        guard try Data(contentsOf: url) == token else { throw CancellationError() }
+    }
+
+    static func stateURL(_ name: String) throws -> URL {
+        if let override = ProcessInfo.processInfo.environment["MYPROXY_DATA_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true).appendingPathComponent(name)
+        }
+        guard let root = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy,
+                message: "无法定位系统接管共享状态目录"
+            )
+        }
+        return root.appendingPathComponent("myproxy", isDirectory: true)
+            .appendingPathComponent(name)
+    }
+}
+
+/// Only actual preference/provider mutations are serialized across processes.
+/// Human authorization waits happen before acquiring this lock. A newer intent
+/// is published before waiting, so older work stops at its next await boundary.
+private final class HostSideEffectLock: @unchecked Sendable {
+    private let descriptor: Int32
+
+    private init(descriptor: Int32) { self.descriptor = descriptor }
+
+    static func acquire(for intent: HostSharedIntent) async throws -> HostSideEffectLock {
+        let path = try HostSharedIntent.stateURL("network-extension-operation.lock").path
+        let descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy, message: "无法打开系统接管操作锁"
+            )
+        }
+        do {
+            while true {
+                try intent.check()
+                if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                    try intent.check()
+                    return HostSideEffectLock(descriptor: descriptor)
+                }
+                guard errno == EWOULDBLOCK || errno == EINTR else {
+                    throw NetworkExtensionControlFailure(
+                        operation: .configureTransparentProxy, message: "无法取得系统接管操作锁"
+                    )
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        } catch {
+            close(descriptor)
+            throw error
+        }
+    }
+
+    deinit {
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+}
+
+private struct HostRuntimeSnapshot: Encodable, Sendable {
+    var phase = "disabled"
+    var dnsPhase = "unknown"
+    var observed = false
+    var desiredRevision: UInt64 = 0
+    var appliedRevision: UInt64?
+    var message: String?
+    var dnsMessage: String?
+}
+
+/// A synchronous, privacy-safe FFI snapshot. Network queries run separately;
+/// reading status never blocks the GPUI thread or starts a provider.
+private final class HostRuntime: @unchecked Sendable {
+    static let shared = HostRuntime()
+    private let lock = NSLock()
+    private var operationRevision: UInt64 = 0
+    private var observation = UUID()
+    private var value = HostRuntimeSnapshot()
+    private var lastRefresh = Date.distantPast
+    private var refreshing = false
+
+    func begin(operation: UInt64, desired: UInt64?, phase: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        operationRevision = operation
+        observation = UUID()
+        value.phase = phase
+        value.observed = true
+        value.message = nil
+        value.dnsMessage = nil
+        value.dnsPhase = phase == "stopping" ? "stopping" : "waiting"
+        if let desired { value.desiredRevision = desired }
+    }
+
+    func update(
+        operation: UInt64, observation expectedObservation: UUID? = nil,
+        _ change: (inout HostRuntimeSnapshot) -> Void
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard operationRevision == operation else { return }
+        if let expectedObservation, observation != expectedObservation { return }
+        change(&value)
+    }
+
+    func observation(for operation: UInt64) -> UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return operationRevision == operation ? observation : nil
+    }
+
+    func snapshot() -> HostRuntimeSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func requestRefresh() -> (operation: UInt64, observation: UUID)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !refreshing, Date().timeIntervalSince(lastRefresh) >= 2,
+              ["running", "disabled", "failed"].contains(value.phase) else { return nil }
+        refreshing = true
+        lastRefresh = Date()
+        return (operationRevision, observation)
+    }
+
+    func finishRefresh(operation: UInt64, observation expectedObservation: UUID) {
+        lock.lock()
+        refreshing = false
+        if operationRevision == operation && observation == expectedObservation { value.observed = true }
+        lock.unlock()
+    }
+
+    func invalidate(operation: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard operationRevision == operation else { return }
+        operationRevision = 0
+        observation = UUID()
+        value.phase = "disabled"
+        value.dnsPhase = "unknown"
+        value.observed = false
+        value.appliedRevision = nil
+        value.desiredRevision = 0
+        value.message = "其他入口更新了接管配置，正在读取运行状态"
+        value.dnsMessage = nil
+        lastRefresh = .distantPast
+    }
+}
+
+/// Serialize side effects, but cancel approval/connection waits immediately.
+/// Each step checks cancellation; a late authorization callback cannot restart
+/// an operation superseded by disable or another configuration.
+private final class HostOperations: @unchecked Sendable {
+    static let shared = HostOperations()
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var latestRevision: UInt64 = 0
+    private var intent: HostSharedIntent?
+
+    func submit(
+        revision: UInt64,
+        desired: UInt64?,
+        phase: String,
+        operation: @escaping @Sendable (HostSharedIntent) async throws -> Void
+    ) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard revision > latestRevision else { return false }
+        let intent = try HostSharedIntent.issue()
+        self.intent = intent
+        latestRevision = revision
+        let previous = task
+        previous?.cancel()
+        HostRuntime.shared.begin(operation: revision, desired: desired, phase: phase)
+        task = Task {
+            await previous?.value
+            do {
+                try intent.check()
+                try await operation(intent)
+            } catch is CancellationError {
+                // A newer queued operation owns cleanup and the visible state.
+            } catch {
+                HostRuntime.shared.update(operation: revision) {
+                    $0.phase = "failed"
+                    $0.message = error.localizedDescription
+                }
+                AppLog.error("ne-host", "operation failed: \(error.localizedDescription)")
+            }
+        }
+        return true
+    }
+
+    func synchronizeIntent() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let intent, !intent.isCurrent else { return }
+        task?.cancel()
+        self.intent = nil
+        HostRuntime.shared.invalidate(operation: latestRevision)
+    }
 }
 
 private actor HostController {
@@ -43,12 +270,11 @@ private actor HostController {
     private var lastSocksPort: UInt16?
     private var lastUsername: String?
     private var lastPassword: String?
+    private var dnsConfigurationError: (intent: HostSharedIntent, message: String)?
 
-    func enable(json: String) async throws -> HostEnableOutcome {
-        let request = try JSONDecoder().decode(
-            HostEnableRequest.self,
-            from: Data(json.utf8)
-        )
+    func enable(_ request: HostEnableRequest, intent: HostSharedIntent) async throws {
+        let operation = request.operationRevision
+        dnsConfigurationError = nil
         let endpoints = try routeEndpoints(from: request)
         let activationIdentifier = UUID()
         let configurations = try providerConfigurations(
@@ -56,104 +282,187 @@ private actor HostController {
             endpoints: endpoints,
             activationIdentifier: activationIdentifier
         )
-        AppLog.info(
-            "ne-host",
-            "enable revision=\(request.revision) socks=\(request.socksPort) rules=\(request.processRules.count)"
-        )
-        let outcome = try await systemExtension.activate()
-        if case .requiresReboot = outcome {
-            AppLog.warn("ne-host", "system extension requires reboot")
-            return .requiresReboot
+        try intent.check()
+        let outcome = try await systemExtension.activate {
+            guard intent.isCurrent else { return }
+            HostRuntime.shared.update(operation: operation) { $0.phase = "waitingApproval" }
         }
-        let canLiveUpdate = await transparentProxy.isConnected()
+        try intent.check()
+        if case .requiresReboot = outcome {
+            HostRuntime.shared.update(operation: operation) {
+                $0.phase = "requiresReboot"
+                $0.dnsPhase = "unknown"
+            }
+            return
+        }
+        let sideEffects = try await HostSideEffectLock.acquire(for: intent)
+        defer { withExtendedLifetime(sideEffects) {} }
+        try intent.check()
+        HostRuntime.shared.update(operation: operation) { $0.phase = "requesting" }
+        let connected = await transparentProxy.isConnected()
+        try intent.check()
+        let canLiveUpdate = connected
             && lastSocksPort == request.socksPort
             && lastUsername == request.username
             && lastPassword == request.password
             && preservesRouteEndpoints(lastEndpoints, endpoints)
+        var applied = false
         if canLiveUpdate {
             do {
                 try await transparentProxy.configureAndApplyRunning(
                     configurations.transparent,
                     revision: request.revision
                 )
-                try await transparentProxy.prepareDNS(
-                    revision: request.revision,
-                    activationIdentifier: activationIdentifier,
-                    bootstrap: configurations.dnsBootstrap
-                )
-                do {
-                    try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
-                } catch {
-                    try? await dnsProxy.disable()
-                    try? await transparentProxy.stop()
-                    throw error
-                }
-                remember(request, endpoints: endpoints)
-                AppLog.info("ne-host", "system extension running")
-                return .running
+                try intent.check()
+                applied = true
             } catch {
-                try? await dnsProxy.disable()
-                try? await transparentProxy.stop()
-                try await transparentProxy.configure(configurations.transparent)
-                try await transparentProxy.start()
-                try await transparentProxy.prepareDNS(
-                    revision: request.revision,
-                    activationIdentifier: activationIdentifier,
-                    bootstrap: configurations.dnsBootstrap
-                )
-                do {
-                    try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
-                } catch {
-                    try? await dnsProxy.disable()
-                    try? await transparentProxy.stop()
-                    throw error
-                }
-                remember(request, endpoints: endpoints)
-                AppLog.info("ne-host", "system extension running")
-                return .running
+                try intent.check()
+                AppLog.warn("ne-host", "live capture update failed; restarting provider")
             }
         }
-        try? await dnsProxy.disable()
-        try? await transparentProxy.stop()
-        try await transparentProxy.configure(configurations.transparent)
-        try await transparentProxy.start()
+        if !applied {
+            try await dnsProxy.disable()
+            try intent.check()
+            try await transparentProxy.stop()
+            try intent.check()
+            try await transparentProxy.configure(configurations.transparent)
+            try intent.check()
+            try await transparentProxy.start()
+            try intent.check()
+        }
+        lastEndpoints = endpoints
+        lastSocksPort = request.socksPort
+        lastUsername = request.username
+        lastPassword = request.password
+        HostRuntime.shared.update(operation: operation) {
+            $0.phase = "requesting"
+            $0.appliedRevision = request.revision
+            $0.dnsPhase = "waiting"
+        }
         do {
             try await transparentProxy.prepareDNS(
                 revision: request.revision,
                 activationIdentifier: activationIdentifier,
                 bootstrap: configurations.dnsBootstrap
             )
+            try intent.check()
             try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
+            try intent.check()
+            // Saving DNS preferences is not a runtime acknowledgement.
         } catch {
-            try? await dnsProxy.disable()
-            try? await transparentProxy.stop()
-            throw error
+            try intent.check()
+            HostRuntime.shared.update(operation: operation) {
+                $0.dnsPhase = "failed"
+                $0.dnsMessage = error.localizedDescription
+            }
+            dnsConfigurationError = (intent, error.localizedDescription)
         }
-        remember(request, endpoints: endpoints)
-        AppLog.info("ne-host", "system extension running")
-        return .running
+        HostRuntime.shared.update(operation: operation) { $0.phase = "running" }
+        if let observation = HostRuntime.shared.observation(for: operation) {
+            await refreshStatus(operation: operation, observation: observation)
+        }
     }
 
-    func disable() async throws {
-        AppLog.info("ne-host", "disable")
+    func disable(operation: UInt64, intent: HostSharedIntent) async throws {
+        let sideEffects = try await HostSideEffectLock.acquire(for: intent)
+        defer { withExtendedLifetime(sideEffects) {} }
+        try intent.check()
         var firstError: Error?
         do { try await dnsProxy.disable() } catch { firstError = error }
+        try intent.check()
         do { try await transparentProxy.stop() } catch { if firstError == nil { firstError = error } }
+        try intent.check()
         lastEndpoints = []
         lastSocksPort = nil
         lastUsername = nil
         lastPassword = nil
+        dnsConfigurationError = nil
         if let firstError { throw firstError }
+        HostRuntime.shared.update(operation: operation) {
+            $0.phase = "disabled"
+            $0.dnsPhase = "disabled"
+            $0.appliedRevision = nil
+        }
     }
 
-    private func remember(
-        _ request: HostEnableRequest,
-        endpoints: [MihomoRouteProxyEndpoint]
-    ) {
-        lastEndpoints = endpoints
-        lastSocksPort = request.socksPort
-        lastUsername = request.username
-        lastPassword = request.password
+    func refreshStatus(operation: UInt64, observation: UUID) async {
+        do {
+            let connected = try await transparentProxy.connectionStatus()
+            guard connected else {
+                HostRuntime.shared.update(operation: operation, observation: observation) {
+                    if $0.phase == "running" {
+                        $0.phase = "failed"
+                        $0.message = "系统接管连接已断开"
+                    }
+                    // A disconnected transparent provider cannot prove whether
+                    // an independently managed DNS provider is running.
+                    if $0.dnsPhase != "disabled" { $0.dnsPhase = "unknown" }
+                }
+                return
+            }
+            let response = try await transparentProxy.runtimeStatus()
+            HostRuntime.shared.update(operation: operation, observation: observation) {
+                guard ["running", "disabled", "failed"].contains($0.phase) else { return }
+                guard response.running && response.captureEnabled else {
+                    $0.phase = "failed"
+                    $0.message = "系统接管 Provider 尚未就绪"
+                    $0.dnsPhase = "unknown"
+                    return
+                }
+                let externalChange = $0.appliedRevision != nil && $0.appliedRevision != response.revision
+                $0.phase = "running"
+                $0.message = externalChange ? "运行配置已由其他入口更新" : nil
+                $0.appliedRevision = response.revision
+                if $0.desiredRevision == 0 { $0.desiredRevision = response.revision }
+                if let dnsConfigurationError, dnsConfigurationError.intent.isCurrent {
+                    $0.dnsPhase = "failed"
+                    $0.dnsMessage = dnsConfigurationError.message
+                    return
+                }
+                guard let report = response.dnsRuntimeReport else {
+                    $0.dnsPhase = "waiting"
+                    return
+                }
+                let revision = response.revision
+                let activation = report.expectedActivationIdentifier
+                guard report.expectedRevision == revision else {
+                    $0.dnsPhase = "unknown"
+                    $0.dnsMessage = "DNS 运行报告属于旧配置"
+                    return
+                }
+                if let failure = report.startupFailure {
+                    $0.dnsPhase = "failed"
+                    $0.dnsMessage = "DNS 启动失败：\(failure.reason.rawValue)"
+                    return
+                }
+                guard let status = report.status else {
+                    $0.dnsPhase = "waiting"
+                    return
+                }
+                do {
+                    try status.validate(expectedRevision: revision, activationIdentifier: activation)
+                    switch status.phase {
+                    case .running:
+                        $0.dnsPhase = status.backendReady ? "running" : "waiting"
+                    case .starting: $0.dnsPhase = "waiting"
+                    case .stopping: $0.dnsPhase = "stopping"
+                    case .stopped: $0.dnsPhase = "disabled"
+                    case .failed: $0.dnsPhase = "failed"
+                    }
+                    $0.dnsMessage = status.failureCategory?.rawValue
+                } catch {
+                    $0.dnsPhase = "unknown"
+                    $0.dnsMessage = "DNS 运行报告已过期或与当前配置不符"
+                }
+            }
+        } catch {
+            HostRuntime.shared.update(operation: operation, observation: observation) {
+                guard ["running", "disabled", "failed"].contains($0.phase) else { return }
+                $0.phase = "failed"
+                $0.message = "无法读取系统接管 Provider 状态"
+                $0.dnsPhase = "unknown"
+            }
+        }
     }
 }
 
@@ -212,125 +521,94 @@ private func captureSnapshot(
     from request: HostEnableRequest
 ) throws -> CaptureConfigurationSnapshot {
     var rules: [CaptureRule] = []
-    var priority = 10
     let gfwDestinations = gfwDestinationMatchers(request.gfwDomains)
-    for (index, rule) in request.processRules.enumerated() {
-        let sources = sourceMatchers(from: rule.pattern)
-        guard !sources.isEmpty else { continue }
-        if let group = gfwGroup(via: rule.via) {
-            if !gfwDestinations.isEmpty {
-                rules.append(
-                    try CaptureRule(
-                        id: "process-gfw-\(index)",
-                        enabled: true,
-                        priority: priority,
-                        sources: sources,
-                        destinations: gfwDestinations,
-                        protocols: [],
-                        portRanges: [],
-                        action: captureAction(via: group),
-                        unavailableFallback: captureFallback(via: group)
-                    )
-                )
-            }
-            rules.append(
-                try CaptureRule(
-                    id: "process-gfw-rest-\(index)",
-                    enabled: true,
-                    priority: priority + 1,
-                    sources: sources,
-                    destinations: [],
-                    protocols: [],
-                    portRanges: [],
-                    action: .direct,
-                    unavailableFallback: .direct
-                )
-            )
-        } else {
-            rules.append(
-                try CaptureRule(
-                    id: "process-\(index)",
-                    enabled: true,
-                    priority: priority,
-                    sources: sources,
-                    destinations: [],
-                    protocols: [],
-                    portRanges: [],
-                    action: captureAction(via: rule.via),
-                    unavailableFallback: captureFallback(via: rule.via)
-                )
-            )
-        }
-        priority += 10
-    }
-    for (index, rule) in request.destRules.enumerated() {
-        let destinations = destinationMatchers(kind: rule.kind, value: rule.value)
-        guard !destinations.isEmpty else { continue }
-        if let group = gfwGroup(via: rule.via) {
-            let hits = request.gfwDomains.compactMap { domain -> DestinationMatcher? in
-                guard domainMatches(kind: rule.kind, value: rule.value, domain: domain) else {
-                    return nil
-                }
-                return try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: domain))
-            }
-            if !hits.isEmpty {
-                rules.append(
-                    try CaptureRule(
-                        id: "dest-gfw-\(index)",
-                        enabled: true,
-                        priority: priority,
-                        sources: [],
-                        destinations: hits,
-                        protocols: [],
-                        portRanges: [],
-                        action: captureAction(via: group),
-                        unavailableFallback: captureFallback(via: group)
-                    )
-                )
-            }
-            rules.append(
-                try CaptureRule(
-                    id: "dest-gfw-rest-\(index)",
-                    enabled: true,
-                    priority: priority + 1,
-                    sources: [],
-                    destinations: destinations,
-                    protocols: [],
-                    portRanges: [],
-                    action: .direct,
-                    unavailableFallback: .direct
-                )
-            )
-        } else {
-            rules.append(
-                try CaptureRule(
-                    id: "dest-\(index)",
-                    enabled: true,
-                    priority: priority,
-                    sources: [],
-                    destinations: destinations,
-                    protocols: [],
-                    portRanges: [],
-                    action: captureAction(via: rule.via),
-                    unavailableFallback: captureFallback(via: rule.via)
-                )
-            )
-        }
-        priority += 10
-    }
-    rules.append(
-        try CaptureRule(
-            id: "default-profile-rules",
-            enabled: true,
-            priority: 10_000,
-            sources: [],
-            destinations: [],
-            protocols: [],
-            portRanges: [],
-            action: .mihomo(.profileRules),
-            unavailableFallback: .direct
+    let needsGFW = request.processRules.contains { gfwGroup(via: $0.via) != nil }
+        || request.destRules.contains { gfwGroup(via: $0.via) != nil }
+    if needsGFW && gfwDestinations.isEmpty {
+        throw NetworkExtensionControlFailure(
+            operation: .configureTransparentProxy,
+            message: "GFWList 不可用，无法应用新接管配置"
         )
-    )
+    }
+
+    func append(
+        _ id: String,
+        sources: [SourceMatcher] = [],
+        destinations: [DestinationMatcher] = [],
+        via: String
+    ) throws {
+        rules.append(try CaptureRule(
+            id: id,
+            priority: rules.count,
+            sources: sources,
+            destinations: destinations,
+            action: captureAction(via: via),
+            unavailableFallback: captureFallback(via: via)
+        ))
+    }
+
+    enum OrderedInput {
+        case process(Int, HostEnableRequest.ProcessRule)
+        case destination(Int, HostEnableRequest.DestRule)
+        var order: UInt64 {
+            switch self {
+            case .process(_, let rule): rule.order
+            case .destination(_, let rule): rule.order
+            }
+        }
+    }
+    let inputs = request.processRules.enumerated().map { OrderedInput.process($0.offset, $0.element) }
+        + request.destRules.enumerated().map { OrderedInput.destination($0.offset, $0.element) }
+    let ordered = inputs.enumerated().sorted {
+        if $0.element.order == $1.element.order { return $0.offset < $1.offset }
+        return $0.element.order < $1.element.order
+    }
+    for input in ordered.map(\.element) {
+        switch input {
+        case .process(let index, let rule):
+            let sources = sourceMatchers(from: rule.pattern)
+            guard !sources.isEmpty else {
+                throw NetworkExtensionControlFailure(
+                    operation: .configureTransparentProxy, message: "无效的应用匹配条件"
+                )
+            }
+            if let group = gfwGroup(via: rule.via) {
+                try append("process-gfw-\(index)", sources: sources,
+                           destinations: gfwDestinations, via: group)
+                try append("process-gfw-rest-\(index)", sources: sources, via: "DIRECT")
+            } else {
+                try append("process-\(index)", sources: sources, via: rule.via)
+            }
+        case .destination(let index, let rule):
+            let destinations = destinationMatchers(kind: rule.kind, value: rule.value)
+            guard !destinations.isEmpty else {
+                throw NetworkExtensionControlFailure(
+                    operation: .configureTransparentProxy, message: "无效的目标匹配条件"
+                )
+            }
+            if let group = gfwGroup(via: rule.via) {
+                guard rule.kind != "cidr" else {
+                    throw NetworkExtensionControlFailure(
+                        operation: .configureTransparentProxy,
+                        message: "GFWList 无法与网段规则求交"
+                    )
+                }
+                let hits = try gfwIntersection(kind: rule.kind, value: rule.value, domains: request.gfwDomains)
+                if !hits.isEmpty {
+                    try append("dest-gfw-\(index)", destinations: hits, via: group)
+                }
+                try append("dest-gfw-rest-\(index)", destinations: destinations, via: "DIRECT")
+            } else {
+                try append("dest-\(index)", destinations: destinations, via: rule.via)
+            }
+        }
+    }
+    rules.append(try CaptureRule(
+        id: "default-profile-rules",
+        priority: rules.count,
+        action: .mihomo(.profileRules),
+        unavailableFallback: .direct
+    ))
     return try CaptureConfigurationSnapshot(revision: request.revision, rules: rules)
 }
 
@@ -374,25 +652,57 @@ private func destinationMatchers(kind: String, value: String) -> [DestinationMat
     }
 }
 
-private func domainMatches(kind: String, value: String, domain: String) -> Bool {
-    let domain = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+/// Intersect the user's condition with suffix entries without replacing a
+/// precise subdomain by its broader GFW parent. Keyword masks use the existing
+/// native matcher, including occurrences spanning the suffix boundary.
+private func gfwIntersection(
+    kind: String, value: String, domains: [String]
+) throws -> [DestinationMatcher] {
     let value = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard !domain.isEmpty, !value.isEmpty else { return false }
-    switch kind {
-    case "keyword":
-        return domain.contains(value)
-    case "suffix":
-        let suffix = value.trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        return domain == suffix || domain.hasSuffix(".\(suffix)")
-    case "domain":
-        if value.hasPrefix("*.") {
-            let suffix = String(value.dropFirst(2))
-            return domain == suffix || domain.hasSuffix(".\(suffix)")
-        }
-        return domain == value || domain.hasSuffix(".\(value)")
-    default:
-        return false
+        .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    guard !value.isEmpty else { return [] }
+    var result: [DestinationMatcher] = []
+    var seen = Set<DestinationMatcher>()
+    func add(_ matcher: DestinationMatcher) {
+        if seen.insert(matcher).inserted { result.append(matcher) }
     }
+    func within(_ host: String, _ suffix: String) -> Bool {
+        host == suffix || host.hasSuffix(".\(suffix)")
+    }
+    for rawDomain in domains {
+        let domain = rawDomain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        switch kind {
+        case "domain" where !value.hasPrefix("*."):
+            if within(value, domain) {
+                add(try .host(HostMatcher(kind: .exact, value: value)))
+            }
+        case "domain", "suffix":
+            let suffix = value.hasPrefix("*.") ? String(value.dropFirst(2)) : value
+            if within(suffix, domain) {
+                add(try .host(HostMatcher(kind: .suffix, value: suffix)))
+            } else if within(domain, suffix) {
+                add(try .host(HostMatcher(kind: .suffix, value: domain)))
+            }
+        case "keyword":
+            if domain.contains(value) {
+                add(try .host(HostMatcher(kind: .suffix, value: domain)))
+            } else {
+                add(try .hostPattern(HostPatternMatcher(pattern: "*\(value)*.\(domain)")))
+                let boundary = ".\(domain)"
+                let maximumOverlap = min(value.count - 1, boundary.count)
+                if maximumOverlap > 0 {
+                    for count in 1...maximumOverlap where value.suffix(count) == boundary.prefix(count) {
+                        add(try .hostPattern(HostPatternMatcher(
+                            pattern: "*\(value.dropLast(count))\(boundary)"
+                        )))
+                    }
+                }
+            }
+        default:
+            break
+        }
+    }
+    return result
 }
 
 private func sourceMatchers(from raw: String) -> [SourceMatcher] {
@@ -520,49 +830,32 @@ private func duplicateString(_ value: String) -> UnsafeMutablePointer<CChar> {
     return pointer
 }
 
-private func runBlocking<T: Sendable>(
-    _ operation: @escaping @Sendable () async throws -> T
-) throws -> T {
-    let semaphore = DispatchSemaphore(value: 0)
-    let box = BlockingResult<T>()
-    Task {
-        do {
-            box.set(.success(try await operation()))
-        } catch {
-            box.set(.failure(error))
-        }
-        semaphore.signal()
-    }
-    semaphore.wait()
-    return try box.get()
-}
-
-private final class BlockingResult<T: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: Result<T, Error>?
-
-    func set(_ value: Result<T, Error>) {
-        lock.lock()
-        self.value = value
-        lock.unlock()
-    }
-
-    func get() throws -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let value else {
-            throw NetworkExtensionControlFailure(
-                operation: .configureTransparentProxy,
-                message: "Host controller returned no result"
-            )
-        }
-        return try value.get()
-    }
-}
-
 @_cdecl("myproxy_ne_free_string")
 public func myproxy_ne_free_string(_ value: UnsafeMutablePointer<CChar>?) {
     value?.deallocate()
+}
+
+@_cdecl("myproxy_ne_validate")
+public func myproxy_ne_validate(
+    _ json: UnsafePointer<CChar>?,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    errorOut?.pointee = nil
+    guard let json else {
+        errorOut?.pointee = duplicateString("missing Network Extension configuration")
+        return -1
+    }
+    do {
+        let request = try JSONDecoder().decode(
+            HostEnableRequest.self, from: Data(String(cString: json).utf8)
+        )
+        _ = try captureSnapshot(from: request)
+        _ = try routeEndpoints(from: request)
+        return 0
+    } catch {
+        errorOut?.pointee = duplicateString(error.localizedDescription)
+        return -1
+    }
 }
 
 @_cdecl("myproxy_ne_enable")
@@ -575,19 +868,26 @@ public func myproxy_ne_enable(
         errorOut?.pointee = duplicateString("missing Network Extension configuration")
         return -1
     }
-    let payload = String(cString: json)
     do {
-        let outcome = try runBlocking {
-            try await HostController.shared.enable(json: payload)
+        let request = try JSONDecoder().decode(
+            HostEnableRequest.self, from: Data(String(cString: json).utf8)
+        )
+        // Validate before scheduling side effects or cancelling a working plan.
+        _ = try captureSnapshot(from: request)
+        _ = try routeEndpoints(from: request)
+        let submitted = try HostOperations.shared.submit(
+            revision: request.operationRevision,
+            desired: request.revision,
+            phase: "requesting"
+        ) { intent in
+            try await HostController.shared.enable(request, intent: intent)
         }
-        switch outcome {
-        case .running:
-            return 0
-        case .requiresReboot:
-            return 2
+        if !submitted {
+            errorOut?.pointee = duplicateString("系统接管操作已被更新请求取代")
+            return -1
         }
+        return 1
     } catch {
-        AppLog.error("ne-host", "enable failed: \(error.localizedDescription)")
         errorOut?.pointee = duplicateString(error.localizedDescription)
         return -1
     }
@@ -595,17 +895,51 @@ public func myproxy_ne_enable(
 
 @_cdecl("myproxy_ne_disable")
 public func myproxy_ne_disable(
+    _ operationRevision: UInt64,
     _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     errorOut?.pointee = nil
     do {
-        try runBlocking {
-            try await HostController.shared.disable()
+        let submitted = try HostOperations.shared.submit(
+            revision: operationRevision, desired: nil, phase: "stopping"
+        ) { intent in
+            try await HostController.shared.disable(operation: operationRevision, intent: intent)
         }
-        return 0
+        if !submitted {
+            errorOut?.pointee = duplicateString("系统接管操作已被更新请求取代")
+            return -1
+        }
+        return 1
     } catch {
-        AppLog.error("ne-host", "disable failed: \(error.localizedDescription)")
         errorOut?.pointee = duplicateString(error.localizedDescription)
         return -1
     }
+}
+
+@_cdecl("myproxy_ne_status")
+public func myproxy_ne_status() -> UnsafeMutablePointer<CChar>? {
+    HostOperations.shared.synchronizeIntent()
+    if let refresh = HostRuntime.shared.requestRefresh() {
+        Task {
+            await HostController.shared.refreshStatus(
+                operation: refresh.operation, observation: refresh.observation
+            )
+            HostRuntime.shared.finishRefresh(
+                operation: refresh.operation, observation: refresh.observation
+            )
+        }
+    }
+    guard let data = try? JSONEncoder().encode(HostRuntime.shared.snapshot()),
+          let json = String(data: data, encoding: .utf8) else { return nil }
+    return duplicateString(json)
+}
+
+/// CLI waits service the native run loop so preference/authorization callbacks
+/// can complete before the command exits. GUI reads use myproxy_ne_status only.
+@_cdecl("myproxy_ne_wait")
+public func myproxy_ne_wait(_ milliseconds: UInt32) {
+    let deadline = Date().addingTimeInterval(Double(min(milliseconds, 100)) / 1000)
+    RunLoop.current.run(until: deadline)
+    let remaining = deadline.timeIntervalSinceNow
+    if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
 }
