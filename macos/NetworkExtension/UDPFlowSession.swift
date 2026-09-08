@@ -335,6 +335,11 @@ final class UDPFlowSession: @unchecked Sendable {
                         record,
                         note: "The requested Mihomo UDP route had no route-specific listener, so this destination used the rule's Direct fallback."
                     )
+                case .profileRules:
+                    configureDirect(
+                        record,
+                        note: "The requested Mihomo UDP group listener was unavailable; this destination used the original path because profile-rules could not be selected here."
+                    )
                 case .reject:
                     publishRejection(
                         record,

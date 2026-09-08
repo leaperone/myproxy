@@ -29,7 +29,7 @@ public struct ApplicationIdentifierPatternMatcher: Codable, Hashable, Sendable {
 
     public init(pattern: String) throws {
         let normalized = pattern.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let allowedPunctuation: Set<Character> = [".", "-", "_", "*", "?", " "]
+        let allowedPunctuation: Set<Character> = [".", "-", "_", "*", "?", " ", "(", ")", "'"]
         guard !normalized.isEmpty,
               normalized.utf8.count <= 255,
               normalized.contains(where: { $0 != "*" && $0 != "?" && $0 != " " }),
@@ -400,6 +400,8 @@ public enum CaptureAction: Codable, Hashable, Sendable {
 public enum UnavailableFallback: String, Codable, Hashable, Sendable {
     case direct
     case reject
+    /// Own the flow on the profile-rules SOCKS inbound so mihomo YAML still applies.
+    case profileRules
 }
 
 public struct CaptureRule: Codable, Hashable, Identifiable, Sendable {

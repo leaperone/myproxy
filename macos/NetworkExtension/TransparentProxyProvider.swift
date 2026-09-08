@@ -585,6 +585,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 activityObserver: relayObserver(for: plan.activity.flowIdentifier)
             )
             return true
+        case .profileRules:
+            recordDirectRelayUnavailable(plan.activity)
+            return false
         case .reject:
             let error = NSError(
                 domain: "local.harry.myproxy.network-extension",
