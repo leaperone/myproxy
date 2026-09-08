@@ -97,7 +97,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
         .with_icon(template_icon())
         .with_icon_as_template(true)
         .with_menu(Box::new(menu))
-        .with_menu_on_left_click(true)
+        .with_menu_on_left_click(false)
         .build()?;
     Ok(TrayKeepAlive {
         tray,
@@ -179,8 +179,7 @@ fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
     else {
         return;
     };
-    // Left click is handled by tray-icon itself and opens the menu.
-    let _ = cx;
+    crate::show_main_window(cx);
 }
 
 fn handle_menu_event(event: MenuEvent, cx: &mut App, displayed_connected: bool) {
