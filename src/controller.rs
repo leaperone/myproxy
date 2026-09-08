@@ -375,12 +375,12 @@ pub fn fetch_totals(mixed_port: u16) -> Result<TrafficTotals> {
 
 pub fn close_one(mixed_port: u16, id: &str) -> Result<()> {
     if id.is_empty() {
-        return Ok(());
+        bail!("connection id is empty");
     }
     let url = format!(
         "http://127.0.0.1:{}/connections/{}",
         controller_port(mixed_port),
-        id
+        encode_path_segment(id)
     );
     ureq::delete(&url)
         .timeout(FETCH_TIMEOUT)
@@ -404,16 +404,12 @@ pub fn close_all(mixed_port: u16) -> Result<()> {
 }
 
 pub fn probe(mixed_port: u16, group_name: &str) -> Result<String> {
+    if group_name == "DIRECT" || group_name == "REJECT" {
+        ready(mixed_port)?;
+        return Ok(group_name.into());
+    }
     let groups = fetch_proxies(mixed_port)?;
-    let group = groups
-        .iter()
-        .find(|group| group.name == group_name)
-        .or_else(|| groups.iter().find(|group| group.name == "PROXY"))
-        .or_else(|| {
-            groups
-                .iter()
-                .find(|group| group.name.eq_ignore_ascii_case("default"))
-        });
+    let group = groups.iter().find(|group| group.name == group_name);
     match group {
         Some(group) if !group.now.trim().is_empty() => {
             let now = group.now.clone();
@@ -421,8 +417,19 @@ pub fn probe(mixed_port: u16, group_name: &str) -> Result<String> {
             Ok(now)
         }
         Some(group) => bail!("group {} has no now", group.name),
-        None => bail!("proxy group missing"),
+        None => bail!("proxy group missing: {group_name}"),
     }
+}
+
+pub fn ready(mixed_port: u16) -> Result<()> {
+    let url = format!("http://127.0.0.1:{}/version", controller_port(mixed_port));
+    let body = authorized_get(&url, FETCH_TIMEOUT).context("Mihomo controller unavailable")?;
+    let version: Value =
+        serde_json::from_str(&body).context("invalid Mihomo controller response")?;
+    if version.get("version").and_then(Value::as_str).is_none() {
+        bail!("Mihomo controller did not report its version");
+    }
+    Ok(())
 }
 
 pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
@@ -466,7 +473,21 @@ pub fn fetch_live(mixed_port: u16, need: LiveNeed) -> Result<LiveSnapshot> {
 
 pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {
     if group.is_empty() || name.is_empty() {
-        return Ok(());
+        bail!("proxy group and member are required");
+    }
+    let groups = fetch_proxies(mixed_port)?;
+    let live = groups
+        .iter()
+        .find(|candidate| candidate.name == group)
+        .with_context(|| format!("proxy group missing: {group}"))?;
+    if live.kind != "selector" {
+        bail!("proxy group {group} is automatic and cannot be selected manually");
+    }
+    if group != GLOBAL_GROUP && name == "REJECT" {
+        bail!("proxy group {group} has no usable nodes");
+    }
+    if !live.members.iter().any(|member| member.name == name) {
+        bail!("proxy member {name} is not in group {group}");
     }
     let url = format!(
         "http://127.0.0.1:{}/proxies/{}",
@@ -480,6 +501,16 @@ pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {
         .set("Content-Type", "application/json")
         .send_string(&body)
         .with_context(|| format!("PUT proxy {group} :{}", controller_port(mixed_port)))?;
+    let updated = fetch_proxies(mixed_port)?
+        .into_iter()
+        .find(|candidate| candidate.name == group)
+        .with_context(|| format!("proxy group disappeared after selecting: {group}"))?;
+    if updated.now != name {
+        bail!(
+            "proxy selection was not applied: {group} remains {}",
+            updated.now
+        );
+    }
     log::info("controller", format!("select {group} -> {name}"));
     Ok(())
 }
@@ -518,15 +549,53 @@ pub fn selection_restores(strategy: &Strategy) -> Vec<(&str, &str)> {
     out
 }
 
-pub fn restore_selections(mixed_port: u16, strategy: &Strategy) {
-    for (group, pick) in selection_restores(strategy) {
-        if let Err(err) = select_proxy(mixed_port, group, pick) {
-            log::debug(
-                "controller",
-                format!("restore {group} -> {pick}: {err:#}"),
-            );
-        }
+pub fn restore_selections(mixed_port: u16, strategy: &Strategy) -> Result<Vec<String>> {
+    let mut restores = selection_restores(strategy);
+    let global_default = crate::compile::default_group(strategy);
+    if strategy.global_selected.trim().is_empty()
+        && (strategy.mixed_mode == crate::strategy::InboundMode::Global
+            || (strategy.system_extension
+                && strategy.extension_mode == crate::strategy::InboundMode::Global))
+    {
+        restores.push((GLOBAL_GROUP, global_default));
     }
+    let groups = fetch_proxies(mixed_port)?;
+    let mut notes = Vec::new();
+    for (group, pick) in restores {
+        let live = groups
+            .iter()
+            .find(|live| live.name == group)
+            .with_context(|| format!("cannot restore missing proxy group: {group}"))?;
+        let valid = live.members.iter().any(|member| member.name == pick);
+        let replacement = if valid {
+            Some(pick)
+        } else if group == GLOBAL_GROUP {
+            live.members
+                .iter()
+                .find(|member| member.name == global_default && member.name != "DIRECT")
+                .map(|member| member.name.as_str())
+        } else {
+            live.members
+                .iter()
+                .find(|member| member.name != "DIRECT" && member.name != "REJECT")
+                .map(|member| member.name.as_str())
+        };
+        let Some(replacement) = replacement else {
+            if group != GLOBAL_GROUP && live.now == "REJECT" {
+                notes.push(format!("节点组 {group} 为空，历史选择无法恢复"));
+                continue;
+            }
+            bail!(
+                "cannot restore {group}: requested member is missing and no valid default exists"
+            );
+        };
+        if !valid {
+            notes.push(format!("{group} 的历史选择已失效，已选择 {replacement}"));
+        }
+        select_proxy(mixed_port, group, replacement)
+            .with_context(|| format!("restore proxy selection for {group}"))?;
+    }
+    Ok(notes)
 }
 
 pub fn reload(mixed_port: u16) -> Result<()> {
@@ -554,6 +623,7 @@ impl LiveGroup {
         let members = raw
             .all
             .iter()
+            .filter(|member| name == GLOBAL_GROUP || member.as_str() != "REJECT")
             .map(|member| LiveMember {
                 name: member.clone(),
                 delay: all.get(member).and_then(latest_delay),

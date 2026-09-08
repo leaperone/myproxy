@@ -4,4 +4,21 @@ base_branch = "main"
 name = "Rust"
 prefix = "src/"
 check = "cargo check --quiet"
-build = "cargo build --quiet"
+build = "cargo build --quiet --bins --features sparkle"
+
+[[scope]]
+name = "Network Extension"
+prefix = "macos/"
+build = "scripts/build-network-extension.sh"
+
+[[scope]]
+name = "Preflight configuration"
+prefix = ".preflight.toml"
+# Parsed as part of preflight Phase 0; this file has no build artifact.
+
+[[domain_check]]
+name = "Existing pure Rust checks"
+trigger_paths = ["src/**"]
+# Isolate logs/state and exclude cases that fetch a remote list.
+# Signed app and network checks remain separate from local unit checks.
+command = 'MYPROXY_DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/myproxy-preflight.XXXXXX")" cargo test --quiet --lib -- --skip network_extension::tests::gfw_via_requests_group_and_keeps_prefix --skip compile::tests::gfwlist_runtime_passes_mihomo_test'

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,20 +9,24 @@ use tray_icon::{
     TrayIconEvent,
 };
 
+use myproxy::network_extension;
 use myproxy::strategy::Strategy;
-use myproxy::supervisor::Supervisor;
+use myproxy::supervisor::{OperationState, Supervisor};
+
+static DISPATCHING: AtomicBool = AtomicBool::new(false);
 
 struct TrayKeepAlive {
     tray: TrayIcon,
     status: MenuItem,
     toggle: MenuItem,
+    apply: MenuItem,
 }
 
 impl Global for TrayKeepAlive {}
 
 #[derive(Clone, PartialEq, Eq)]
 struct MenuFace {
-    connected: bool,
+    busy: bool,
     status: String,
     action: String,
     tooltip: String,
@@ -36,12 +41,39 @@ pub fn install(cx: &mut App) {
         }
         Err(err) => myproxy::log::warn("tray", format!("menu bar icon failed: {err:#}")),
     }
+    let observed = Arc::new(Mutex::new(initial.clone()));
+    let health_face = observed.clone();
+    // Health work may recover the core; event consumption runs independently.
+    cx.spawn(async move |cx| loop {
+        let health_face = health_face.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if !Supervisor::shared().is_busy() {
+                    if let Ok(strategy) = Strategy::load() {
+                        Supervisor::shared().observe(&strategy);
+                    }
+                }
+                *health_face.lock().expect("tray observed face") = menu_face();
+            })
+            .await;
+        cx.background_executor()
+            .timer(Duration::from_millis(1500))
+            .await;
+    })
+    .detach();
     let last = Arc::new(Mutex::new(initial));
     cx.spawn(async move |cx| loop {
         cx.background_executor()
-            .timer(Duration::from_millis(1000))
+            .timer(Duration::from_millis(100))
             .await;
-        let face = cx.background_executor().spawn(async { menu_face() }).await;
+        let mut face = observed.lock().expect("tray observed face").clone();
+        if DISPATCHING.load(Ordering::Acquire) || Supervisor::shared().is_busy() {
+            if !face.busy {
+                face.status = "正在处理操作…".into();
+            }
+            face.busy = true;
+            face.action = "处理中…".into();
+        }
         let displayed = last.lock().expect("tray menu face").clone();
         let face_changed = displayed != face;
         let mut clicks = Vec::new();
@@ -60,9 +92,16 @@ pub fn install(cx: &mut App) {
                 handle_tray_event(event, cx);
             }
             for event in menus {
-                handle_menu_event(event, cx, displayed.connected);
+                handle_menu_event(event, cx);
             }
-            if face_changed {
+            if DISPATCHING.load(Ordering::Acquire) || Supervisor::shared().is_busy() {
+                if !face.busy {
+                    face.status = "正在处理操作…".into();
+                }
+                face.busy = true;
+                face.action = "处理中…".into();
+            }
+            if face_changed || displayed != face {
                 if let Some(tray) = cx.try_global::<TrayKeepAlive>() {
                     tray.apply(&face);
                 }
@@ -103,6 +142,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
         tray,
         status,
         toggle,
+        apply,
     })
 }
 
@@ -110,6 +150,8 @@ impl TrayKeepAlive {
     fn apply(&self, face: &MenuFace) {
         self.status.set_text(&face.status);
         self.toggle.set_text(&face.action);
+        self.toggle.set_enabled(!face.busy);
+        self.apply.set_enabled(!face.busy);
         if let Err(err) = self.tray.set_tooltip(Some(&face.tooltip)) {
             myproxy::log::debug("tray", format!("tooltip failed: {err:#}"));
         }
@@ -117,56 +159,45 @@ impl TrayKeepAlive {
 }
 
 fn menu_face() -> MenuFace {
-    let strategy = match Strategy::load() {
-        Ok(strategy) => strategy,
-        Err(_) => {
-            return MenuFace {
-                connected: false,
-                status: "未连接".into(),
-                action: "连接".into(),
-                tooltip: "MyProxy · 未连接".into(),
-            };
-        }
+    let supervisor = Supervisor::shared();
+    let operation = supervisor.operation_state();
+    let busy = operation.is_busy() || DISPATCHING.load(Ordering::Acquire);
+    let health = supervisor.last_health();
+    let runtime = supervisor.runtime_identity();
+    let extension = network_extension::status();
+    let mut status = match operation {
+        OperationState::Connecting => "正在连接…".into(),
+        OperationState::Applying => "正在应用策略…".into(),
+        OperationState::Disconnecting => "正在断开…".into(),
+        _ if busy => "正在处理操作…".into(),
+        _ if health.ready && runtime.is_some() => format!(
+            "Mixed 已就绪 · {} · 系统接管 {} · DNS {}",
+            runtime
+                .map(|identity| format!("127.0.0.1:{}", identity.mixed_port))
+                .unwrap_or_default(),
+            extension.phase_label(),
+            extension.dns_label()
+        ),
+        _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "核心尚未就绪".into()),
+        _ => "未连接".into(),
     };
-    let health = Supervisor::shared().observe(&strategy);
-    if !health.wanted {
-        return MenuFace {
-            connected: false,
-            status: "未连接".into(),
-            action: "连接".into(),
-                tooltip: "MyProxy · 未连接".into(),
-        };
+    if !busy && operation == OperationState::Error {
+        status = health
+            .note
+            .unwrap_or_else(|| "上次操作失败，请在窗口查看详情".into());
     }
-    if !health.ready {
-        return MenuFace {
-            connected: true,
-            status: health.note.unwrap_or_else(|| "核心异常".into()),
-            action: "断开".into(),
-            tooltip: "MyProxy · 核心异常".into(),
-        };
-    }
-    let endpoint = format!("127.0.0.1:{}", strategy.mixed_port);
-    let now = (!health.proxy_now.is_empty()).then_some(health.proxy_now.as_str());
-    let mode = if strategy.system_extension {
-        "系统接管"
-    } else if strategy.tun {
-        "TUN"
-    } else {
-        "Mixed"
-    };
-    let status = match now {
-        Some(now) => format!("已连接 · {mode} · {now}"),
-        None => format!("已连接 · {mode}"),
-    };
-    let tooltip = match now {
-        Some(now) => format!("MyProxy · 已连接 · {endpoint} · {now}"),
-        None => format!("MyProxy · 已连接 · {endpoint}"),
-    };
     MenuFace {
-        connected: true,
+        busy,
+        action: if busy {
+            "处理中…"
+        } else if supervisor.wanted() {
+            "断开"
+        } else {
+            "连接"
+        }
+        .into(),
+        tooltip: format!("MyProxy · {status}"),
         status,
-        action: "断开".into(),
-        tooltip,
     }
 }
 
@@ -182,57 +213,60 @@ fn handle_tray_event(event: TrayIconEvent, cx: &mut App) {
     crate::show_main_window(cx);
 }
 
-fn handle_menu_event(event: MenuEvent, cx: &mut App, displayed_connected: bool) {
+fn handle_menu_event(event: MenuEvent, cx: &mut App) {
     match event.id.as_ref() {
         "open" => crate::show_main_window(cx),
         "about" => crate::show_about(),
-        "toggle" if displayed_connected => disconnect_async(cx),
-        "toggle" => connect(cx),
-        "apply" => apply(cx),
+        "toggle" | "apply" => {
+            if Supervisor::shared().is_busy() || DISPATCHING.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let apply = event.id.as_ref() == "apply";
+            let disconnect = !apply && Supervisor::shared().wanted();
+            if let Some(tray) = cx.try_global::<TrayKeepAlive>() {
+                tray.status.set_text(if apply {
+                    "正在应用策略…"
+                } else if disconnect {
+                    "正在断开…"
+                } else {
+                    "正在连接…"
+                });
+                tray.toggle.set_text("处理中…");
+                tray.toggle.set_enabled(false);
+                tray.apply.set_enabled(false);
+            }
+            cx.background_executor()
+                .spawn(async move {
+                    let supervisor = Supervisor::shared();
+                    let result = if disconnect {
+                        supervisor.disconnect()
+                    } else {
+                        Strategy::load().and_then(|strategy| {
+                            if apply {
+                                let cached = myproxy::catalog::Catalog::load()
+                                    .ok()
+                                    .is_some_and(|catalog| catalog.matches_strategy(&strategy));
+                                if cached {
+                                    supervisor.apply_cached(&strategy).map(|_| ())
+                                } else {
+                                    supervisor.apply(&strategy).map(|_| ())
+                                }
+                            } else {
+                                supervisor.connect(&strategy)
+                            }
+                        })
+                    };
+                    if let Err(err) = result {
+                        myproxy::log::error("tray", format!("operation failed: {err:#}"));
+                    }
+                    DISPATCHING.store(false, Ordering::Release);
+                })
+                .detach();
+        }
         "updates" => crate::sparkle::check(),
         "quit" => crate::quit_app(cx),
         _ => {}
     }
-}
-
-fn connect(cx: &mut App) {
-    cx.background_executor()
-        .spawn(async move {
-            match Strategy::load() {
-                Ok(strategy) => {
-                    if let Err(err) = Supervisor::shared().connect(&strategy) {
-                        myproxy::log::error("tray", format!("connect failed: {err:#}"));
-                    }
-                }
-                Err(err) => myproxy::log::error("tray", format!("load strategy failed: {err:#}")),
-            }
-        })
-        .detach();
-}
-
-fn disconnect() {
-    if let Err(err) = Supervisor::shared().disconnect() {
-        myproxy::log::error("tray", format!("disconnect failed: {err:#}"));
-    }
-}
-
-fn disconnect_async(cx: &mut App) {
-    cx.background_executor()
-        .spawn(async move {
-            disconnect();
-        })
-        .detach();
-}
-
-fn apply(cx: &mut App) {
-    cx.background_executor()
-        .spawn(async move {
-            match Strategy::load().and_then(|strategy| Supervisor::shared().apply(&strategy)) {
-                Ok(_) => {}
-                Err(err) => myproxy::log::error("tray", format!("apply failed: {err:#}")),
-            }
-        })
-        .detach();
 }
 
 fn template_icon() -> Icon {

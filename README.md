@@ -68,6 +68,35 @@ cargo run --bin myproxyctl -- connect
 
 Default Mixed port is **7890**.
 
+## Routing and runtime state
+
+`strategy.json` stores the saved configuration. Saving, applying, Mihomo readiness,
+System Extension activation, and DNS readiness are separate states. Apply validates
+the candidate before replacing a running configuration; a failed activation reports
+the failure and attempts to restore the previous working configuration.
+
+The protected `runtime-state.json` keeps the applied YAML and matching System
+Extension request together. An older running core without this snapshot requires
+one disconnect and reconnect before applying changes. `MYPROXY_DATA_DIR` overrides
+the data directory for isolated command checks; normal launches keep the standard
+application support directory.
+
+- Groups resolve pins in order, then automatic matches. Exact exclusions apply to
+  both; name exclusions apply only to automatic matches. Empty groups reject traffic
+  and show as unavailable instead of silently routing it directly.
+- Matchers inside one rule are OR conditions. Rules are evaluated in their displayed
+  order, after built-in local-network bypasses. Mixed and System Extension each have
+  their own mode; TUN follows the profile rules and is mutually exclusive with System
+  Extension.
+- `gfw:<group>` filters against the cached GFW domain list in System Extension.
+  Mixed and TUN retain the compatibility behavior of routing that rule to the group.
+- The connections page shows connections recorded by Mihomo. System Extension
+  traffic passed directly to macOS or rejected before Mihomo is outside that list;
+  **显示直连** reveals only DIRECT connections recorded by the core.
+
+Source checks and builds do not verify macOS approval, DNS forwarding, or actual
+traffic. Those require acceptance on the signed installed application.
+
 ## Signing
 
 Local packaging uses a Developer ID identity from the login keychain when one exists; otherwise it ad-hoc signs. Both CI release channels require Developer ID signing, notarization, and Sparkle signatures:

@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -338,11 +340,10 @@ impl Strategy {
     }
 
     pub fn save(&self) -> Result<()> {
+        self.validate()?;
         let path = paths::strategy_path()?;
-        let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_string_pretty(self)?;
-        fs::write(&tmp, data)?;
-        fs::rename(&tmp, &path)?;
+        paths::atomic_write(&path, data.as_bytes())?;
         log::debug("strategy", "saved strategy.json");
         Ok(())
     }
@@ -354,6 +355,194 @@ impl Strategy {
             url,
         });
         self.subscriptions.last().expect("just pushed")
+    }
+
+    /// Validate persisted intent without fetching subscriptions or touching the running core.
+    pub fn validate(&self) -> Result<()> {
+        let controller = self
+            .mixed_port
+            .checked_add(107)
+            .filter(|_| self.mixed_port != 0)
+            .context("mixed port must be between 1 and 65428")?;
+        if self.tun && self.system_extension {
+            anyhow::bail!("TUN and System Extension cannot both be enabled");
+        }
+        if self.tun || self.system_extension {
+            let dns = crate::compile::DNS_LISTEN_PORT;
+            if self.mixed_port == dns
+                || controller == dns
+                || (self.system_extension && self.mixed_port + 1 == dns)
+            {
+                anyhow::bail!(
+                    "mixed/controller/System Extension listener conflicts with DNS port {dns}"
+                );
+            }
+        }
+        regex::Regex::new(&self.exclude_filter).context("invalid exclude_filter regex")?;
+        let mut names = HashSet::new();
+        let mut ids = HashSet::new();
+        for group in &self.groups {
+            validate_name("group", &group.name)?;
+            if reserved_proxy_name(&group.name)
+                || ["group:", "node:", "gfw:", "gfwlist:"]
+                    .iter()
+                    .any(|prefix| group.name.to_ascii_lowercase().starts_with(prefix))
+            {
+                anyhow::bail!("reserved group name: {}", group.name);
+            }
+            if !names.insert(group.name.to_ascii_lowercase()) {
+                anyhow::bail!("duplicate group name: {}", group.name);
+            }
+            if group.id.is_empty() || !ids.insert(&group.id) {
+                anyhow::bail!("duplicate or empty group id: {}", group.name);
+            }
+            Group::parse_kind(&group.kind).with_context(|| format!("group {}", group.name))?;
+        }
+        names.clear();
+        ids.clear();
+        for subscription in &self.subscriptions {
+            validate_name("subscription", &subscription.name)?;
+            if !names.insert(subscription.name.to_ascii_lowercase()) {
+                anyhow::bail!("duplicate subscription name: {}", subscription.name);
+            }
+            if subscription.id.is_empty() || !ids.insert(&subscription.id) {
+                anyhow::bail!("duplicate or empty subscription id: {}", subscription.name);
+            }
+            if subscription.url.trim().is_empty() {
+                anyhow::bail!("subscription {} has an empty URL", subscription.name);
+            }
+        }
+        names.clear();
+        ids.clear();
+        for set in &self.rule_sets {
+            validate_name("rule", &set.name)?;
+            if !names.insert(set.name.to_ascii_lowercase()) {
+                anyhow::bail!(
+                    "duplicate rule name: {}; edit the existing rule instead",
+                    set.name
+                );
+            }
+            if set.id.is_empty() || !ids.insert(&set.id) {
+                anyhow::bail!("duplicate or empty rule id: {}", set.name);
+            }
+            if set.matchers.is_empty() {
+                anyhow::bail!("rule {} needs at least one matcher", set.name);
+            }
+            self.validate_target(&set.via, None)
+                .with_context(|| format!("rule {} target", set.name))?;
+            for matcher in &set.matchers {
+                matcher
+                    .validate()
+                    .with_context(|| format!("rule {}", set.name))?;
+                if crate::gfw::gfw_group(&set.via).is_some() && matcher.kind == "cidr" {
+                    anyhow::bail!(
+                        "rule {}: gfw targets cannot evaluate a CIDR against a domain list",
+                        set.name
+                    );
+                }
+            }
+        }
+        if self.routing_profile == RoutingProfile::Group {
+            self.validate_target(&self.unmatched_via, None)
+                .context("unmatched target")?;
+        }
+        if !self.global_selected.is_empty() {
+            validate_name("GLOBAL selection", &self.global_selected)?;
+        }
+        if self.groups.is_empty()
+            && (self.mixed_mode == InboundMode::Proxy
+                || (self.system_extension && self.extension_mode == InboundMode::Proxy)
+                || self.routing_profile == RoutingProfile::Gfwlist)
+        {
+            anyhow::bail!("the selected inbound/routing mode requires a proxy group");
+        }
+        Ok(())
+    }
+
+    /// Candidate validation uses the catalog that will actually be applied.
+    /// Saved intent may refer to nodes from subscriptions that have not refreshed yet.
+    pub fn validate_catalog(&self, catalog: &crate::catalog::Catalog) -> Result<()> {
+        catalog.validate()?;
+        for node in &catalog.nodes {
+            if self
+                .groups
+                .iter()
+                .any(|group| group.name.eq_ignore_ascii_case(&node.name))
+            {
+                anyhow::bail!("node name conflicts with a group: {}", node.name);
+            }
+        }
+        for set in &self.rule_sets {
+            self.validate_target(&set.via, Some(catalog))
+                .with_context(|| format!("rule {} target", set.name))?;
+        }
+        if self.routing_profile == RoutingProfile::Group {
+            self.validate_target(&self.unmatched_via, Some(catalog))
+                .context("unmatched target")?;
+        }
+        // Historical selector picks are checked against live members when restored;
+        // a removed subscription node must not prevent a safe default from loading.
+        Ok(())
+    }
+
+    fn validate_target(&self, raw: &str, catalog: Option<&crate::catalog::Catalog>) -> Result<()> {
+        validate_name("target", raw)?;
+        let gfw = crate::gfw::gfw_group(raw);
+        let target = gfw.unwrap_or(raw);
+        let explicit_group = target.strip_prefix("group:");
+        let explicit_node = target.strip_prefix("node:");
+        if gfw.is_some() && explicit_node.is_some() {
+            anyhow::bail!("gfw target must name a group");
+        }
+        let target = explicit_group.or(explicit_node).unwrap_or(target);
+        if target.is_empty() {
+            anyhow::bail!("target name cannot be empty");
+        }
+        if explicit_node.is_none() {
+            let group = self.resolve_group_reference(target);
+            if group.is_some() {
+                return Ok(());
+            }
+            if gfw.is_some() || explicit_group.is_some() {
+                anyhow::bail!("group does not exist: {target}");
+            }
+            if target.eq_ignore_ascii_case("DIRECT") || target.eq_ignore_ascii_case("REJECT") {
+                return Ok(());
+            }
+        }
+        if let Some(catalog) = catalog {
+            if !catalog.nodes.iter().any(|node| node.name == target) {
+                anyhow::bail!("target does not exist: {target}");
+            }
+        } else if target.eq_ignore_ascii_case(GLOBAL_GROUP) || target.ends_with(':') {
+            anyhow::bail!("invalid target: {target}");
+        }
+        Ok(())
+    }
+
+    fn resolve_group_reference(&self, name: &str) -> Option<&Group> {
+        self.groups
+            .iter()
+            .find(|group| group.name.eq_ignore_ascii_case(name))
+            .or_else(|| {
+                if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("proxy") {
+                    self.groups
+                        .iter()
+                        .find(|group| group.name == self.default_group_name())
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn references_group(&self, raw: &str, id: &str) -> bool {
+        if raw.starts_with("node:") {
+            return false;
+        }
+        let name = crate::gfw::gfw_group(raw).unwrap_or(raw);
+        let name = name.strip_prefix("group:").unwrap_or(name);
+        self.resolve_group_reference(name)
+            .is_some_and(|group| group.id == id)
     }
 
     pub fn remove_subscription(&mut self, id_or_name: &str) -> bool {
@@ -508,21 +697,97 @@ impl Strategy {
     }
 
     pub fn remove_group(&mut self, name: &str) -> bool {
-        let before = self.groups.len();
-        self.groups.retain(|g| g.name != name && g.id != name);
-        self.groups.len() != before
+        self.remove_group_checked(name).is_ok()
     }
 
-    pub fn update_group(&mut self, id: &str, mut next: Group) -> bool {
-        let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
-            return false;
-        };
-        next.id = group.id.clone();
-        if next.selected.trim().is_empty() {
-            next.selected = group.selected.clone();
+    pub fn remove_group_checked(&mut self, name: &str) -> Result<()> {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.name == name || group.id == name)
+            .with_context(|| format!("group not found: {name}"))?;
+        let mut refs = Vec::new();
+        for set in &self.rule_sets {
+            if self.references_group(&set.via, &group.id) {
+                refs.push(format!("rule {}", set.name));
+            }
         }
-        *group = next;
-        true
+        if self.references_group(&self.unmatched_via, &group.id) {
+            refs.push("unmatched_via".into());
+        }
+        if self.references_group(&self.global_selected, &group.id) {
+            refs.push("GLOBAL".into());
+        }
+        if group.name == self.default_group_name()
+            && (self.mixed_mode == InboundMode::Proxy
+                || (self.system_extension && self.extension_mode == InboundMode::Proxy)
+                || self.routing_profile == RoutingProfile::Gfwlist)
+        {
+            refs.push("default inbound/routing group".into());
+        }
+        if !refs.is_empty() {
+            anyhow::bail!(
+                "group {} is still referenced by {}; change those targets first",
+                group.name,
+                refs.join(", ")
+            );
+        }
+        let id = group.id.clone();
+        self.groups.retain(|group| group.id != id);
+        Ok(())
+    }
+
+    pub fn update_group(&mut self, id: &str, mut next: Group) -> Result<()> {
+        let index = self
+            .groups
+            .iter()
+            .position(|group| group.id == id)
+            .context("节点组已不存在")?;
+        let renamed = self.groups[index].name != next.name;
+        if renamed {
+            let mut candidate = self.clone();
+            candidate.groups[index].name = next.name.clone();
+            let previous_default = self
+                .groups
+                .iter()
+                .find(|group| group.name == self.default_group_name());
+            let next_default = candidate
+                .groups
+                .iter()
+                .find(|group| group.name == candidate.default_group_name());
+            if previous_default.map(|group| &group.id) != next_default.map(|group| &group.id)
+                && (self.mixed_mode == InboundMode::Proxy
+                    || (self.system_extension && self.extension_mode == InboundMode::Proxy)
+                    || self.routing_profile == RoutingProfile::Gfwlist)
+            {
+                anyhow::bail!("改名会改变正在使用的默认节点组；请先调整入口模式或分流预设");
+            }
+            // Resolve aliases before replacement, while the old default group still exists.
+            let refs: Vec<bool> = self
+                .rule_sets
+                .iter()
+                .map(|set| self.references_group(&set.via, id))
+                .collect();
+            let fallback = self.references_group(&self.unmatched_via, id);
+            let global = self.references_group(&self.global_selected, id);
+            for (set, referenced) in self.rule_sets.iter_mut().zip(refs) {
+                if referenced {
+                    rename_target(&mut set.via, &next.name);
+                }
+            }
+            if fallback {
+                rename_target(&mut self.unmatched_via, &next.name);
+            }
+            if global {
+                rename_target(&mut self.global_selected, &next.name);
+            }
+        }
+        next.id = self.groups[index].id.clone();
+        if next.selected.trim().is_empty() {
+            next.selected = self.groups[index].selected.clone();
+        }
+        self.groups[index] = next;
+        Ok(())
     }
 
     pub fn set_group_selected(&mut self, id: &str, node: String) -> bool {
@@ -541,27 +806,21 @@ impl Strategy {
         self.rule_sets.last().expect("just pushed")
     }
 
-    pub fn add_matcher(&mut self, name: String, matcher: Matcher, via: String) -> &RuleSet {
-        if let Some(index) = self
+    pub fn add_matcher(&mut self, name: String, matcher: Matcher, via: String) -> Result<&RuleSet> {
+        if self
             .rule_sets
             .iter()
-            .position(|s| s.name.eq_ignore_ascii_case(&name))
+            .any(|set| set.name.eq_ignore_ascii_case(&name))
         {
-            let set = &mut self.rule_sets[index];
-            if !set.matchers.iter().any(|m| m.same_as(&matcher)) {
-                set.matchers.push(matcher);
-            }
-            if !via.trim().is_empty() {
-                set.via = via;
-            }
-            return &self.rule_sets[index];
+            anyhow::bail!("duplicate rule name: {name}; edit the existing rule instead");
         }
-        self.add_rule_set(RuleSet {
+        matcher.validate()?;
+        Ok(self.add_rule_set(RuleSet {
             id: Uuid::new_v4().to_string(),
             name,
             via,
             matchers: vec![matcher],
-        })
+        }))
     }
 
     pub fn update_rule_set(&mut self, id: &str, mut next: RuleSet) -> bool {
@@ -681,8 +940,8 @@ impl Group {
             if !self.name_contains.is_empty() {
                 parts.push(format!("名称含 {}", self.name_contains.join(" / ")));
             }
-            if parts.is_empty() {
-                parts.push("无自动匹配（仅钉住）".into());
+            if self.name_contains.is_empty() {
+                parts.push("无自动匹配（仅钉住；来源只限定范围）".into());
             }
         }
         if !self.name_excludes.is_empty() {
@@ -713,11 +972,67 @@ impl Group {
     }
 }
 
+fn validate_name(kind: &str, name: &str) -> Result<()> {
+    if name.trim().is_empty()
+        || name != name.trim()
+        || name.chars().any(|ch| ch == ',' || ch.is_control())
+    {
+        anyhow::bail!("invalid {kind} name/value: use non-empty text without surrounding whitespace, commas or control characters");
+    }
+    Ok(())
+}
+
+pub(crate) fn reserved_proxy_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "DIRECT" | "REJECT" | "GLOBAL" | "REJECT-DROP" | "PASS" | "COMPATIBLE"
+    )
+}
+
+fn rename_target(target: &mut String, name: &str) {
+    if crate::gfw::gfw_group(target).is_some() {
+        let prefix = target
+            .split_once(':')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or("gfw");
+        *target = format!("{prefix}:{name}");
+    } else if target.starts_with("group:") {
+        *target = format!("group:{name}");
+    } else {
+        *target = name.to_string();
+    }
+}
+
 pub fn parse_list(raw: &str) -> Vec<String> {
     raw.split([',', '，', '/', '|'])
         .map(|part| part.trim().to_string())
         .filter(|part| !part.is_empty())
         .collect()
+}
+
+pub fn parse_matcher_list(raw: &str) -> Vec<String> {
+    raw.split([',', '，', '|', '\n'])
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn validate_cidr(raw: &str) -> Result<()> {
+    let (ip, prefix) = raw
+        .trim()
+        .split_once('/')
+        .with_context(|| format!("invalid CIDR: {raw}"))?;
+    let ip: IpAddr = ip
+        .parse()
+        .with_context(|| format!("invalid CIDR address: {raw}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .with_context(|| format!("invalid CIDR prefix: {raw}"))?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        anyhow::bail!("CIDR prefix out of range: {raw}");
+    }
+    Ok(())
 }
 
 pub fn join_list(parts: &[String]) -> String {
@@ -841,6 +1156,15 @@ impl Rule {
 }
 
 impl Matcher {
+    pub fn validate(&self) -> Result<()> {
+        validate_name("matcher", &self.value)?;
+        match self.kind.as_str() {
+            "cidr" => validate_cidr(&self.value),
+            "app" | "domain" | "suffix" | "keyword" => Ok(()),
+            _ => anyhow::bail!("unsupported matcher kind: {}", self.kind),
+        }
+    }
+
     pub fn app(value: String) -> Self {
         Self {
             kind: "app".into(),

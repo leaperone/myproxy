@@ -6,6 +6,8 @@ Strategy JSON under `~/Library/Application Support/myproxy/` is authoritative. G
 
 Public repo: https://github.com/leaperone/myproxy. Stable Sparkle channel: `https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml`. Prod and Nightly both run `generate_appcast` against previous same-channel zips for deltas (Nightly skips the `nightly` pointer tag). While Mixed is listening, in-app update checks and downloads fetch GitHub release assets through that HTTP proxy with a new CONNECT per host so the 302 to `release-assets.githubusercontent.com` does not reuse the GitHub tunnel; Sparkle reads a loopback appcast whose enclosure paths keep `.zip` / `.delta`.
 
+Runtime safety: empty groups use an unavailable REJECT sentinel, never implicit DIRECT; UI counts and selections exclude that sentinel. RuleSet matchers remain OR conditions, with cross-type order preserved in System Extension after built-in local bypasses. Saved strategy is intent, not proof of activation: report core, System Extension, and DNS separately, and use the applied runtime identity for controller requests. Connections are Mihomo records, not an audit of all machine traffic. See README “Routing and runtime state” for the user-facing contract.
+
 ```sh
 scripts/fetch-mihomo.sh
 scripts/fetch-sparkle.sh

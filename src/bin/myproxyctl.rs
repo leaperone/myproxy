@@ -1,7 +1,10 @@
-use anyhow::{bail, Result};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use myproxy::catalog;
 use myproxy::controller;
+use myproxy::network_extension::{self, DnsPhase, Phase, RuntimeStatus};
 use myproxy::paths;
 use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy, GLOBAL_GROUP};
 use myproxy::supervisor::Supervisor;
@@ -76,6 +79,8 @@ enum Commands {
 #[derive(Subcommand)]
 enum SubCmd {
     List,
+    /// Refresh subscriptions explicitly and apply the resulting catalog.
+    Refresh,
     Add {
         url: String,
         #[arg(long)]
@@ -104,6 +109,9 @@ enum GroupCmd {
     },
     Set {
         name: String,
+        /// Rename the group and update every group reference.
+        #[arg(long)]
+        rename: Option<String>,
         #[arg(long, value_parser = ["select", "fallback", "url-test"])]
         kind: Option<String>,
         #[arg(long)]
@@ -231,11 +239,17 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Status => {
             let strategy = Strategy::load()?;
             let catalog = catalog::Catalog::load()?;
+            let supervisor = adopted_supervisor(&strategy);
+            let runtime = supervisor.runtime_identity();
+            let controller_ready = runtime
+                .as_ref()
+                .is_some_and(|identity| controller::ready(identity.mixed_port).is_ok());
+            let extension = network_extension::wait_for_settle(Duration::from_secs(5));
             let unmatched = myproxy::compile::unmatched_target(&strategy);
-            let status = serde_json::json!({
+            emit(json, serde_json::json!({
                 "mixed_port": strategy.mixed_port,
                 "mixed_mode": strategy.mixed_mode.as_str(),
-                "global": strategy.global_selected.as_str(),
+                "global": strategy.global_selected,
                 "tun": strategy.tun,
                 "extension": strategy.system_extension,
                 "extension_mode": strategy.extension_mode.as_str(),
@@ -245,96 +259,105 @@ fn run(cli: Cli) -> Result<()> {
                 "subscriptions": strategy.subscriptions.len(),
                 "nodes": catalog.nodes.len(),
                 "excluded": catalog.excluded.len(),
+                "refresh_warnings": catalog.refresh_warnings(),
                 "groups": strategy.groups.len(),
                 "rules": strategy.rule_sets.len(),
+                "operation": supervisor.operation_state(),
+                "runtime": runtime.as_ref().map(|identity| serde_json::json!({
+                    "generation": identity.generation,
+                    "mixed_port": identity.mixed_port,
+                    "controller_ready": controller_ready,
+                })),
+                "extension_runtime": extension,
                 "strategy": paths::strategy_path()?.display().to_string(),
-            });
-            emit(
-                json,
-                status,
-                format!(
-                    "mixed-port {}  mixed-mode {}  global {}  tun {}  extension {}  extension-mode {}  routing {}  unmatched {}  subs {}  nodes {}  excluded {}  groups {}  rules {}",
-                    strategy.mixed_port,
-                    strategy.mixed_mode.as_str(),
-                    if strategy.global_selected.is_empty() {
-                        "—"
-                    } else {
-                        strategy.global_selected.as_str()
-                    },
-                    if strategy.tun { "on" } else { "off" },
-                    if strategy.system_extension {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                    strategy.extension_mode.as_str(),
-                    strategy.routing_profile.as_str(),
-                    unmatched,
-                    strategy.subscriptions.len(),
-                    catalog.nodes.len(),
-                    catalog.excluded.len(),
-                    strategy.groups.len(),
-                    strategy.rule_sets.len()
-                ),
-            );
+            }), format!(
+                "saved mixed-port {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
+                strategy.mixed_port, strategy.mixed_mode.as_str(), strategy.tun,
+                strategy.system_extension, strategy.routing_profile.as_str(), unmatched,
+                runtime.as_ref().map(|identity| format!("mixed-port {} (generation {})", identity.mixed_port, identity.generation))
+                    .unwrap_or_else(|| "disconnected / unverified".into()),
+                if controller_ready { "ready" } else { "unavailable" },
+                if extension.observed { extension.phase_label() } else { "unknown" },
+                if extension.observed { extension.dns_label() } else { "unknown" },
+                strategy.subscriptions.len(), catalog.nodes.len(), catalog.excluded.len(),
+                strategy.groups.len(), strategy.rule_sets.len()
+            ));
             if !json {
+                for warning in catalog.refresh_warnings() {
+                    println!("{warning}");
+                }
+                if let Some(message) = extension.message {
+                    println!("{message}");
+                }
+                if let Some(message) = extension.dns_message {
+                    println!("{message}");
+                }
                 println!("strategy {}", paths::strategy_path()?.display());
             }
         }
         Commands::Apply => {
-            myproxy::log::debug("ctl", "apply");
             let strategy = Strategy::load()?;
-            let supervisor = Supervisor::default();
-            supervisor.adopt_running(strategy.tun, strategy.system_extension, strategy.mixed_port);
-            let catalog = supervisor.apply(&strategy)?;
-            emit(
-                json,
-                serde_json::json!({
-                    "status": "applied",
-                    "nodes": catalog.nodes.len(),
-                    "excluded": catalog.excluded.len(),
-                    "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
-                }),
-                format!(
-                    "applied {} nodes, {} excluded → {}",
-                    catalog.nodes.len(),
-                    catalog.excluded.len(),
-                    paths::runtime_yaml_path()?.display()
-                ),
-            );
+            let supervisor = adopted_supervisor(&strategy);
+            let catalog = supervisor.apply_cached(&strategy)?;
+            report_applied(json, &supervisor, &catalog)?;
         }
         Commands::Connect => {
-            myproxy::log::debug("ctl", "connect");
             let strategy = Strategy::load()?;
-            Supervisor::default().connect(&strategy)?;
+            let supervisor = adopted_supervisor(&strategy);
+            supervisor.connect(&strategy)?;
+            let (extension, cancelled) = settle_extension()?;
+            let runtime = supervisor.runtime_identity();
             emit(
                 json,
                 serde_json::json!({
-                    "status": "connected",
-                    "mixed_port": strategy.mixed_port,
-                    "transport": if strategy.system_extension { "extension" } else if strategy.tun { "tun" } else { "mixed" },
+                    "status": "core_ready",
+                    "mixed_port": runtime.as_ref().map(|identity| identity.mixed_port),
+                    "extension_runtime": extension,
+                    "extension_request_cancelled": cancelled,
                 }),
                 format!(
-                    "connected mixed-port {}{}",
-                    strategy.mixed_port,
-                    if strategy.system_extension {
-                        " se"
-                    } else if strategy.tun {
-                        " tun"
+                    "Mihomo ready; Mixed :{}; extension {}; DNS {}{}",
+                    runtime
+                        .as_ref()
+                        .map(|identity| identity.mixed_port)
+                        .unwrap_or(strategy.mixed_port),
+                    extension.phase_label(),
+                    extension.dns_label(),
+                    if cancelled {
+                        "; pending enable cancelled; open the signed .app to enable System Extension"
                     } else {
                         ""
                     }
                 ),
             );
+            extension_outcome(&extension, cancelled)?;
         }
         Commands::Disconnect => {
-            myproxy::log::debug("ctl", "disconnect");
-            Supervisor::default().disconnect()?;
+            let strategy = Strategy::load().unwrap_or_default();
+            let supervisor = adopted_supervisor(&strategy);
+            supervisor.disconnect()?;
+            let (extension, cancelled) = settle_extension()?;
+            let complete = extension.observed
+                && matches!(
+                    extension.phase,
+                    Phase::Disabled | Phase::Unsupported | Phase::Unbundled
+                );
             emit(
                 json,
-                serde_json::json!({"status": "disconnected"}),
-                "disconnected",
+                serde_json::json!({
+                    "status": if complete { "disconnected" } else { "core_stopped" },
+                    "extension_runtime": extension,
+                    "extension_request_cancelled": cancelled,
+                }),
+                format!(
+                    "Mihomo stopped; extension {}; DNS {}",
+                    extension.phase_label(),
+                    extension.dns_label()
+                ),
             );
+            if !complete {
+                bail!("core stopped, but System Extension shutdown is not confirmed");
+            }
         }
         Commands::Port { port } => {
             let mut strategy = Strategy::load()?;
@@ -342,8 +365,8 @@ fn run(cli: Cli) -> Result<()> {
             strategy.save()?;
             emit(
                 json,
-                serde_json::json!({"mixed_port": port}),
-                format!("mixed-port {port}"),
+                serde_json::json!({"mixed_port": port, "status": "saved", "applied": false}),
+                format!("saved mixed-port {port}; apply/connect to activate"),
             );
         }
         Commands::Tun { state } => {
@@ -354,11 +377,17 @@ fn run(cli: Cli) -> Result<()> {
             };
             let mut strategy = Strategy::load()?;
             strategy.tun = on;
+            if on {
+                strategy.system_extension = false;
+            }
             strategy.save()?;
             emit(
                 json,
-                serde_json::json!({"tun": on}),
-                format!("tun {}", if on { "on" } else { "off" }),
+                serde_json::json!({"tun": on, "extension": strategy.system_extension, "status": "saved", "applied": false}),
+                format!(
+                    "saved tun {}; apply/connect to activate",
+                    if on { "on" } else { "off" }
+                ),
             );
         }
         Commands::Extension { state } => {
@@ -375,8 +404,11 @@ fn run(cli: Cli) -> Result<()> {
             strategy.save()?;
             emit(
                 json,
-                serde_json::json!({"extension": on, "tun": strategy.tun}),
-                format!("extension {}", if on { "on" } else { "off" }),
+                serde_json::json!({"extension": on, "tun": strategy.tun, "status": "saved", "applied": false}),
+                format!(
+                    "saved extension {}; apply/connect to activate",
+                    if on { "on" } else { "off" }
+                ),
             );
         }
         Commands::MixedMode { mode } => {
@@ -417,31 +449,75 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Global { name } => {
             let mut strategy = Strategy::load()?;
-            let mut live = false;
+            let supervisor = adopted_supervisor(&strategy);
+            let runtime = supervisor.runtime_identity();
+            let mut live = None;
             if let Some(name) = name {
                 let name = name.trim();
                 if name.is_empty() {
                     bail!("global <node>");
                 }
+                if supervisor.is_busy() {
+                    bail!("another core operation is in progress");
+                }
+                if let Some(identity) = runtime.as_ref() {
+                    let groups = controller::fetch_proxies(identity.mixed_port)?;
+                    let global = groups
+                        .iter()
+                        .find(|group| group.name == GLOBAL_GROUP)
+                        .context("GLOBAL selector missing from the running core")?;
+                    if !global.members.iter().any(|member| member.name == name) {
+                        bail!("{name} is not a member of the running GLOBAL selector");
+                    }
+                } else {
+                    let catalog = catalog::Catalog::load()?;
+                    if !matches!(name, "DIRECT" | "REJECT")
+                        && !strategy.groups.iter().any(|group| group.name == name)
+                        && !catalog.nodes.iter().any(|node| {
+                            node.name == name
+                                && strategy
+                                    .subscriptions
+                                    .iter()
+                                    .any(|sub| sub.name == node.subscription)
+                        })
+                    {
+                        bail!("GLOBAL member does not exist: {name}");
+                    }
+                }
                 strategy.set_global_selected(name.to_string());
                 strategy.save()?;
-                live = controller::select_proxy(strategy.mixed_port, GLOBAL_GROUP, name).is_ok();
+                if let Some(identity) = runtime {
+                    supervisor
+                        .select_proxy(identity, GLOBAL_GROUP, name)
+                        .context("GLOBAL selection saved but not applied")?;
+                    live = Some(name.to_string());
+                }
+            } else if let Some(identity) = runtime {
+                let groups = controller::fetch_proxies(identity.mixed_port)?;
+                let global = groups
+                    .into_iter()
+                    .find(|group| group.name == GLOBAL_GROUP)
+                    .context("GLOBAL selector missing from the running core")?;
+                live = Some(global.now);
             }
             emit(
                 json,
                 serde_json::json!({
-                    "global": strategy.global_selected.as_str(),
-                    "live": live,
+                    "global": strategy.global_selected,
+                    "live": live.is_some(),
+                    "runtime_global": live,
                     "mixed_mode": strategy.mixed_mode.as_str(),
                     "extension_mode": strategy.extension_mode.as_str(),
                 }),
-                if strategy.global_selected.is_empty() {
-                    "global —".into()
-                } else if live {
-                    format!("global {} (live)", strategy.global_selected)
-                } else {
-                    format!("global {}", strategy.global_selected)
-                },
+                format!(
+                    "global saved {}; runtime {}",
+                    if strategy.global_selected.is_empty() {
+                        "—"
+                    } else {
+                        &strategy.global_selected
+                    },
+                    live.as_deref().unwrap_or("disconnected")
+                ),
             );
         }
         Commands::Routing { profile, via } => {
@@ -529,13 +605,27 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Commands::Subscription { cmd } => match cmd {
+            SubCmd::Refresh => {
+                let strategy = Strategy::load()?;
+                let supervisor = adopted_supervisor(&strategy);
+                let catalog = supervisor.apply(&strategy)?;
+                report_applied(json, &supervisor, &catalog)?;
+            }
             SubCmd::List => {
-                let subscriptions = Strategy::load()?.subscriptions;
+                let subscriptions: Vec<_> = Strategy::load()?
+                    .subscriptions
+                    .into_iter()
+                    .map(|sub| serde_json::json!({"id": sub.id, "name": sub.name}))
+                    .collect();
                 if json {
                     println!("{}", serde_json::json!({"subscriptions": subscriptions}));
                 } else {
                     for sub in subscriptions {
-                        println!("{}\t{}\t{}", sub.id, sub.name, sub.url);
+                        println!(
+                            "{}\t{}",
+                            sub["id"].as_str().unwrap_or_default(),
+                            sub["name"].as_str().unwrap_or_default()
+                        );
                     }
                 }
             }
@@ -621,6 +711,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             GroupCmd::Set {
                 name,
+                rename,
                 kind,
                 all,
                 source,
@@ -632,27 +723,34 @@ fn run(cli: Cli) -> Result<()> {
                     .map(strategy::Group::parse_kind)
                     .transpose()?;
                 let mut strategy = Strategy::load()?;
-                {
-                    let some = strategy
-                        .group_mut(&name)
-                        .ok_or_else(|| anyhow::anyhow!("no group"))?;
-                    if let Some(kind) = kind {
-                        some.kind = kind;
-                    }
-                    if let Some(all) = all {
-                        some.all_nodes = all;
-                    }
-                    if !source.is_empty() {
-                        some.sources = source;
-                    }
-                    if !contains.is_empty() {
-                        some.name_contains = contains;
-                        some.all_nodes = false;
-                    }
-                    if !not_contains.is_empty() {
-                        some.name_excludes = not_contains;
-                    }
+                let mut group = strategy
+                    .groups
+                    .iter()
+                    .find(|group| group.name == name || group.id == name)
+                    .cloned()
+                    .context("group not found")?;
+                let id = group.id.clone();
+                if let Some(rename) = rename {
+                    group.name = rename.trim().to_string();
                 }
+                if let Some(kind) = kind {
+                    group.kind = kind;
+                }
+                if let Some(all) = all {
+                    group.all_nodes = all;
+                }
+                if !source.is_empty() {
+                    group.sources = source;
+                }
+                if !contains.is_empty() {
+                    group.name_contains = contains;
+                    group.all_nodes = false;
+                }
+                if !not_contains.is_empty() {
+                    group.name_excludes = not_contains;
+                }
+                let name = group.name.clone();
+                strategy.update_group(&id, group)?;
                 strategy.save()?;
                 emit(
                     json,
@@ -662,9 +760,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             GroupCmd::Remove { name } => {
                 let mut strategy = Strategy::load()?;
-                if !strategy.remove_group(&name) {
-                    bail!("group not found");
-                }
+                strategy.remove_group_checked(&name)?;
                 strategy.save()?;
                 emit(
                     json,
@@ -737,32 +833,60 @@ fn run(cli: Cli) -> Result<()> {
                 cidr,
                 via,
             } => {
-                if app.is_empty()
-                    && domain.is_empty()
-                    && suffix.is_empty()
-                    && keyword.is_empty()
-                    && cidr.is_empty()
-                {
-                    bail!("need --app, --domain, --suffix, --keyword, or --cidr");
+                let mut matchers = Vec::new();
+                for (kind, raw) in [
+                    ("app", app),
+                    ("domain", domain),
+                    ("suffix", suffix),
+                    ("keyword", keyword),
+                    ("cidr", cidr),
+                ] {
+                    for value in strategy::parse_matcher_list(&raw) {
+                        let matcher = if kind == "suffix" {
+                            Matcher::suffix(value)
+                        } else {
+                            Matcher {
+                                kind: kind.into(),
+                                value,
+                            }
+                        };
+                        matcher.validate()?;
+                        if !matchers
+                            .iter()
+                            .any(|existing: &Matcher| existing.same_as(&matcher))
+                        {
+                            matchers.push(matcher);
+                        }
+                    }
                 }
-                let matcher = if !app.is_empty() {
-                    Matcher::app(app)
-                } else if !keyword.is_empty() {
-                    Matcher::keyword(keyword)
-                } else if !cidr.is_empty() {
-                    Matcher::cidr(cidr)
-                } else if !domain.is_empty() {
-                    Matcher::domain(domain)
-                } else {
-                    Matcher::suffix(suffix)
-                };
+                let first = matchers
+                    .first()
+                    .context("need --app, --domain, --suffix, --keyword, or --cidr")?;
                 let name = name
-                    .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| matcher.display_value());
+                    .filter(|name| !name.trim().is_empty())
+                    .map(|name| name.trim().to_string())
+                    .unwrap_or_else(|| first.display_value());
                 let mut strategy = Strategy::load()?;
-                let set = strategy.add_matcher(name, matcher, via);
-                let value = serde_json::json!({"status": "added", "id": set.id, "name": set.name, "via": set.via, "matchers": set.matchers.len()});
-                let message = format!("{}\t{}\t{} matchers", set.name, set.via, set.matchers.len());
+                if strategy
+                    .rule_sets
+                    .iter()
+                    .any(|set| set.name.eq_ignore_ascii_case(&name))
+                {
+                    bail!("duplicate rule name: {name}; edit the existing rule instead");
+                }
+                let set = strategy.add_rule_set(strategy::RuleSet {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name,
+                    via: via.trim().to_string(),
+                    matchers,
+                });
+                let value = serde_json::json!({"status": "added", "id": set.id, "name": set.name, "via": set.via, "matchers": set.matchers.len(), "applied": false});
+                let message = format!(
+                    "saved {}\t{}\t{} matchers; apply/connect to activate",
+                    set.name,
+                    set.via,
+                    set.matchers.len()
+                );
                 strategy.save()?;
                 emit(json, value, message);
             }
@@ -783,6 +907,83 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+fn adopted_supervisor(strategy: &Strategy) -> std::sync::Arc<Supervisor> {
+    let supervisor = Supervisor::shared();
+    supervisor.adopt_running(strategy.tun, strategy.system_extension, strategy.mixed_port);
+    supervisor
+}
+
+fn settle_extension() -> Result<(RuntimeStatus, bool)> {
+    let status = network_extension::wait_for_settle(Duration::from_secs(30));
+    if status.is_pending() || status.phase == Phase::WaitingApproval {
+        let enabling = matches!(status.phase, Phase::Requesting | Phase::WaitingApproval);
+        let cancelled = network_extension::cancel_pending_for_cli()?;
+        Ok((network_extension::status(), enabling && cancelled))
+    } else {
+        Ok((status, false))
+    }
+}
+
+fn extension_outcome(status: &RuntimeStatus, cancelled: bool) -> Result<()> {
+    if !status.observed {
+        bail!("Mihomo operation completed, but System Extension/DNS status is not confirmed");
+    }
+    if cancelled || status.phase == Phase::RequiresReboot {
+        bail!(
+            "Mihomo is ready, but System Extension is not active; finish setup in the signed .app"
+        );
+    }
+    if status.phase == Phase::Failed || status.dns_phase == DnsPhase::Failed {
+        bail!(
+            "Mihomo is ready, but System Extension/DNS failed: {}",
+            status
+                .message
+                .as_deref()
+                .or(status.dns_message.as_deref())
+                .unwrap_or("see extension_runtime")
+        );
+    }
+    Ok(())
+}
+
+fn report_applied(json: bool, supervisor: &Supervisor, catalog: &catalog::Catalog) -> Result<()> {
+    let (extension, cancelled) = settle_extension()?;
+    let running = supervisor.runtime_identity().is_some();
+    emit(
+        json,
+        serde_json::json!({
+            "status": if running { "core_applied" } else { "prepared" },
+            "nodes": catalog.nodes.len(), "excluded": catalog.excluded.len(),
+            "refresh_warnings": catalog.refresh_warnings(),
+            "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
+            "extension_runtime": extension, "extension_request_cancelled": cancelled,
+        }),
+        format!(
+            "{}: {} nodes, {} excluded; extension {}; DNS {}{}",
+            if running {
+                "core applied"
+            } else {
+                "prepared; core disconnected"
+            },
+            catalog.nodes.len(),
+            catalog.excluded.len(),
+            extension.phase_label(),
+            extension.dns_label(),
+            if cancelled {
+                "; pending enable cancelled; complete setup in the signed .app"
+            } else {
+                ""
+            }
+        ),
+    );
+    if !json {
+        for warning in catalog.refresh_warnings() {
+            println!("{warning}");
+        }
+    }
+    extension_outcome(&extension, cancelled)
+}
+
 fn emit(json: bool, value: serde_json::Value, human: impl std::fmt::Display) {
     if json {
         println!("{value}");
@@ -791,12 +992,10 @@ fn emit(json: bool, value: serde_json::Value, human: impl std::fmt::Display) {
     }
 }
 
-fn infer_name(url: &str) -> String {
-    url.split('/')
-        .filter(|s| !s.is_empty())
-        .last()
-        .unwrap_or("subscription")
-        .chars()
-        .take(24)
-        .collect()
+fn infer_name(_url: &str) -> String {
+    // Subscription URLs often end in access tokens; never turn those into names/logs.
+    format!(
+        "subscription-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    )
 }

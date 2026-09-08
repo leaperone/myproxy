@@ -17,6 +17,7 @@ actor AppleDNSProxyManager {
     func configureAndEnable(_ bootstrap: Data) async throws {
         let manager = NEDNSProxyManager.shared()
         try await load(manager)
+        try Task.checkCancellation()
         let providerProtocol = NEDNSProxyProviderProtocol()
         providerProtocol.providerBundleIdentifier = providerBundleIdentifier
         providerProtocol.providerConfiguration = [
@@ -41,6 +42,7 @@ actor AppleDNSProxyManager {
     func disable() async throws {
         let manager = NEDNSProxyManager.shared()
         try await load(manager)
+        try Task.checkCancellation()
         guard manager.providerProtocol?.providerBundleIdentifier == providerBundleIdentifier else {
             self.manager = nil
             return

@@ -9,26 +9,26 @@ use gpui_kit::component::button::{
 use gpui_kit::component::dialog::{Cancel, Confirm, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::sidebar::{
-    Sidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
-};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Selectable, Sizable, StyledExt,
     Theme, TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
 use gpui_kit::KeyDownEvent;
+use gpui_kit::*;
 use myproxy::catalog::{self, Catalog};
 use myproxy::controller::{
     self, ConnectionColumn, ConnectionFilters, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals,
 };
 use myproxy::log;
+use myproxy::network_extension::{self, RuntimeStatus};
 use myproxy::strategy::{
     join_list, parse_list, Group, InboundMode, Matcher, RoutingProfile, RuleSet, Strategy,
     GLOBAL_GROUP,
 };
-use myproxy::supervisor::{CoreHealth, Supervisor};
+use myproxy::supervisor::{CoreHealth, OperationState, RuntimeIdentity, Supervisor};
 use myproxy::updates::{self, UpdateChannel};
 
 use crate::appearance::Appearance;
@@ -119,6 +119,8 @@ struct GroupEditor {
     include: Vec<String>,
     blocked: Vec<String>,
     selected: String,
+    member_query: Entity<InputState>,
+    member_limit: usize,
 }
 
 impl GroupEditor {
@@ -190,7 +192,15 @@ impl GroupEditor {
         cx.observe(&sources, |_, _, cx| cx.notify()).detach();
         cx.observe(&contains, |_, _, cx| cx.notify()).detach();
         cx.observe(&excludes, |_, _, cx| cx.notify()).detach();
+        let member_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索预览节点…"));
+        cx.observe(&member_query, |this, _, cx| {
+            this.member_limit = 80;
+            cx.notify();
+        })
+        .detach();
         Self {
+            member_query,
+            member_limit: 80,
             parent,
             edit_id,
             notice: String::new(),
@@ -234,19 +244,11 @@ impl GroupEditor {
         }
     }
 
-    fn commit(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut next = self.draft(cx);
         if next.name.is_empty() {
             self.notice = "需要组名。".into();
-            cx.notify();
-            return false;
-        }
-        if !next.all_nodes
-            && next.sources.is_empty()
-            && next.name_contains.is_empty()
-            && next.include.is_empty()
-        {
-            self.notice = "条件组需要来源、名称含或钉住；否则打开「全部」。".into();
+            self.name.read(cx).focus_handle(cx).focus(window, cx);
             cx.notify();
             return false;
         }
@@ -254,9 +256,10 @@ impl GroupEditor {
         let result = self.parent.update(cx, |parent, cx| {
             let previous = parent.strategy.clone();
             if let Some(id) = &edit_id {
-                if !parent.strategy.update_group(id, next) {
-                    return Err("保存失败：节点组已不存在。".to_string());
-                }
+                parent
+                    .strategy
+                    .update_group(id, next)
+                    .map_err(|err| format!("保存失败：{err}"))?;
             } else {
                 next.id = uuid::Uuid::new_v4().to_string();
                 parent.strategy.add_group(next);
@@ -265,9 +268,9 @@ impl GroupEditor {
                 parent.group_modal_open = false;
                 parent.group_edit_id = None;
                 parent.status = if edit_id.is_some() {
-                    "已保存节点组。".into()
+                    "节点组已保存，正在应用…".into()
                 } else {
-                    "已添加节点组。".into()
+                    "节点组已添加，正在应用…".into()
                 };
                 cx.notify();
                 Ok(())
@@ -376,8 +379,6 @@ impl Render for GroupEditor {
                 ),
             );
         }
-        const PREVIEW_LIMIT: usize = 80;
-        let extra = members.len().saturating_sub(PREVIEW_LIMIT);
         let contains = parse_list(&self.contains.read(cx).value());
         let excludes = parse_list(&self.excludes.read(cx).value());
         let sources = parse_list(&self.sources.read(cx).value());
@@ -386,6 +387,25 @@ impl Render for GroupEditor {
         let radius = theme.radius;
         let group_box = theme.group_box;
         let subscriptions = parent.strategy.subscriptions.clone();
+        let query = self.member_query.read(cx).value().trim().to_lowercase();
+        let preview: Vec<_> = members
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| name.to_lowercase().contains(&query))
+            .map(|(ix, name)| {
+                (
+                    name.clone(),
+                    false,
+                    (self.kind == "fallback").then_some(ix + 1),
+                )
+            })
+            .chain(
+                self.blocked
+                    .iter()
+                    .filter(|name| !members.contains(name) && name.to_lowercase().contains(&query))
+                    .map(|name| (name.clone(), true, None)),
+            )
+            .collect();
 
         v_flex()
             .gap_3()
@@ -401,7 +421,7 @@ impl Render for GroupEditor {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().w(px(160.)).child(Input::new(&self.name)))
+                    .child(v_flex().gap_1().w(px(160.)).child(div().text_xs().child("组名")).child(Input::new(&self.name)))
                     .child({
                         let entity = entity.clone();
                         let mut group = ButtonGroup::new("group-mode").compact().outline().small();
@@ -511,7 +531,7 @@ impl Render for GroupEditor {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().flex_1().child(Input::new(&self.contains)))
+                    .child(v_flex().gap_1().flex_1().min_w_0().child(div().text_xs().child("名称包含")).child(Input::new(&self.contains)))
                     .children(REGION_PRESETS.iter().map(|(label, tokens)| {
                         let entity = entity.clone();
                         let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
@@ -536,7 +556,7 @@ impl Render for GroupEditor {
                     &contains,
                 ))
             })
-            .child(Input::new(&self.excludes))
+            .child(v_flex().gap_1().child(div().text_xs().child("名称不含（仅自动匹配）")).child(Input::new(&self.excludes)))
             .when(!excludes.is_empty(), |this| {
                 this.child(chip_row(
                     entity.clone(),
@@ -551,58 +571,26 @@ impl Render for GroupEditor {
                 draft.kind_setting_label(),
                 draft.policy_label()
             )))
+            .when(!draft.all_nodes && draft.name_contains.is_empty(), |this| {
+                this.child(div().text_xs().text_color(muted_fg).child("仅选择来源不会自动加入节点；请添加名称条件或钉住节点。空组保持不可用，不会直连。"))
+            })
+            .child(v_flex().gap_1().child(div().text_xs().child("搜索预览成员（含排除项）")).child(Input::new(&self.member_query)))
             .child(
-                v_flex()
-                    .id("group-preview")
-                    .max_h(px(240.))
-                    .overflow_y_scroll()
-                    .rounded(radius)
-                    .border_1()
-                    .border_color(border)
-                    .bg(group_box)
-                    .when(members.is_empty() && self.blocked.is_empty(), |this| {
-                        this.child(div().p_3().text_xs().text_color(muted_fg).child(
-                            if parent.catalog.nodes.is_empty() {
-                                "目录是空的。先到订阅页 Apply。".to_string()
-                            } else {
-                                "没有成员。放宽条件，或钉住节点。".to_string()
-                            },
-                        ))
-                    })
-                    .children(
-                        members
-                            .iter()
-                            .take(PREVIEW_LIMIT)
-                            .enumerate()
-                            .map(|(ix, name)| {
-                                render_member_row(
-                                    entity.clone(),
-                                    &theme,
-                                    name,
-                                    self.include.iter().any(|n| n == name),
-                                    false,
-                                    (self.kind == "fallback").then_some(ix + 1),
-                                )
-                            }),
-                    )
-                    .when(extra > 0, |this| {
-                        this.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(format!("其余 {extra} 个未列出。收紧条件或排除后再看。")),
-                        )
-                    })
-                    .children(
-                        self.blocked
-                            .iter()
-                            .filter(|name| !members.iter().any(|m| m == *name))
-                            .map(|name| {
-                                render_member_row(entity.clone(), &theme, name, false, true, None)
-                            }),
-                    ),
+                v_flex().id("group-preview").max_h(px(240.)).overflow_y_scroll()
+                    .rounded(radius).border_1().border_color(border).bg(group_box)
+                    .when(preview.is_empty(), |this| this.child(div().p_3().text_xs().text_color(muted_fg).child(
+                        if parent.catalog.nodes.is_empty() { "目录为空，请到订阅页刷新。" }
+                        else if !query.is_empty() { "没有匹配搜索的成员。" }
+                        else { "没有成员。请添加名称条件或钉住节点。" })))
+                    .children(preview.iter().take(self.member_limit).map(|(name, blocked, rank)| {
+                        render_member_row(entity.clone(), &theme, name, self.include.contains(name), *blocked, *rank)
+                    }))
+                    .when(preview.len() > self.member_limit, |this| {
+                        let entity = entity.clone();
+                        this.child(Button::new("group-preview-more").small()
+                            .label(format!("继续显示（已显示 {} / {}）", self.member_limit, preview.len()))
+                            .on_click(move |_, _, app| { entity.update(app, |this, cx| { this.member_limit += 80; cx.notify(); }); }))
+                    }),
             )
     }
 }
@@ -672,17 +660,23 @@ impl RuleSetEditor {
 
     fn add_matchers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.match_input.read(cx).value();
-        let parts = parse_list(&raw);
+        let parts = myproxy::strategy::parse_matcher_list(&raw);
         if parts.is_empty() {
             self.notice = format!("填写{}。", self.draft_kind.placeholder());
             cx.notify();
             return;
         }
-        for part in parts {
-            let matcher = self.draft_kind.into_matcher(part);
-            if matcher.value.is_empty() {
-                continue;
-            }
+        let matchers: Vec<_> = parts
+            .into_iter()
+            .map(|part| self.draft_kind.into_matcher(part))
+            .collect();
+        if let Some(error) = matchers.iter().find_map(|matcher| matcher.validate().err()) {
+            self.notice = format!("匹配值无效：{error}");
+            self.match_input.read(cx).focus_handle(cx).focus(window, cx);
+            cx.notify();
+            return;
+        }
+        for matcher in matchers {
             if !self.matchers.iter().any(|m| m.same_as(&matcher)) {
                 self.matchers.push(matcher);
             }
@@ -694,10 +688,17 @@ impl RuleSetEditor {
         cx.notify();
     }
 
-    fn commit(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.match_input.read(cx).value().trim().is_empty() {
+            self.add_matchers(window, cx);
+            if !self.match_input.read(cx).value().trim().is_empty() {
+                return false;
+            }
+        }
         let mut next = self.draft(cx);
         if next.name.is_empty() {
             self.notice = "需要项目名。".into();
+            self.name.read(cx).focus_handle(cx).focus(window, cx);
             cx.notify();
             return false;
         }
@@ -718,21 +719,13 @@ impl RuleSetEditor {
                 if !parent.strategy.update_rule_set(id, next) {
                     return Err("保存失败：规则已不存在。".to_string());
                 }
-            } else if let Some(index) = parent
+            } else if parent
                 .strategy
                 .rule_sets
                 .iter()
-                .position(|s| s.name.eq_ignore_ascii_case(&next.name))
+                .any(|set| set.name.eq_ignore_ascii_case(&next.name))
             {
-                let mut merged = parent.strategy.rule_sets[index].clone();
-                for matcher in next.matchers {
-                    if !merged.matchers.iter().any(|m| m.same_as(&matcher)) {
-                        merged.matchers.push(matcher);
-                    }
-                }
-                merged.via = next.via;
-                let id = merged.id.clone();
-                parent.strategy.update_rule_set(&id, merged);
+                return Err("规则名称已存在，请编辑已有规则。".into());
             } else {
                 next.id = uuid::Uuid::new_v4().to_string();
                 parent.strategy.add_rule_set(next);
@@ -741,9 +734,9 @@ impl RuleSetEditor {
                 parent.rule_modal_open = false;
                 parent.rule_edit_id = None;
                 parent.status = if edit_id.is_some() {
-                    "已保存规则。".into()
+                    "规则已保存，正在应用…".into()
                 } else {
-                    "已添加规则。".into()
+                    "规则已添加，正在应用…".into()
                 };
                 cx.notify();
                 Ok(())
@@ -786,7 +779,7 @@ impl Render for RuleSetEditor {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().flex_1().child(Input::new(&self.name)))
+                    .child(v_flex().flex_1().gap_1().child(div().text_xs().child("规则名称")).child(Input::new(&self.name)))
                     .child({
                         let entity = entity.clone();
                         Button::new("rule-via")
@@ -842,7 +835,7 @@ impl Render for RuleSetEditor {
                             });
                         })
                     })
-                    .child(div().flex_1().child(Input::new(&self.match_input)))
+                    .child(v_flex().flex_1().gap_1().child(div().text_xs().child("匹配值")).child(Input::new(&self.match_input)))
                     .child({
                         let entity = entity.clone();
                         Button::new("add-matcher").small().label("加入").on_click(
@@ -858,7 +851,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("逗号分隔可一次加入多条。走向可是直连、节点组、GFWList → 组，或某个节点。系统接管下 GFWList 在本机判断。"),
+                    .child("逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 走向在系统接管中判断 GFWList；Mixed/TUN 兼容路径直接走指定组。"),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
@@ -1005,8 +998,8 @@ fn via_menu(
 }
 
 enum LivePageJob {
-    Rows(u16),
-    Snapshot(u16, LiveNeed),
+    Rows(RuntimeIdentity, u64),
+    Snapshot(RuntimeIdentity, u64, LiveNeed),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1067,11 +1060,17 @@ pub struct AppView {
     traffic_prev: Option<(Instant, u64, u64)>,
     proxy_groups: Vec<LiveGroup>,
     proxy_error: Option<String>,
-    delays: HashMap<String, u32>,
     delaying: HashSet<String>,
     window_active: bool,
     log_generation: u64,
     connection_filters: ConnectionFilters,
+    runtime: Option<RuntimeIdentity>,
+    operation: OperationState,
+    extension_status: RuntimeStatus,
+    live_revision: u64,
+    member_query: Entity<InputState>,
+    member_limits: HashMap<String, usize>,
+    global_limit: usize,
 }
 
 impl AppView {
@@ -1115,22 +1114,22 @@ impl AppView {
 
                 let health_strategy = this
                     .update(cx, |this, _| {
-                        if this.busy {
+                        if this.is_busy() {
                             None
                         } else {
-                            Some((this.supervisor.clone(), this.strategy.clone()))
+                            Some((this.supervisor.clone(), this.applied.clone(), this.live_revision))
                         }
                     })
                     .ok()
                     .flatten();
-                if let Some((supervisor, strategy)) = health_strategy {
-                    let health = cx
+                if let Some((supervisor, strategy, revision)) = health_strategy {
+                    let _health = cx
                         .background_executor()
                         .spawn(async move { supervisor.observe(&strategy) })
                         .await;
                     if this
                         .update(cx, |this, cx| {
-                            if this.apply_health(health) {
+                            if !this.is_busy() && this.live_revision == revision && this.apply_health(this.supervisor.last_health()) {
                                 cx.notify();
                             }
                         })
@@ -1154,16 +1153,16 @@ impl AppView {
                     .ok()
                     .flatten();
                 match live_job {
-                    Some(LivePageJob::Rows(port)) => {
+                    Some(LivePageJob::Rows(identity, revision)) => {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
-                                controller::fetch(port).map_err(|err| err.to_string())
+                                controller::fetch(identity.mixed_port).map_err(|err| err.to_string())
                             })
                             .await;
                         if this
                             .update(cx, |this, cx| {
-                                if this.apply_traffic(result) {
+                                if this.accepts_live(identity, revision) && this.apply_traffic(result) {
                                     cx.notify();
                                 }
                             })
@@ -1172,16 +1171,16 @@ impl AppView {
                             break;
                         }
                     }
-                    Some(LivePageJob::Snapshot(port, need)) => {
+                    Some(LivePageJob::Snapshot(identity, revision, need)) => {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
-                                controller::fetch_live(port, need).map_err(|err| err.to_string())
+                                controller::fetch_live(identity.mixed_port, need).map_err(|err| err.to_string())
                             })
                             .await;
                         if this
                             .update(cx, |this, cx| {
-                                if this.apply_live_snapshot(result) {
+                                if this.accepts_live(identity, revision) && this.apply_live_snapshot(result) {
                                     cx.notify();
                                 }
                             })
@@ -1196,14 +1195,14 @@ impl AppView {
                 if this
                     .update(cx, |this, cx| {
                         let started = Instant::now();
-                        let mut dirty = false;
-                        if !this.busy && !this.wanted && this.connected {
+                        let mut dirty = this.sync_runtime();
+                        if !this.is_busy() && !this.wanted && this.connected {
                             this.connected = false;
                             this.clear_live();
                             dirty = true;
                         }
                         let editing = this.group_modal_open || this.rule_modal_open;
-                        if !this.busy {
+                        if !this.is_busy() {
                             if let Some(path) = strategy_path.as_deref() {
                                 let stamp = file_stamp(path);
                                 if stamp != this.strategy_stamp {
@@ -1290,6 +1289,24 @@ impl AppView {
                 }
             });
         });
+        let rule_query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选规则…"));
+        let global_query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选 GLOBAL…"));
+        let member_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索所有组的节点…"));
+        cx.observe(&rule_query, |_, _, cx| cx.notify()).detach();
+        cx.observe(&global_query, |this, _, cx| {
+            this.global_limit = 36;
+            cx.notify();
+        })
+        .detach();
+        cx.observe(&member_query, |this, _, cx| {
+            this.member_limits.clear();
+            cx.notify();
+        })
+        .detach();
+        let applied = supervisor
+            .applied_strategy()
+            .unwrap_or_else(|| strategy.clone());
         let this = Self {
             page: initial_page(),
             sidebar_compact: false,
@@ -1307,8 +1324,8 @@ impl AppView {
             group_edit_id: None,
             rule_modal_open: false,
             rule_edit_id: None,
-            rule_query: cx.new(|cx| InputState::new(window, cx).placeholder("筛选规则…")),
-            global_query: cx.new(|cx| InputState::new(window, cx).placeholder("筛选 GLOBAL…")),
+            rule_query,
+            global_query,
             filter_input: cx.new(|cx| {
                 InputState::new(window, cx).default_value(strategy.exclude_filter.clone())
             }),
@@ -1317,7 +1334,7 @@ impl AppView {
             }),
             strategy: strategy.clone(),
             saved: strategy.clone(),
-            applied: strategy,
+            applied,
             catalog,
             appearance,
             _appearance_observer: appearance_observer,
@@ -1329,13 +1346,19 @@ impl AppView {
             traffic_prev: None,
             proxy_groups: Vec::new(),
             proxy_error: None,
-            delays: HashMap::new(),
             delaying: HashSet::new(),
             window_active: true,
             log_generation: log::stamp(),
             pending_port_input: None,
             pending_filter_input: None,
             connection_filters: ConnectionFilters::default(),
+            runtime: None,
+            operation: OperationState::Idle,
+            extension_status: network_extension::status(),
+            live_revision: 0,
+            member_query,
+            member_limits: HashMap::new(),
+            global_limit: 36,
         };
         if crate::onboard::should_prompt() {
             cx.defer_in(window, |_this, window, cx| {
@@ -1391,12 +1414,61 @@ impl AppView {
         }
     }
 
+    fn is_busy(&self) -> bool {
+        self.busy || self.supervisor.is_busy()
+    }
+
+    fn operation_label(&self) -> &str {
+        match self.supervisor.operation_state() {
+            OperationState::Connecting => "正在连接…",
+            OperationState::Applying => "正在应用…",
+            OperationState::Disconnecting => "正在断开…",
+            _ if self.busy => &self.status,
+            _ => self.connected_label(),
+        }
+    }
+
+    fn mixed_endpoint(&self) -> String {
+        self.runtime
+            .map(|runtime| format!("127.0.0.1:{}", runtime.mixed_port))
+            .unwrap_or_else(|| "未监听".into())
+    }
+
+    fn sync_runtime(&mut self) -> bool {
+        let runtime = self.supervisor.runtime_identity();
+        let operation = self.supervisor.operation_state();
+        let extension_status = network_extension::status();
+        let changed = self.runtime != runtime
+            || self.operation != operation
+            || self.extension_status != extension_status;
+        if self.runtime != runtime {
+            self.live_revision = self.live_revision.wrapping_add(1);
+            self.clear_live();
+            if runtime.is_some() {
+                if let Some(applied) = self.supervisor.applied_strategy() {
+                    self.applied = applied;
+                }
+            }
+        }
+        self.runtime = runtime;
+        self.operation = operation;
+        self.extension_status = extension_status;
+        changed
+    }
+
+    fn accepts_live(&self, identity: RuntimeIdentity, revision: u64) -> bool {
+        self.connected
+            && !self.is_busy()
+            && self.live_revision == revision
+            && self.supervisor.runtime_identity() == Some(identity)
+    }
+
     fn persist(&mut self) -> bool {
         self.persist_with_override(false)
     }
 
     fn persist_with_override(&mut self, overwrite_external: bool) -> bool {
-        if self.busy {
+        if self.is_busy() {
             self.status = "正在处理上一项操作。".into();
             return false;
         }
@@ -1438,7 +1510,7 @@ impl AppView {
     }
 
     fn persist_and_apply(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.busy {
+        if self.is_busy() {
             self.status = "正在处理上一项操作。".into();
             return false;
         }
@@ -1449,23 +1521,37 @@ impl AppView {
     }
 
     fn start_apply(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.busy {
+        self.start_apply_with_refresh(false, cx)
+    }
+
+    fn start_apply_with_refresh(&mut self, refresh: bool, cx: &mut Context<Self>) -> bool {
+        if self.is_busy() {
             self.status = "正在处理上一项操作。".into();
             return false;
         }
         let strategy = self.strategy.clone();
+        let refresh = refresh || !self.catalog.matches_strategy(&strategy);
         let supervisor = self.supervisor.clone();
         self.busy = true;
-        self.status = "正在应用策略…".into();
+        self.live_revision = self.live_revision.wrapping_add(1);
+        self.status = if refresh {
+            "正在刷新订阅并应用策略…"
+        } else {
+            "正在应用策略…"
+        }
+        .into();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let apply_strategy = strategy.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    supervisor
-                        .apply(&apply_strategy)
-                        .map_err(|err| err.to_string())
+                    (if refresh {
+                        supervisor.apply(&apply_strategy)
+                    } else {
+                        supervisor.apply_cached(&apply_strategy)
+                    })
+                    .map_err(|err| err.to_string())
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1476,17 +1562,16 @@ impl AppView {
                         if this.strategy == strategy {
                             this.mark_applied();
                         }
+                        this.sync_runtime();
                         this.status = format!(
-                            "已编译 {} 个节点，排除 {}。{}Mixed {}。",
+                            "策略已应用 · {} 个节点 · Mixed {}。",
                             this.catalog.nodes.len(),
-                            this.catalog.excluded.len(),
-                            if this.strategy.system_extension {
-                                "系统接管 · "
-                            } else {
-                                ""
-                            },
-                            this.strategy.mixed_port
+                            this.mixed_endpoint()
                         );
+                        let warnings = this.catalog.refresh_warnings();
+                        if !warnings.is_empty() {
+                            this.status.push_str(&format!(" {}", warnings.join("；")));
+                        }
                         if this.connected {
                             this.refresh_live(cx);
                         }
@@ -1505,15 +1590,7 @@ impl AppView {
     }
 
     fn is_dirty(&self) -> bool {
-        let mut current = self.strategy.clone();
-        let mut applied = self.applied.clone();
-        for group in &mut current.groups {
-            group.selected.clear();
-        }
-        for group in &mut applied.groups {
-            group.selected.clear();
-        }
-        current != applied
+        self.strategy != self.applied
     }
 
     fn mark_applied(&mut self) {
@@ -1536,7 +1613,7 @@ impl AppView {
     }
 
     fn apply_health(&mut self, health: CoreHealth) -> bool {
-        let mut dirty = false;
+        let mut dirty = self.sync_runtime();
         if self.wanted != health.wanted {
             self.wanted = health.wanted;
             dirty = true;
@@ -1549,27 +1626,13 @@ impl AppView {
             }
             dirty = true;
         }
-        if health.ready && self.proxy_groups.is_empty() {
-            let groups = controller::last_probed_groups();
-            if !groups.is_empty() && self.apply_proxies(Ok(groups)) {
-                dirty = true;
-            }
-        }
         if let Some(note) = health.note {
             if self.status != note {
-                self.status = note;
+                self.status = format!("{note}正在应用…");
                 dirty = true;
             }
         } else if became_ready {
-            self.status = format!(
-                "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
-                if self.strategy.system_extension {
-                    "系统接管 · "
-                } else {
-                    ""
-                },
-                self.strategy.mixed_port
-            );
+            self.status = format!("Mixed 已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
             dirty = true;
         }
         dirty
@@ -1589,11 +1652,9 @@ impl AppView {
         let dirty = self.clear_traffic()
             || !self.proxy_groups.is_empty()
             || self.proxy_error.is_some()
-            || !self.delays.is_empty()
             || !self.delaying.is_empty();
         self.proxy_groups.clear();
         self.proxy_error = None;
-        self.delays.clear();
         self.delaying.clear();
         dirty
     }
@@ -1610,18 +1671,22 @@ impl AppView {
         }
     }
 
-    fn live_page_job(&self) -> Option<LivePageJob> {
-        if !self.window_active || !self.connected {
+    fn live_page_job(&mut self) -> Option<LivePageJob> {
+        if !self.window_active || !self.connected || self.is_busy() {
             return None;
         }
+        let runtime = self.supervisor.runtime_identity()?;
+        self.live_revision = self.live_revision.wrapping_add(1);
         match self.page {
-            Page::Connections => Some(LivePageJob::Rows(self.strategy.mixed_port)),
+            Page::Connections => Some(LivePageJob::Rows(runtime, self.live_revision)),
             Page::Overview | Page::Groups => Some(LivePageJob::Snapshot(
-                self.strategy.mixed_port,
+                runtime,
+                self.live_revision,
                 LiveNeed::Totals,
             )),
             Page::Settings if self.strategy.uses_global() => Some(LivePageJob::Snapshot(
-                self.strategy.mixed_port,
+                runtime,
+                self.live_revision,
                 LiveNeed::Totals,
             )),
             _ => None,
@@ -1653,14 +1718,7 @@ impl AppView {
 
     fn apply_proxies(&mut self, result: Result<Vec<LiveGroup>, String>) -> bool {
         match result {
-            Ok(mut groups) => {
-                for group in &mut groups {
-                    for member in &mut group.members {
-                        if let Some(delay) = self.delays.get(&member.name) {
-                            member.delay = Some(*delay);
-                        }
-                    }
-                }
+            Ok(groups) => {
                 let changed = self.proxy_groups != groups || self.proxy_error.is_some();
                 self.proxy_groups = groups;
                 self.proxy_error = None;
@@ -1668,7 +1726,7 @@ impl AppView {
             }
             Err(err) => {
                 log::debug("ui", format!("proxies poll failed: {err}"));
-                let msg = "暂时读不到节点组状态。";
+                let msg = "暂时读不到节点组状态，当前显示为上次读取结果。";
                 let changed = self.proxy_error.as_deref() != Some(msg);
                 self.proxy_error = Some(msg.into());
                 changed
@@ -1688,11 +1746,14 @@ impl AppView {
         if let Some(now) = self.live_now(GLOBAL_GROUP) {
             return now.to_string();
         }
+        if self.connected {
+            return "等待核心状态".into();
+        }
         let pick = self.strategy.global_selected.trim();
         if pick.is_empty() {
             "—".into()
         } else {
-            pick.to_string()
+            format!("{pick}（已保存）")
         }
     }
 
@@ -1704,7 +1765,10 @@ impl AppView {
             .iter()
             .find(|group| group.name == GLOBAL_GROUP)
         {
-            live.members.iter().map(|member| member.name.clone()).collect()
+            live.members
+                .iter()
+                .map(|member| member.name.clone())
+                .collect()
         } else {
             let mut names = vec!["DIRECT".into(), "REJECT".into()];
             for group in &self.strategy.groups {
@@ -1767,16 +1831,6 @@ impl AppView {
                     .filter(|now| !now.is_empty())
             })
             .map(str::to_string)
-            .or_else(|| {
-                self.strategy
-                    .groups
-                    .iter()
-                    .find(|group| {
-                        group.name == "PROXY" || group.name.eq_ignore_ascii_case("default")
-                    })
-                    .map(|group| group.selected.clone())
-                    .filter(|name| !name.is_empty())
-            })
             .unwrap_or_else(|| {
                 if self.proxy_error.is_some() {
                     "读不到".into()
@@ -1795,27 +1849,30 @@ impl AppView {
             return;
         };
         cx.spawn(async move |this, cx| match job {
-            LivePageJob::Rows(port) => {
+            LivePageJob::Rows(identity, revision) => {
                 let traffic = cx
                     .background_executor()
-                    .spawn(async move { controller::fetch(port).map_err(|err| err.to_string()) })
+                    .spawn(async move {
+                        controller::fetch(identity.mixed_port).map_err(|err| err.to_string())
+                    })
                     .await;
                 this.update(cx, |this, cx| {
-                    if this.apply_traffic(traffic) {
+                    if this.accepts_live(identity, revision) && this.apply_traffic(traffic) {
                         cx.notify();
                     }
                 })
                 .ok();
             }
-            LivePageJob::Snapshot(port, need) => {
+            LivePageJob::Snapshot(identity, revision, need) => {
                 let snap = cx
                     .background_executor()
                     .spawn(async move {
-                        controller::fetch_live(port, need).map_err(|err| err.to_string())
+                        controller::fetch_live(identity.mixed_port, need)
+                            .map_err(|err| err.to_string())
                     })
                     .await;
                 this.update(cx, |this, cx| {
-                    if this.apply_live_snapshot(snap) {
+                    if this.accepts_live(identity, revision) && this.apply_live_snapshot(snap) {
                         cx.notify();
                     }
                 })
@@ -1857,9 +1914,11 @@ impl AppView {
             }
             Err(err) => {
                 log::debug("ui", format!("connections poll failed: {err}"));
-                let msg = "暂时读不到核心连接。";
+                let msg = "暂时读不到核心连接，列表为上次读取结果。";
                 let changed = self.traffic_error.as_deref() != Some(msg);
                 self.traffic_error = Some(msg.into());
+                self.traffic_has_rate = false;
+                self.traffic_prev = None;
                 changed
             }
         }
@@ -1882,9 +1941,11 @@ impl AppView {
             }
             Err(err) => {
                 log::debug("ui", format!("connections poll failed: {err}"));
-                let msg = "暂时读不到核心连接。";
+                let msg = "暂时读不到核心连接，列表为上次读取结果。";
                 let changed = self.traffic_error.as_deref() != Some(msg);
                 self.traffic_error = Some(msg.into());
+                self.traffic_has_rate = false;
+                self.traffic_prev = None;
                 changed
             }
         }
@@ -1899,6 +1960,9 @@ impl AppView {
         move |_, _, app| {
             entity.update(app, |this, cx| {
                 this.page = page;
+                this.live_revision = this.live_revision.wrapping_add(1);
+                this.traffic_has_rate = false;
+                this.traffic_prev = None;
                 if this.connected
                     && matches!(page, Page::Connections | Page::Overview | Page::Groups)
                 {
@@ -1915,10 +1979,15 @@ impl AppView {
         page: Page,
         label: &'static str,
         icon: IconName,
-    ) -> SidebarMenuItem {
-        SidebarMenuItem::new(label)
+    ) -> Button {
+        Button::new(SharedString::from(format!("nav-{label}")))
+            .ghost()
+            .w_full()
             .icon(icon)
-            .active(self.page == page)
+            .selected(self.page == page)
+            .accessibility_label(label)
+            .tooltip(label)
+            .when(!self.sidebar_compact, |button| button.label(label))
             .on_click(self.select_page(cx, page))
     }
 
@@ -1929,7 +1998,7 @@ impl AppView {
         let entity = cx.entity();
         move |_, _, app| {
             entity.update(app, |this, cx| {
-                if this.busy {
+                if this.is_busy() {
                     this.status = "正在处理上一项操作。".into();
                     cx.notify();
                     return;
@@ -1962,12 +2031,12 @@ impl AppView {
     }
 
     fn start_connect(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.is_busy() {
             self.status = "正在处理上一项操作。".into();
             cx.notify();
             return;
         }
-        let connect = !self.wanted;
+        let connect = !self.supervisor.wanted();
         if connect && !self.persist() {
             cx.notify();
             return;
@@ -1975,6 +2044,7 @@ impl AppView {
         let strategy = self.strategy.clone();
         let supervisor = self.supervisor.clone();
         self.busy = true;
+        self.live_revision = self.live_revision.wrapping_add(1);
         self.status = if connect {
             "正在连接…".into()
         } else {
@@ -2011,13 +2081,8 @@ impl AppView {
                         this.apply_health(this.supervisor.last_health());
                         if this.connected {
                             this.status = format!(
-                                "已连接 {}127.0.0.1:{}（HTTP + SOCKS5）",
-                                if this.strategy.system_extension {
-                                    "系统接管 · "
-                                } else {
-                                    ""
-                                },
-                                this.strategy.mixed_port
+                                "Mixed 已就绪 · {}（HTTP + SOCKS5）",
+                                this.mixed_endpoint()
                             );
                             this.refresh_live(cx);
                         } else if this.status.starts_with("正在连接") {
@@ -2067,6 +2132,7 @@ impl AppView {
         let editor =
             cx.new(|cx| RuleSetEditor::new(parent.clone(), existing, fallback_via, window, cx));
         let editing = id.is_some();
+        let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
         window.open_dialog(cx, move |dialog, window, _| {
             let ok_label = if editing { "保存" } else { "添加" };
             dialog
@@ -2125,6 +2191,7 @@ impl AppView {
                 })
                 .child(editor.clone())
         });
+        initial_focus.focus(window, cx);
     }
 
     fn open_group_dialog(&mut self, id: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
@@ -2149,6 +2216,7 @@ impl AppView {
         let parent = cx.entity();
         let editor = cx.new(|cx| GroupEditor::new(parent.clone(), existing, window, cx));
         let editing = id.is_some();
+        let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
         window.open_dialog(cx, move |dialog, window, _| {
             let ok_label = if editing { "保存" } else { "添加" };
             dialog
@@ -2207,9 +2275,13 @@ impl AppView {
                 })
                 .child(editor.clone())
         });
+        initial_focus.focus(window, cx);
     }
 
     fn set_selected_rule_via(&mut self, id: &str, via: &str, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         if !self.strategy.set_rule_via(id, via.to_string()) {
             self.status = "改走向失败。".into();
             return;
@@ -2218,6 +2290,9 @@ impl AppView {
     }
 
     fn move_selected_rule(&mut self, id: &str, delta: i32, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         if !self.strategy.move_rule(id, delta) {
             return;
         }
@@ -2225,6 +2300,10 @@ impl AppView {
     }
 
     fn remove_selected_rule(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+        let previous = self.strategy.clone();
         let editing = self.rule_edit_id.as_deref() == Some(id);
         if !self.strategy.remove_rule(id) {
             return;
@@ -2235,147 +2314,199 @@ impl AppView {
                 self.rule_edit_id = None;
                 window.close_dialog(cx);
             }
-            self.status = "已删除规则。".into();
+            self.status = "规则已删除，正在应用…".into();
+        } else {
+            self.strategy = previous;
         }
     }
 
+    fn live_group(&self, group: &Group) -> Option<&LiveGroup> {
+        self.proxy_groups
+            .iter()
+            .find(|live| live.name == group.name)
+    }
+
     fn group_now<'a>(&'a self, group: &'a Group) -> &'a str {
-        self.live_now(&group.name)
-            .or_else(|| {
-                if group.selected.is_empty() {
-                    None
-                } else {
-                    Some(group.selected.as_str())
-                }
-            })
-            .unwrap_or("—")
+        if self.connected {
+            return match self.live_group(group) {
+                Some(live) if live.members.is_empty() => "不可用",
+                Some(live) if !live.now.is_empty() => &live.now,
+                _ => "等待核心状态",
+            };
+        }
+        if catalog::resolve_group_members(group, &self.catalog).is_empty() {
+            "不可用"
+        } else if group.selected.is_empty() {
+            "—"
+        } else {
+            &group.selected
+        }
     }
 
     fn group_member_names(&self, group: &Group) -> Vec<String> {
-        if let Some(live) = self
-            .proxy_groups
-            .iter()
-            .find(|live| live.name == group.name)
-        {
-            return live
-                .members
-                .iter()
-                .map(|member| member.name.clone())
-                .collect();
+        if self.connected {
+            return self
+                .live_group(group)
+                .map(|live| {
+                    live.members
+                        .iter()
+                        .map(|member| member.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
         }
         catalog::resolve_group_members(group, &self.catalog)
     }
 
     fn member_delay(&self, name: &str) -> Option<u32> {
-        self.delays.get(name).copied().or_else(|| {
-            self.proxy_groups
-                .iter()
-                .flat_map(|group| group.members.iter())
-                .find(|member| member.name == name)
-                .and_then(|member| member.delay)
-        })
+        self.proxy_groups
+            .iter()
+            .flat_map(|group| group.members.iter())
+            .find(|member| member.name == name)
+            .and_then(|member| member.delay)
     }
 
     fn select_global_member(&mut self, node: &str, cx: &mut Context<Self>) {
-        if !self.strategy.set_global_selected(node.to_string()) {
-            return;
-        }
-        self.applied.global_selected = self.strategy.global_selected.clone();
-        if let Some(live) = self
-            .proxy_groups
-            .iter_mut()
-            .find(|group| group.name == GLOBAL_GROUP)
-        {
-            live.now = node.to_string();
-        }
-        if self.persist() {
-            self.status = format!("GLOBAL 已切换到 {node}");
-        }
-        if self.connected {
-            let port = self.strategy.mixed_port;
-            let node = node.to_string();
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        controller::select_proxy(port, GLOBAL_GROUP, &node)
-                            .map_err(|err| err.to_string())
-                    })
-                    .await;
-                this.update(cx, |this, cx| {
-                    if let Err(err) = result {
-                        this.status = format!("GLOBAL 切换失败: {err}");
-                    }
-                    this.refresh_live(cx);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
-        cx.notify();
+        self.select_member(GLOBAL_GROUP, node, cx);
     }
 
     fn select_group_member(&mut self, group_id: &str, node: &str, cx: &mut Context<Self>) {
-        if !self.strategy.set_group_selected(group_id, node.to_string()) {
-            self.status = "只能在手动选择组里点选节点。".into();
+        self.select_member(group_id, node, cx);
+    }
+
+    fn select_member(&mut self, group_id: &str, node: &str, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+        let previous = self.strategy.clone();
+        let group_name = if group_id == GLOBAL_GROUP {
+            self.strategy.set_global_selected(node.to_string());
+            GLOBAL_GROUP.to_string()
+        } else {
+            if !self.strategy.set_group_selected(group_id, node.to_string()) {
+                self.status = "只能在手动选择组里点选节点。".into();
+                cx.notify();
+                return;
+            }
+            self.strategy
+                .groups
+                .iter()
+                .find(|group| group.id == group_id || group.name == group_id)
+                .map(|group| group.name.clone())
+                .unwrap_or_default()
+        };
+        if !self.persist() {
+            self.strategy = previous;
             cx.notify();
             return;
         }
-        let group_name = self
-            .strategy
-            .groups
-            .iter()
-            .find(|group| group.id == group_id || group.name == group_id)
-            .map(|group| group.name.clone())
-            .unwrap_or_default();
-        if let Some(applied) = self
-            .applied
-            .groups
-            .iter_mut()
-            .find(|group| group.id == group_id || group.name == group_id)
-        {
-            applied.selected = node.to_string();
-        }
-        if let Some(live) = self
-            .proxy_groups
-            .iter_mut()
-            .find(|group| group.name == group_name)
-        {
-            live.now = node.to_string();
-        }
-        if self.persist() {
-            self.status = format!("已切换到 {node}");
-        }
-        if self.connected && !group_name.is_empty() {
-            let port = self.strategy.mixed_port;
-            let group_name = group_name.clone();
-            let node = node.to_string();
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        controller::select_proxy(port, &group_name, &node)
-                            .map_err(|err| err.to_string())
-                    })
-                    .await;
-                this.update(cx, |this, cx| {
-                    if let Err(err) = result {
-                        this.status = format!("切换失败: {err}");
-                    }
-                    this.refresh_live(cx);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
+        let Some(identity) = self
+            .supervisor
+            .runtime_identity()
+            .filter(|_| self.connected)
+        else {
+            self.status = "选择已保存，下次连接后生效。".into();
+            cx.notify();
+            return;
+        };
+        self.busy = true;
+        self.live_revision = self.live_revision.wrapping_add(1);
+        self.status = format!("正在将 {group_name} 切换到 {node}…");
+        let node = node.to_string();
+        let supervisor = self.supervisor.clone();
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let request_group = group_name.clone();
+            let request_node = node.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    supervisor
+                        .select_proxy(identity, &request_group, &request_node)
+                        .map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                this.sync_runtime();
+                match result {
+                    Ok(()) => this.status = format!("{group_name} 已切换到 {node}。"),
+                    Err(err) => this.status = format!("切换失败：{err}。选择已保存，尚未生效。"),
+                }
+                this.refresh_live(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_connections(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(identity) = self
+            .supervisor
+            .runtime_identity()
+            .filter(|_| self.connected)
+        else {
+            return;
+        };
+        self.busy = true;
+        self.live_revision = self.live_revision.wrapping_add(1);
+        self.status = if id.is_some() {
+            "正在关闭连接…"
+        } else {
+            "正在关闭核心的全部连接（包含筛选外连接）…"
+        }
+        .into();
+        let supervisor = self.supervisor.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let request_id = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match request_id {
+                        Some(id) => supervisor.close_one(identity, &id),
+                        None => supervisor.close_all(identity),
+                    }
+                    .map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                if this.supervisor.runtime_identity() == Some(identity) {
+                    match result {
+                        Ok(()) => {
+                            if let Some(id) = &id {
+                                this.traffic.connections.retain(|conn| &conn.id != id);
+                            } else {
+                                this.traffic.connections.clear();
+                            }
+                            this.status = if id.is_some() {
+                                "连接已关闭。"
+                            } else {
+                                "核心的全部连接已关闭。"
+                            }
+                            .into();
+                        }
+                        Err(err) => this.status = format!("关闭失败：{err}"),
+                    }
+                } else {
+                    this.status = "运行配置已变化，请重新确认连接列表。".into();
+                }
+                this.refresh_live(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start_group_delay(&mut self, group_name: &str, cx: &mut Context<Self>) {
-        if !self.connected {
-            self.status = "连接后再测延迟。".into();
+        if !self.connected || self.is_busy() {
+            self.status = "核心空闲且连接后再测延迟。".into();
             cx.notify();
             return;
         }
@@ -2383,7 +2514,9 @@ impl AppView {
             return;
         }
         self.status = format!("正在测 {group_name} 延迟…");
-        let port = self.strategy.mixed_port;
+        let Some(identity) = self.supervisor.runtime_identity() else {
+            return;
+        };
         let name = group_name.to_string();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -2391,30 +2524,19 @@ impl AppView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    controller::test_group_delay(port, &probe).map_err(|err| err.to_string())
+                    controller::test_group_delay(identity.mixed_port, &probe)
+                        .map_err(|err| err.to_string())
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.delaying.remove(&name);
+                if this.supervisor.runtime_identity() != Some(identity) {
+                    return;
+                }
                 match result {
-                    Ok(map) => {
-                        for (member, delay) in map {
-                            if member.is_empty() {
-                                if let Some(now) = this.live_now(&name).map(str::to_string) {
-                                    this.delays.insert(now, delay);
-                                }
-                            } else {
-                                this.delays.insert(member, delay);
-                            }
-                        }
-                        for group in &mut this.proxy_groups {
-                            for member in &mut group.members {
-                                if let Some(delay) = this.delays.get(&member.name) {
-                                    member.delay = Some(*delay);
-                                }
-                            }
-                        }
-                        this.status = format!("已更新 {name} 延迟。");
+                    Ok(_) => {
+                        this.status = format!("{name} 探测完成，正在读取核心最新探测记录。");
+                        this.refresh_live(cx);
                     }
                     Err(err) => {
                         this.status = format!("测延迟失败: {err}");
@@ -2435,6 +2557,11 @@ impl Render for AppView {
             self.window_active = true;
             self.refresh_live(cx);
         } else {
+            if !active && self.window_active {
+                self.live_revision = self.live_revision.wrapping_add(1);
+                self.traffic_has_rate = false;
+                self.traffic_prev = None;
+            }
             self.window_active = active;
         }
         if let Some(value) = self.pending_port_input.take() {
@@ -2484,13 +2611,13 @@ impl Render for AppView {
 impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
-        let busy = self.busy;
+        let busy = self.is_busy();
         let warn_live = !busy
             && (self.wanted && !connected
                 || self.traffic_error.is_some()
                 || self.proxy_error.is_some());
         let live_label = if busy {
-            self.status.clone()
+            self.operation_label().to_string()
         } else if connected && self.traffic_has_rate {
             format!(
                 "已连接 · ↑{} · ↓{}",
@@ -2562,61 +2689,56 @@ impl AppView {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        Sidebar::new("nav")
-            .w(px(216.))
-            .collapsible(true)
-            .collapsed(self.sidebar_compact)
-            .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_sm().font_semibold().child("控制"))
-                        .child(
-                            Button::new("toggle-sidebar")
-                                .ghost()
-                                .small()
-                                .icon(if self.sidebar_compact {
-                                    IconName::PanelLeftOpen
-                                } else {
-                                    IconName::PanelLeft
-                                })
-                                .tooltip(if self.sidebar_compact { "展开侧栏" } else { "收起侧栏" })
-                                .on_click({
-                                    let entity = cx.entity();
-                                    move |_, _, app| {
-                                        entity.update(app, |this, cx| {
-                                            this.sidebar_compact = !this.sidebar_compact;
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
-                ),
-            )
+        v_flex()
+            .id("nav")
+            .flex_shrink_0()
+            .h_full()
+            .gap_2()
+            .p_2()
+            .w(px(if self.sidebar_compact { 56. } else { 216. }))
+            .bg(theme.sidebar)
             .child(
-                SidebarGroup::new("会话").child(
-                    SidebarMenu::new()
-                        .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
-                        .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
-                        .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
-                        .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
-                        .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map)),
-                ),
+                Button::new("toggle-sidebar")
+                    .ghost()
+                    .small()
+                    .icon(if self.sidebar_compact {
+                        IconName::PanelLeftOpen
+                    } else {
+                        IconName::PanelLeft
+                    })
+                    .tooltip(if self.sidebar_compact {
+                        "展开侧栏"
+                    } else {
+                        "收起侧栏"
+                    })
+                    .accessibility_label(if self.sidebar_compact {
+                        "展开侧栏"
+                    } else {
+                        "收起侧栏"
+                    })
+                    .on_click({
+                        let entity = cx.entity();
+                        move |_, _, app| {
+                            entity.update(app, |this, cx| {
+                                this.sidebar_compact = !this.sidebar_compact;
+                                cx.notify();
+                            });
+                        }
+                    }),
             )
-            .child(
-                SidebarGroup::new("系统").child(
-                    SidebarMenu::new()
-                        .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
-                ),
-            )
+            .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
+            .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
+            .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
+            .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
+            .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map))
+            .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings))
     }
 
     fn page_view(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         v_flex()
             .id("page")
             .flex_1()
+            .min_w_0()
             .h_full()
             .overflow_hidden()
             .p_6()
@@ -2660,14 +2782,10 @@ impl AppView {
     fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
         let wanted = self.wanted;
-        let busy = self.busy;
+        let busy = self.is_busy();
         let mut connect = Button::new("hero-connect").large();
         connect = if busy {
-            connect.label(if wanted {
-                "正在断开…"
-            } else {
-                "正在连接…"
-            })
+            connect.label(self.operation_label().to_string())
         } else if wanted {
             connect.danger().label("断开")
         } else {
@@ -2707,6 +2825,7 @@ impl AppView {
                     .w_full()
                     .p_5()
                     .gap_4()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .rounded(theme.radius)
@@ -2733,23 +2852,13 @@ impl AppView {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(if connected {
-                                        if self.strategy.system_extension {
-                                            format!(
-                                                "系统接管中 · 应用无需填代理 · Mixed 127.0.0.1:{} 仍可用",
-                                                self.strategy.mixed_port
-                                            )
-                                        } else {
-                                            format!(
-                                                "仅 Mixed 127.0.0.1:{} · 未填代理的应用不会进规则",
-                                                self.strategy.mixed_port
-                                            )
-                                        }
+                                        format!("Mixed {} · 系统接管 {} · DNS {}{}", self.mixed_endpoint(),
+                                            self.extension_status.phase_label(), self.extension_status.dns_label(),
+                                            if self.applied.tun { " · TUN 按策略规则运行" } else { "" })
                                     } else if wanted {
-                                        "核心还不能用。正在自动确认，必要时会重新加载或重连。".into()
-                                    } else if self.strategy.system_extension {
-                                        "下次连接会请求系统扩展。请在系统设置 › 通用 › 登录项与扩展 › 网络扩展 里允许 myproxy。".into()
+                                        "核心尚未就绪，请查看操作状态。".into()
                                     } else {
-                                        "连接后，自己填了代理的应用会进规则。要拦截其他应用，先打开设置里的系统接管。".into()
+                                        "连接后 Mixed 可供显式代理客户端使用；系统接管和 TUN 需分别启用。".into()
                                     }),
                             ),
                     )
@@ -2765,6 +2874,7 @@ impl AppView {
             .child(
                 h_flex()
                     .gap_3()
+                    .flex_wrap()
                     .child(metric(
                         theme,
                         "状态",
@@ -2772,18 +2882,21 @@ impl AppView {
                     ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
-                    .child(metric(theme, "连接数", &conns))
+                    .child(metric(theme, "连接数", &conns)),
+            )
+            .child(
+                h_flex().gap_3().flex_wrap()
                     .child(metric(theme, "PROXY", &now))
                     .child(metric(theme, "GLOBAL", &self.global_now()))
                     .child(metric(
                         theme,
                         "系统接管",
-                        if self.strategy.system_extension { "开" } else { "关" },
+                        self.extension_status.phase_label(),
                     ))
                     .child(metric(
                         theme,
                         "Mixed",
-                        &format!("127.0.0.1:{}", self.strategy.mixed_port),
+                        &self.mixed_endpoint(),
                     ))
                     .child(metric(
                         theme,
@@ -2838,11 +2951,9 @@ impl AppView {
         } else {
             "—".into()
         };
-        let mixed = format!("127.0.0.1:{}", self.strategy.mixed_port);
-        let filtered = controller::filter_connections(
-            &self.traffic.connections,
-            &self.connection_filters,
-        );
+        let mixed = self.mixed_endpoint();
+        let filtered =
+            controller::filter_connections(&self.traffic.connections, &self.connection_filters);
         let filter_note = if !connected || self.traffic.connections.is_empty() {
             String::new()
         } else if filtered.len() == self.traffic.connections.len()
@@ -2852,7 +2963,7 @@ impl AppView {
             String::new()
         } else {
             format!(
-                "显示 {} / {} 条",
+                "当前筛选 {} / 已加载 {} 条",
                 filtered.len(),
                 self.traffic.connections.len()
             )
@@ -2860,21 +2971,19 @@ impl AppView {
         v_flex()
             .id("connections-page")
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .overflow_hidden()
             .gap_4()
             .child(page_title(
                 theme,
                 "连接",
-                if self.strategy.system_extension {
-                    "系统接管打开后，未自己填代理的应用也会出现在这里。主动指定代理的连接仍会列出。"
-                } else {
-                    "当前只看到主动指定代理的连接。要拦截其他应用，先打开设置里的系统接管。"
-                },
+                "经过 Mihomo 的连接。系统接管原生放行或拒绝的活动不在此数据源内；显示直连仅含核心记录的 DIRECT。",
             ))
             .child(
                 h_flex()
                     .gap_3()
+                    .flex_wrap()
                     .child(metric(
                         theme,
                         "状态",
@@ -2917,7 +3026,7 @@ impl AppView {
                                             Toggle::new("show-direct-connections")
                                                 .small()
                                                 .outline()
-                                                .label("显示直连")
+                                                .label("显示核心直连")
                                                 .checked(self.connection_filters.show_direct)
                                                 .on_click(move |checked, _, app| {
                                                     let show = *checked;
@@ -2951,28 +3060,11 @@ impl AppView {
                                             Button::new("close-all-connections")
                                                 .small()
                                                 .danger()
-                                                .label("关闭全部")
+                                                .label("关闭核心全部连接")
+                                                .disabled(self.is_busy())
+                                                .tooltip("关闭 Mihomo 全部连接，包含当前筛选外的连接")
                                                 .on_click(move |_, _, app| {
-                                                    entity.update(app, |this, cx| {
-                                                        let port = this.strategy.mixed_port;
-                                                        this.traffic.connections.clear();
-                                                        this.status = "已关闭全部连接。".into();
-                                                        cx.background_executor()
-                                                            .spawn(async move {
-                                                                if let Err(err) =
-                                                                    controller::close_all(port)
-                                                                {
-                                                                    log::debug(
-                                                                        "ui",
-                                                                        format!(
-                                                                            "close all failed: {err:#}"
-                                                                        ),
-                                                                    );
-                                                                }
-                                                            })
-                                                            .detach();
-                                                        cx.notify();
-                                                    });
+                                                    entity.update(app, |this, cx| this.close_connections(None, cx));
                                                 })
                                         }),
                                 )
@@ -2983,13 +3075,13 @@ impl AppView {
             .when(!connected && !self.wanted, |this| {
                 this.child(empty_hint(
                     theme,
-                    "核心未连接。点右上角「连接」后，这里会显示经过 Mixed 端口的连接。",
+                    "核心未连接。到总览连接后，这里显示经过 Mihomo 的连接。",
                 ))
             })
             .when(!connected && self.wanted, |this| {
                 this.child(empty_hint(
                     theme,
-                    "核心异常，正在自动检查。恢复后这里会列出经过 Mixed 的连接。",
+                    "核心未就绪。恢复后显示经过 Mihomo 的连接。",
                 ))
             })
             .when(
@@ -2997,7 +3089,7 @@ impl AppView {
                 |this| {
                     this.child(empty_hint(
                         theme,
-                        "暂时没有连接。只有进入 Mixed 端口的流量会出现在这里。",
+                        "核心目前未记录连接。这不代表全机没有网络活动。",
                     ))
                 },
             )
@@ -3016,8 +3108,11 @@ impl AppView {
                         .id("connection-list")
                         .flex_1()
                         .min_h_0()
+                        .min_w_0()
+                        .w_full()
+                        .overflow_x_scroll()
                         .overflow_y_scroll()
-                        .gap_1()
+                        .child(v_flex().min_w(px(920.)).w_full().gap_1()
                         .child(connection_header_row(
                             entity.clone(),
                             theme,
@@ -3039,7 +3134,7 @@ impl AppView {
                             )
                         })
                         .children(filtered.into_iter().map(|conn| {
-                            render_connection_row(entity.clone(), theme, conn)
+                            render_connection_row(entity.clone(), theme, conn, self.is_busy())
                         }))
                         .when(
                             self.traffic.connection_count > self.traffic.connections.len(),
@@ -3047,7 +3142,7 @@ impl AppView {
                                 this.child(
                                     div().px_3().py_2().text_xs().text_color(muted_fg).child(
                                         format!(
-                                            "仅列出流量最高的 {} 条，共 {} 条。",
+                                            "当前仅加载流量最高的 {} 条，核心共 {} 条；筛选只作用于已加载列表。",
                                             self.traffic.connections.len(),
                                             self.traffic.connection_count
                                         ),
@@ -3055,7 +3150,7 @@ impl AppView {
                                 )
                             },
                         ),
-                )
+                ))
             })
     }
 
@@ -3066,98 +3161,163 @@ impl AppView {
             .child(page_title(
                 theme,
                 "订阅",
-                "多个机场 URL。排除过滤器在导入时丢掉流量/余额/官网一类节点。",
+                "添加或删除后需应用。规则和模式变更使用匹配的缓存；刷新按钮会重新获取订阅。",
             ))
+            .child(
+                Button::new("refresh-subscriptions")
+                    .label("刷新订阅并应用")
+                    .disabled(self.is_busy())
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, app| {
+                            entity.update(app, |this, cx| {
+                                if this.persist() {
+                                    this.start_apply_with_refresh(true, cx);
+                                }
+                                cx.notify();
+                            });
+                        }
+                    }),
+            )
             .child(
                 h_flex()
                     .gap_2()
-                    .items_center()
-                    .child(div().w(px(160.)).child(Input::new(&self.name_input)))
-                    .child(div().flex_1().child(Input::new(&self.url_input)))
-                    .child({
-                        let entity = entity.clone();
-                        Button::new("add-sub").primary().label("添加").on_click(
-                            move |_, window, app| {
-                                entity.update(app, |this, cx| {
-                                    let name = this.name_input.read(cx).value().to_string();
-                                    let url = this.url_input.read(cx).value().to_string();
-                                    if url.trim().is_empty() {
-                                        this.status = "需要订阅 URL。".into();
-                                    } else {
-                                        let name = if name.trim().is_empty() {
-                                            "sub".into()
+                    .items_end()
+                    .flex_wrap()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .w(px(160.))
+                            .child(div().text_xs().child("订阅名"))
+                            .child(Input::new(&self.name_input)),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .min_w(px(180.))
+                            .child(div().text_xs().child("订阅 URL"))
+                            .child(Input::new(&self.url_input)),
+                    )
+                    .child(
+                        Button::new("add-sub")
+                            .primary()
+                            .label("添加")
+                            .disabled(self.is_busy())
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, window, app| {
+                                    entity.update(app, |this, cx| {
+                                        if this.is_busy() {
+                                            return;
+                                        }
+                                        let name =
+                                            this.name_input.read(cx).value().trim().to_string();
+                                        let url =
+                                            this.url_input.read(cx).value().trim().to_string();
+                                        if name.is_empty() || url.is_empty() {
+                                            this.status = "填写订阅名和订阅 URL。".into();
                                         } else {
-                                            name
-                                        };
-                                        this.strategy.add_subscription(name, url.trim().into());
-                                        this.persist();
-                                        this.name_input.update(cx, |input, cx| {
-                                            input.set_value("", window, cx);
-                                        });
-                                        this.url_input.update(cx, |input, cx| {
-                                            input.set_value("", window, cx);
-                                        });
-                                    }
-                                    cx.notify();
-                                });
-                            },
-                        )
-                    }),
+                                            let previous = this.strategy.clone();
+                                            this.strategy.add_subscription(name, url);
+                                            if this.persist() {
+                                                this.status =
+                                                    "订阅已添加，尚未应用。请刷新订阅并应用。"
+                                                        .into();
+                                                this.name_input.update(cx, |input, cx| {
+                                                    input.set_value("", window, cx)
+                                                });
+                                                this.url_input.update(cx, |input, cx| {
+                                                    input.set_value("", window, cx)
+                                                });
+                                            } else {
+                                                this.strategy = previous;
+                                            }
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    ),
             )
             .when(self.strategy.subscriptions.is_empty(), |this| {
-                this.child(empty_hint(
-                    theme,
-                    "还没有订阅。填 URL 后点添加，或用 myproxyctl subscription add。",
-                ))
+                this.child(empty_hint(theme, "还没有订阅。填写名称和 URL 后添加。"))
             })
             .children(self.strategy.subscriptions.iter().map(|sub| {
-                let id = sub.id.clone();
                 let entity = entity.clone();
+                let id = sub.id.clone();
+                let warning = self.catalog.subscription_warning(&sub.name);
                 panel(
                     theme,
                     &sub.name,
-                    h_flex()
-                        .w_full()
-                        .justify_between()
+                    v_flex()
+                        .gap_2()
                         .child(
-                            div()
-                                .text_xs()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_color(theme.muted_foreground)
-                                .child(sub.url.clone()),
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .font_family(theme.mono_font_family.clone())
+                                        .text_color(theme.muted_foreground)
+                                        .child(sub.url.clone()),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("del-sub-{id}")))
+                                        .small()
+                                        .danger()
+                                        .label("删除")
+                                        .disabled(self.is_busy())
+                                        .on_click(move |_, _, app| {
+                                            entity.update(app, |this, cx| {
+                                                if this.is_busy() {
+                                                    return;
+                                                }
+                                                let previous = this.strategy.clone();
+                                                this.strategy.remove_subscription(&id);
+                                                if this.persist() {
+                                                    this.status =
+                                                        "订阅已删除，尚未应用。请应用配置。".into();
+                                                } else {
+                                                    this.strategy = previous;
+                                                }
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
                         )
-                        .child(
-                            Button::new(SharedString::from(format!("del-{id}")))
-                                .small()
-                                .danger()
-                                .label("删除")
-                                .on_click(move |_, _, app| {
-                                    entity.update(app, |this, cx| {
-                                        this.strategy.remove_subscription(&id);
-                                        this.persist();
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
+                        .when_some(warning, |this, warning| {
+                            this.child(div().text_xs().text_color(theme.warning).child(warning))
+                        }),
                 )
             }))
-            .children(self.catalog.excluded.iter().take(8).map(|ex| {
+            .child(
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("excluded {} ({}) — {}", ex.name, ex.subscription, ex.reason))
-            }))
+                    .child(format!(
+                        "当前目录 {} 个节点，{} 项被排除。",
+                        self.catalog.nodes.len(),
+                        self.catalog.excluded.len()
+                    )),
+            )
     }
 
     fn groups(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
         let accent = theme.accent;
+        let query = self.member_query.read(cx).value().trim().to_lowercase();
         v_flex()
             .gap_4()
             .child(page_title(
                 theme,
                 "节点组",
-                "点节点切换当前出口；点卡片空白处编辑匹配条件。来源 ∩ 名称含（或，支持 * ?）∪ 钉住 − 排除。GLOBAL 是 mihomo 内置选择组，仅「全局」模式整段走它。",
+                "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件，卡片边框仅表示编辑中。来源约束名称匹配，钉住优先，精确排除最终生效。",
             ))
             .child(
                 h_flex().child({
@@ -3186,8 +3346,11 @@ impl AppView {
                     self.connected,
                     self.strategy.uses_global(),
                     &self.global_query,
+                    self.global_limit,
+                    self.is_busy(),
                 )
             })
+            .child(v_flex().gap_1().child(div().text_xs().child("搜索节点组成员")).child(Input::new(&self.member_query)))
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
             })
@@ -3200,12 +3363,17 @@ impl AppView {
                 )
             })
             .children(self.strategy.groups.iter().map(|group| {
-                let count = catalog::count_group_members(group, &self.catalog);
+                let member_names = self.group_member_names(group);
+                let count = if self.connected {
+                    self.live_group(group).map(|live| live.members.len())
+                } else {
+                    Some(member_names.len())
+                };
                 let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
                 let now = self.group_now(group).to_string();
-                let members: Vec<(String, Option<u32>)> = self
-                    .group_member_names(group)
+                let members: Vec<(String, Option<u32>)> = member_names
                     .into_iter()
+                    .filter(|name| name.to_lowercase().contains(&query))
                     .map(|name| {
                         let delay = self.member_delay(&name);
                         (name, delay)
@@ -3223,6 +3391,8 @@ impl AppView {
                     group.kind == "select",
                     self.delaying.contains(&group.name),
                     self.connected,
+                    *self.member_limits.get(&group.id).unwrap_or(&36),
+                    self.is_busy(),
                 )
             }))
     }
@@ -3251,7 +3421,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "规则",
-                "先选分流预设，再写自己的规则。自上而下第一条命中；规则集整包装卸，不拆进下面的表。",
+                "规则入口先绕过本机和私网，再按下表自上而下首条命中。同一规则内是任一条件命中；GFWList 预设独立装卸。",
             ))
             .child(self.routing_panel(cx, theme))
             .child(
@@ -3338,7 +3508,7 @@ impl AppView {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("主动指定 HTTP/SOCKS 的客户端仍用这个端口。系统接管打开后，未填代理的应用也会进核心。"),
+                            .child("显式 HTTP/SOCKS 客户端使用 Mixed。系统接管按捕获规则转入核心；原生放行和拒绝流量不进入核心连接列表。"),
                     )
                     .child(
                         h_flex()
@@ -3350,7 +3520,7 @@ impl AppView {
                             .child({
                                 let entity = entity.clone();
                                 Button::new("save-port")
-                                    .disabled(self.busy)
+                                    .disabled(self.is_busy())
                                     .label("保存端口")
                                     .on_click(
                                     move |_, _, app| {
@@ -3392,7 +3562,7 @@ impl AppView {
                     .child({
                         let entity = entity.clone();
                         Button::new("save-filter")
-                            .disabled(self.busy)
+                            .disabled(self.is_busy())
                             .primary()
                             .label("保存过滤器")
                             .on_click(
@@ -3446,7 +3616,7 @@ impl AppView {
                             } else {
                                 button.primary().label("安装")
                             };
-                            button.disabled(self.busy).on_click(move |_, _, app| {
+                            button.disabled(self.is_busy()).on_click(move |_, _, app| {
                                 entity.update(app, |this, cx| {
                                     match myproxy::cli_install::install() {
                                         Ok(path) => {
@@ -3504,16 +3674,9 @@ impl AppView {
     }
 
     fn inbound_modes_subtitle(&self) -> String {
-        let base = format!(
-            "Mixed {} · 接管 {}",
-            self.strategy.mixed_mode.label(),
-            self.strategy.extension_mode.label()
-        );
-        if self.strategy.uses_global() {
-            format!("{base} · GLOBAL {}", self.global_now())
-        } else {
-            base
-        }
+        format!("已保存模式：Mixed {} · 系统接管 {}。规则模式先绕过本机/私网再匹配策略；代理、全局、直连绕过用户规则。TUN 固定按策略规则。{}",
+            self.strategy.mixed_mode.label(), self.strategy.extension_mode.label(),
+            if self.is_dirty() { " 当前有待应用修改。" } else { "" })
     }
 
     fn global_mode_row(
@@ -3534,38 +3697,30 @@ impl AppView {
         }
         v_flex()
             .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(if active {
-                        format!("GLOBAL 当前 {now} · 点下方组或到节点组选节点")
-                    } else {
-                        format!("内置 GLOBAL 当前 {now} · 仅「全局」模式整段走它")
-                    }),
-            )
+            .child(div().text_xs().text_color(muted_fg).child(if active {
+                format!("GLOBAL 当前 {now} · 点下方组或到节点组选节点")
+            } else {
+                format!("内置 GLOBAL 当前 {now} · 仅「全局」模式整段走它")
+            }))
             .when(active, |this| {
-                this.child(
-                    h_flex().w_full().flex_wrap().gap_1().children(
-                        shortcuts.into_iter().map(|name| {
-                            let entity = entity.clone();
-                            let pick = name.clone();
-                            let mut button = Button::new(SharedString::from(format!(
-                                "{id_prefix}-global-{name}"
-                            )))
-                            .small()
-                            .label(name.clone());
-                            if name == now {
-                                button = button.primary();
-                            }
-                            button.disabled(self.busy).on_click(move |_, _, app| {
-                                entity.update(app, |this, cx| {
-                                    this.select_global_member(&pick, cx);
-                                });
-                            })
-                        }),
-                    ),
-                )
+                this.child(h_flex().w_full().flex_wrap().gap_1().children(
+                    shortcuts.into_iter().map(|name| {
+                        let entity = entity.clone();
+                        let pick = name.clone();
+                        let mut button =
+                            Button::new(SharedString::from(format!("{id_prefix}-global-{name}")))
+                                .small()
+                                .label(name.clone());
+                        if name == now {
+                            button = button.primary();
+                        }
+                        button.disabled(self.is_busy()).on_click(move |_, _, app| {
+                            entity.update(app, |this, cx| {
+                                this.select_global_member(&pick, cx);
+                            });
+                        })
+                    }),
+                ))
             })
     }
 
@@ -3590,7 +3745,7 @@ impl AppView {
                 } else {
                     btn.label(mode.label())
                 };
-                btn.disabled(self.busy).on_click(move |_, _, app| {
+                btn.disabled(self.is_busy()).on_click(move |_, _, app| {
                     entity.update(app, |this, cx| {
                         set(this, mode, cx);
                         cx.notify();
@@ -3600,25 +3755,31 @@ impl AppView {
     }
 
     fn set_mixed_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         self.strategy.mixed_mode = mode;
         if mode == InboundMode::Global {
             self.strategy.ensure_global_selected();
         }
-        self.persist_inbound_mode(cx, format!("已将 Mixed 设为{}。", mode.label()));
+        self.persist_inbound_mode(cx, format!("Mixed 已保存为{}。", mode.label()));
     }
 
     fn set_extension_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         self.strategy.extension_mode = mode;
         if mode == InboundMode::Global {
             self.strategy.ensure_global_selected();
         }
-        self.persist_inbound_mode(cx, format!("已将系统接管设为{}。", mode.label()));
+        self.persist_inbound_mode(cx, format!("系统接管已保存为{}。", mode.label()));
     }
 
     fn persist_inbound_mode(&mut self, cx: &mut Context<Self>, note: String) {
         if self.wanted {
             if self.persist_and_apply(cx) {
-                self.status = note;
+                self.status = format!("{note}正在应用…");
             }
         } else if self.persist() {
             self.status = format!("{note}下次连接或应用后生效。");
@@ -3626,6 +3787,9 @@ impl AppView {
     }
 
     fn set_system_extension(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         self.strategy.system_extension = on;
         if on {
             self.strategy.tun = false;
@@ -3636,12 +3800,15 @@ impl AppView {
             self.status = if on {
                 "已记录。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
             } else {
-                "已关闭系统接管。".into()
+                "已保存关闭系统接管的意图。".into()
             };
         }
     }
 
     fn set_tun(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         self.strategy.tun = on;
         if on {
             self.strategy.system_extension = false;
@@ -3652,7 +3819,7 @@ impl AppView {
             self.status = if on {
                 "已记录。下次连接走 TUN；首次会要管理员密码。".into()
             } else {
-                "已关闭 TUN。".into()
+                "已保存关闭 TUN 的意图。".into()
             };
         }
     }
@@ -3670,7 +3837,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("自己的规则始终优先。GFWList 整包装上或卸下，不写进下面的规则表。"),
+                        .child("规则入口先绕过本机与私网，再按用户规则、GFWList、未命中走向处理。GFWList 整包装卸。"),
                 )
                 .child(
                     h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().map(
@@ -3686,7 +3853,7 @@ impl AppView {
                             } else {
                                 btn.label(profile.label())
                             };
-                            btn.disabled(self.busy).on_click(move |_, _, app| {
+                            btn.disabled(self.is_busy()).on_click(move |_, _, app| {
                                 entity.update(app, |this, cx| {
                                     this.set_routing_profile(profile, cx);
                                     cx.notify();
@@ -3711,7 +3878,7 @@ impl AppView {
                                 } else {
                                     btn.label(name.clone())
                                 };
-                                btn.disabled(self.busy).on_click(move |_, _, app| {
+                                btn.disabled(self.is_busy()).on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
                                         this.strategy.routing_profile = RoutingProfile::Group;
                                         this.strategy.unmatched_via = name.clone();
@@ -3746,8 +3913,11 @@ impl AppView {
     }
 
     fn set_routing_profile(&mut self, profile: RoutingProfile, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         self.strategy.set_routing_profile(profile);
-        self.persist_inbound_mode(cx, format!("已将分流设为{}。", profile.label()));
+        self.persist_inbound_mode(cx, format!("分流已保存为{}。", profile.label()));
     }
 
     fn system_extension_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -3777,24 +3947,24 @@ impl AppView {
                                 ),
                         )
                         .child({
-                            let mut toggle = Button::new("se-toggle").small();
-                            toggle = if on {
-                                toggle.danger().label("关闭")
-                            } else {
-                                toggle.primary().label("开启")
-                            };
-                            toggle.disabled(self.busy).on_click({
-                                let entity = entity.clone();
-                                move |_, _, app| {
-                                    entity.update(app, |this, cx| {
-                                        this.set_system_extension(
-                                            !this.strategy.system_extension,
-                                            cx,
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                            })
+                            Switch::new("se-toggle")
+                                .small()
+                                .label(if on { "开启" } else { "关闭" })
+                                .checked(on)
+                                .accessibility_label("系统接管")
+                                .disabled(self.is_busy())
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            this.set_system_extension(
+                                                !this.strategy.system_extension,
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                })
                         }),
                 )
                 .child(
@@ -3802,11 +3972,14 @@ impl AppView {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(if on {
-                            "已打开。连接后到「系统设置 › 通用 › 登录项与扩展 › 网络扩展」允许 myproxy。"
+                            "已保存启用意图；实际状态见下方。首次需在系统设置中允许网络扩展。"
                         } else {
-                            "关闭时，只有自己填了代理的应用会进规则。"
+                            "关闭系统接管后，显式代理客户端仍可使用 Mixed；TUN 单独控制。"
                         }),
                 )
+                .child(div().text_xs().child(format!("系统接管：{} · DNS：{}", self.extension_status.phase_label(), self.extension_status.dns_label())))
+                .when_some(self.extension_status.message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(message)))
+                .when_some(self.extension_status.dns_message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(format!("DNS：{message}"))))
                 .child(self.inbound_mode_buttons(
                     cx,
                     "extension-mode",
@@ -3833,23 +4006,23 @@ impl AppView {
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("用虚拟网卡拦截流量，与系统接管不能同时开。一般保持关闭。"),
+                                        .child("TUN 与系统接管互斥，固定按策略规则运行，不使用 Mixed 或接管的模式按钮。"),
                                 ),
                         )
                         .child({
                             let entity = entity.clone();
-                            let mut toggle = Button::new("tun-toggle").small();
-                            toggle = if tun_on {
-                                toggle.danger().label("关闭")
-                            } else {
-                                toggle.primary().label("开启")
-                            };
-                            toggle.disabled(self.busy).on_click(move |_, _, app| {
-                                entity.update(app, |this, cx| {
-                                    this.set_tun(!this.strategy.tun, cx);
-                                    cx.notify();
-                                });
-                            })
+                            Switch::new("tun-toggle")
+                                .small()
+                                .label(if tun_on { "开启" } else { "关闭" })
+                                .checked(tun_on)
+                                .accessibility_label("TUN")
+                                .disabled(self.is_busy())
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.set_tun(!this.strategy.tun, cx);
+                                        cx.notify();
+                                    });
+                                })
                         }),
                 ),
         )
@@ -3871,13 +4044,17 @@ impl AppView {
                     "登录后自动打开 myproxy。需要安装为 .app。",
                     self.strategy.launch_at_login,
                     |this, cx| {
-                        this.strategy.launch_at_login = !this.strategy.launch_at_login;
-                        let sync_err =
-                            myproxy::login_item::sync(this.strategy.launch_at_login).err();
-                        this.persist();
-                        if let Some(err) = sync_err {
-                            log::warn("login", format!("{err:#}"));
-                            this.status = format!("已保存。开机启动未生效：{err}");
+                        let previous = this.strategy.launch_at_login;
+                        this.strategy.launch_at_login = !previous;
+                        if this.persist() {
+                            if let Err(err) =
+                                myproxy::login_item::sync(this.strategy.launch_at_login)
+                            {
+                                log::warn("login", format!("{err:#}"));
+                                this.status = format!("已保存。开机启动未生效：{err}");
+                            }
+                        } else {
+                            this.strategy.launch_at_login = previous;
                         }
                         cx.notify();
                     },
@@ -3895,8 +4072,11 @@ impl AppView {
                     "启动时不显示主窗口，可从菜单栏打开。",
                     self.strategy.silent_launch,
                     |this, cx| {
-                        this.strategy.silent_launch = !this.strategy.silent_launch;
-                        this.persist();
+                        let previous = this.strategy.silent_launch;
+                        this.strategy.silent_launch = !previous;
+                        if !this.persist() {
+                            this.strategy.silent_launch = previous;
+                        }
                         cx.notify();
                     },
                 ))
@@ -3908,8 +4088,11 @@ impl AppView {
                     "不加载主界面，仅运行核心与菜单栏。点菜单栏图标可打开窗口。",
                     self.strategy.lite_mode,
                     |this, cx| {
-                        this.strategy.lite_mode = !this.strategy.lite_mode;
-                        this.persist();
+                        let previous = this.strategy.lite_mode;
+                        this.strategy.lite_mode = !previous;
+                        if !this.persist() {
+                            this.strategy.lite_mode = previous;
+                        }
                         cx.notify();
                     },
                 ))
@@ -3921,8 +4104,11 @@ impl AppView {
                     "启动后自动连接。",
                     self.strategy.connect_on_launch,
                     |this, cx| {
-                        this.strategy.connect_on_launch = !this.strategy.connect_on_launch;
-                        this.persist();
+                        let previous = this.strategy.connect_on_launch;
+                        this.strategy.connect_on_launch = !previous;
+                        if !this.persist() {
+                            this.strategy.connect_on_launch = previous;
+                        }
                         cx.notify();
                     },
                 )),
@@ -3959,15 +4145,19 @@ impl AppView {
                     ),
             )
             .child({
-                let mut toggle = Button::new(id).small();
-                toggle = if on {
-                    toggle.label("关闭")
-                } else {
-                    toggle.primary().label("开启")
-                };
-                toggle.disabled(self.busy).on_click(move |_, _, app| {
-                    entity.update(app, |this, cx| apply(this, cx));
-                })
+                Switch::new(id)
+                    .small()
+                    .label(if on { "开启" } else { "关闭" })
+                    .checked(on)
+                    .accessibility_label(title)
+                    .disabled(self.is_busy())
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            if !this.is_busy() {
+                                apply(this, cx);
+                            }
+                        });
+                    })
             })
     }
 
@@ -4029,11 +4219,7 @@ impl AppView {
             "更新",
             v_flex()
                 .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .child(format!("当前版本 {version}")),
-                )
+                .child(div().text_sm().child(format!("当前版本 {version}")))
                 .child(
                     h_flex()
                         .items_center()
@@ -4050,13 +4236,13 @@ impl AppView {
                                     Button::new("update-prod")
                                         .label(UpdateChannel::Prod.label())
                                         .selected(channel == UpdateChannel::Prod)
-                                        .disabled(self.busy),
+                                        .disabled(self.is_busy()),
                                 )
                                 .child(
                                     Button::new("update-nightly")
                                         .label(UpdateChannel::Nightly.label())
                                         .selected(channel == UpdateChannel::Nightly)
-                                        .disabled(self.busy),
+                                        .disabled(self.is_busy()),
                                 )
                                 .on_click(move |indices, _, app| {
                                     let next = match indices.first() {
@@ -4401,7 +4587,7 @@ fn render_group_card(
     entity: Entity<AppView>,
     theme: &Theme,
     group: &Group,
-    count: usize,
+    count: Option<usize>,
     selected: bool,
     accent: Hsla,
     now: &str,
@@ -4409,14 +4595,15 @@ fn render_group_card(
     can_select: bool,
     delaying: bool,
     connected: bool,
+    limit: usize,
+    busy: bool,
 ) -> impl IntoElement {
     let id = group.id.clone();
     let del_id = group.id.clone();
     let group_name = group.name.clone();
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
-    let shown = members.iter().take(36).cloned().collect::<Vec<_>>();
-    let extra = members.len().saturating_sub(shown.len());
+    let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     v_flex()
         .id(SharedString::from(format!("group-card-{id}")))
         .p_4()
@@ -4443,27 +4630,43 @@ fn render_group_card(
                 .w_full()
                 .items_center()
                 .justify_between()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child(format!(
-                            "{}  ·  {}  ·  {} 个节点",
-                            group.name,
-                            group.kind_label(),
-                            count
-                        )),
-                )
+                .child(div().text_sm().font_semibold().child(format!(
+                        "{}  ·  {}  ·  {}",
+                        group.name,
+                        group.kind_label(),
+                        count
+                            .map(|count| format!("{count} 个节点"))
+                            .unwrap_or_else(|| "等待核心状态".into())
+                    )))
                 .child(
                     h_flex()
                         .gap_1()
                         .child({
                             let entity = entity.clone();
+                            let id = id.clone();
+                            Button::new(SharedString::from(format!("edit-group-{id}")))
+                                .small()
+                                .label("编辑")
+                                .accessibility_label(format!("编辑节点组 {}", group_name))
+                                .on_click(move |_, window, app| {
+                                    app.stop_propagation();
+                                    entity.update(app, |this, cx| {
+                                        this.open_group_dialog(Some(&id), window, cx);
+                                        cx.notify();
+                                    });
+                                })
+                        })
+                        .child({
+                            let entity = entity.clone();
                             let name = group_name.clone();
                             Button::new(SharedString::from(format!("delay-group-{id}")))
                                 .small()
-                                .label(if delaying { "测延迟…" } else { "测延迟" })
-                                .disabled(delaying || !connected)
+                                .label(if delaying {
+                                    "测延迟…"
+                                } else {
+                                    "测延迟"
+                                })
+                                .disabled(delaying || !connected || busy)
                                 .on_click(move |_, _, app| {
                                     app.stop_propagation();
                                     entity.update(app, |this, cx| {
@@ -4477,39 +4680,57 @@ fn render_group_card(
                                 .small()
                                 .danger()
                                 .label("删除")
+                                .disabled(busy)
                                 .on_click(move |_, window, app| {
                                     app.stop_propagation();
-                                    let close_modal = entity
-                                        .read(app)
-                                        .group_edit_id
-                                        .as_deref()
+                                    let close_modal = entity.read(app).group_edit_id.as_deref()
                                         == Some(del_id.as_str());
-                                    entity.update(app, |this, cx| {
-                                        if close_modal {
+                                    let removed = entity.update(app, |this, cx| {
+                                        if this.is_busy() {
+                                            return false;
+                                        }
+                                        let previous = this.strategy.clone();
+                                        if let Err(err) =
+                                            this.strategy.remove_group_checked(&del_id)
+                                        {
+                                            this.status = format!("无法删除节点组：{err:#}");
+                                            cx.notify();
+                                            return false;
+                                        }
+                                        let applied = this.persist_and_apply(cx);
+                                        if applied && close_modal {
                                             this.group_modal_open = false;
                                             this.group_edit_id = None;
+                                        } else if !applied {
+                                            this.strategy = previous;
                                         }
-                                        this.strategy.remove_group(&del_id);
-                                        this.persist_and_apply(cx);
                                         cx.notify();
+                                        applied
                                     });
-                                    if close_modal {
+                                    if close_modal && removed {
                                         window.close_dialog(app);
                                     }
                                 })
                         }),
                 ),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted_fg)
-                .child(format!("当前 {}  ·  {}", now, group.policy_label())),
-        )
+        .child(div().text_xs().text_color(muted_fg).child(format!(
+            "{} {}  ·  {}",
+            if connected {
+                "核心当前"
+            } else {
+                "已保存选择"
+            },
+            now,
+            group.policy_label()
+        )))
         .when(!shown.is_empty(), |this| {
             this.child(
-                h_flex().w_full().flex_wrap().gap_1().children(
-                    shown.into_iter().map(|(name, delay)| {
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(shown.into_iter().map(|(name, delay)| {
                         let delay_text = format_delay(delay);
                         let label = if delay_text.is_empty() {
                             name.clone()
@@ -4519,33 +4740,61 @@ fn render_group_card(
                         let is_now = name == now;
                         let entity = entity.clone();
                         let group_id = id.clone();
-                        let mut button = Button::new(SharedString::from(format!(
-                            "pick-{id}-{name}"
-                        )))
-                        .small()
-                        .label(label);
-                        if is_now {
-                            button = button.primary();
-                        }
                         if can_select {
-                            button = button.on_click(move |_, _, app| {
-                                app.stop_propagation();
-                                entity.update(app, |this, cx| {
-                                    this.select_group_member(&group_id, &name, cx);
-                                });
-                            });
+                            Button::new(SharedString::from(format!("pick-{id}-{name}")))
+                                .small()
+                                .label(label)
+                                .max_w_full()
+                                .overflow_hidden()
+                                .tooltip(name.clone())
+                                .selected(is_now)
+                                .disabled(busy)
+                                .accessibility_label(format!("选择 {name}"))
+                                .on_click(move |_, _, app| {
+                                    app.stop_propagation();
+                                    entity.update(app, |this, cx| {
+                                        this.select_group_member(&group_id, &name, cx)
+                                    });
+                                })
+                                .into_any_element()
+                        } else {
+                            div()
+                                .max_w_full()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .px_2()
+                                .py_1()
+                                .rounded(theme.radius)
+                                .text_xs()
+                                .bg(if is_now {
+                                    theme.accent.opacity(0.14)
+                                } else {
+                                    theme.muted
+                                })
+                                .child(if is_now {
+                                    format!("{label} · 当前")
+                                } else {
+                                    label
+                                })
+                                .into_any_element()
                         }
-                        button
-                    }),
-                ),
+                    })),
             )
         })
-        .when(extra > 0, |this| {
+        .when(members.len() > limit, |this| {
+            let entity = entity.clone();
+            let id = id.clone();
             this.child(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(format!("其余 {extra} 个在编辑窗查看")),
+                Button::new(SharedString::from(format!("more-{id}")))
+                    .small()
+                    .label(format!("继续显示（{} / {}）", limit, members.len()))
+                    .on_click(move |_, _, app| {
+                        app.stop_propagation();
+                        entity.update(app, |this, cx| {
+                            *this.member_limits.entry(id.clone()).or_insert(36) += 36;
+                            cx.notify();
+                        });
+                    }),
             )
         })
 }
@@ -4560,11 +4809,12 @@ fn render_global_card(
     connected: bool,
     inbound_global: bool,
     query: &Entity<InputState>,
+    limit: usize,
+    busy: bool,
 ) -> impl IntoElement {
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
-    let shown = members.iter().take(36).cloned().collect::<Vec<_>>();
-    let extra = members.len().saturating_sub(shown.len());
+    let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     let shown_empty = shown.is_empty();
     v_flex()
         .id("group-card-GLOBAL")
@@ -4585,17 +4835,18 @@ fn render_global_card(
                     div()
                         .text_sm()
                         .font_semibold()
-                        .child(format!(
-                            "GLOBAL  ·  内置选择  ·  {} 个成员",
-                            members.len()
-                        )),
+                        .child(format!("GLOBAL  ·  内置选择  ·  {} 个成员", members.len())),
                 )
                 .child({
                     let entity = entity.clone();
                     Button::new("delay-group-GLOBAL")
                         .small()
-                        .label(if delaying { "测延迟…" } else { "测延迟" })
-                        .disabled(delaying || !connected)
+                        .label(if delaying {
+                            "测延迟…"
+                        } else {
+                            "测延迟"
+                        })
+                        .disabled(delaying || !connected || busy)
                         .on_click(move |_, _, app| {
                             entity.update(app, |this, cx| {
                                 this.start_group_delay(GLOBAL_GROUP, cx);
@@ -4616,8 +4867,11 @@ fn render_global_card(
         .child(div().w_full().child(Input::new(query)))
         .when(!shown_empty, |this| {
             this.child(
-                h_flex().w_full().flex_wrap().gap_1().children(
-                    shown.into_iter().map(|(name, delay)| {
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(shown.into_iter().map(|(name, delay)| {
                         let delay_text = format_delay(delay);
                         let label = if delay_text.is_empty() {
                             name.clone()
@@ -4626,11 +4880,15 @@ fn render_global_card(
                         };
                         let is_now = name == now;
                         let entity = entity.clone();
-                        let mut button = Button::new(SharedString::from(format!(
-                            "pick-GLOBAL-{name}"
-                        )))
-                        .small()
-                        .label(label);
+                        let mut button =
+                            Button::new(SharedString::from(format!("pick-GLOBAL-{name}")))
+                                .small()
+                                .label(label)
+                                .max_w_full()
+                                .overflow_hidden()
+                                .tooltip(name.clone())
+                                .disabled(busy)
+                                .selected(is_now);
                         if is_now {
                             button = button.primary();
                         }
@@ -4639,16 +4897,7 @@ fn render_global_card(
                                 this.select_global_member(&name, cx);
                             });
                         })
-                    }),
-                ),
-            )
-        })
-        .when(extra > 0, |this| {
-            this.child(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(format!("其余 {extra} 个，用筛选缩小")),
+                    })),
             )
         })
         .when(shown_empty, |this| {
@@ -4657,6 +4906,20 @@ fn render_global_card(
                     .text_xs()
                     .text_color(muted_fg)
                     .child("没有匹配的成员。"),
+            )
+        })
+        .when(members.len() > limit, |this| {
+            let entity = entity.clone();
+            this.child(
+                Button::new("more-GLOBAL")
+                    .small()
+                    .label(format!("继续显示（{} / {}）", limit, members.len()))
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.global_limit += 36;
+                            cx.notify();
+                        });
+                    }),
             )
         })
 }
@@ -4791,17 +5054,15 @@ fn connection_filter_header(
                     let checked = current.as_deref() == Some(value.as_str());
                     let pick_entity = entity.clone();
                     let picked = value.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(value.clone())
-                            .checked(checked)
-                            .on_click(move |_, _, app| {
-                                pick_entity.update(app, |this, cx| {
-                                    this.connection_filters
-                                        .set_column(column, Some(picked.clone()));
-                                    cx.notify();
-                                });
-                            }),
-                    );
+                    menu = menu.item(PopupMenuItem::new(value.clone()).checked(checked).on_click(
+                        move |_, _, app| {
+                            pick_entity.update(app, |this, cx| {
+                                this.connection_filters
+                                    .set_column(column, Some(picked.clone()));
+                                cx.notify();
+                            });
+                        },
+                    ));
                 }
                 menu
             }
@@ -4818,13 +5079,20 @@ fn connection_col(
     color: Hsla,
     mono: Option<SharedString>,
 ) -> impl IntoElement {
+    let text = text.into();
+    let full_text = text.clone();
     div()
+        .id(SharedString::from(format!("cell-{text}")))
+        .overflow_hidden()
+        .text_ellipsis()
+        .tooltip(move |window, cx| Tooltip::new(full_text.clone()).build(window, cx))
         .w(width)
         .min_w(width)
+        .flex_shrink_0()
         .text_xs()
         .text_color(color)
         .when_some(mono, |this, family| this.font_family(family))
-        .child(text.into())
+        .child(text)
 }
 
 fn connection_col_flex(
@@ -4832,19 +5100,26 @@ fn connection_col_flex(
     color: Hsla,
     mono: Option<SharedString>,
 ) -> impl IntoElement {
+    let text = text.into();
+    let full_text = text.clone();
     div()
+        .id(SharedString::from(format!("cell-{text}")))
+        .overflow_hidden()
+        .text_ellipsis()
+        .tooltip(move |window, cx| Tooltip::new(full_text.clone()).build(window, cx))
         .flex_1()
         .min_w(px(96.))
         .text_xs()
         .text_color(color)
         .when_some(mono, |this, family| this.font_family(family))
-        .child(text.into())
+        .child(text)
 }
 
 fn render_connection_row(
     entity: Entity<AppView>,
     theme: &Theme,
     conn: &controller::LiveConnection,
+    busy: bool,
 ) -> impl IntoElement {
     let id = conn.id.clone();
     let muted = theme.muted;
@@ -4871,7 +5146,12 @@ fn render_connection_row(
             muted_fg,
             Some(mono.clone()),
         ))
-        .child(connection_col(px(64.), conn.network.clone(), muted_fg, None))
+        .child(connection_col(
+            px(64.),
+            conn.network.clone(),
+            muted_fg,
+            None,
+        ))
         .child(connection_col(px(168.), conn.chain.clone(), fg, None))
         .child(connection_col(px(72.), up, muted_fg, Some(mono.clone())))
         .child(connection_col(px(72.), down, muted_fg, Some(mono)))
@@ -4887,21 +5167,10 @@ fn render_connection_row(
                 .small()
                 .danger()
                 .label("关闭")
+                .disabled(busy)
+                .accessibility_label(format!("关闭 {} 的连接", conn.destination))
                 .on_click(move |_, _, app| {
-                    let id = id.clone();
-                    entity.update(app, |this, cx| {
-                        this.traffic.connections.retain(|conn| conn.id != id);
-                        let port = this.strategy.mixed_port;
-                        let close_id = id.clone();
-                        cx.background_executor()
-                            .spawn(async move {
-                                if let Err(err) = controller::close_one(port, &close_id) {
-                                    log::debug("ui", format!("close connection failed: {err:#}"));
-                                }
-                            })
-                            .detach();
-                        cx.notify();
-                    });
+                    entity.update(app, |this, cx| this.close_connections(Some(id.clone()), cx));
                 })
         })
 }
@@ -5035,12 +5304,7 @@ fn render_rule_set_card(
                                 .text_color(muted_fg)
                                 .child(format!("{}", index + 1)),
                         )
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .child(set.name.clone()),
-                        )
+                        .child(div().text_sm().font_semibold().child(set.name.clone()))
                         .child(pill(theme, &via_label(&via), accent)),
                 )
                 .child({
@@ -5098,6 +5362,7 @@ fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
 fn metric(theme: &Theme, label: &str, value: &str) -> impl IntoElement {
     v_flex()
         .flex_1()
+        .min_w(px(140.))
         .p_4()
         .gap_1()
         .rounded(theme.radius)
@@ -5137,12 +5402,9 @@ fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
 }
 
 fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
-    div()
-        .size_2()
-        .rounded_full()
-        .bg(if on {
-            theme.success
-        } else {
-            theme.muted_foreground
-        })
+    div().size_2().rounded_full().bg(if on {
+        theme.success
+    } else {
+        theme.muted_foreground
+    })
 }
