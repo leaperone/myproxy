@@ -12,7 +12,7 @@
 *.mobileprovision
 *.pem
 
-# Local planning artifacts
+# Local planning artifacts (canonical: ~/.vibe/planning/<abs-path>/)
 /.planning/
 
 # Local Git worktrees
@@ -26,8 +26,3 @@
 
 # Fetched Sparkle.framework + tools; fetch with scripts/fetch-sparkle.sh
 /resources/sparkle/
-
-
-# Keep project planning artifacts tracked
-!.planning/
-!.planning/**
