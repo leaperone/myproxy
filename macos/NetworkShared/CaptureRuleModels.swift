@@ -201,11 +201,12 @@ public struct HostMatcher: Codable, Hashable, Sendable {
         guard !value.isEmpty, value.utf8.count <= 253 else { return false }
         let labels = value.split(separator: ".", omittingEmptySubsequences: false)
         return labels.allSatisfy { label in
-            guard !label.isEmpty, label.utf8.count <= 63,
-                  label.first != "-", label.last != "-"
+            guard !label.isEmpty, label.utf8.count <= 63
             else { return false }
+            // Mihomo treats these values as literal host matchers and accepts
+            // service-style labels such as `_tcp` and labels ending in `-`.
             return label.allSatisfy { character in
-                character.isLetter || character.isNumber || character == "-"
+                character.isLetter || character.isNumber || character == "-" || character == "_"
             }
         }
     }

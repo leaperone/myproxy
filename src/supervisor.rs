@@ -1011,19 +1011,79 @@ fn validate_runtime_config(yaml: &Path) -> Result<()> {
         );
     }
     // Mihomo's parser can echo credential-bearing proxy entries on failure.
-    // Keep its raw diagnostics private and report only the validation stage.
-    let status = mihomo_command(&bin)?
+    // Keep raw diagnostics private and report only a safe location/category.
+    let output = mihomo_command(&bin)?
         .arg("-t")
         .arg("-f")
         .arg(yaml)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .context("mihomo -t")?;
-    if !status.success() {
-        bail!("候选配置未通过 Mihomo 校验；运行配置未改变");
+    if !output.status.success() {
+        let detail = mihomo_validation_detail(&output);
+        if detail.is_empty() {
+            bail!("候选配置未通过 Mihomo 校验；运行配置未改变");
+        }
+        bail!("候选配置未通过 Mihomo 校验：{detail}；运行配置未改变");
     }
     Ok(())
+}
+
+fn mihomo_validation_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    let line = text
+        .lines()
+        .find(|line| line.contains("level=error"))
+        .or_else(|| text.lines().rev().find(|line| !line.trim().is_empty()))
+        .unwrap_or_default();
+    let message = line
+        .split_once("msg=\"")
+        .map(|(_, value)| value.trim_end_matches('"'))
+        .unwrap_or(line)
+        .replace("\\\"", "\"")
+        .to_ascii_lowercase();
+    let location = if let Some(caps) = regex::Regex::new(r"proxy group\[(\d+)\]")
+        .expect("static mihomo location pattern")
+        .captures(&message)
+    {
+        format!("代理组 #{}", &caps[1])
+    } else if let Some(caps) = regex::Regex::new(r"proxy (\d+):")
+        .expect("static mihomo location pattern")
+        .captures(&message)
+    {
+        format!("节点 #{}", &caps[1])
+    } else if let Some(caps) = regex::Regex::new(r"rules\[(\d+)\]")
+        .expect("static mihomo location pattern")
+        .captures(&message)
+    {
+        format!("规则 #{}", &caps[1])
+    } else if let Some(caps) = regex::Regex::new(r"yaml: line (\d+)")
+        .expect("static mihomo location pattern")
+        .captures(&message)
+    {
+        format!("YAML 第 {} 行", &caps[1])
+    } else {
+        "候选配置".into()
+    };
+    let reason = if message.contains("unsupport proxy type") {
+        "节点类型不受当前 Mihomo 支持"
+    } else if message.contains("not found") {
+        "引用了不存在的节点或节点组"
+    } else if message.contains("cannot parse") || message.contains("invalid syntax") {
+        "字段格式错误"
+    } else if message.contains("yaml:") || message.contains("did not find expected") {
+        "YAML 结构错误"
+    } else if message.contains("missing") || message.contains("required") {
+        "缺少必要字段"
+    } else {
+        "Mihomo 拒绝了配置"
+    };
+    format!("{location}{reason}")
 }
 
 fn cancellation_revision() -> Result<Vec<u8>> {
