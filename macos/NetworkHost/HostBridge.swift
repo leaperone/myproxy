@@ -31,6 +31,7 @@ private struct HostEnableRequest: Decodable, Sendable {
     let gfwDomains: [String]
     let groupPorts: [GroupPort]
     let gfwPorts: [GroupPort]
+    let capturePrivateNetworks: Bool?
 }
 
 /// Shared by the GUI and installed CLI. Atomic replacement defines the latest
@@ -125,6 +126,8 @@ private struct HostRuntimeSnapshot: Encodable, Sendable {
     var appliedRevision: UInt64?
     var message: String?
     var dnsMessage: String?
+    var captureEnabled = false
+    var failOpen = true
 }
 
 /// A synchronous, privacy-safe FFI snapshot. Network queries run separately;
@@ -390,6 +393,11 @@ private actor HostController {
         }
     }
 
+    func activityBatch(cursor: UInt64, limit: Int) async throws -> HostActivityProcessBatch {
+        let response = try await transparentProxy.fetchActivity(cursor: cursor, limit: limit)
+        return HostActivityProcessBatch(response.activityBatch)
+    }
+
     func refreshStatus(operation: UInt64, observation: UUID) async {
         do {
             let connected = try await transparentProxy.connectionStatus()
@@ -418,6 +426,8 @@ private actor HostController {
                 $0.phase = "running"
                 $0.message = externalChange ? "运行配置已由其他入口更新" : nil
                 $0.appliedRevision = response.revision
+                $0.captureEnabled = response.captureEnabled
+                $0.failOpen = response.failOpen ?? true
                 if $0.desiredRevision == 0 { $0.desiredRevision = response.revision }
                 if let dnsConfigurationError, dnsConfigurationError.intent.isCurrent {
                     $0.dnsPhase = "failed"
@@ -620,7 +630,11 @@ private func captureSnapshot(
         action: .mihomo(.profileRules),
         unavailableFallback: .direct
     ))
-    return try CaptureConfigurationSnapshot(revision: request.revision, rules: rules)
+    return try CaptureConfigurationSnapshot(
+        revision: request.revision,
+        rules: rules,
+        capturePrivateNetworks: request.capturePrivateNetworks ?? false
+    )
 }
 
 private func gfwGroup(via: String) -> String? {
@@ -866,6 +880,94 @@ public func myproxy_ne_disable(
         errorOut?.pointee = duplicateString(error.localizedDescription)
         return -1
     }
+}
+
+private struct HostActivityProcessBatch: Encodable, Sendable {
+    struct Entry: Encodable, Sendable {
+        let relayLocalPort: UInt16
+        let process: String
+        let matcher: String
+        let relayState: String
+    }
+
+    let entries: [Entry]
+    let nextCursor: UInt64
+    let hasMore: Bool
+
+    init(_ batch: AppRoutingActivityBatch?) {
+        let joinable: Set<AppRoutingRelayState> = [
+            .connecting, .ready, .relaying, .completed
+        ]
+        var entries: [Entry] = []
+        if let batch {
+            for activity in batch.activities {
+                guard let port = activity.relayLocalPort, port > 0 else { continue }
+                guard joinable.contains(activity.relayState) else { continue }
+                let source = activity.source
+                let process = HostActivityProcessBatch.processLabel(source)
+                guard process != "—" else { continue }
+                entries.append(Entry(
+                    relayLocalPort: port,
+                    process: process,
+                    matcher: HostActivityProcessBatch.matcherLabel(source, fallback: process),
+                    relayState: activity.relayState.rawValue
+                ))
+            }
+        }
+        self.entries = entries
+        self.nextCursor = batch?.nextCursor ?? 0
+        self.hasMore = batch?.hasMore ?? false
+    }
+
+    private static func processLabel(_ source: AppRoutingActivitySource) -> String {
+        if let path = source.executablePath {
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            if !name.isEmpty { return name }
+        }
+        if let bundle = source.bundleIdentifier, !bundle.isEmpty { return bundle }
+        if let signing = source.signingIdentifier, !signing.isEmpty { return signing }
+        return "—"
+    }
+
+    private static func matcherLabel(
+        _ source: AppRoutingActivitySource,
+        fallback: String
+    ) -> String {
+        if let bundle = source.bundleIdentifier, !bundle.isEmpty { return bundle }
+        if let signing = source.signingIdentifier, !signing.isEmpty { return signing }
+        return fallback
+    }
+}
+
+@_cdecl("myproxy_ne_activity_batch")
+public func myproxy_ne_activity_batch(
+    _ cursor: UInt64,
+    _ limit: UInt32
+) -> UnsafeMutablePointer<CChar>? {
+    let boxed = ActivityBatchBox()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        do {
+            boxed.value = try await HostController.shared.activityBatch(
+                cursor: cursor,
+                limit: max(1, min(Int(limit), 500))
+            )
+        } catch {
+            boxed.value = HostActivityProcessBatch(nil)
+        }
+        semaphore.signal()
+    }
+    _ = semaphore.wait(timeout: .now() + 0.8)
+    guard let batch = boxed.value,
+          let data = try? JSONEncoder().encode(batch),
+          let json = String(data: data, encoding: .utf8) else {
+        return duplicateString("{\"entries\":[],\"nextCursor\":0,\"hasMore\":false}")
+    }
+    return duplicateString(json)
+}
+
+private final class ActivityBatchBox: @unchecked Sendable {
+    var value: HostActivityProcessBatch?
 }
 
 @_cdecl("myproxy_ne_status")

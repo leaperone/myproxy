@@ -999,7 +999,7 @@ fn via_menu(
 }
 
 enum LivePageJob {
-    Rows(RuntimeIdentity, u64),
+    Rows(RuntimeIdentity, u64, bool),
     Snapshot(RuntimeIdentity, u64, LiveNeed),
 }
 
@@ -1154,11 +1154,12 @@ impl AppView {
                     .ok()
                     .flatten();
                 match live_job {
-                    Some(LivePageJob::Rows(identity, revision)) => {
+                    Some(LivePageJob::Rows(identity, revision, join_activity)) => {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
-                                controller::fetch(identity.mixed_port).map_err(|err| err.to_string())
+                                controller::fetch(identity.mixed_port, join_activity)
+                                    .map_err(|err| err.to_string())
                             })
                             .await;
                         if this
@@ -1176,7 +1177,8 @@ impl AppView {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
-                                controller::fetch_live(identity.mixed_port, need).map_err(|err| err.to_string())
+                                controller::fetch_live(identity.mixed_port, need, false)
+                                    .map_err(|err| err.to_string())
                             })
                             .await;
                         if this
@@ -1439,6 +1441,19 @@ impl AppView {
         self.runtime = runtime;
         self.operation = operation;
         self.extension_status = extension_status;
+        if self.strategy.system_extension {
+            match self.extension_status.phase {
+                Phase::WaitingApproval => {
+                    self.status =
+                        "系统接管等待授权。请在系统设置 › 通用 › 登录项与扩展中允许 myproxy。"
+                            .into();
+                }
+                Phase::RequiresReboot => {
+                    self.status = "系统接管需要重启后才能生效。".into();
+                }
+                _ => {}
+            }
+        }
         changed
     }
 
@@ -1554,6 +1569,10 @@ impl AppView {
                             this.catalog.nodes.len(),
                             this.mixed_endpoint()
                         );
+                        let failed = this.catalog.fetch_failure_count();
+                        if failed > 0 {
+                            this.status.push_str(&format!(" {failed} 个订阅拉取失败。"));
+                        }
                         let warnings = this.catalog.refresh_warnings();
                         if !warnings.is_empty() {
                             this.status.push_str(&format!(" {}", warnings.join("；")));
@@ -1675,7 +1694,11 @@ impl AppView {
         let runtime = self.supervisor.runtime_identity()?;
         self.live_revision = self.live_revision.wrapping_add(1);
         match self.page {
-            Page::Connections => Some(LivePageJob::Rows(runtime, self.live_revision)),
+            Page::Connections => Some(LivePageJob::Rows(
+                runtime,
+                self.live_revision,
+                self.strategy.system_extension,
+            )),
             Page::Overview | Page::Groups => Some(LivePageJob::Snapshot(
                 runtime,
                 self.live_revision,
@@ -1838,11 +1861,12 @@ impl AppView {
             return;
         };
         cx.spawn(async move |this, cx| match job {
-            LivePageJob::Rows(identity, revision) => {
+            LivePageJob::Rows(identity, revision, join_activity) => {
                 let traffic = cx
                     .background_executor()
                     .spawn(async move {
-                        controller::fetch(identity.mixed_port).map_err(|err| err.to_string())
+                        controller::fetch(identity.mixed_port, join_activity)
+                            .map_err(|err| err.to_string())
                     })
                     .await;
                 this.update(cx, |this, cx| {
@@ -1856,7 +1880,7 @@ impl AppView {
                 let snap = cx
                     .background_executor()
                     .spawn(async move {
-                        controller::fetch_live(identity.mixed_port, need)
+                        controller::fetch_live(identity.mixed_port, need, false)
                             .map_err(|err| err.to_string())
                     })
                     .await;
@@ -2097,15 +2121,90 @@ impl AppView {
     }
 
     fn open_rule_dialog(&mut self, id: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        window.close_all_dialogs(cx);
         let existing =
             id.and_then(|id| self.strategy.rule_sets.iter().find(|s| s.id == id).cloned());
         if id.is_some() && existing.is_none() {
             self.status = "找不到这条规则。".into();
             return;
         }
+        self.present_rule_dialog(existing, window, cx);
+    }
+
+    fn open_rule_dialog_for_process(
+        &mut self,
+        process: &str,
+        matcher: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let matcher = matcher.trim();
+        if matcher.is_empty() || matcher == "—" {
+            self.status = "这条连接没有可用的进程名。".into();
+            return;
+        }
+        if let Some(existing) = self.strategy.rule_sets.iter().find(|set| {
+            set.matchers.iter().any(|item| {
+                item.kind == "app" && item.value.eq_ignore_ascii_case(matcher)
+            })
+        }) {
+            self.open_rule_dialog(Some(&existing.id.clone()), window, cx);
+            return;
+        }
+        self.present_rule_dialog(
+            Some(RuleSet {
+                id: String::new(),
+                name: process.trim().to_string(),
+                via: default_via(&self.strategy),
+                matchers: vec![Matcher::app(matcher.to_string())],
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn set_connection_process_via(
+        &mut self,
+        process: &str,
+        matcher: &str,
+        via: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        let matcher = matcher.trim();
+        if matcher.is_empty() || matcher == "—" {
+            self.status = "这条连接没有可用的进程名。".into();
+            return;
+        }
+        if let Some(set) = self.strategy.rule_sets.iter_mut().find(|set| {
+            set.matchers.iter().any(|item| {
+                item.kind == "app" && item.value.eq_ignore_ascii_case(matcher)
+            })
+        }) {
+            set.via = via.to_string();
+        } else {
+            self.strategy.add_rule_set(RuleSet {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: process.trim().to_string(),
+                via: via.to_string(),
+                matchers: vec![Matcher::app(matcher.to_string())],
+            });
+        }
+        self.persist_and_apply(cx);
+    }
+
+    fn present_rule_dialog(
+        &mut self,
+        existing: Option<RuleSet>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.close_all_dialogs(cx);
         self.rule_modal_open = true;
-        self.rule_edit_id = existing.as_ref().map(|s| s.id.clone());
+        self.rule_edit_id = existing
+            .as_ref()
+            .and_then(|set| (!set.id.is_empty()).then(|| set.id.clone()));
         log::debug(
             "ui",
             format!(
@@ -2120,7 +2219,7 @@ impl AppView {
         let fallback_via = default_via(&self.strategy);
         let editor =
             cx.new(|cx| RuleSetEditor::new(parent.clone(), existing, fallback_via, window, cx));
-        let editing = id.is_some();
+        let editing = self.rule_edit_id.is_some();
         let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
         window.open_dialog(cx, move |dialog, window, _| {
             let ok_label = if editing { "保存" } else { "添加" };
@@ -3018,9 +3117,10 @@ impl AppView {
                         theme,
                         "节点",
                         &format!(
-                            "{} 个可用，{} 个已排除",
+                            "{} kept / 过滤 {} / 拉取失败 {}",
                             self.catalog.nodes.len(),
-                            self.catalog.excluded.len()
+                            self.catalog.filter_excluded_count(),
+                            self.catalog.fetch_failure_count()
                         ),
                     )),
             )
@@ -3094,7 +3194,11 @@ impl AppView {
             .child(page_title(
                 theme,
                 "连接",
-                "经过 Mihomo 的连接。系统接管原生放行或拒绝的活动不在此数据源内；显示直连只含核心记下的 DIRECT。",
+                if self.strategy.system_extension {
+                    "经过 Mihomo 的连接。系统接管中继后会尽量显示真实进程；扩展直接放行或拒绝的活动不在此表。"
+                } else {
+                    "经过 Mihomo 的连接。当前只看到主动指定 Mixed 的客户端。打开系统接管后，未填代理的应用也会出现。"
+                },
             ))
             .child(
                 h_flex()
@@ -3209,7 +3313,11 @@ impl AppView {
                 |this| {
                     this.child(empty_hint(
                         theme,
-                        "核心目前未记录连接。这不代表全机没有网络活动。",
+                        if self.strategy.system_extension {
+                            "核心目前未记录连接。系统接管已打开时，被中继进 Mihomo 的应用会列在这里。"
+                        } else {
+                            "核心目前未记录连接。只有进入 Mixed 或被系统接管中继的流量会出现在这里。"
+                        },
                     ))
                 },
             )
@@ -3254,7 +3362,13 @@ impl AppView {
                             )
                         })
                         .children(filtered.into_iter().map(|conn| {
-                            render_connection_row(entity.clone(), theme, conn, self.is_busy())
+                            render_connection_row(
+                                entity.clone(),
+                                theme,
+                                conn,
+                                via_choices(&self.strategy, &self.catalog, None),
+                                self.is_busy(),
+                            )
                         }))
                         .when(
                             self.traffic.connection_count > self.traffic.connections.len(),
@@ -3424,9 +3538,10 @@ impl AppView {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(format!(
-                        "当前目录 {} 个节点，{} 项被排除。",
+                        "当前目录 {} 个节点，过滤排除 {}，拉取失败 {}。",
                         self.catalog.nodes.len(),
-                        self.catalog.excluded.len()
+                        self.catalog.filter_excluded_count(),
+                        self.catalog.fetch_failure_count()
                     )),
             )
     }
@@ -4246,7 +4361,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("规则入口先绕过本机与私网，再按用户规则、GFWList、未命中走向处理。GFWList 整包装卸。"),
+                        .child("规则入口先绕过本机与私网，再按用户规则、GFWList 或国内直连、未命中走向处理。GFWList 整包装卸。国内直连的 GEOIP 在 Mihomo 里求值，系统接管不做 IP 库。"),
                 )
                 .child(
                     h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().map(
@@ -4271,7 +4386,9 @@ impl AppView {
                         },
                     )),
                 )
-                .when(current == RoutingProfile::Group, |this| {
+                .when(
+                    matches!(current, RoutingProfile::Group | RoutingProfile::Chinadirect),
+                    |this| {
                     this.child(
                         h_flex().gap_1().flex_wrap().children(
                             self.strategy.groups.iter().map(|group| {
@@ -4289,7 +4406,6 @@ impl AppView {
                                 };
                                 btn.disabled(self.is_busy()).on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
-                                        this.strategy.routing_profile = RoutingProfile::Group;
                                         this.strategy.unmatched_via = name.clone();
                                         this.persist_inbound_mode(
                                             cx,
@@ -4315,6 +4431,9 @@ impl AppView {
                             }
                             RoutingProfile::Group => {
                                 format!("未命中走 {unmatched}。连接或应用后生效。")
+                            }
+                            RoutingProfile::Chinadirect => {
+                                format!("中国大陆 IP 直连（GEOIP,CN）。其余走 {unmatched}。未单独命中的接管流量在 Mihomo 里做 GEOIP。")
                             }
                         }),
                 ),
@@ -4422,8 +4541,123 @@ impl AppView {
                     })
                 })
                 .child(div().text_xs().child(format!("系统接管：{} · DNS：{}", self.extension_status.phase_label(), self.extension_status.dns_label())))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "捕获 {} · 失败开放 {}",
+                            if self.extension_status.capture_enabled { "开" } else { "关" },
+                            if self.extension_status.fail_open { "开" } else { "关" }
+                        )),
+                )
                 .when_some(self.extension_status.message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(message)))
                 .when_some(self.extension_status.dns_message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(format!("DNS：{message}"))))
+                .child({
+                    Button::new("open-login-items")
+                        .small()
+                        .ghost()
+                        .label("打开登录项与扩展")
+                        .on_click(move |_, _, _| {
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
+                                .spawn();
+                        })
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if self.strategy.lan_capture {
+                            "内置旁路：本机组件、回环、链路本地、.local。局域网地址会进规则。"
+                        } else {
+                            "内置旁路：本机组件、回环、私网、链路本地、.local。这些项不能删除。"
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(div().text_sm().child("局域网也进规则"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("关闭私网旁路。回环和本机组件仍直连。"),
+                                ),
+                        )
+                        .child({
+                            let entity = entity.clone();
+                            let lan_on = self.strategy.lan_capture;
+                            Switch::new("lan-capture-toggle")
+                                .small()
+                                .label(if lan_on { "开启" } else { "关闭" })
+                                .checked(lan_on)
+                                .accessibility_label("局域网也进规则")
+                                .disabled(self.is_busy())
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.strategy.lan_capture = !this.strategy.lan_capture;
+                                        this.persist_inbound_mode(
+                                            cx,
+                                            if this.strategy.lan_capture {
+                                                "局域网将进入规则。".into()
+                                            } else {
+                                                "局域网恢复内置旁路。".into()
+                                            },
+                                        );
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(div().text_sm().child("系统代理"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("把系统 HTTP/HTTPS/SOCKS 指到 Mixed。未开接管、未开此项时浏览器需手填端口。与系统接管、TUN 三选一即可。断开或退出会恢复。"),
+                                ),
+                        )
+                        .child({
+                            let entity = entity.clone();
+                            let proxy_on = self.strategy.system_proxy;
+                            Switch::new("system-proxy-toggle")
+                                .small()
+                                .label(if proxy_on { "开启" } else { "关闭" })
+                                .checked(proxy_on)
+                                .accessibility_label("系统代理")
+                                .disabled(self.is_busy())
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.strategy.system_proxy = !this.strategy.system_proxy;
+                                        this.persist_inbound_mode(
+                                            cx,
+                                            if this.strategy.system_proxy {
+                                                "系统代理将指向 Mixed。".into()
+                                            } else {
+                                                "将恢复原先的系统代理。".into()
+                                            },
+                                        );
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                )
                 .child(self.inbound_mode_buttons(
                     cx,
                     "extension-mode",
@@ -5601,9 +5835,12 @@ fn render_connection_row(
     entity: Entity<AppView>,
     theme: &Theme,
     conn: &controller::LiveConnection,
+    via_choices: Vec<ViaChoice>,
     busy: bool,
 ) -> impl IntoElement {
     let id = conn.id.clone();
+    let process = conn.process.clone();
+    let app_matcher = conn.app_matcher.clone();
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
     let fg = theme.foreground;
@@ -5622,6 +5859,52 @@ fn render_connection_row(
         .border_color(theme.border)
         .bg(theme.group_box)
         .hover(move |style| style.bg(muted))
+        .context_menu({
+            let entity = entity.clone();
+            let process = process.clone();
+            let app_matcher = app_matcher.clone();
+            move |menu, window, cx| {
+                let create_entity = entity.clone();
+                let create_process = process.clone();
+                let create_matcher = app_matcher.clone();
+                menu.min_w(px(168.))
+                    .item(
+                        PopupMenuItem::new("对此进程建规则").on_click(move |_, window, app| {
+                            create_entity.update(app, |this, cx| {
+                                this.open_rule_dialog_for_process(
+                                    &create_process,
+                                    &create_matcher,
+                                    window,
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        }),
+                    )
+                    .submenu("改为走向", window, cx, {
+                        let entity = entity.clone();
+                        let process = process.clone();
+                        let app_matcher = app_matcher.clone();
+                        let choices = via_choices.clone();
+                        move |menu, _, _| {
+                            let entity = entity.clone();
+                            let process = process.clone();
+                            let app_matcher = app_matcher.clone();
+                            via_menu(menu, &choices, "", move |app, value| {
+                                entity.update(app, |this, cx| {
+                                    this.set_connection_process_via(
+                                        &process,
+                                        &app_matcher,
+                                        &value,
+                                        cx,
+                                    );
+                                    cx.notify();
+                                });
+                            })
+                        }
+                    })
+            }
+        })
         .child(connection_col(px(108.), conn.process.clone(), fg, None))
         .child(connection_col_flex(
             conn.destination.clone(),

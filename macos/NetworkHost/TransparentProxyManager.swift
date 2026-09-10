@@ -169,6 +169,25 @@ actor AppleTransparentProxyManager {
         ))
     }
 
+    func fetchActivity(cursor: UInt64, limit: Int) async throws -> HostProviderControlResponse {
+        try await send(HostProviderControlRequest(
+            command: "activity",
+            revision: nil,
+            activationIdentifier: nil,
+            dnsProxyBootstrap: nil,
+            captureEnabled: nil,
+            failOpen: nil,
+            captureConfigurationSnapshot: nil,
+            mihomoRouteProxyCatalog: nil,
+            mihomoSOCKSHost: nil,
+            mihomoSOCKSPort: nil,
+            mihomoSOCKSUsername: nil,
+            mihomoSOCKSPassword: nil,
+            activityCursor: cursor,
+            activityLimit: limit
+        ))
+    }
+
     func stop() async throws {
         let loadedManager: NETransparentProxyManager?
         if let manager {
@@ -409,6 +428,8 @@ private struct HostProviderControlRequest: Encodable, Sendable {
     let mihomoSOCKSPort: UInt16?
     let mihomoSOCKSUsername: String?
     let mihomoSOCKSPassword: String?
+    var activityCursor: UInt64? = nil
+    var activityLimit: Int? = nil
 }
 
 struct HostProviderControlResponse: Decodable, Sendable {
@@ -416,7 +437,9 @@ struct HostProviderControlResponse: Decodable, Sendable {
     let revision: UInt64
     let running: Bool
     let captureEnabled: Bool
+    let failOpen: Bool?
     let message: String?
+    let activityBatch: AppRoutingActivityBatch?
     let dnsRuntimeReport: DNSProxyRuntimeReport?
 }
 

@@ -48,7 +48,7 @@ enum Commands {
     Global {
         name: Option<String>,
     },
-    /// Rule-page fallback: `allowlist`, `gfwlist`, or `group` plus optional via.
+    /// Rule-page fallback: `allowlist`, `gfwlist`, `group`, or `chinadirect`.
     Routing {
         profile: Option<String>,
         via: Option<String>,
@@ -535,7 +535,10 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(profile) = profile {
                 let profile = RoutingProfile::parse(&profile)?;
                 strategy.set_routing_profile(profile);
-                if profile == RoutingProfile::Group {
+                if matches!(
+                    profile,
+                    RoutingProfile::Group | RoutingProfile::Chinadirect
+                ) {
                     if let Some(via) = via.as_deref() {
                         let via = via.trim();
                         if via.is_empty() {
@@ -580,6 +583,10 @@ fn run(cli: Cli) -> Result<()> {
                     strategy.unmatched_via = myproxy::compile::default_group(&strategy).to_string();
                 } else if via.eq_ignore_ascii_case("gfwlist") || via.eq_ignore_ascii_case("gfw") {
                     strategy.set_routing_profile(RoutingProfile::Gfwlist);
+                } else if via.eq_ignore_ascii_case("chinadirect")
+                    || via.eq_ignore_ascii_case("china")
+                {
+                    strategy.set_routing_profile(RoutingProfile::Chinadirect);
                 } else {
                     strategy.set_routing_profile(RoutingProfile::Group);
                     strategy.unmatched_via = via.to_string();
@@ -1014,7 +1021,10 @@ fn report_applied(json: bool, supervisor: &Supervisor, catalog: &catalog::Catalo
         json,
         serde_json::json!({
             "status": if running { "core_applied" } else { "prepared" },
-            "nodes": catalog.nodes.len(), "excluded": catalog.excluded.len(),
+            "nodes": catalog.nodes.len(),
+            "excluded": catalog.excluded.len(),
+            "filter_excluded": catalog.filter_excluded_count(),
+            "fetch_failures": catalog.fetch_failure_count(),
             "refresh_warnings": catalog.refresh_warnings(),
             "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
             "extension_runtime": extension, "extension_request_cancelled": cancelled,

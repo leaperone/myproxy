@@ -326,14 +326,18 @@ public struct RuleDecision: Codable, Hashable, Sendable {
 /// Security-critical bypasses are compiled into the engine and are deliberately
 /// absent from user configuration snapshots.
 public struct BuiltInBypassPolicy: Sendable {
-    public init() {}
+    public let capturePrivateNetworks: Bool
+
+    public init(capturePrivateNetworks: Bool = false) {
+        self.capturePrivateNetworks = capturePrivateNetworks
+    }
 
     public func reason(for context: FlowContext) -> BuiltInBypassReason? {
         if context.source.isTrustedMyproxyComponent {
             return .trustedmyproxyComponent
         }
         if let address = context.destination.ipAddress {
-            if address.isPrivate { return .privateNetwork }
+            if address.isPrivate && !capturePrivateNetworks { return .privateNetwork }
             if address.isLoopback { return .loopback }
             if address.isLinkLocal { return .linkLocal }
             if address.isMulticast { return .multicast }
@@ -482,9 +486,12 @@ public struct CaptureRuleEngine: Sendable {
     }
 
     private let orderedRules: [OrderedRule]
-    private let builtInBypass = BuiltInBypassPolicy()
+    private let builtInBypass: BuiltInBypassPolicy
 
     public init(snapshot: CaptureConfigurationSnapshot) {
+        builtInBypass = BuiltInBypassPolicy(
+            capturePrivateNetworks: snapshot.capturePrivateNetworks
+        )
         orderedRules = snapshot.rules.enumerated()
             .map {
                 OrderedRule(

@@ -510,6 +510,14 @@ impl Supervisor {
                 bail!("连接操作已取消");
             }
             candidate.save()?;
+            if should_run {
+                if let Err(err) = crate::system_proxy::sync(
+                    candidate.strategy.system_proxy,
+                    candidate.strategy.mixed_port,
+                ) {
+                    log::warn("system-proxy", format!("sync failed: {err:#}"));
+                }
+            }
             if let Some(health) = health {
                 self.mark_ready(health.proxy_now.clone());
                 self.store_health(health);
@@ -696,6 +704,9 @@ impl Supervisor {
     }
 
     fn disconnect_inner(&self, mixed_port: Option<u16>) -> Result<()> {
+        if let Err(err) = crate::system_proxy::restore() {
+            log::warn("system-proxy", format!("restore failed: {err:#}"));
+        }
         crate::network_extension::disable_async()
             .and_then(|()| crate::network_extension::wait_disabled(Duration::from_secs(30)))
             .context("系统接管未关闭，已保留核心以免系统 DNS 被劫持后断网")?;
