@@ -74,6 +74,14 @@ enum Commands {
         #[command(subcommand)]
         cmd: RuleCmd,
     },
+    /// Write the current strategy JSON. Omit the path to use Downloads.
+    Export {
+        path: Option<std::path::PathBuf>,
+    },
+    /// Replace the live strategy from a JSON file after writing a backup.
+    Import {
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -198,6 +206,8 @@ fn run(cli: Cli) -> Result<()> {
                 "subscription",
                 "group",
                 "rule",
+                "export",
+                "import",
                 "log",
             ];
             emit(
@@ -903,6 +913,57 @@ fn run(cli: Cli) -> Result<()> {
                 );
             }
         },
+        Commands::Export { path } => {
+            let strategy = Strategy::load()?;
+            let path = match path {
+                Some(path) => path,
+                None => strategy::default_export_path()?,
+            };
+            strategy::export_to(&strategy, &path)?;
+            emit(
+                json,
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "schema": strategy.schema,
+                    "subscriptions": strategy.subscriptions.len(),
+                    "groups": strategy.groups.len(),
+                    "rules": strategy.rule_sets.len(),
+                }),
+                format!(
+                    "exported {} subscriptions, {} groups, {} rules to {}",
+                    strategy.subscriptions.len(),
+                    strategy.groups.len(),
+                    strategy.rule_sets.len(),
+                    path.display()
+                ),
+            );
+        }
+        Commands::Import { path } => {
+            let outcome = strategy::import_from(&path)?;
+            emit(
+                json,
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "backup": outcome.backup.as_ref().map(|backup| backup.display().to_string()),
+                    "schema": outcome.strategy.schema,
+                    "subscriptions": outcome.strategy.subscriptions.len(),
+                    "groups": outcome.strategy.groups.len(),
+                    "rules": outcome.strategy.rule_sets.len(),
+                    "applied": false,
+                }),
+                format!(
+                    "imported {} subscriptions, {} groups, {} rules{}; apply/connect to activate",
+                    outcome.strategy.subscriptions.len(),
+                    outcome.strategy.groups.len(),
+                    outcome.strategy.rule_sets.len(),
+                    outcome
+                        .backup
+                        .as_ref()
+                        .map(|backup| format!("; backup {}", backup.display()))
+                        .unwrap_or_default()
+                ),
+            );
+        }
     }
     Ok(())
 }

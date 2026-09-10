@@ -55,7 +55,11 @@ All commands accept `--json` for one machine-readable success result on stdout. 
 myproxyctl --json capabilities
 myproxyctl --json status
 myproxyctl --json group list
+myproxyctl --json export
+myproxyctl --json import ~/Downloads/myproxy-strategy-2026-09-10.json
 ```
+
+`export` writes the current `strategy.json` (default `~/Downloads/myproxy-strategy-YYYY-MM-DD.json`). `import` replaces the live file after writing `strategy.json.bak-import-*` and does not apply; run `apply` if the core should pick it up. The **设置 → 配置** panel does the same with a file dialog.
 
 ```sh
 cargo run --bin myproxyctl -- subscription add 'https://…' --name Example

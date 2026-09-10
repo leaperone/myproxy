@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1275,6 +1275,127 @@ pub fn load_from(path: &Path) -> Result<Strategy> {
     Ok(strategy)
 }
 
+/// Pretty-print `strategy` to `path`. Does not touch the live strategy file.
+pub fn export_to(strategy: &Strategy, path: &Path) -> Result<()> {
+    strategy.validate().context("invalid strategy")?;
+    if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let data = serde_json::to_string_pretty(strategy)?;
+    paths::atomic_write(path, data.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    log::info(
+        "strategy",
+        format!("exported strategy to {}", path.display()),
+    );
+    Ok(())
+}
+
+/// Parse, migrate, and validate a strategy file without writing the live copy.
+pub fn parse_import(path: &Path) -> Result<Strategy> {
+    let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if data.trim().is_empty() {
+        anyhow::bail!("strategy file is empty");
+    }
+    let value: serde_json::Value = serde_json::from_str(&data).context("parse strategy JSON")?;
+    if !value.is_object() {
+        anyhow::bail!("strategy file must be a JSON object");
+    }
+    let mut strategy: Strategy = serde_json::from_value(value).context("decode strategy JSON")?;
+    strategy.migrate();
+    strategy.validate().context("invalid strategy")?;
+    Ok(strategy)
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportOutcome {
+    pub strategy: Strategy,
+    pub backup: Option<PathBuf>,
+}
+
+/// Replace the live `strategy.json` after writing `strategy.json.bak-import-*`.
+pub fn import_from(path: &Path) -> Result<ImportOutcome> {
+    let strategy = parse_import(path)?;
+    let current = paths::strategy_path()?;
+    let backup = backup_strategy_at(&current)?;
+    strategy.save()?;
+    log::info(
+        "strategy",
+        format!(
+            "imported strategy subscriptions={} groups={} rules={}",
+            strategy.subscriptions.len(),
+            strategy.groups.len(),
+            strategy.rule_sets.len()
+        ),
+    );
+    Ok(ImportOutcome { strategy, backup })
+}
+
+pub fn default_export_name() -> String {
+    format!("myproxy-strategy-{}.json", local_date_stamp())
+}
+
+pub fn default_export_path() -> Result<PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+        .context("no Downloads directory")?;
+    Ok(dir.join(default_export_name()))
+}
+
+fn backup_strategy_at(current: &Path) -> Result<Option<PathBuf>> {
+    if !current.exists() {
+        return Ok(None);
+    }
+    let backup = import_backup_path(current);
+    fs::copy(current, &backup).with_context(|| format!("backup {}", current.display()))?;
+    log::info("strategy", format!("import backup {}", backup.display()));
+    Ok(Some(backup))
+}
+
+fn import_backup_path(current: &Path) -> PathBuf {
+    let stamp = local_datetime_stamp();
+    let candidate = current.with_file_name(format!("strategy.json.bak-import-{stamp}"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    current.with_file_name(format!(
+        "strategy.json.bak-import-{stamp}-{}",
+        &Uuid::new_v4().simple().to_string()[..6]
+    ))
+}
+
+fn local_date_stamp() -> String {
+    let tm = local_now();
+    format!(
+        "{:04}-{:02}-{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday
+    )
+}
+
+fn local_datetime_stamp() -> String {
+    let tm = local_now();
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+fn local_now() -> libc::tm {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm = std::mem::zeroed::<libc::tm>();
+        libc::localtime_r(&now, &mut tm);
+        tm
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,5 +1488,102 @@ mod tests {
         assert!(strategy.set_global_selected("DIRECT".into()));
         assert_eq!(strategy.global_selected, "DIRECT");
         assert!(!strategy.set_global_selected("  ".into()));
+    }
+
+    fn temp_json(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("myproxy-strategy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir.join(name)
+    }
+
+    #[test]
+    fn export_to_roundtrips_through_load_from() {
+        let mut strategy = Strategy::default();
+        strategy.mixed_port = 7891;
+        strategy.developer_mode = true;
+        let path = temp_json("strategy.json");
+        export_to(&strategy, &path).expect("export");
+        let loaded = load_from(&path).expect("load export");
+        assert_eq!(loaded, strategy);
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn parse_import_migrates_schema_5() {
+        let path = temp_json("old.json");
+        fs::write(
+            &path,
+            r#"{
+            "schema": 5,
+            "exclude_filter": "",
+            "subscriptions": [],
+            "groups": [],
+            "rule_sets": []
+        }"#,
+        )
+        .expect("write");
+        let imported = parse_import(&path).expect("parse schema 5");
+        assert_eq!(imported.schema, STRATEGY_SCHEMA);
+        assert_eq!(imported.mixed_mode, InboundMode::Rule);
+        assert_eq!(imported.routing_profile, RoutingProfile::Allowlist);
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn parse_import_rejects_empty_and_non_object() {
+        let empty = temp_json("empty.json");
+        fs::write(&empty, "   ").expect("write empty");
+        assert!(parse_import(&empty).is_err());
+
+        let array = temp_json("array.json");
+        fs::write(&array, "[]").expect("write array");
+        assert!(parse_import(&array).is_err());
+
+        let invalid = temp_json("bad.json");
+        fs::write(&invalid, "{not json").expect("write bad");
+        assert!(parse_import(&invalid).is_err());
+        let _ = fs::remove_dir_all(empty.parent().expect("parent"));
+        let _ = fs::remove_dir_all(array.parent().expect("parent"));
+        let _ = fs::remove_dir_all(invalid.parent().expect("parent"));
+    }
+
+    #[test]
+    fn backup_strategy_keeps_previous_bytes() {
+        let dir = std::env::temp_dir().join(format!("myproxy-bak-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let current = dir.join("strategy.json");
+        fs::write(&current, "{\"schema\":7}").expect("write current");
+        let backup = backup_strategy_at(&current)
+            .expect("backup")
+            .expect("backup path");
+        assert!(backup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("strategy.json.bak-import-")));
+        assert_eq!(
+            fs::read_to_string(&backup).expect("read backup"),
+            "{\"schema\":7}"
+        );
+        assert_eq!(
+            fs::read_to_string(&current).expect("read current"),
+            "{\"schema\":7}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_import_failure_leaves_existing_file() {
+        let dir = std::env::temp_dir().join(format!("myproxy-keep-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let current = dir.join("strategy.json");
+        fs::write(&current, "keep-me").expect("write current");
+        let bad = dir.join("bad.json");
+        fs::write(&bad, "[]").expect("write bad");
+        assert!(parse_import(&bad).is_err());
+        assert_eq!(
+            fs::read_to_string(&current).expect("read current"),
+            "keep-me"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

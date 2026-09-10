@@ -1,4 +1,5 @@
 mod appearance;
+mod file_dialog;
 mod onboard;
 mod sparkle;
 #[cfg(target_os = "macos")]
