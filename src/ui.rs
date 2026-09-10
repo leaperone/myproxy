@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -3582,8 +3582,215 @@ impl AppView {
             ))
             .child(self.startup_panel(cx, theme))
             .child(self.cli_install_panel(cx, theme))
+            .child(self.strategy_backup_panel(cx, theme))
             .child(self.logs_panel(theme))
             .child(self.developer_panel(cx, theme))
+    }
+
+    fn strategy_backup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        panel(
+            theme,
+            "配置",
+            v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("导出或导入整份策略，含订阅链接、节点组、规则和本机开关。导入会先留下一份备份。"),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("export-strategy")
+                                .label("导出")
+                                .disabled(self.is_busy())
+                                .on_click(move |_, window, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.export_strategy(window, cx);
+                                    });
+                                })
+                        })
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("import-strategy")
+                                .label("导入")
+                                .disabled(self.is_busy())
+                                .on_click(move |_, window, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.begin_import_strategy(window, cx);
+                                    });
+                                })
+                        }),
+                ),
+        )
+    }
+
+    fn export_strategy(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            self.status = "正在处理上一项操作。".into();
+            cx.notify();
+            return;
+        }
+        if let Ok(port) = self.port_input.read(cx).value().trim().parse::<u16>() {
+            self.strategy.mixed_port = port;
+        }
+        self.strategy.exclude_filter = self.filter_input.read(cx).value().to_string();
+        let default_name = myproxy::strategy::default_export_name();
+        match crate::file_dialog::save_strategy(&default_name) {
+            Ok(crate::file_dialog::FileDialogChoice::Cancelled) => {}
+            Ok(crate::file_dialog::FileDialogChoice::Path(path)) => {
+                match myproxy::strategy::export_to(&self.strategy, &path) {
+                    Ok(()) => self.status = format!("已导出到 {}", path.display()),
+                    Err(error) => {
+                        log::error("ui", format!("export strategy failed: {error:#}"));
+                        self.status = format!("导出失败：{error:#}");
+                    }
+                }
+            }
+            Err(error) => self.status = format!("无法打开保存面板：{error:#}"),
+        }
+        cx.notify();
+    }
+
+    fn begin_import_strategy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            self.status = "正在处理上一项操作。".into();
+            cx.notify();
+            return;
+        }
+        if self.group_modal_open || self.rule_modal_open {
+            self.status = "请先关闭编辑窗口再导入。".into();
+            cx.notify();
+            return;
+        }
+        let path = match crate::file_dialog::open_strategy() {
+            Ok(crate::file_dialog::FileDialogChoice::Cancelled) => return,
+            Ok(crate::file_dialog::FileDialogChoice::Path(path)) => path,
+            Err(error) => {
+                self.status = format!("无法打开文件面板：{error:#}");
+                cx.notify();
+                return;
+            }
+        };
+        match myproxy::strategy::parse_import(&path) {
+            Ok(preview) => self.open_import_confirm(path, preview, window, cx),
+            Err(error) => {
+                self.status = format!("无法读取配置：{error:#}");
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_import_confirm(
+        &mut self,
+        path: PathBuf,
+        preview: Strategy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("配置")
+            .to_string();
+        let message = format!(
+            "将用「{file_name}」整份替换当前策略（{} 个订阅、{} 个节点组、{} 条规则）。导入前会留下备份。",
+            preview.subscriptions.len(),
+            preview.groups.len(),
+            preview.rule_sets.len()
+        );
+        let parent = cx.entity();
+        window.close_all_dialogs(cx);
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("导入配置")
+                .width(px(440.))
+                .overlay_closable(true)
+                .button_props(DialogButtonProps::default().on_ok({
+                    let parent = parent.clone();
+                    let path = path.clone();
+                    move |_, _, cx| {
+                        parent.update(cx, |this, cx| {
+                            this.finish_import_strategy(&path, cx);
+                        });
+                        true
+                    }
+                }))
+                .child(div().text_sm().child(message.clone()))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("import-strategy-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(Cancel), cx)
+                                }),
+                        )
+                        .child(
+                            Button::new("import-strategy-ok")
+                                .primary()
+                                .label("导入")
+                                .on_click(|_, window, cx| {
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn finish_import_strategy(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            self.status = "正在处理上一项操作。".into();
+            cx.notify();
+            return;
+        }
+        match myproxy::strategy::import_from(path) {
+            Ok(outcome) => self.adopt_imported(outcome, cx),
+            Err(error) => {
+                log::error("ui", format!("import strategy failed: {error:#}"));
+                self.status = format!("导入失败：{error:#}");
+                cx.notify();
+            }
+        }
+    }
+
+    fn adopt_imported(
+        &mut self,
+        outcome: myproxy::strategy::ImportOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        self.strategy = outcome.strategy.clone();
+        self.saved = outcome.strategy.clone();
+        if let Ok(path) = myproxy::paths::strategy_path() {
+            self.strategy_stamp = file_stamp(&path);
+        }
+        self.external_change_pending = false;
+        self.pending_port_input = Some(self.strategy.mixed_port.to_string());
+        self.pending_filter_input = Some(self.strategy.exclude_filter.clone());
+        log::set_developer(self.strategy.developer_mode);
+        self.applied.update_channel = self.strategy.update_channel;
+        crate::sparkle::set_channel(self.strategy.update_channel.unwrap_or_default());
+        if let Err(error) = myproxy::login_item::sync(self.strategy.launch_at_login) {
+            log::warn("login", format!("{error:#}"));
+        }
+        let backup_note = outcome
+            .backup
+            .as_ref()
+            .map(|path| format!("备份：{}。", path.display()))
+            .unwrap_or_default();
+        if self.wanted {
+            if self.start_apply(cx) {
+                self.status = format!("已导入策略。{backup_note}正在应用…");
+            }
+        } else {
+            self.status = format!("已导入策略。{backup_note}下次连接或应用后生效。");
+            cx.notify();
+        }
     }
 
     fn cli_install_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
