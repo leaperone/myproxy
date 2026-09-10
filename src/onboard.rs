@@ -49,17 +49,6 @@ pub fn mark_cli_done() {
     save(&state);
 }
 
-pub fn should_prompt() -> bool {
-    if !myproxy::cli_install::available() {
-        return false;
-    }
-    if myproxy::cli_install::is_installed() {
-        mark_cli_done();
-        return false;
-    }
-    !load().cli_done
-}
-
 struct OnboardView {
     notice: String,
     installed: bool,
@@ -153,9 +142,6 @@ pub fn open(
     cx: &mut App,
     on_result: impl Fn(Result<PathBuf, String>, &mut App) + 'static,
 ) {
-    if !should_prompt() {
-        return;
-    }
     let view = cx.new(|_| OnboardView {
         notice: String::new(),
         installed: false,

@@ -2,7 +2,7 @@
 
 macOS menu-bar controller ([GPUI](https://github.com/zed-industries/zed)) for a bundled [mihomo](https://github.com/MetaCubeX/mihomo) core.
 
-Strategy JSON under `~/Library/Application Support/myproxy/` is the source of truth: subscriptions, node groups, rules, and Mixed port (HTTP + SOCKS5 on one loopback port). The UI is Chinese: **连接**, **节点组**, **规则**, **设置**.
+Strategy JSON under `~/Library/Application Support/myproxy/` is the source of truth: subscriptions, node groups, rules, and Mixed port (HTTP + SOCKS5 on one loopback port). The UI is Chinese: **总览**, **连接**, **订阅**, **节点组**, **规则**, **设置**.
 
 ## Install
 
@@ -89,9 +89,9 @@ application support directory.
   both; name exclusions apply only to automatic matches. Empty groups reject traffic
   and show as unavailable instead of silently routing it directly.
 - Matchers inside one rule are OR conditions. Rules are evaluated in their displayed
-  order, after built-in local-network bypasses. Mixed and System Extension each have
-  their own mode; TUN follows the profile rules and is mutually exclusive with System
-  Extension.
+  order, after built-in local-network bypasses, and only after traffic enters Mixed,
+  System Extension, or TUN. Mixed and System Extension each have their own mode; TUN
+  follows the profile rules and is mutually exclusive with System Extension.
 - `gfw:<group>` is evaluated by mihomo (`RULE-SET,gfw` then DIRECT on a miss).
   System Extension still captures the user's own process and domain/suffix/keyword/cidr
   matchers, including pins whose via is `gfw:<group>`. It does not embed the GFW
