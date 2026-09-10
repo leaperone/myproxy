@@ -129,7 +129,8 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
                revision: snapshot.revision,
                generationID: snapshot.generationID,
                createdAt: snapshot.createdAt,
-               rules: dnsRules
+               rules: dnsRules,
+               capturePrivateNetworks: snapshot.capturePrivateNetworks
            ) {
             dnsLoadResult = .loaded(filteredSnapshot)
         } else {

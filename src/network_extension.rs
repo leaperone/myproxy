@@ -27,6 +27,8 @@ pub struct EnableRequest {
     pub group_ports: Vec<GroupPort>,
     #[serde(default)]
     pub gfw_ports: Vec<GroupPort>,
+    #[serde(default)]
+    pub capture_private_networks: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +142,14 @@ pub struct RuntimeStatus {
     pub applied_revision: Option<u64>,
     pub message: Option<String>,
     pub dns_message: Option<String>,
+    #[serde(default)]
+    pub capture_enabled: bool,
+    #[serde(default = "default_fail_open")]
+    pub fail_open: bool,
+}
+
+fn default_fail_open() -> bool {
+    true
 }
 
 impl RuntimeStatus {
@@ -177,7 +187,72 @@ fn unavailable_status() -> RuntimeStatus {
         applied_revision: None,
         message: None,
         dns_message: None,
+        capture_enabled: false,
+        fail_open: true,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityProcess {
+    pub display: String,
+    pub matcher: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityBatch {
+    #[serde(default)]
+    entries: Vec<ActivityEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityEntry {
+    relay_local_port: u16,
+    process: String,
+    matcher: String,
+    relay_state: String,
+}
+
+fn joinable_relay_state(state: &str) -> bool {
+    matches!(
+        state,
+        "connecting" | "ready" | "relaying" | "completed"
+    )
+}
+
+/// Latest NE relay-port → process map. Empty when SE is off or the host cannot read activity.
+pub fn activity_process_by_port(
+    system_extension: bool,
+) -> std::collections::HashMap<u16, ActivityProcess> {
+    if !system_extension {
+        return std::collections::HashMap::new();
+    }
+    #[cfg(target_os = "macos")]
+    if login_item::is_bundled() {
+        let value = unsafe { ffi::myproxy_ne_activity_batch(0, 500) };
+        if let Some(json) = take_error(value) {
+            if let Ok(batch) = serde_json::from_str::<ActivityBatch>(&json) {
+                return batch
+                    .entries
+                    .into_iter()
+                    .filter(|entry| {
+                        entry.relay_local_port > 0 && joinable_relay_state(&entry.relay_state)
+                    })
+                    .map(|entry| {
+                        (
+                            entry.relay_local_port,
+                            ActivityProcess {
+                                display: entry.process,
+                                matcher: entry.matcher,
+                            },
+                        )
+                    })
+                    .collect();
+            }
+        }
+    }
+    std::collections::HashMap::new()
 }
 
 /// Reads a bounded in-memory host snapshot. The host refreshes its existing
@@ -432,6 +507,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         gfw_domains: Vec::new(),
         group_ports,
         gfw_ports,
+        capture_private_networks: strategy.lan_capture,
     })
 }
 
@@ -614,6 +690,7 @@ mod ffi {
         pub fn myproxy_ne_enable(json: *const c_char, error_out: *mut *mut c_char) -> i32;
         pub fn myproxy_ne_disable(operation_revision: u64, error_out: *mut *mut c_char) -> i32;
         pub fn myproxy_ne_status() -> *mut c_char;
+        pub fn myproxy_ne_activity_batch(cursor: u64, limit: u32) -> *mut c_char;
         pub fn myproxy_ne_wait(milliseconds: u32);
         pub fn myproxy_ne_free_string(value: *mut c_char);
     }
@@ -774,6 +851,28 @@ mod tests {
             "user dest pins stay in the capture plan"
         );
         assert!(plan.gfw_domains.is_empty());
+    }
+
+    #[test]
+    fn joinable_relay_states_are_live_or_completed() {
+        assert!(joinable_relay_state("connecting"));
+        assert!(joinable_relay_state("completed"));
+        assert!(!joinable_relay_state("failed"));
+        assert!(!joinable_relay_state("notApplicable"));
+    }
+
+    #[test]
+    fn activity_map_skips_ffi_when_system_extension_is_off() {
+        assert!(activity_process_by_port(false).is_empty());
+    }
+
+    #[test]
+    fn lan_capture_is_copied_into_enable_request() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.lan_capture = true;
+        let plan = inbound_plan(&strategy);
+        assert!(plan.capture_private_networks);
     }
 
     #[test]

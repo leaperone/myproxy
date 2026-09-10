@@ -117,16 +117,18 @@ pub enum RoutingProfile {
     Allowlist,
     Gfwlist,
     Group,
+    Chinadirect,
 }
 
 impl RoutingProfile {
-    pub const ALL: [Self; 3] = [Self::Allowlist, Self::Gfwlist, Self::Group];
+    pub const ALL: [Self; 4] = [Self::Allowlist, Self::Gfwlist, Self::Group, Self::Chinadirect];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Allowlist => "allowlist",
             Self::Gfwlist => "gfwlist",
             Self::Group => "group",
+            Self::Chinadirect => "chinadirect",
         }
     }
 
@@ -135,6 +137,7 @@ impl RoutingProfile {
             Self::Allowlist => "正面清单",
             Self::Gfwlist => "GFWList",
             Self::Group => "未匹配走组",
+            Self::Chinadirect => "国内直连",
         }
     }
 
@@ -143,7 +146,8 @@ impl RoutingProfile {
             "allowlist" | "direct" => Ok(Self::Allowlist),
             "gfwlist" | "gfw" => Ok(Self::Gfwlist),
             "group" => Ok(Self::Group),
-            _ => anyhow::bail!("routing must be allowlist, gfwlist, or group"),
+            "chinadirect" | "china" | "geoip-cn" | "geoipcn" => Ok(Self::Chinadirect),
+            _ => anyhow::bail!("routing must be allowlist, gfwlist, group, or chinadirect"),
         }
     }
 }
@@ -176,6 +180,12 @@ pub struct Strategy {
     /// When true, activate MClash-style System Extension intercept (NETransparentProxyProvider).
     #[serde(default)]
     pub system_extension: bool,
+    /// When true, RFC1918 destinations skip the built-in private-network bypass.
+    #[serde(default)]
+    pub lan_capture: bool,
+    /// When true, point macOS system HTTP/HTTPS/SOCKS at Mixed while connected.
+    #[serde(default)]
+    pub system_proxy: bool,
     /// How Mixed inbound traffic is routed. Independent of `extension_mode`.
     #[serde(default)]
     pub mixed_mode: InboundMode,
@@ -298,6 +308,8 @@ impl Default for Strategy {
             update_channel: None,
             tun: false,
             system_extension: false,
+            lan_capture: false,
+            system_proxy: false,
             mixed_mode: InboundMode::Rule,
             extension_mode: InboundMode::Rule,
             global_selected: String::new(),
@@ -442,7 +454,10 @@ impl Strategy {
                 }
             }
         }
-        if self.routing_profile == RoutingProfile::Group {
+        if matches!(
+            self.routing_profile,
+            RoutingProfile::Group | RoutingProfile::Chinadirect
+        ) {
             self.validate_target(&self.unmatched_via, None)
                 .context("unmatched target")?;
         }
@@ -452,7 +467,8 @@ impl Strategy {
         if self.groups.is_empty()
             && (self.mixed_mode == InboundMode::Proxy
                 || (self.system_extension && self.extension_mode == InboundMode::Proxy)
-                || self.routing_profile == RoutingProfile::Gfwlist)
+                || self.routing_profile == RoutingProfile::Gfwlist
+                || self.routing_profile == RoutingProfile::Chinadirect)
         {
             anyhow::bail!("the selected inbound/routing mode requires a proxy group");
         }
@@ -476,7 +492,10 @@ impl Strategy {
             self.validate_target(&set.via, Some(catalog))
                 .with_context(|| format!("rule {} target", set.name))?;
         }
-        if self.routing_profile == RoutingProfile::Group {
+        if matches!(
+            self.routing_profile,
+            RoutingProfile::Group | RoutingProfile::Chinadirect
+        ) {
             self.validate_target(&self.unmatched_via, Some(catalog))
                 .context("unmatched target")?;
         }
@@ -594,7 +613,10 @@ impl Strategy {
 
     pub fn set_routing_profile(&mut self, profile: RoutingProfile) {
         self.routing_profile = profile;
-        if profile == RoutingProfile::Group {
+        if matches!(
+            profile,
+            RoutingProfile::Group | RoutingProfile::Chinadirect
+        ) {
             let via = self.unmatched_via.trim();
             if via.is_empty() || via.eq_ignore_ascii_case("direct") {
                 self.unmatched_via = self.default_group_name().to_string();

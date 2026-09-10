@@ -207,6 +207,9 @@ fn try_compile_root(
             default_group(strategy)
         ));
     }
+    if strategy.routing_profile == RoutingProfile::Chinadirect {
+        rules.push("GEOIP,CN,DIRECT".into());
+    }
     rules.push(format!("MATCH,{}", unmatched_target(strategy)));
     let rules: Vec<serde_yaml::Value> = rules.into_iter().map(serde_yaml::Value::String).collect();
     root.insert("rules".into(), serde_yaml::Value::Sequence(rules));
@@ -651,10 +654,14 @@ fn resolve_group_target(via: &str, strategy: &Strategy) -> String {
 pub fn unmatched_target(strategy: &Strategy) -> String {
     match strategy.routing_profile {
         RoutingProfile::Allowlist | RoutingProfile::Gfwlist => "DIRECT".into(),
-        RoutingProfile::Group => {
+        RoutingProfile::Group | RoutingProfile::Chinadirect => {
             let via = strategy.unmatched_via.trim();
-            if via.is_empty() {
-                "DIRECT".into()
+            if via.is_empty() || via.eq_ignore_ascii_case("direct") {
+                if strategy.routing_profile == RoutingProfile::Chinadirect {
+                    default_group(strategy).to_string()
+                } else {
+                    "DIRECT".into()
+                }
             } else {
                 via_target(via, strategy)
             }
@@ -760,6 +767,25 @@ mod tests {
             .any(|rule| rule.starts_with("DOMAIN-SUFFIX,telegram.org,")));
         assert!(!rules.iter().any(|rule| rule.starts_with("RULE-SET,")));
         assert_eq!(rules.last().copied(), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn chinadirect_emits_geoip_then_match_default_group() {
+        let mut strategy = Strategy::default();
+        strategy.routing_profile = RoutingProfile::Chinadirect;
+        strategy.unmatched_via = "PROXY".into();
+        let root = compiled(&strategy);
+        let rules = rule_strings(&root);
+        let geo = rules
+            .iter()
+            .position(|rule| *rule == "GEOIP,CN,DIRECT")
+            .expect("geoip");
+        let matched = rules
+            .iter()
+            .position(|rule| *rule == "MATCH,PROXY")
+            .expect("match");
+        assert!(geo < matched);
+        assert!(!root.contains_key("rule-providers"));
     }
 
     #[test]

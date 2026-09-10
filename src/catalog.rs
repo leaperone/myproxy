@@ -104,6 +104,22 @@ impl Catalog {
         })
     }
 
+    pub fn fetch_failure_count(&self) -> usize {
+        let mut names: Vec<_> = self.subscription_urls.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .filter(|name| self.subscription_warning(name).is_some())
+            .count()
+    }
+
+    pub fn filter_excluded_count(&self) -> usize {
+        self.excluded
+            .iter()
+            .filter(|item| !item.reason.starts_with("fetch failed:"))
+            .count()
+    }
+
     pub fn refresh_warnings(&self) -> Vec<String> {
         let mut subscriptions: Vec<_> = self.subscription_urls.keys().collect();
         subscriptions.sort();
@@ -432,4 +448,41 @@ fn source_matches(group: &crate::strategy::Group, node: &Node) -> bool {
     group.sources.iter().any(|source| {
         source.eq_ignore_ascii_case(&node.subscription) || source == &node.subscription
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_failures_are_not_counted_as_filter_excludes() {
+        let catalog = Catalog {
+            nodes: vec![Node {
+                name: "HK".into(),
+                subscription: "A".into(),
+                raw: serde_yaml::from_str("name: HK").expect("yaml"),
+            }],
+            excluded: vec![
+                Excluded {
+                    name: "*".into(),
+                    subscription: "A".into(),
+                    reason: "fetch failed: timeout".into(),
+                },
+                Excluded {
+                    name: "广告".into(),
+                    subscription: "B".into(),
+                    reason: "exclude_filter".into(),
+                },
+            ],
+            subscription_urls: HashMap::from([
+                ("A".into(), "https://example.invalid/a".into()),
+                ("B".into(), "https://example.invalid/b".into()),
+            ]),
+            exclude_filter: String::new(),
+        };
+        assert_eq!(catalog.fetch_failure_count(), 1);
+        assert_eq!(catalog.filter_excluded_count(), 1);
+        assert!(catalog.subscription_warning("A").is_some());
+        assert!(catalog.subscription_warning("B").is_none());
+    }
 }

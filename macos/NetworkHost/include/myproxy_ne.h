@@ -15,6 +15,8 @@ int myproxy_ne_enable(const char *json, char **error_out);
 int myproxy_ne_disable(uint64_t operation_revision, char **error_out);
 /* JSON snapshot; caller frees with myproxy_ne_free_string. */
 char *myproxy_ne_status(void);
+/* Slim activity JSON for connection-process join; caller frees with myproxy_ne_free_string. */
+char *myproxy_ne_activity_batch(uint64_t cursor, uint32_t limit);
 /* Service native callbacks during bounded CLI waits; not used by the GUI. */
 void myproxy_ne_wait(uint32_t milliseconds);
 

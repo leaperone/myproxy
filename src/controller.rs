@@ -35,6 +35,7 @@ pub struct TrafficTotals {
 pub struct LiveConnection {
     pub id: String,
     pub process: String,
+    pub app_matcher: String,
     pub destination: String,
     pub network: String,
     pub chain: String,
@@ -282,6 +283,8 @@ struct RawMetadata {
     destination_ip: String,
     #[serde(default, rename = "destinationPort")]
     destination_port: Value,
+    #[serde(default, rename = "sourcePort")]
+    source_port: Value,
     #[serde(default)]
     process: String,
     #[serde(default, rename = "processPath")]
@@ -312,7 +315,7 @@ struct RawHistory {
     delay: u32,
 }
 
-pub fn fetch(mixed_port: u16) -> Result<TrafficSnapshot> {
+pub fn fetch(mixed_port: u16, system_extension: bool) -> Result<TrafficSnapshot> {
     let url = format!(
         "http://127.0.0.1:{}/connections",
         controller_port(mixed_port)
@@ -326,10 +329,11 @@ pub fn fetch(mixed_port: u16) -> Result<TrafficSnapshot> {
         .context("read connections body")?;
     let parsed: ConnectionsResponse =
         serde_json::from_str(&body).context("parse connections json")?;
+    let by_port = crate::network_extension::activity_process_by_port(system_extension);
     let mut connections: Vec<LiveConnection> = parsed
         .connections
         .into_iter()
-        .map(LiveConnection::from_raw)
+        .map(|raw| LiveConnection::from_raw(raw, &by_port))
         .collect();
     connections.sort_by(|a, b| {
         (b.upload.saturating_add(b.download)).cmp(&(a.upload.saturating_add(a.download)))
@@ -447,9 +451,9 @@ pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
     Ok(groups)
 }
 
-pub fn fetch_live(mixed_port: u16, need: LiveNeed) -> Result<LiveSnapshot> {
+pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Result<LiveSnapshot> {
     let (traffic, fetched_rows) = match need {
-        LiveNeed::Rows => (fetch(mixed_port)?, true),
+        LiveNeed::Rows => (fetch(mixed_port, system_extension)?, true),
         LiveNeed::Totals => {
             let totals = fetch_totals(mixed_port)?;
             (
@@ -717,8 +721,24 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 impl LiveConnection {
-    fn from_raw(raw: RawConnection) -> Self {
-        let process = process_label(&raw.metadata.process, &raw.metadata.process_path);
+    fn from_raw(
+        raw: RawConnection,
+        by_port: &HashMap<u16, crate::network_extension::ActivityProcess>,
+    ) -> Self {
+        let mut process = process_label(&raw.metadata.process, &raw.metadata.process_path);
+        let mut app_matcher = process.clone();
+        if let Some(port) = parse_port(&raw.metadata.source_port) {
+            if let Some(hit) = by_port.get(&port) {
+                if !hit.display.is_empty() && hit.display != "—" {
+                    process = hit.display.clone();
+                    app_matcher = if hit.matcher.trim().is_empty() {
+                        process.clone()
+                    } else {
+                        hit.matcher.clone()
+                    };
+                }
+            }
+        }
         let destination = destination_label(
             &raw.metadata.host,
             &raw.metadata.destination_ip,
@@ -737,6 +757,7 @@ impl LiveConnection {
         Self {
             id: raw.id,
             process,
+            app_matcher,
             destination,
             network: if raw.metadata.network.is_empty() {
                 "—".into()
@@ -748,6 +769,14 @@ impl LiveConnection {
             download: raw.download,
             duration: format_age(secs_since_start(&raw.start)),
         }
+    }
+}
+
+fn parse_port(value: &Value) -> Option<u16> {
+    match value {
+        Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0),
+        Value::String(s) => s.trim().parse::<u16>().ok().filter(|n| *n > 0),
+        _ => None,
     }
 }
 
@@ -894,6 +923,7 @@ mod tests {
         LiveConnection {
             id: process.to_string(),
             process: process.into(),
+            app_matcher: process.into(),
             destination: destination.into(),
             network: network.into(),
             chain: chain.into(),
@@ -980,5 +1010,57 @@ mod tests {
             connection_column_values(&rows, &filters, ConnectionColumn::Destination),
             ["github.com:443"]
         );
+    }
+
+    fn raw_conn(id: &str, source_port: u16, process: &str, host: &str) -> RawConnection {
+        RawConnection {
+            id: id.into(),
+            metadata: RawMetadata {
+                source_port: Value::from(source_port),
+                process: process.into(),
+                host: host.into(),
+                destination_port: Value::from(443),
+                network: "tcp".into(),
+                ..RawMetadata::default()
+            },
+            upload: 0,
+            download: 0,
+            start: String::new(),
+            chains: vec!["PROXY".into()],
+        }
+    }
+
+    #[test]
+    fn activity_port_join_overrides_process_without_crossing_rows() {
+        let mut by_port = HashMap::new();
+        by_port.insert(
+            41234,
+            crate::network_extension::ActivityProcess {
+                display: "Safari".into(),
+                matcher: "com.apple.Safari".into(),
+            },
+        );
+        by_port.insert(
+            41235,
+            crate::network_extension::ActivityProcess {
+                display: "Arc".into(),
+                matcher: "company.thebrowser.Browser".into(),
+            },
+        );
+        let safari = LiveConnection::from_raw(
+            raw_conn("1", 41234, "myproxy-extension", "apple.com"),
+            &by_port,
+        );
+        let arc = LiveConnection::from_raw(
+            raw_conn("2", 41235, "myproxy-extension", "github.com"),
+            &by_port,
+        );
+        let untouched = LiveConnection::from_raw(raw_conn("3", 9, "curl", "example.com"), &by_port);
+        assert_eq!(safari.process, "Safari");
+        assert_eq!(safari.app_matcher, "com.apple.Safari");
+        assert_eq!(arc.process, "Arc");
+        assert_eq!(arc.app_matcher, "company.thebrowser.Browser");
+        assert_eq!(untouched.process, "curl");
+        assert_eq!(untouched.app_matcher, "curl");
     }
 }
