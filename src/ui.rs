@@ -851,7 +851,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 走向在系统接管中判断 GFWList；Mixed/TUN 兼容路径直接走指定组。"),
+                    .child("逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。"),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))

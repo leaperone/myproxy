@@ -88,8 +88,9 @@ application support directory.
   order, after built-in local-network bypasses. Mixed and System Extension each have
   their own mode; TUN follows the profile rules and is mutually exclusive with System
   Extension.
-- `gfw:<group>` filters against the cached GFW domain list in System Extension.
-  Mixed and TUN retain the compatibility behavior of routing that rule to the group.
+- `gfw:<group>` is evaluated by mihomo (`RULE-SET,gfw` then DIRECT on a miss).
+  System Extension only maps a process to that GFW inlet or the profile-rules
+  inlet; it does not embed the GFW domain list.
 - The connections page shows connections recorded by Mihomo. System Extension
   traffic passed directly to macOS or rejected before Mihomo is outside that list;
   **显示直连** reveals only DIRECT connections recorded by the core.

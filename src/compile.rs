@@ -116,6 +116,7 @@ fn try_compile_root(
     );
     root.insert("secret".into(), CONTROLLER_SECRET.into());
     insert_inbound_listeners(&mut root, strategy, request)?;
+    insert_gfw_sub_rules(&mut root, strategy, request);
 
     if strategy.system_extension {
         // The DNS proxy provider captures system resolver flows at the
@@ -162,68 +163,40 @@ fn try_compile_root(
 
     let mut rules = Vec::new();
     append_default_direct_rules(&mut rules);
+    append_gfw_inlet_rules(&mut rules, strategy, request);
     for set in &strategy.rule_sets {
-        let target = via_target(&set.via, strategy);
         for matcher in &set.matchers {
-            match matcher.kind.as_str() {
-                "keyword" => {
-                    rules.push(format!("DOMAIN-KEYWORD,{},{}", matcher.value, target));
-                }
-                "suffix" => {
+            let Some(condition) = matcher_condition(matcher) else {
+                continue;
+            };
+            let routed = wrap_gfw_condition(&condition, &set.via, matcher.kind.as_str());
+            let target = rule_via_target(&set.via, strategy);
+            let se_app = matcher.kind == "app" && strategy.system_extension;
+            let inlet_names = se_app.then(|| network_extension_inlet_names(request));
+            if se_app {
+                // A forwarded SE flow belongs to the provider process.
+                // Keep process rules for Mixed/TUN without matching that
+                // forwarding identity a second time on the private inlet.
+                let names = inlet_names.as_deref().expect("se inlet names");
+                rules.push(format!(
+                    "AND,((NOT,((IN-NAME,{names}))),({routed})),{target}"
+                ));
+            } else if matcher.kind == "cidr" {
+                rules.push(format!("{routed},{target},no-resolve"));
+            } else {
+                rules.push(format!("{routed},{target}"));
+            }
+            // gfw:<group> is hit → group, miss → DIRECT. Process GFW
+            // inlets already MATCH DIRECT; dest/Mixed process rules need
+            // the same rest line so later MATCH/group cannot steal a miss.
+            if gfw::gfw_group(&set.via).is_some() && matcher.kind != "cidr" {
+                if let Some(names) = inlet_names.as_deref() {
                     rules.push(format!(
-                        "DOMAIN-SUFFIX,{},{}",
-                        matcher.value.trim_start_matches('.'),
-                        target
+                        "AND,((NOT,((IN-NAME,{names}))),({condition})),DIRECT"
                     ));
+                } else {
+                    rules.push(format!("{condition},DIRECT"));
                 }
-                "domain" => {
-                    if matcher.value.starts_with("*.") {
-                        rules.push(format!(
-                            "DOMAIN-SUFFIX,{},{}",
-                            matcher.value.trim_start_matches("*."),
-                            target
-                        ));
-                    } else {
-                        rules.push(format!("DOMAIN,{},{}", matcher.value, target));
-                    }
-                }
-                "app" => {
-                    let value = matcher.value.trim();
-                    let kind = if value.contains('/') {
-                        "PROCESS-PATH"
-                    } else {
-                        "PROCESS-NAME"
-                    };
-                    let condition = if value.contains(['*', '?']) {
-                        let pattern = regex::escape(value)
-                            .replace(r"\*", ".*")
-                            .replace(r"\?", ".");
-                        format!("{kind}-REGEX,^{pattern}$")
-                    } else {
-                        format!("{kind},{value}")
-                    };
-                    // A forwarded SE flow belongs to the provider process.
-                    // Keep process rules for Mixed/TUN without matching that
-                    // forwarding identity a second time on the private inlet.
-                    if strategy.system_extension {
-                        rules.push(format!("AND,((NOT,((IN-NAME,myproxy-network-extension-socks-ipv4/myproxy-network-extension-socks-ipv6))),({condition})),{target}"));
-                    } else {
-                        rules.push(format!("{condition},{target}"));
-                    }
-                }
-                "cidr" => {
-                    let value = matcher.value.trim();
-                    if value.is_empty() {
-                        continue;
-                    }
-                    let kind = if value.contains(':') {
-                        "IP-CIDR6"
-                    } else {
-                        "IP-CIDR"
-                    };
-                    rules.push(format!("{kind},{value},{target},no-resolve"));
-                }
-                _ => {}
             }
         }
     }
@@ -244,8 +217,163 @@ fn append_default_direct_rules(rules: &mut Vec<String>) {
     rules.extend(DEFAULT_DIRECT_RULES.iter().map(|rule| (*rule).to_string()));
 }
 
+fn matcher_condition(matcher: &crate::strategy::Matcher) -> Option<String> {
+    match matcher.kind.as_str() {
+        "keyword" => Some(format!("DOMAIN-KEYWORD,{}", matcher.value)),
+        "suffix" => Some(format!(
+            "DOMAIN-SUFFIX,{}",
+            matcher.value.trim_start_matches('.')
+        )),
+        "domain" => {
+            if matcher.value.starts_with("*.") {
+                Some(format!(
+                    "DOMAIN-SUFFIX,{}",
+                    matcher.value.trim_start_matches("*.")
+                ))
+            } else {
+                Some(format!("DOMAIN,{}", matcher.value))
+            }
+        }
+        "app" => {
+            let value = matcher.value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let kind = if value.contains('/') {
+                "PROCESS-PATH"
+            } else {
+                "PROCESS-NAME"
+            };
+            let condition = if value.contains(['*', '?']) {
+                let pattern = regex::escape(value)
+                    .replace(r"\*", ".*")
+                    .replace(r"\?", ".");
+                format!("{kind}-REGEX,^{pattern}$")
+            } else {
+                format!("{kind},{value}")
+            };
+            Some(condition)
+        }
+        "cidr" => {
+            let value = matcher.value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let kind = if value.contains(':') {
+                "IP-CIDR6"
+            } else {
+                "IP-CIDR"
+            };
+            Some(format!("{kind},{value}"))
+        }
+        _ => None,
+    }
+}
+
+fn wrap_gfw_condition(condition: &str, via: &str, kind: &str) -> String {
+    if gfw::gfw_group(via).is_some() && kind != "cidr" {
+        format!("AND,(({condition}),(RULE-SET,{}))", gfw::PROVIDER)
+    } else {
+        condition.to_string()
+    }
+}
+
+fn rule_via_target(via: &str, strategy: &Strategy) -> String {
+    if let Some(group) = gfw::gfw_group(via) {
+        return via_target(group, strategy);
+    }
+    via_target(via, strategy)
+}
+
+fn gfw_socks_prefix(port: u16) -> String {
+    format!("myproxy-network-extension-socks-gfw-{port}")
+}
+
+fn gfw_sub_rule_name(port: u16) -> String {
+    format!("gfw-{port}")
+}
+
+fn gfw_inlet_group(name: &str, strategy: &Strategy) -> String {
+    if let Some(group) = gfw::gfw_group(name) {
+        via_target(group, strategy)
+    } else {
+        via_target(name, strategy)
+    }
+}
+
+fn network_extension_inlet_names(
+    plan: Option<&crate::network_extension::EnableRequest>,
+) -> String {
+    let mut names = vec![
+        "myproxy-network-extension-socks-ipv4".to_string(),
+        "myproxy-network-extension-socks-ipv6".to_string(),
+    ];
+    if let Some(plan) = plan {
+        for port in &plan.gfw_ports {
+            let prefix = gfw_socks_prefix(port.port);
+            names.push(format!("{prefix}-ipv4"));
+            names.push(format!("{prefix}-ipv6"));
+        }
+    }
+    names.join("/")
+}
+
+fn append_gfw_inlet_rules(
+    rules: &mut Vec<String>,
+    strategy: &Strategy,
+    plan: Option<&crate::network_extension::EnableRequest>,
+) {
+    let Some(plan) = plan else {
+        return;
+    };
+    for port in &plan.gfw_ports {
+        let prefix = gfw_socks_prefix(port.port);
+        let names = format!("{prefix}-ipv4/{prefix}-ipv6");
+        let group = gfw_inlet_group(&port.name, strategy);
+        rules.push(format!(
+            "AND,((IN-NAME,{names}),(RULE-SET,{})),{group}",
+            gfw::PROVIDER
+        ));
+        rules.push(format!("IN-NAME,{names},DIRECT"));
+    }
+}
+
+fn insert_gfw_sub_rules(
+    root: &mut serde_yaml::Mapping,
+    strategy: &Strategy,
+    plan: Option<&crate::network_extension::EnableRequest>,
+) {
+    let Some(plan) = plan else {
+        return;
+    };
+    if plan.gfw_ports.is_empty() {
+        return;
+    }
+    let mut sub = serde_yaml::Mapping::new();
+    for port in &plan.gfw_ports {
+        let group = gfw_inlet_group(&port.name, strategy);
+        let items = vec![
+            serde_yaml::Value::String(format!("RULE-SET,{},{group}", gfw::PROVIDER)),
+            serde_yaml::Value::String("MATCH,DIRECT".into()),
+        ];
+        sub.insert(
+            gfw_sub_rule_name(port.port).into(),
+            serde_yaml::Value::Sequence(items),
+        );
+    }
+    root.insert("sub-rules".into(), serde_yaml::Value::Mapping(sub));
+}
+
+fn needs_gfw_provider(strategy: &Strategy) -> bool {
+    strategy.routing_profile == RoutingProfile::Gfwlist
+        || strategy
+            .rule_sets
+            .iter()
+            .any(|set| gfw::gfw_group(&set.via).is_some())
+}
+
 fn insert_rule_providers(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
-    if strategy.routing_profile != RoutingProfile::Gfwlist {
+    if !needs_gfw_provider(strategy) {
         return;
     }
     if let Err(err) = paths::ruleset_dir() {
@@ -427,6 +555,7 @@ fn append_network_extension_listeners(
         outbound.as_deref(),
         &plan.username,
         &plan.password,
+        None,
     );
     for group in &plan.group_ports {
         push_socks_pair(
@@ -436,6 +565,18 @@ fn append_network_extension_listeners(
             Some(group.name.as_str()),
             &plan.username,
             &plan.password,
+            None,
+        );
+    }
+    for group in &plan.gfw_ports {
+        push_socks_pair(
+            listeners,
+            &gfw_socks_prefix(group.port),
+            group.port,
+            None,
+            &plan.username,
+            &plan.password,
+            Some(&gfw_sub_rule_name(group.port)),
         );
     }
 }
@@ -447,6 +588,7 @@ fn push_socks_pair(
     outbound: Option<&str>,
     username: &str,
     password: &str,
+    rule: Option<&str>,
 ) {
     for (suffix, host) in [("ipv4", "127.0.0.1"), ("ipv6", "::1")] {
         let mut item = serde_yaml::Mapping::new();
@@ -457,6 +599,9 @@ fn push_socks_pair(
         item.insert("udp".into(), true.into());
         if let Some(proxy) = outbound {
             item.insert("proxy".into(), proxy.into());
+        }
+        if let Some(rule) = rule {
+            item.insert("rule".into(), rule.to_string().into());
         }
         let mut user = serde_yaml::Mapping::new();
         user.insert("username".into(), username.into());
@@ -929,6 +1074,89 @@ mod tests {
                 .expect("default se socks");
             assert_eq!(proxy_field(default_socks), expected, "se mode {mode:?}");
         }
+    }
+
+    #[test]
+    fn dest_gfw_emits_and_rule_set_and_provider() {
+        let mut strategy = Strategy::default();
+        strategy.rule_sets.push(crate::strategy::RuleSet {
+            id: "safari".into(),
+            name: "Safari".into(),
+            via: "gfw:Default".into(),
+            matchers: vec![crate::strategy::Matcher {
+                kind: "suffix".into(),
+                value: "example.com".into(),
+            }],
+        });
+        let root = compiled(&strategy);
+        assert!(root.contains_key("rule-providers"));
+        let rules = rule_strings(&root);
+        assert!(
+            rules.iter().any(|rule| {
+                *rule == "AND,((DOMAIN-SUFFIX,example.com),(RULE-SET,gfw)),PROXY"
+            }),
+            "{rules:?}"
+        );
+        let hit = rules
+            .iter()
+            .position(|rule| *rule == "AND,((DOMAIN-SUFFIX,example.com),(RULE-SET,gfw)),PROXY")
+            .expect("gfw hit");
+        let miss = rules
+            .iter()
+            .position(|rule| *rule == "DOMAIN-SUFFIX,example.com,DIRECT")
+            .expect("gfw miss");
+        assert!(hit < miss, "{rules:?}");
+        assert!(!rules.iter().any(|rule| rule.starts_with("IN-NAME,")));
+    }
+
+    #[test]
+    fn process_gfw_emits_inlet_without_proxy() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        if let Some(set) = strategy.rule_sets.first_mut() {
+            set.via = "gfw:Default".into();
+            set.matchers = vec![crate::strategy::Matcher {
+                kind: "app".into(),
+                value: "Safari".into(),
+            }];
+        }
+        let plan = crate::network_extension::inbound_plan(&strategy);
+        let port = plan.gfw_ports[0].port;
+        let root = compiled(&strategy);
+        let prefix = format!("myproxy-network-extension-socks-gfw-{port}");
+        let ipv4 = format!("{prefix}-ipv4");
+        let listener_names: Vec<&str> = listeners(&root).into_iter().map(listener_name).collect();
+        assert!(listener_names.contains(&ipv4.as_str()), "{listener_names:?}");
+        let inlet = listeners(&root)
+            .into_iter()
+            .find(|item| listener_name(item) == ipv4)
+            .expect("gfw inlet");
+        assert_eq!(proxy_field(inlet), None);
+        let sub_name = format!("gfw-{port}");
+        assert_eq!(
+            inlet.get("rule").and_then(serde_yaml::Value::as_str),
+            Some(sub_name.as_str())
+        );
+        let sub = root
+            .get("sub-rules")
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|rules| rules.get(&sub_name))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("gfw sub-rule");
+        assert_eq!(
+            sub,
+            &vec![
+                serde_yaml::Value::String("RULE-SET,gfw,PROXY".into()),
+                serde_yaml::Value::String("MATCH,DIRECT".into()),
+            ]
+        );
+        let rules = rule_strings(&root);
+        let inlet_names = format!("{prefix}-ipv4/{prefix}-ipv6");
+        let hit = format!("AND,((IN-NAME,{inlet_names}),(RULE-SET,gfw)),PROXY");
+        let miss = format!("IN-NAME,{inlet_names},DIRECT");
+        assert!(rules.iter().any(|rule| *rule == hit), "{rules:?}");
+        assert!(rules.iter().any(|rule| *rule == miss), "{rules:?}");
     }
 
     #[test]

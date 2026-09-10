@@ -30,6 +30,7 @@ private struct HostEnableRequest: Decodable, Sendable {
     let destRules: [DestRule]
     let gfwDomains: [String]
     let groupPorts: [GroupPort]
+    let gfwPorts: [GroupPort]
 }
 
 /// Shared by the GUI and installed CLI. Atomic replacement defines the latest
@@ -521,87 +522,20 @@ private func captureSnapshot(
     from request: HostEnableRequest
 ) throws -> CaptureConfigurationSnapshot {
     var rules: [CaptureRule] = []
-    let gfwDestinations = gfwDestinationMatchers(request.gfwDomains)
-    let needsGFW = request.processRules.contains { gfwGroup(via: $0.via) != nil }
-        || request.destRules.contains { gfwGroup(via: $0.via) != nil }
-    if needsGFW && gfwDestinations.isEmpty {
-        throw NetworkExtensionControlFailure(
-            operation: .configureTransparentProxy,
-            message: "GFWList 不可用，无法应用新接管配置"
-        )
-    }
-
-    func append(
-        _ id: String,
-        sources: [SourceMatcher] = [],
-        destinations: [DestinationMatcher] = [],
-        via: String
-    ) throws {
+    for (index, rule) in request.processRules.enumerated() {
+        let sources = sourceMatchers(from: rule.pattern)
+        guard !sources.isEmpty else {
+            throw NetworkExtensionControlFailure(
+                operation: .configureTransparentProxy, message: "无效的应用匹配条件"
+            )
+        }
         rules.append(try CaptureRule(
-            id: id,
+            id: "process-\(index)",
             priority: rules.count,
             sources: sources,
-            destinations: destinations,
-            action: captureAction(via: via),
-            unavailableFallback: captureFallback(via: via)
+            action: captureAction(via: rule.via),
+            unavailableFallback: captureFallback(via: rule.via)
         ))
-    }
-
-    enum OrderedInput {
-        case process(Int, HostEnableRequest.ProcessRule)
-        case destination(Int, HostEnableRequest.DestRule)
-        var order: UInt64 {
-            switch self {
-            case .process(_, let rule): rule.order
-            case .destination(_, let rule): rule.order
-            }
-        }
-    }
-    let inputs = request.processRules.enumerated().map { OrderedInput.process($0.offset, $0.element) }
-        + request.destRules.enumerated().map { OrderedInput.destination($0.offset, $0.element) }
-    let ordered = inputs.enumerated().sorted {
-        if $0.element.order == $1.element.order { return $0.offset < $1.offset }
-        return $0.element.order < $1.element.order
-    }
-    for input in ordered.map(\.element) {
-        switch input {
-        case .process(let index, let rule):
-            let sources = sourceMatchers(from: rule.pattern)
-            guard !sources.isEmpty else {
-                throw NetworkExtensionControlFailure(
-                    operation: .configureTransparentProxy, message: "无效的应用匹配条件"
-                )
-            }
-            if let group = gfwGroup(via: rule.via) {
-                try append("process-gfw-\(index)", sources: sources,
-                           destinations: gfwDestinations, via: group)
-                try append("process-gfw-rest-\(index)", sources: sources, via: "DIRECT")
-            } else {
-                try append("process-\(index)", sources: sources, via: rule.via)
-            }
-        case .destination(let index, let rule):
-            let destinations = destinationMatchers(kind: rule.kind, value: rule.value)
-            guard !destinations.isEmpty else {
-                throw NetworkExtensionControlFailure(
-                    operation: .configureTransparentProxy, message: "无效的目标匹配条件"
-                )
-            }
-            if let group = gfwGroup(via: rule.via) {
-                guard rule.kind != "cidr" else {
-                    throw NetworkExtensionControlFailure(
-                        operation: .configureTransparentProxy,
-                        message: "GFWList 无法与网段规则求交"
-                    )
-                }
-                let hits = try gfwIntersection(kind: rule.kind, value: rule.value, domains: request.gfwDomains)
-                if !hits.isEmpty {
-                    try append("dest-gfw-\(index)", destinations: hits, via: group)
-                }
-                try append("dest-gfw-rest-\(index)", destinations: destinations, via: "DIRECT")
-            } else {
-                try append("dest-\(index)", destinations: destinations, via: rule.via)
-            }
-        }
     }
     rules.append(try CaptureRule(
         id: "default-profile-rules",
@@ -610,99 +544,6 @@ private func captureSnapshot(
         unavailableFallback: .direct
     ))
     return try CaptureConfigurationSnapshot(revision: request.revision, rules: rules)
-}
-
-private func gfwGroup(via: String) -> String? {
-    let trimmed = via.trimmingCharacters(in: .whitespacesAndNewlines)
-    let lower = trimmed.lowercased()
-    for prefix in ["gfw:", "gfwlist:"] where lower.hasPrefix(prefix) {
-        let group = trimmed.dropFirst(prefix.count)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return group.isEmpty ? nil : group
-    }
-    return nil
-}
-
-private func gfwDestinationMatchers(_ domains: [String]) -> [DestinationMatcher] {
-    domains.compactMap { domain in
-        try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: domain))
-    }
-}
-
-private func destinationMatchers(kind: String, value: String) -> [DestinationMatcher] {
-    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return [] }
-    switch kind {
-    case "suffix":
-        let host = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        return (try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: host))).map { [$0] } ?? []
-    case "domain":
-        if trimmed.hasPrefix("*.") {
-            let host = String(trimmed.dropFirst(2))
-            return (try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: host))).map { [$0] } ?? []
-        }
-        return (try? DestinationMatcher.host(HostMatcher(kind: .exact, value: trimmed))).map { [$0] } ?? []
-    case "keyword":
-        return (try? DestinationMatcher.hostPattern(HostPatternMatcher(pattern: "*\(trimmed)*")))
-            .map { [$0] } ?? []
-    case "cidr":
-        return (try? DestinationMatcher.network(IPNetwork(trimmed))).map { [$0] } ?? []
-    default:
-        return []
-    }
-}
-
-/// Intersect the user's condition with suffix entries without replacing a
-/// precise subdomain by its broader GFW parent. Keyword masks use the existing
-/// native matcher, including occurrences spanning the suffix boundary.
-private func gfwIntersection(
-    kind: String, value: String, domains: [String]
-) throws -> [DestinationMatcher] {
-    let value = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-    guard !value.isEmpty else { return [] }
-    var result: [DestinationMatcher] = []
-    var seen = Set<DestinationMatcher>()
-    func add(_ matcher: DestinationMatcher) {
-        if seen.insert(matcher).inserted { result.append(matcher) }
-    }
-    func within(_ host: String, _ suffix: String) -> Bool {
-        host == suffix || host.hasSuffix(".\(suffix)")
-    }
-    for rawDomain in domains {
-        let domain = rawDomain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        switch kind {
-        case "domain" where !value.hasPrefix("*."):
-            if within(value, domain) {
-                add(try .host(HostMatcher(kind: .exact, value: value)))
-            }
-        case "domain", "suffix":
-            let suffix = value.hasPrefix("*.") ? String(value.dropFirst(2)) : value
-            if within(suffix, domain) {
-                add(try .host(HostMatcher(kind: .suffix, value: suffix)))
-            } else if within(domain, suffix) {
-                add(try .host(HostMatcher(kind: .suffix, value: domain)))
-            }
-        case "keyword":
-            if domain.contains(value) {
-                add(try .host(HostMatcher(kind: .suffix, value: domain)))
-            } else {
-                add(try .hostPattern(HostPatternMatcher(pattern: "*\(value)*.\(domain)")))
-                let boundary = ".\(domain)"
-                let maximumOverlap = min(value.count - 1, boundary.count)
-                if maximumOverlap > 0 {
-                    for count in 1...maximumOverlap where value.suffix(count) == boundary.prefix(count) {
-                        add(try .hostPattern(HostPatternMatcher(
-                            pattern: "*\(value.dropLast(count))\(boundary)"
-                        )))
-                    }
-                }
-            }
-        default:
-            break
-        }
-    }
-    return result
 }
 
 private func sourceMatchers(from raw: String) -> [SourceMatcher] {
@@ -807,7 +648,7 @@ private func routeEndpoints(
         ),
     ]
     var seen = Set<String>()
-    for group in request.groupPorts {
+    for group in request.groupPorts + request.gfwPorts {
         let name = group.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, seen.insert(name).inserted else { continue }
         endpoints.append(
