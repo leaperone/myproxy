@@ -25,6 +25,8 @@ pub struct EnableRequest {
     pub dest_rules: Vec<DestRule>,
     pub gfw_domains: Vec<String>,
     pub group_ports: Vec<GroupPort>,
+    #[serde(default)]
+    pub gfw_ports: Vec<GroupPort>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +59,7 @@ struct CaptureFace {
     dest_rules: Vec<DestRule>,
     gfw_domains: Vec<String>,
     group_ports: Vec<GroupPort>,
+    gfw_ports: Vec<GroupPort>,
 }
 
 struct Session {
@@ -290,25 +293,7 @@ pub fn prepare_request(request: &EnableRequest) -> Result<()> {
     }
 }
 
-fn validate_request(request: &EnableRequest) -> Result<()> {
-    let needs_gfw = request
-        .process_rules
-        .iter()
-        .any(|rule| gfw::gfw_group(&rule.via).is_some())
-        || request
-            .dest_rules
-            .iter()
-            .any(|rule| gfw::gfw_group(&rule.via).is_some());
-    if request
-        .dest_rules
-        .iter()
-        .any(|rule| gfw::gfw_group(&rule.via).is_some() && rule.kind == "cidr")
-    {
-        bail!("GFWList 无法与网段规则求交，请改用节点组或域名条件");
-    }
-    if needs_gfw && request.gfw_domains.is_empty() {
-        bail!("GFWList 不可用，保留原接管配置；请刷新列表后重试");
-    }
+fn validate_request(_request: &EnableRequest) -> Result<()> {
     Ok(())
 }
 
@@ -336,77 +321,69 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
     }
 
     let mut process_rules = Vec::new();
-    let mut dest_rules = Vec::new();
     let mut order = 0u64;
     let mut needed = Vec::new();
-    let mut wants_gfw = false;
+    let mut gfw_needed = Vec::new();
     if strategy.extension_mode == InboundMode::Rule {
         for set in &strategy.rule_sets {
-            let via = set.via.trim().to_string();
+            let via = set.via.trim();
             if via.is_empty() {
                 continue;
             }
-            let capture_via = if let Some(group) = gfw::gfw_group(&via) {
-                wants_gfw = true;
+            let capture_via = if let Some(group) = gfw::gfw_group(via) {
                 format!("gfw:{}", compile::via_target(group, strategy))
             } else {
-                compile::via_target(&via, strategy)
+                compile::via_target(via, strategy)
             };
-            if let Some(name) = pin_group(&capture_via, strategy) {
-                if !needed.iter().any(|existing| existing == &name) {
-                    needed.push(name);
-                }
-            }
+            let mut saw_app = false;
             for matcher in &set.matchers {
                 let value = matcher.value.trim();
                 if value.is_empty() {
                     continue;
                 }
-                match matcher.kind.as_str() {
-                    "app" => push_app_patterns(&mut process_rules, order, value, &capture_via),
-                    "domain" | "suffix" | "keyword" | "cidr" => dest_rules.push(DestRule {
-                        order,
-                        kind: matcher.kind.clone(),
-                        value: value.to_string(),
-                        via: capture_via.clone(),
-                    }),
-                    _ => {}
+                if matcher.kind == "app" {
+                    saw_app = true;
+                    push_app_patterns(&mut process_rules, order, value, &capture_via);
                 }
                 order = order.saturating_add(1);
             }
+            if !saw_app {
+                continue;
+            }
+            if gfw::gfw_group(&capture_via).is_some() {
+                if !gfw_needed.iter().any(|existing| existing == &capture_via) {
+                    gfw_needed.push(capture_via);
+                }
+            } else if let Some(name) = pin_group(&capture_via, strategy) {
+                if !needed.iter().any(|existing| existing == &name) {
+                    needed.push(name);
+                }
+            }
         }
     }
-    let gfw_domains = if wants_gfw {
-        gfw::ensure_domains()
-    } else {
-        Vec::new()
-    };
 
-    let mut group_ports = Vec::new();
-    for name in needed {
-        let port = if let Some(port) = session.group_ports.get(&name).copied() {
-            port
-        } else {
-            let port = next_listener_port(
-                session.next_port,
-                session.socks_port,
-                controller,
-                strategy.mixed_port,
-                &session.group_ports,
-            )?;
-            session.group_ports.insert(name.clone(), port);
-            session.next_port = port.checked_add(1).unwrap_or(1024);
-            port
-        };
-        group_ports.push(GroupPort { name, port });
-    }
+    let group_ports = allocate_named_ports(
+        &needed,
+        session,
+        socks_port,
+        controller,
+        strategy.mixed_port,
+    )?;
+    let gfw_ports = allocate_named_ports(
+        &gfw_needed,
+        session,
+        socks_port,
+        controller,
+        strategy.mixed_port,
+    )?;
 
     let face = CaptureFace {
         socks_port,
         process_rules: process_rules.clone(),
-        dest_rules: dest_rules.clone(),
-        gfw_domains: gfw_domains.clone(),
+        dest_rules: Vec::new(),
+        gfw_domains: Vec::new(),
         group_ports: group_ports.clone(),
+        gfw_ports: gfw_ports.clone(),
     };
     if session.last_face.as_ref() != Some(&face) {
         session.revision = session.revision.saturating_add(1);
@@ -420,10 +397,42 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         username: session.username.clone(),
         password: session.password.clone(),
         process_rules,
-        dest_rules,
-        gfw_domains,
+        dest_rules: Vec::new(),
+        gfw_domains: Vec::new(),
         group_ports,
+        gfw_ports,
     })
+}
+
+fn allocate_named_ports(
+    names: &[String],
+    session: &mut Session,
+    socks_port: u16,
+    controller: u16,
+    mixed: u16,
+) -> Result<Vec<GroupPort>> {
+    let mut ports = Vec::new();
+    for name in names {
+        let port = if let Some(port) = session.group_ports.get(name).copied() {
+            port
+        } else {
+            let port = next_listener_port(
+                session.next_port,
+                socks_port,
+                controller,
+                mixed,
+                &session.group_ports,
+            )?;
+            session.group_ports.insert(name.clone(), port);
+            session.next_port = port.checked_add(1).unwrap_or(1024);
+            port
+        };
+        ports.push(GroupPort {
+            name: name.clone(),
+            port,
+        });
+    }
+    Ok(ports)
 }
 
 fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &str, via: &str) {
@@ -595,14 +604,16 @@ mod tests {
             "rule mode should keep process pins"
         );
         assert!(
-            !plan.dest_rules.is_empty(),
-            "rule mode should keep domain pins"
+            plan.dest_rules.is_empty(),
+            "domain pins belong to mihomo, not NE: {:?}",
+            plan.dest_rules
         );
         assert!(
             !plan.group_ports.is_empty(),
             "rule mode should keep group SOCKS"
         );
         assert!(plan.gfw_domains.is_empty());
+        assert!(plan.gfw_ports.is_empty());
     }
 
     #[test]
@@ -620,10 +631,16 @@ mod tests {
         let plan = inbound_plan(&strategy);
         assert_eq!(plan.process_rules[0].via, "gfw:PROXY");
         assert!(
-            plan.group_ports.iter().any(|port| port.name == "PROXY"),
-            "gfw via should allocate the unwrapped group SOCKS: {:?}",
+            plan.gfw_ports.iter().any(|port| port.name == "gfw:PROXY"),
+            "process gfw via should allocate a GFW inlet: {:?}",
+            plan.gfw_ports
+        );
+        assert!(
+            plan.group_ports.is_empty(),
+            "process gfw via must not pin the unwrapped group SOCKS: {:?}",
             plan.group_ports
         );
+        assert!(plan.gfw_domains.is_empty());
     }
 
     #[test]
@@ -666,12 +683,10 @@ mod tests {
             "exact app pins should also capture Electron helpers: {:?}",
             plan.process_rules
         );
-        assert_eq!(
+        assert!(
+            plan.dest_rules.is_empty(),
+            "suffix pins stay in mihomo YAML: {:?}",
             plan.dest_rules
-                .iter()
-                .find(|rule| rule.value == "cpa.leaper.one")
-                .map(|rule| rule.via.as_str()),
-            Some("AI Proxy")
         );
         assert!(
             plan.group_ports.iter().any(|port| port.name == "Default"),
@@ -679,8 +694,8 @@ mod tests {
             plan.group_ports
         );
         assert!(
-            plan.group_ports.iter().any(|port| port.name == "AI Proxy"),
-            "{:?}",
+            !plan.group_ports.iter().any(|port| port.name == "AI Proxy"),
+            "dest-only via must not allocate a group SOCKS: {:?}",
             plan.group_ports
         );
     }
@@ -693,5 +708,6 @@ mod tests {
         let plan = inbound_plan(&strategy);
         assert!(plan.process_rules.is_empty());
         assert!(plan.group_ports.is_empty());
+        assert!(plan.gfw_ports.is_empty());
     }
 }
