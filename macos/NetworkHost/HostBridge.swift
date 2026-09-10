@@ -521,21 +521,72 @@ private func providerConfigurations(
 private func captureSnapshot(
     from request: HostEnableRequest
 ) throws -> CaptureConfigurationSnapshot {
+    guard request.gfwDomains.isEmpty else {
+        throw NetworkExtensionControlFailure(
+            operation: .configureTransparentProxy,
+            message: "系统接管不再嵌入 GFWList 域名"
+        )
+    }
+
     var rules: [CaptureRule] = []
-    for (index, rule) in request.processRules.enumerated() {
-        let sources = sourceMatchers(from: rule.pattern)
-        guard !sources.isEmpty else {
-            throw NetworkExtensionControlFailure(
-                operation: .configureTransparentProxy, message: "无效的应用匹配条件"
-            )
-        }
+
+    func append(
+        _ id: String,
+        sources: [SourceMatcher] = [],
+        destinations: [DestinationMatcher] = [],
+        via: String
+    ) throws {
         rules.append(try CaptureRule(
-            id: "process-\(index)",
+            id: id,
             priority: rules.count,
             sources: sources,
-            action: captureAction(via: rule.via),
-            unavailableFallback: captureFallback(via: rule.via)
+            destinations: destinations,
+            action: captureAction(via: via),
+            unavailableFallback: captureFallback(via: via)
         ))
+    }
+
+    enum OrderedInput {
+        case process(Int, HostEnableRequest.ProcessRule)
+        case destination(Int, HostEnableRequest.DestRule)
+        var order: UInt64 {
+            switch self {
+            case .process(_, let rule): rule.order
+            case .destination(_, let rule): rule.order
+            }
+        }
+    }
+    let inputs = request.processRules.enumerated().map { OrderedInput.process($0.offset, $0.element) }
+        + request.destRules.enumerated().map { OrderedInput.destination($0.offset, $0.element) }
+    let ordered = inputs.enumerated().sorted {
+        if $0.element.order == $1.element.order { return $0.offset < $1.offset }
+        return $0.element.order < $1.element.order
+    }
+    for input in ordered.map(\.element) {
+        switch input {
+        case .process(let index, let rule):
+            let sources = sourceMatchers(from: rule.pattern)
+            guard !sources.isEmpty else {
+                throw NetworkExtensionControlFailure(
+                    operation: .configureTransparentProxy, message: "无效的应用匹配条件"
+                )
+            }
+            try append("process-\(index)", sources: sources, via: rule.via)
+        case .destination(let index, let rule):
+            if rule.kind == "cidr" && gfwGroup(via: rule.via) != nil {
+                throw NetworkExtensionControlFailure(
+                    operation: .configureTransparentProxy,
+                    message: "GFWList 无法与网段规则求交"
+                )
+            }
+            let destinations = destinationMatchers(kind: rule.kind, value: rule.value)
+            guard !destinations.isEmpty else {
+                throw NetworkExtensionControlFailure(
+                    operation: .configureTransparentProxy, message: "无效的目标匹配条件"
+                )
+            }
+            try append("dest-\(index)", destinations: destinations, via: rule.via)
+        }
     }
     rules.append(try CaptureRule(
         id: "default-profile-rules",
@@ -544,6 +595,40 @@ private func captureSnapshot(
         unavailableFallback: .direct
     ))
     return try CaptureConfigurationSnapshot(revision: request.revision, rules: rules)
+}
+
+private func gfwGroup(via: String) -> String? {
+    let trimmed = via.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = trimmed.lowercased()
+    for prefix in ["gfw:", "gfwlist:"] where lower.hasPrefix(prefix) {
+        let group = trimmed.dropFirst(prefix.count)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return group.isEmpty ? nil : group
+    }
+    return nil
+}
+
+private func destinationMatchers(kind: String, value: String) -> [DestinationMatcher] {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return [] }
+    switch kind {
+    case "suffix":
+        let host = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        return (try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: host))).map { [$0] } ?? []
+    case "domain":
+        if trimmed.hasPrefix("*.") {
+            let host = String(trimmed.dropFirst(2))
+            return (try? DestinationMatcher.host(HostMatcher(kind: .suffix, value: host))).map { [$0] } ?? []
+        }
+        return (try? DestinationMatcher.host(HostMatcher(kind: .exact, value: trimmed))).map { [$0] } ?? []
+    case "keyword":
+        return (try? DestinationMatcher.hostPattern(HostPatternMatcher(pattern: "*\(trimmed)*")))
+            .map { [$0] } ?? []
+    case "cidr":
+        return (try? DestinationMatcher.network(IPNetwork(trimmed))).map { [$0] } ?? []
+    default:
+        return []
+    }
 }
 
 private func sourceMatchers(from raw: String) -> [SourceMatcher] {

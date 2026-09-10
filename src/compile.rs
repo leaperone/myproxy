@@ -1160,6 +1160,42 @@ mod tests {
     }
 
     #[test]
+    fn dest_gfw_with_se_emits_inlet_without_list() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        strategy.rule_sets = vec![crate::strategy::RuleSet {
+            id: "safari".into(),
+            name: "Safari".into(),
+            via: "gfw:Default".into(),
+            matchers: vec![crate::strategy::Matcher {
+                kind: "suffix".into(),
+                value: "example.com".into(),
+            }],
+        }];
+        let plan = crate::network_extension::inbound_plan(&strategy);
+        assert!(plan.gfw_domains.is_empty());
+        assert_eq!(
+            plan.dest_rules
+                .iter()
+                .find(|rule| rule.value == "example.com")
+                .map(|rule| rule.via.as_str()),
+            Some("gfw:PROXY")
+        );
+        let port = plan.gfw_ports[0].port;
+        let root = compiled(&strategy);
+        let prefix = format!("myproxy-network-extension-socks-gfw-{port}");
+        let ipv4 = format!("{prefix}-ipv4");
+        let names: Vec<&str> = listeners(&root).into_iter().map(listener_name).collect();
+        assert!(names.contains(&ipv4.as_str()), "{names:?}");
+        let inlet = listeners(&root)
+            .into_iter()
+            .find(|item| listener_name(item) == ipv4)
+            .expect("gfw inlet");
+        assert_eq!(proxy_field(inlet), None);
+    }
+
+    #[test]
     fn gfwlist_runtime_passes_mihomo_test() {
         let bin = crate::paths::bundled_mihomo();
         if !bin.is_file() {
