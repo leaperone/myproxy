@@ -134,7 +134,7 @@ impl RoutingProfile {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Allowlist => "正面清单",
+            Self::Allowlist => "未命中直连",
             Self::Gfwlist => "GFWList",
             Self::Group => "未匹配走组",
             Self::Chinadirect => "国内直连",
@@ -1439,6 +1439,7 @@ mod tests {
         assert_eq!(strategy.mixed_mode, InboundMode::Rule);
         assert_eq!(strategy.extension_mode, InboundMode::Rule);
         assert_eq!(strategy.routing_profile, RoutingProfile::Allowlist);
+        assert_eq!(strategy.routing_profile.label(), "未命中直连");
     }
 
     #[test]

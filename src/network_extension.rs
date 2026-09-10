@@ -331,6 +331,22 @@ pub fn wait_disabled(timeout: Duration) -> Result<()> {
     }
 }
 
+/// Opens Login Items & Extensions so the user can allow the System Extension.
+pub fn open_login_items_settings() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("open")
+            .arg(crate::setup::LOGIN_ITEMS_PREFERENCE)
+            .status()?;
+        if !status.success() {
+            bail!("无法打开系统设置");
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    bail!("仅 macOS 可打开系统设置")
+}
+
 /// A short-lived CLI cannot retain an authorization continuation after exit.
 /// Cancel only unfinished work, then finish its cleanup before returning.
 pub fn cancel_pending_for_cli() -> Result<bool> {

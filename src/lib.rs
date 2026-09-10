@@ -8,6 +8,7 @@ pub mod log;
 pub mod login_item;
 pub mod network_extension;
 pub mod paths;
+pub mod setup;
 pub mod strategy;
 pub mod supervisor;
 pub mod system_proxy;

@@ -24,6 +24,7 @@ use myproxy::controller::{
 };
 use myproxy::log;
 use myproxy::network_extension::{self, Phase, RuntimeStatus};
+use myproxy::setup::{self, SetupNext};
 use myproxy::strategy::{
     join_list, parse_list, Group, InboundMode, Matcher, RoutingProfile, RuleSet, Strategy,
     GLOBAL_GROUP,
@@ -1312,7 +1313,11 @@ impl AppView {
         let this = Self {
             page: initial_page(),
             sidebar_compact: false,
-            status: "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into(),
+            status: if catalog.nodes.is_empty() {
+                "策略已加载。先添加订阅并刷新，再连接。".into()
+            } else {
+                "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into()
+            },
             connected: false,
             wanted,
             busy: false,
@@ -1362,25 +1367,6 @@ impl AppView {
             member_limits: HashMap::new(),
             global_limit: 36,
         };
-        if crate::onboard::should_prompt() {
-            cx.defer_in(window, |_this, window, cx| {
-                let entity = cx.entity();
-                crate::onboard::open(window, cx, move |result, cx| {
-                    entity.update(cx, |this, cx| {
-                        match result {
-                            Ok(path) => {
-                                this.cli_installed = true;
-                                this.status = format!("命令行工具已安装：{}", path.display());
-                            }
-                            Err(error) => {
-                                this.status = format!("命令行工具安装失败：{error}");
-                            }
-                        }
-                        cx.notify();
-                    });
-                });
-            });
-        }
         this
     }
 
@@ -2881,18 +2867,148 @@ impl AppView {
             })
     }
 
-    fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        let connected = self.connected;
-        let wanted = self.wanted;
+    fn setup_next(&self) -> SetupNext {
+        setup::next_setup_action(
+            self.strategy.subscriptions.len(),
+            self.catalog.nodes.len(),
+            self.connected,
+        )
+    }
+
+    fn overview_connect_button(&self, cx: &mut Context<Self>, primary: bool) -> Button {
         let busy = self.is_busy();
         let mut connect = Button::new("hero-connect").large();
         connect = if busy {
             connect.label(self.operation_label().to_string())
-        } else if wanted {
+        } else if self.wanted {
             connect.danger().label("断开")
-        } else {
+        } else if primary {
             connect.primary().label("连接")
+        } else {
+            connect.label("连接")
         };
+        connect
+            .h(px(48.))
+            .px_8()
+            .min_w(px(132.))
+            .disabled(busy)
+            .on_click(self.on_connect(cx))
+    }
+
+    fn overview_hero(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.is_busy();
+        let next = self.setup_next();
+        let entity = cx.entity();
+        match next {
+            SetupNext::AddSubscription => h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("hero-add-subscription")
+                        .large()
+                        .primary()
+                        .label("添加订阅")
+                        .h(px(48.))
+                        .px_8()
+                        .on_click(self.select_page(cx, Page::Subscriptions)),
+                )
+                .child(self.overview_connect_button(cx, false))
+                .into_any_element(),
+            SetupNext::RefreshCatalog => h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("hero-refresh-subscriptions")
+                        .large()
+                        .primary()
+                        .label("刷新订阅并应用")
+                        .h(px(48.))
+                        .px_8()
+                        .disabled(busy)
+                        .on_click({
+                            let entity = entity.clone();
+                            move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    if this.persist() {
+                                        this.start_apply_with_refresh(true, cx);
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .child(self.overview_connect_button(cx, false))
+                .into_any_element(),
+            SetupNext::Connect | SetupNext::Ready => {
+                self.overview_connect_button(cx, true).into_any_element()
+            }
+        }
+    }
+
+    fn overview_setup_card(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let next = self.setup_next();
+        let has_sub = !self.strategy.subscriptions.is_empty();
+        let has_nodes = !self.catalog.nodes.is_empty();
+        let muted = theme.muted_foreground;
+        let inbound = format!(
+            "规则只处理进入代理的流量。Mixed 把客户端代理设为 {}（HTTP + SOCKS5）。系统接管在设置里打开，并到 {} 允许 myproxy。TUN 与接管互斥，首次要管理员密码。",
+            self.mixed_endpoint(),
+            setup::login_items_path_label()
+        );
+        v_flex()
+            .w_full()
+            .p_4()
+            .gap_2()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.group_box)
+            .child(div().text_sm().font_semibold().child("配置"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(if has_sub {
+                        "1. 添加订阅 — 已完成"
+                    } else {
+                        "1. 添加订阅 — 下一步"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(if has_nodes {
+                        "2. 刷新得到节点 — 已完成"
+                    } else {
+                        "2. 刷新得到节点 — 有订阅后点「刷新订阅并应用」"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(if self.connected {
+                        "3. 连接核心 — 已连接"
+                    } else {
+                        "3. 连接核心 — 有节点后再连。空组出口不可用，不会直连。"
+                    }),
+            )
+            .child(div().text_xs().text_color(muted).child(inbound))
+            .when(next == SetupNext::AddSubscription, |this| {
+                this.child(
+                    Button::new("setup-add-subscription")
+                        .small()
+                        .primary()
+                        .label("添加订阅")
+                        .on_click(self.select_page(cx, Page::Subscriptions)),
+                )
+            })
+    }
+
+    fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let connected = self.connected;
+        let wanted = self.wanted;
         let up = if connected && self.traffic_error.is_some() {
             "读不到".into()
         } else if connected && self.traffic_has_rate {
@@ -2922,6 +3038,7 @@ impl AppView {
                 "总览",
                 &self.inbound_modes_subtitle(),
             ))
+            .child(self.overview_setup_card(cx, theme))
             .child(
                 h_flex()
                     .w_full()
@@ -2960,18 +3077,14 @@ impl AppView {
                                     } else if wanted {
                                         "核心尚未就绪，请查看操作状态。".into()
                                     } else {
-                                        "连接后 Mixed 可供显式代理客户端使用；系统接管和 TUN 需分别启用。".into()
+                                        format!(
+                                            "连接后 Mixed {} 可供显式代理客户端使用。系统接管和 TUN 在设置里分别打开；规则只处理进入这三条入站的流量。",
+                                            self.mixed_endpoint()
+                                        )
                                     }),
                             ),
                     )
-                    .child(
-                        connect
-                            .h(px(48.))
-                            .px_8()
-                            .min_w(px(132.))
-                            .disabled(busy)
-                            .on_click(self.on_connect(cx)),
-                    ),
+                    .child(self.overview_hero(cx)),
             )
             .child(
                 h_flex()
@@ -3133,7 +3246,7 @@ impl AppView {
                                             Toggle::new("show-direct-connections")
                                                 .small()
                                                 .outline()
-                                                .label("显示核心直连")
+                                                .label("显示直连")
                                                 .checked(self.connection_filters.show_direct)
                                                 .on_click(move |checked, _, app| {
                                                     let show = *checked;
@@ -3180,9 +3293,13 @@ impl AppView {
                 },
             )
             .when(!connected && !self.wanted, |this| {
-                this.child(empty_hint(
+                this.child(empty_hint_action(
                     theme,
                     "核心未连接。到总览连接后，这里显示经过 Mihomo 的连接。",
+                    Button::new("connections-go-overview")
+                        .primary()
+                        .label("去总览连接")
+                        .on_click(self.select_page(cx, Page::Overview)),
                 ))
             })
             .when(!connected && self.wanted, |this| {
@@ -3358,7 +3475,10 @@ impl AppView {
                     ),
             )
             .when(self.strategy.subscriptions.is_empty(), |this| {
-                this.child(empty_hint(theme, "还没有订阅。填写名称和 URL 后添加。"))
+                this.child(empty_hint(
+                    theme,
+                    "还没有订阅。在上方填写名称和 URL，然后点添加。",
+                ))
             })
             .children(self.strategy.subscriptions.iter().map(|sub| {
                 let entity = entity.clone();
@@ -3470,7 +3590,22 @@ impl AppView {
             })
             .child(v_flex().gap_1().child(div().text_xs().child("搜索节点组成员")).child(Input::new(&self.member_query)))
             .when(self.strategy.groups.is_empty(), |this| {
-                this.child(empty_hint(theme, "还没有节点组。默认会有 PROXY 组。"))
+                this.child(empty_hint_action(
+                    theme,
+                    "还没有节点组。添加一个组，或导入带默认 PROXY 的配置。",
+                    Button::new("groups-add-empty")
+                        .primary()
+                        .label("添加节点组")
+                        .on_click({
+                            let entity = entity.clone();
+                            move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    this.open_group_dialog(None, window, cx);
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                ))
             })
             .when(self.connected && self.proxy_error.is_some(), |this| {
                 this.child(
@@ -3571,9 +3706,21 @@ impl AppView {
                     ),
             )
             .when(self.strategy.rule_sets.is_empty(), |this| {
-                this.child(empty_hint(
+                this.child(empty_hint_action(
                     theme,
-                    "还没有规则。添加一个项目，把 Cursor、GitHub 这类收进去，再选走向。未命中的流量按本页分流预设走。",
+                    "还没有规则。添加进程或域名，再选走向。未命中的流量按本页分流预设走。",
+                    Button::new("rules-add-empty")
+                        .primary()
+                        .label("添加规则")
+                        .on_click({
+                            let entity = entity.clone();
+                            move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    this.open_rule_dialog(None, window, cx);
+                                    cx.notify();
+                                });
+                            }
+                        }),
                 ))
             })
             .when(
@@ -3609,7 +3756,10 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                "打开系统接管后，应用不用自己填代理。第一次会请你在系统设置里允许 myproxy。",
+                &format!(
+                    "系统接管让应用不用自己填代理。第一次请到 {} 允许 myproxy。Mixed 给显式客户端；TUN 与接管互斥。",
+                    setup::login_items_path_label()
+                ),
             ))
             .child(self.system_extension_panel(cx, theme))
             .child(panel(
@@ -3626,7 +3776,10 @@ impl AppView {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("显式 HTTP/SOCKS 客户端使用 Mixed。系统接管按捕获规则转入核心；原生放行和拒绝流量不进入核心连接列表。"),
+                            .child(format!(
+                                "把客户端 HTTP 或 SOCKS5 代理设为 {}。系统接管按捕获规则转入核心；原生放行和拒绝不进连接列表。",
+                                self.mixed_endpoint()
+                            )),
                     )
                     .child(
                         h_flex()
@@ -3649,7 +3802,7 @@ impl AppView {
                                                 this.strategy.mixed_port = port;
                                                 this.persist();
                                             } else {
-                                                this.status = "端口无效。".into();
+                                                this.status = "端口须为 1 到 65535。".into();
                                             }
                                             cx.notify();
                                         });
@@ -3676,6 +3829,12 @@ impl AppView {
                 "排除过滤器",
                 v_flex()
                     .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("从订阅节点名里排除流量、剩余、到期这类字样。不影响已保存的组。"),
+                    )
                     .child(Input::new(&self.filter_input))
                     .child({
                         let entity = entity.clone();
@@ -3933,30 +4092,66 @@ impl AppView {
                                         .child("让 Agent 或终端直接使用 myproxyctl 配置代理。"),
                                 ),
                         )
-                        .child({
-                            let entity = entity.clone();
-                            let mut button = Button::new("install-cli").small();
-                            button = if installed {
-                                button.label("已安装，更新链接")
-                            } else {
-                                button.primary().label("安装")
-                            };
-                            button.disabled(self.is_busy()).on_click(move |_, _, app| {
-                                entity.update(app, |this, cx| {
-                                    match myproxy::cli_install::install() {
-                                        Ok(path) => {
-                                            this.cli_installed = true;
-                                            this.status =
-                                                format!("命令行工具已安装：{}", path.display());
-                                        }
-                                        Err(error) => {
-                                            this.status = format!("命令行工具安装失败：{error:#}");
-                                        }
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                        }),
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child({
+                                    let entity = entity.clone();
+                                    let mut button = Button::new("install-cli").small();
+                                    button = if installed {
+                                        button.label("已安装，更新链接")
+                                    } else {
+                                        button.primary().label("安装")
+                                    };
+                                    button.disabled(self.is_busy()).on_click(move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            match myproxy::cli_install::install() {
+                                                Ok(path) => {
+                                                    this.cli_installed = true;
+                                                    this.status = format!(
+                                                        "命令行工具已安装：{}",
+                                                        path.display()
+                                                    );
+                                                }
+                                                Err(error) => {
+                                                    this.status = format!(
+                                                        "命令行工具安装失败：{error:#}"
+                                                    );
+                                                }
+                                            }
+                                            cx.notify();
+                                        });
+                                    })
+                                })
+                                .child({
+                                    let entity = entity.clone();
+                                    Button::new("cli-install-help")
+                                        .small()
+                                        .label("安装说明")
+                                        .on_click(move |_, window, app| {
+                                            let entity = entity.clone();
+                                            crate::onboard::open(window, app, move |result, cx| {
+                                                entity.update(cx, |this, cx| {
+                                                    match result {
+                                                        Ok(path) => {
+                                                            this.cli_installed = true;
+                                                            this.status = format!(
+                                                                "命令行工具已安装：{}",
+                                                                path.display()
+                                                            );
+                                                        }
+                                                        Err(error) => {
+                                                            this.status = format!(
+                                                                "命令行工具安装失败：{error}"
+                                                            );
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            });
+                                        })
+                                }),
+                        ),
                 )
                 .child(
                     div()
@@ -4124,7 +4319,10 @@ impl AppView {
             self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
-                "已记录。下次连接会请求系统扩展，请在系统设置里允许 myproxy。".into()
+                format!(
+                    "已记录。下次连接会请求系统扩展，请到 {} 允许 myproxy。",
+                    setup::login_items_path_label()
+                )
             } else {
                 "已保存关闭系统接管的意图。".into()
             };
@@ -4229,7 +4427,7 @@ impl AppView {
                                 "未命中直连。Telegram 和其他自己的规则仍按各自走向。".to_string()
                             }
                             RoutingProfile::Gfwlist => {
-                                "已装 Loyalsoldier GFWList，列表内走默认组，其余直连。换回正面清单即卸下。".to_string()
+                                "已装 Loyalsoldier GFWList，列表内走默认组，其余直连。换回未命中直连即卸下。".to_string()
                             }
                             RoutingProfile::Group => {
                                 format!("未命中走 {unmatched}。连接或应用后生效。")
@@ -4302,11 +4500,46 @@ impl AppView {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(if on {
-                            "已保存启用意图；实际状态见下方。首次需在系统设置中允许网络扩展。"
+                            format!(
+                                "已保存启用意图；实际状态见下方。请到 {} 允许 myproxy。",
+                                setup::login_items_path_label()
+                            )
                         } else {
-                            "关闭系统接管后，显式代理客户端仍可使用 Mixed；TUN 单独控制。"
+                            "关闭系统接管后，显式代理客户端仍可使用 Mixed；TUN 单独控制。".into()
                         }),
                 )
+                .child({
+                    let entity = entity.clone();
+                    let waiting = matches!(
+                        self.extension_status.phase,
+                        Phase::WaitingApproval | Phase::Requesting
+                    );
+                    let mut button = Button::new("open-login-items")
+                        .small()
+                        .label("打开系统设置");
+                    if waiting {
+                        button = button.primary();
+                    }
+                    button.on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            match network_extension::open_login_items_settings() {
+                                Ok(()) => {
+                                    this.status = format!(
+                                        "已打开系统设置。到 {} 允许 myproxy。",
+                                        setup::login_items_path_label()
+                                    );
+                                }
+                                Err(error) => {
+                                    this.status = format!(
+                                        "无法打开系统设置：{error:#}。请手动到 {}。",
+                                        setup::login_items_path_label()
+                                    );
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                })
                 .child(div().text_xs().child(format!("系统接管：{} · DNS：{}", self.extension_status.phase_label(), self.extension_status.dns_label())))
                 .child(
                     div()
@@ -5391,15 +5624,37 @@ fn file_stamp(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
-fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
+fn empty_hint_box(theme: &Theme) -> Div {
     div()
         .p_4()
         .rounded(theme.radius)
         .border_1()
         .border_color(theme.border)
+}
+
+fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
+    empty_hint_box(theme)
         .text_sm()
         .text_color(theme.muted_foreground)
         .child(text.to_string())
+}
+
+fn empty_hint_action(
+    theme: &Theme,
+    text: &str,
+    action: impl IntoElement,
+) -> impl IntoElement {
+    empty_hint_box(theme).child(
+        v_flex()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(text.to_string()),
+            )
+            .child(action),
+    )
 }
 
 fn connection_header_row(
