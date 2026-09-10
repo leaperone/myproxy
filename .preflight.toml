@@ -16,6 +16,18 @@ name = "Preflight configuration"
 prefix = ".preflight.toml"
 # Parsed as part of preflight Phase 0; this file has no build artifact.
 
+[[scope]]
+name = "Package version"
+prefix = "Cargo.toml"
+
+[[scope]]
+name = "Lockfile version"
+prefix = "Cargo.lock"
+
+[[scope]]
+name = "Packaging metadata"
+prefix = "packaging/"
+
 [[domain_check]]
 name = "Existing pure Rust checks"
 trigger_paths = ["src/**"]
