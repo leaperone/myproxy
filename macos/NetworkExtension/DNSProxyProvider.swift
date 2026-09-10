@@ -396,7 +396,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                 flow: tcpFlow,
                 proxy: proxy,
                 destination: destination,
-                unavailableFallback: .reject,
+                unavailableFallback: .direct,
                 activityObserver: observer
             )
         }
@@ -728,7 +728,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             initialDestination: destination,
             mihomoDestination: destination,
             proxy: proxy,
-            unavailableFallback: .reject,
+            unavailableFallback: .direct,
             activity: activity,
             parentFlowIdentifier: parentIdentifier
         )

@@ -696,7 +696,9 @@ impl Supervisor {
     }
 
     fn disconnect_inner(&self, mixed_port: Option<u16>) -> Result<()> {
-        let extension_result = crate::network_extension::disable_async();
+        crate::network_extension::disable_async()
+            .and_then(|()| crate::network_extension::wait_disabled(Duration::from_secs(30)))
+            .context("系统接管未关闭，已保留核心以免系统 DNS 被劫持后断网")?;
         let port = mixed_port
             .or(*self.running_mixed_port.lock().expect("supervisor lock"))
             .or_else(|| {
@@ -721,7 +723,7 @@ impl Supervisor {
         if stopped || child_pid.is_some() {
             log::info("supervisor", "disconnect");
         }
-        extension_result
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {

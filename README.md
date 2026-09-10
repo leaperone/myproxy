@@ -95,6 +95,10 @@ application support directory.
 - The connections page shows connections recorded by Mihomo. System Extension
   traffic passed directly to macOS or rejected before Mihomo is outside that list;
   **显示直连** reveals only DIRECT connections recorded by the core.
+- System Extension DNS interception stays coupled to the core: disconnect waits
+  until capture and DNS are down before stopping Mihomo. If NEDNSProxy cannot be
+  disabled, the core is kept so system resolution is not blackholed. When the
+  private SOCKS backend is down, the DNS provider relays queries directly.
 
 Source checks and builds do not verify macOS approval, DNS forwarding, or actual
 traffic. Those require acceptance on the signed installed application.
