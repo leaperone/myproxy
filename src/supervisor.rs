@@ -466,7 +466,8 @@ impl Supervisor {
     fn activate(&self, mut candidate: RuntimeConfig, should_run: bool) -> Result<()> {
         let previous = RuntimeConfig::load()?;
         let previous_yaml = fs::read(paths::runtime_yaml_path()?).ok();
-        let running = self.is_running();
+        let spawned_here = self.spawned_core_alive();
+        let running = spawned_here || pid_file_alive(None);
         if running && previous.is_none() {
             bail!("当前核心没有已验证的运行快照；请先断开，再连接，以建立可回退配置");
         }
@@ -483,9 +484,9 @@ impl Supervisor {
         let result = (|| -> Result<()> {
             let health = if should_run {
                 let reconnect = previous.as_ref().map_or(true, |old| {
-                    needs_reconnect(
+                    must_respawn_core(
+                        spawned_here,
                         running,
-                        true,
                         old.strategy.tun,
                         old.strategy.system_extension,
                         Some(old.strategy.mixed_port),
@@ -553,12 +554,25 @@ impl Supervisor {
         Ok(())
     }
 
+    fn spawned_core_alive(&self) -> bool {
+        let mut slot = self.child.lock().expect("supervisor lock");
+        if let Some(child) = slot.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                return true;
+            }
+            *slot = None;
+        }
+        false
+    }
+
     fn start_runtime(&self, runtime: &mut RuntimeConfig) -> Result<CoreHealth> {
         runtime.validate_extension_snapshot()?;
         let strategy = &runtime.strategy;
         if !is_wanted() {
             bail!("连接操作已取消");
         }
+        reclaim_owned_mihomo(Some(strategy.mixed_port), None);
+        wait_for_owned_ports_free(strategy.mixed_port);
         let bin = paths::bundled_mihomo();
         let log_file = File::create(paths::mihomo_log_path()?).context("mihomo.log")?;
         let mut child = mihomo_command(&bin)?
@@ -569,8 +583,8 @@ impl Supervisor {
             .stderr(Stdio::from(log_file))
             .spawn()
             .context("spawn mihomo")?;
-        if let Err(error) =
-            paths::atomic_write(&paths::pid_path()?, child.id().to_string().as_bytes())
+        let child_pid = child.id() as i32;
+        if let Err(error) = paths::atomic_write(&paths::pid_path()?, child_pid.to_string().as_bytes())
         {
             let _ = child.kill();
             let _ = child.wait();
@@ -580,6 +594,7 @@ impl Supervisor {
         *self.running_tun.lock().expect("supervisor lock") = strategy.tun;
         *self.running_se.lock().expect("supervisor lock") = strategy.system_extension;
         self.remember_mixed_port(Some(strategy.mixed_port));
+        let needs_dns = strategy.tun || strategy.system_extension;
         let deadline = Instant::now() + Duration::from_secs(if strategy.tun { 8 } else { 3 });
         loop {
             if !is_wanted() {
@@ -588,8 +603,9 @@ impl Supervisor {
             if !self.is_running() {
                 bail!("mihomo 在启动时退出，请检查内核日志");
             }
-            if mixed_listening(strategy.mixed_port)
+            if pid_owns_tcp_listen(child_pid, strategy.mixed_port)
                 && controller::ready(strategy.mixed_port).is_ok()
+                && (!needs_dns || pid_owns_dns(child_pid))
             {
                 break;
             }
@@ -1189,6 +1205,49 @@ fn wait_for_port_free(port: u16) {
     }
 }
 
+fn wait_for_owned_ports_free(mixed_port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let busy = owned_listen_ports(mixed_port).iter().any(|port| {
+            if *port == compile::DNS_LISTEN_PORT {
+                !pids_listening_tcp(*port).is_empty() || !pids_bound_udp(*port).is_empty()
+            } else {
+                !pids_listening_tcp(*port).is_empty()
+            }
+        });
+        if !busy {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    wait_for_port_free(mixed_port);
+}
+
+fn pid_owns_tcp_listen(pid: i32, port: u16) -> bool {
+    pids_listening_tcp(port).contains(&pid)
+}
+
+fn pid_owns_dns(pid: i32) -> bool {
+    pid_owns_tcp_listen(pid, compile::DNS_LISTEN_PORT)
+        || pids_bound_udp(compile::DNS_LISTEN_PORT).contains(&pid)
+}
+
+fn lsof_bin() -> &'static str {
+    if Path::new("/usr/sbin/lsof").is_file() {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    }
+}
+
+fn pgrep_bin() -> &'static str {
+    if Path::new("/usr/bin/pgrep").is_file() {
+        "/usr/bin/pgrep"
+    } else {
+        "pgrep"
+    }
+}
+
 fn parse_pid_lines(bytes: &[u8]) -> Vec<i32> {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -1198,7 +1257,8 @@ fn parse_pid_lines(bytes: &[u8]) -> Vec<i32> {
 }
 
 fn pids_from_lsof(args: &[&str]) -> Vec<i32> {
-    let Ok(output) = Command::new("lsof").args(args).output() else {
+    let Ok(output) = Command::new(lsof_bin()).args(args).output() else {
+        log::warn("supervisor", "lsof unavailable while reclaiming mihomo");
         return Vec::new();
     };
     parse_pid_lines(&output.stdout)
@@ -1215,7 +1275,8 @@ fn pids_bound_udp(port: u16) -> Vec<i32> {
 }
 
 fn pids_named_mihomo() -> Vec<i32> {
-    let Ok(output) = Command::new("pgrep").arg("-x").arg("mihomo").output() else {
+    let Ok(output) = Command::new(pgrep_bin()).arg("-x").arg("mihomo").output() else {
+        log::warn("supervisor", "pgrep unavailable while reclaiming mihomo");
         return Vec::new();
     };
     parse_pid_lines(&output.stdout)
@@ -1267,6 +1328,25 @@ fn process_exe(pid: i32) -> Option<PathBuf> {
         let _ = pid;
         None
     }
+}
+
+fn must_respawn_core(
+    spawned_here: bool,
+    running: bool,
+    running_tun: bool,
+    running_se: bool,
+    running_port: Option<u16>,
+    strategy: &Strategy,
+) -> bool {
+    !spawned_here
+        || needs_reconnect(
+            running,
+            true,
+            running_tun,
+            running_se,
+            running_port,
+            strategy,
+        )
 }
 
 fn needs_reconnect(
@@ -1367,7 +1447,9 @@ mod tests {
         assert_eq!(PORT.load(Ordering::SeqCst), 7891);
         supervisor.remember_mixed_port(None);
         assert_eq!(PORT.load(Ordering::SeqCst), 0);
-        assert_eq!(supervisor.update_download_port(), None);
+        if !pid_file_alive(None) {
+            assert_eq!(supervisor.update_download_port(), None);
+        }
     }
 
     #[test]
@@ -1409,6 +1491,37 @@ mod tests {
         assert_eq!(ports[1], compile::network_extension_socks_port(7891));
         assert_eq!(ports[2], compile::controller_port(7891));
         assert_eq!(ports[3], compile::DNS_LISTEN_PORT);
+    }
+
+    #[test]
+    fn empty_supervisor_must_respawn_even_if_pid_file_looks_running() {
+        let strategy = Strategy {
+            mixed_port: 7891,
+            system_extension: true,
+            ..Strategy::default()
+        };
+        assert!(must_respawn_core(
+            false,
+            true,
+            false,
+            true,
+            Some(7891),
+            &strategy,
+        ));
+        assert!(!must_respawn_core(
+            true,
+            true,
+            false,
+            true,
+            Some(7891),
+            &strategy,
+        ));
+    }
+
+    #[test]
+    fn unknown_pid_does_not_own_listen_ports() {
+        assert!(!pid_owns_tcp_listen(1, 7891));
+        assert!(!pid_owns_dns(1));
     }
 }
 

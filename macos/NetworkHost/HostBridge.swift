@@ -322,7 +322,7 @@ private actor HostController {
             }
         }
         if !applied {
-            try await dnsProxy.disable()
+            try await disableDNSProxyAllowingDenied(intent: intent)
             try intent.check()
             try await transparentProxy.stop()
             try intent.check()
@@ -369,7 +369,7 @@ private actor HostController {
         defer { withExtendedLifetime(sideEffects) {} }
         try intent.check()
         var firstError: Error?
-        do { try await dnsProxy.disable() } catch { firstError = error }
+        do { try await disableDNSProxyAllowingDenied(intent: intent) } catch { firstError = error }
         try intent.check()
         do { try await transparentProxy.stop() } catch { if firstError == nil { firstError = error } }
         try intent.check()
@@ -463,6 +463,26 @@ private actor HostController {
                 $0.message = "无法读取系统接管 Provider 状态"
                 $0.dnsPhase = "unknown"
             }
+        }
+    }
+}
+
+private func isRecoverableDNSProxyDisableError(_ error: Error) -> Bool {
+    let text = error.localizedDescription
+    return text.contains("NEDNSProxyErrorDomain 1") || text.contains("permission denied")
+}
+
+private extension HostController {
+    func disableDNSProxyAllowingDenied(intent: HostSharedIntent) async throws {
+        do {
+            try await dnsProxy.disable()
+        } catch {
+            try intent.check()
+            guard isRecoverableDNSProxyDisableError(error) else { throw error }
+            AppLog.warn(
+                "ne-host",
+                "dns proxy disable denied; continuing so a new configuration can be saved"
+            )
         }
     }
 }
