@@ -293,7 +293,17 @@ pub fn prepare_request(request: &EnableRequest) -> Result<()> {
     }
 }
 
-fn validate_request(_request: &EnableRequest) -> Result<()> {
+fn validate_request(request: &EnableRequest) -> Result<()> {
+    if !request.gfw_domains.is_empty() {
+        bail!("系统接管不再嵌入 GFWList 域名");
+    }
+    if request
+        .dest_rules
+        .iter()
+        .any(|rule| gfw::gfw_group(&rule.via).is_some() && rule.kind == "cidr")
+    {
+        bail!("GFWList 无法与网段规则求交，请改用节点组或域名条件");
+    }
     Ok(())
 }
 
@@ -321,6 +331,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
     }
 
     let mut process_rules = Vec::new();
+    let mut dest_rules = Vec::new();
     let mut order = 0u64;
     let mut needed = Vec::new();
     let mut gfw_needed = Vec::new();
@@ -335,19 +346,34 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
             } else {
                 compile::via_target(via, strategy)
             };
-            let mut saw_app = false;
+            let mut pins_inlet = false;
             for matcher in &set.matchers {
                 let value = matcher.value.trim();
                 if value.is_empty() {
                     continue;
                 }
-                if matcher.kind == "app" {
-                    saw_app = true;
-                    push_app_patterns(&mut process_rules, order, value, &capture_via);
+                match matcher.kind.as_str() {
+                    "app" => {
+                        pins_inlet = true;
+                        push_app_patterns(&mut process_rules, order, value, &capture_via);
+                    }
+                    "domain" | "suffix" | "keyword" | "cidr" => {
+                        if matcher.kind == "cidr" && gfw::gfw_group(&capture_via).is_some() {
+                            bail!("GFWList 无法与网段规则求交，请改用节点组或域名条件");
+                        }
+                        pins_inlet = true;
+                        dest_rules.push(DestRule {
+                            order,
+                            kind: matcher.kind.clone(),
+                            value: value.to_string(),
+                            via: capture_via.clone(),
+                        });
+                    }
+                    _ => {}
                 }
                 order = order.saturating_add(1);
             }
-            if !saw_app {
+            if !pins_inlet {
                 continue;
             }
             if gfw::gfw_group(&capture_via).is_some() {
@@ -380,7 +406,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
     let face = CaptureFace {
         socks_port,
         process_rules: process_rules.clone(),
-        dest_rules: Vec::new(),
+        dest_rules: dest_rules.clone(),
         gfw_domains: Vec::new(),
         group_ports: group_ports.clone(),
         gfw_ports: gfw_ports.clone(),
@@ -397,7 +423,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         username: session.username.clone(),
         password: session.password.clone(),
         process_rules,
-        dest_rules: Vec::new(),
+        dest_rules,
         gfw_domains: Vec::new(),
         group_ports,
         gfw_ports,
@@ -591,7 +617,7 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strategy::{InboundMode, Strategy};
+    use crate::strategy::{InboundMode, RoutingProfile, Strategy};
 
     #[test]
     fn rule_mode_pins_app_matchers() {
@@ -604,9 +630,8 @@ mod tests {
             "rule mode should keep process pins"
         );
         assert!(
-            plan.dest_rules.is_empty(),
-            "domain pins belong to mihomo, not NE: {:?}",
-            plan.dest_rules
+            !plan.dest_rules.is_empty(),
+            "rule mode should keep user domain pins"
         );
         assert!(
             !plan.group_ports.is_empty(),
@@ -639,6 +664,36 @@ mod tests {
             plan.group_ports.is_empty(),
             "process gfw via must not pin the unwrapped group SOCKS: {:?}",
             plan.group_ports
+        );
+        assert!(plan.gfw_domains.is_empty());
+    }
+
+    #[test]
+    fn dest_gfw_keeps_user_host_without_list() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        strategy.rule_sets = vec![crate::strategy::RuleSet {
+            id: "safari".into(),
+            name: "Safari".into(),
+            via: "gfw:Default".into(),
+            matchers: vec![crate::strategy::Matcher {
+                kind: "suffix".into(),
+                value: "example.com".into(),
+            }],
+        }];
+        let plan = inbound_plan(&strategy);
+        assert_eq!(
+            plan.dest_rules
+                .iter()
+                .find(|rule| rule.value == "example.com")
+                .map(|rule| rule.via.as_str()),
+            Some("gfw:PROXY")
+        );
+        assert!(
+            plan.gfw_ports.iter().any(|port| port.name == "gfw:PROXY"),
+            "{:?}",
+            plan.gfw_ports
         );
         assert!(plan.gfw_domains.is_empty());
     }
@@ -683,10 +738,12 @@ mod tests {
             "exact app pins should also capture Electron helpers: {:?}",
             plan.process_rules
         );
-        assert!(
-            plan.dest_rules.is_empty(),
-            "suffix pins stay in mihomo YAML: {:?}",
+        assert_eq!(
             plan.dest_rules
+                .iter()
+                .find(|rule| rule.value == "cpa.leaper.one")
+                .map(|rule| rule.via.as_str()),
+            Some("AI Proxy")
         );
         assert!(
             plan.group_ports.iter().any(|port| port.name == "Default"),
@@ -694,10 +751,24 @@ mod tests {
             plan.group_ports
         );
         assert!(
-            !plan.group_ports.iter().any(|port| port.name == "AI Proxy"),
-            "dest-only via must not allocate a group SOCKS: {:?}",
+            plan.group_ports.iter().any(|port| port.name == "AI Proxy"),
+            "user dest pins should allocate a group SOCKS: {:?}",
             plan.group_ports
         );
+    }
+
+    #[test]
+    fn gfwlist_profile_keeps_user_dest_without_list() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        strategy.extension_mode = InboundMode::Rule;
+        strategy.routing_profile = RoutingProfile::Gfwlist;
+        let plan = inbound_plan(&strategy);
+        assert!(
+            !plan.dest_rules.is_empty(),
+            "user dest pins stay in the capture plan"
+        );
+        assert!(plan.gfw_domains.is_empty());
     }
 
     #[test]
@@ -707,6 +778,7 @@ mod tests {
         strategy.extension_mode = InboundMode::Global;
         let plan = inbound_plan(&strategy);
         assert!(plan.process_rules.is_empty());
+        assert!(plan.dest_rules.is_empty());
         assert!(plan.group_ports.is_empty());
         assert!(plan.gfw_ports.is_empty());
     }

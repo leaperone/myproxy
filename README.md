@@ -89,8 +89,9 @@ application support directory.
   their own mode; TUN follows the profile rules and is mutually exclusive with System
   Extension.
 - `gfw:<group>` is evaluated by mihomo (`RULE-SET,gfw` then DIRECT on a miss).
-  System Extension only maps a process to that GFW inlet or the profile-rules
-  inlet; it does not embed the GFW domain list.
+  System Extension still captures the user's own process and domain/suffix/keyword/cidr
+  matchers, including pins whose via is `gfw:<group>`. It does not embed the GFW
+  domain list.
 - The connections page shows connections recorded by Mihomo. System Extension
   traffic passed directly to macOS or rejected before Mihomo is outside that list;
   **显示直连** reveals only DIRECT connections recorded by the core.
