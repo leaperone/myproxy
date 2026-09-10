@@ -5,3 +5,4 @@
 - 域名 `gfw:` 编成 `AND` + `RULE-SET`；有 `gfw:` 或 GFWList 时写入 rule-provider。
 - HostBridge snapshot 只保留进程规则 + 默认 profile-rules。
 - 验证：compile 20、network_extension 4，均通过。
+- 审查后补 dest/`gfw:` 未命中 → DIRECT，并更新 README / 规则编辑器文案。

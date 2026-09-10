@@ -171,11 +171,13 @@ fn try_compile_root(
             };
             let routed = wrap_gfw_condition(&condition, &set.via, matcher.kind.as_str());
             let target = rule_via_target(&set.via, strategy);
-            if matcher.kind == "app" && strategy.system_extension {
+            let se_app = matcher.kind == "app" && strategy.system_extension;
+            let inlet_names = se_app.then(|| network_extension_inlet_names(request));
+            if se_app {
                 // A forwarded SE flow belongs to the provider process.
                 // Keep process rules for Mixed/TUN without matching that
                 // forwarding identity a second time on the private inlet.
-                let names = network_extension_inlet_names(request);
+                let names = inlet_names.as_deref().expect("se inlet names");
                 rules.push(format!(
                     "AND,((NOT,((IN-NAME,{names}))),({routed})),{target}"
                 ));
@@ -183,6 +185,18 @@ fn try_compile_root(
                 rules.push(format!("{routed},{target},no-resolve"));
             } else {
                 rules.push(format!("{routed},{target}"));
+            }
+            // gfw:<group> is hit → group, miss → DIRECT. Process GFW
+            // inlets already MATCH DIRECT; dest/Mixed process rules need
+            // the same rest line so later MATCH/group cannot steal a miss.
+            if gfw::gfw_group(&set.via).is_some() && matcher.kind != "cidr" {
+                if let Some(names) = inlet_names.as_deref() {
+                    rules.push(format!(
+                        "AND,((NOT,((IN-NAME,{names}))),({condition})),DIRECT"
+                    ));
+                } else {
+                    rules.push(format!("{condition},DIRECT"));
+                }
             }
         }
     }
@@ -1083,6 +1097,15 @@ mod tests {
             }),
             "{rules:?}"
         );
+        let hit = rules
+            .iter()
+            .position(|rule| *rule == "AND,((DOMAIN-SUFFIX,example.com),(RULE-SET,gfw)),PROXY")
+            .expect("gfw hit");
+        let miss = rules
+            .iter()
+            .position(|rule| *rule == "DOMAIN-SUFFIX,example.com,DIRECT")
+            .expect("gfw miss");
+        assert!(hit < miss, "{rules:?}");
         assert!(!rules.iter().any(|rule| rule.starts_with("IN-NAME,")));
     }
 
