@@ -357,6 +357,8 @@ private actor HostController {
                 $0.dnsMessage = error.localizedDescription
             }
             dnsConfigurationError = (intent, error.localizedDescription)
+            // A half-enabled NEDNSProxy with no backend blackholes getaddrinfo.
+            try? await disableDNSProxyAllowingDenied(intent: intent)
         }
         HostRuntime.shared.update(operation: operation) { $0.phase = "running" }
         if let observation = HostRuntime.shared.observation(for: operation) {
@@ -369,7 +371,9 @@ private actor HostController {
         defer { withExtendedLifetime(sideEffects) {} }
         try intent.check()
         var firstError: Error?
-        do { try await disableDNSProxyAllowingDenied(intent: intent) } catch { firstError = error }
+        // Do not swallow NEDNSProxyErrorDomain 1 here. A false "disabled"
+        // lets disconnect kill :1053 while queries are still intercepted.
+        do { try await dnsProxy.disable() } catch { firstError = error }
         try intent.check()
         do { try await transparentProxy.stop() } catch { if firstError == nil { firstError = error } }
         try intent.check()
@@ -473,6 +477,8 @@ private func isRecoverableDNSProxyDisableError(_ error: Error) -> Bool {
 }
 
 private extension HostController {
+    /// Only for enable/restart: a denied disable must not block writing a new
+    /// DNS configuration. A full disable still throws so the core stays up.
     func disableDNSProxyAllowingDenied(intent: HostSharedIntent) async throws {
         do {
             try await dnsProxy.disable()

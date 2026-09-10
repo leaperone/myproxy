@@ -221,17 +221,22 @@ fn wait_for_callbacks() {
     std::thread::sleep(Duration::from_millis(100));
 }
 
+/// The core must keep `:1053` until capture and DNS are both proven down.
+/// Unknown DNS state is not proof that macOS restored its resolver settings.
+pub fn capture_released_for_core_stop(status: &RuntimeStatus) -> bool {
+    matches!(status.phase, Phase::Unsupported | Phase::Unbundled)
+        || (status.observed
+            && status.phase == Phase::Disabled
+            && status.dns_phase == DnsPhase::Disabled)
+}
+
 /// Shutdown is complete only after both native managers acknowledge disable.
 /// Unknown DNS state is not proof that macOS restored its resolver settings.
 pub fn wait_disabled(timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let current = status();
-        if matches!(current.phase, Phase::Unsupported | Phase::Unbundled)
-            || (current.observed
-                && current.phase == Phase::Disabled
-                && current.dns_phase == DnsPhase::Disabled)
-        {
+        if capture_released_for_core_stop(&current) {
             return Ok(());
         }
         if current.phase == Phase::Failed {
@@ -781,5 +786,27 @@ mod tests {
         assert!(plan.dest_rules.is_empty());
         assert!(plan.group_ports.is_empty());
         assert!(plan.gfw_ports.is_empty());
+    }
+
+    #[test]
+    fn core_stops_only_after_capture_and_dns_are_down() {
+        let unbundled = unavailable_status();
+        assert!(capture_released_for_core_stop(&unbundled));
+
+        let mut running = unbundled.clone();
+        running.phase = Phase::Running;
+        running.dns_phase = DnsPhase::Running;
+        assert!(!capture_released_for_core_stop(&running));
+
+        let mut denied = unbundled.clone();
+        denied.phase = Phase::Failed;
+        denied.dns_phase = DnsPhase::Unknown;
+        denied.message = Some("permission denied".into());
+        assert!(!capture_released_for_core_stop(&denied));
+
+        let mut down = unbundled;
+        down.phase = Phase::Disabled;
+        down.dns_phase = DnsPhase::Disabled;
+        assert!(capture_released_for_core_stop(&down));
     }
 }
