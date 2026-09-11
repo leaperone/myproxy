@@ -30,6 +30,7 @@ use myproxy::strategy::{
     GLOBAL_GROUP,
 };
 use myproxy::supervisor::{CoreHealth, OperationState, RuntimeIdentity, Supervisor};
+use myproxy::theme_ext;
 use myproxy::updates::{self, UpdateChannel};
 
 use crate::appearance::Appearance;
@@ -414,7 +415,7 @@ impl Render for GroupEditor {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.warning)
+                        .text_color(theme_ext::warning_text(&theme))
                         .child(self.notice.clone()),
                 )
             })
@@ -772,7 +773,7 @@ impl Render for RuleSetEditor {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.warning)
+                        .text_color(theme_ext::warning_text(&theme))
                         .child(self.notice.clone()),
                 )
             })
@@ -2739,7 +2740,7 @@ impl AppView {
                         .items_center()
                         .child(div().text_sm().font_semibold().child("MyProxy"))
                         .children(
-                            updates::build_badge().map(|label| pill(theme, label, theme.warning)),
+                            updates::build_badge().map(|label| pill(theme, label)),
                         ),
                 )
                 .child(
@@ -2751,7 +2752,7 @@ impl AppView {
                             div()
                                 .text_xs()
                                 .text_color(if warn_live {
-                                    theme.warning
+                                    theme_ext::warning_text(theme)
                                 } else {
                                     theme.muted_foreground
                                 })
@@ -2841,7 +2842,7 @@ impl AppView {
                             || self.status.contains("异常")
                             || self.status.contains("无响应")
                         {
-                            theme.warning
+                            theme_ext::warning_text(theme)
                         } else {
                             theme.muted_foreground
                         },
@@ -2881,7 +2882,7 @@ impl AppView {
         connect = if busy {
             connect.label(self.operation_label().to_string())
         } else if self.wanted {
-            connect.danger().label("断开")
+            connect.label("断开")
         } else if primary {
             connect.primary().label("连接")
         } else {
@@ -3090,11 +3091,6 @@ impl AppView {
                 h_flex()
                     .gap_3()
                     .flex_wrap()
-                    .child(metric(
-                        theme,
-                        "状态",
-                        self.connected_label(),
-                    ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
                     .child(metric(theme, "连接数", &conns)),
@@ -3117,7 +3113,7 @@ impl AppView {
                         theme,
                         "节点",
                         &format!(
-                            "{} kept / 过滤 {} / 拉取失败 {}",
+                            "保留 {} / 过滤 {} / 拉取失败 {}",
                             self.catalog.nodes.len(),
                             self.catalog.filter_excluded_count(),
                             self.catalog.fetch_failure_count()
@@ -3130,7 +3126,7 @@ impl AppView {
                     this.child(
                         div()
                             .text_xs()
-                            .text_color(theme.warning)
+                            .text_color(theme_ext::warning_text(theme))
                             .child(
                                 self.traffic_error
                                     .clone()
@@ -3226,7 +3222,7 @@ impl AppView {
                                 div()
                                     .text_xs()
                                     .text_color(if self.traffic_error.is_some() {
-                                        theme.warning
+                                        theme_ext::warning_text(theme)
                                     } else {
                                         muted_fg
                                     })
@@ -3529,7 +3525,12 @@ impl AppView {
                                 ),
                         )
                         .when_some(warning, |this, warning| {
-                            this.child(div().text_xs().text_color(theme.warning).child(warning))
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme_ext::warning_text(theme))
+                                    .child(warning),
+                            )
                         }),
                 )
             }))
@@ -3548,7 +3549,6 @@ impl AppView {
 
     fn groups(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
-        let accent = theme.accent;
         let query = self.member_query.read(cx).value().trim().to_lowercase();
         v_flex()
             .gap_4()
@@ -3577,7 +3577,6 @@ impl AppView {
                 render_global_card(
                     entity.clone(),
                     theme,
-                    accent,
                     &now,
                     &members,
                     self.delaying.contains(GLOBAL_GROUP),
@@ -3611,7 +3610,7 @@ impl AppView {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.warning)
+                        .text_color(theme_ext::warning_text(theme))
                         .child(self.proxy_error.clone().unwrap_or_default()),
                 )
             })
@@ -3638,7 +3637,6 @@ impl AppView {
                     group,
                     count,
                     selected,
-                    accent,
                     &now,
                     &members,
                     group.kind == "select",
@@ -3664,7 +3662,6 @@ impl AppView {
             .collect();
         let visible_len = visible.len();
         let muted_fg = theme.muted_foreground;
-        let accent = theme.accent;
         v_flex()
             .id("rules-page")
             .flex_1()
@@ -3743,7 +3740,6 @@ impl AppView {
                             self.rule_edit_id.as_deref() == Some(set.id.as_str()),
                             &set,
                             via_choices(&self.strategy, &self.catalog, Some(&set.via)),
-                            accent,
                         )
                     })),
             )
@@ -4551,19 +4547,8 @@ impl AppView {
                             if self.extension_status.fail_open { "开" } else { "关" }
                         )),
                 )
-                .when_some(self.extension_status.message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(message)))
-                .when_some(self.extension_status.dns_message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(format!("DNS：{message}"))))
-                .child({
-                    Button::new("open-login-items")
-                        .small()
-                        .ghost()
-                        .label("打开登录项与扩展")
-                        .on_click(move |_, _, _| {
-                            let _ = std::process::Command::new("open")
-                                .arg("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
-                                .spawn();
-                        })
-                })
+                .when_some(self.extension_status.message.clone(), |this, message| this.child(div().text_xs().text_color(theme_ext::warning_text(theme)).child(message)))
+                .when_some(self.extension_status.dns_message.clone(), |this, message| this.child(div().text_xs().text_color(theme_ext::warning_text(theme)).child(format!("DNS：{message}"))))
                 .child(
                     div()
                         .text_xs()
@@ -5037,7 +5022,7 @@ impl AppView {
                         .children(log::recent(80).into_iter().map(|line| {
                             let color = match log::Level::from_line(&line) {
                                 Some(log::Level::Error) | Some(log::Level::Warn) => {
-                                    Some(theme.warning)
+                                    Some(theme_ext::warning_text(theme))
                                 }
                                 Some(log::Level::Debug) | Some(log::Level::Trace) => {
                                     Some(theme.muted_foreground)
@@ -5137,7 +5122,6 @@ fn render_member_row(
 ) -> impl IntoElement {
     let name_owned = name.to_string();
     let muted_fg = theme.muted_foreground;
-    let accent = theme.accent;
     h_flex()
         .id(SharedString::from(format!("member-{name}")))
         .w_full()
@@ -5162,10 +5146,8 @@ fn render_member_row(
                 .when(blocked, |this| this.text_color(muted_fg))
                 .child(name.to_string()),
         )
-        .when(pinned, |this| this.child(pill(theme, "钉住", accent)))
-        .when(blocked, |this| {
-            this.child(pill(theme, "排除", theme.warning))
-        })
+        .when(pinned, |this| this.child(pill(theme, "钉住")))
+        .when(blocked, |this| this.child(pill(theme, "排除")))
         .when(pinned, |this| {
             let up_entity = entity.clone();
             let up_name = name_owned.clone();
@@ -5282,7 +5264,6 @@ fn render_group_card(
     group: &Group,
     count: Option<usize>,
     selected: bool,
-    accent: Hsla,
     now: &str,
     members: &[(String, Option<u32>)],
     can_select: bool,
@@ -5294,8 +5275,9 @@ fn render_group_card(
     let id = group.id.clone();
     let del_id = group.id.clone();
     let group_name = group.name.clone();
-    let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
+    let hover = theme_ext::row_hover(theme);
+    let selected_border = theme_ext::selection_border(theme);
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     v_flex()
         .id(SharedString::from(format!("group-card-{id}")))
@@ -5303,11 +5285,10 @@ fn render_group_card(
         .gap_2()
         .rounded(theme.radius)
         .border_1()
-        .border_color(if selected { accent } else { theme.border })
+        .border_color(if selected { selected_border } else { theme.border })
         .bg(theme.group_box)
         .cursor_pointer()
-        .when(selected, |this| this.bg(accent.opacity(0.14)))
-        .hover(move |style| style.bg(muted))
+        .hover(move |style| style.bg(hover))
         .on_click({
             let entity = entity.clone();
             let id = id.clone();
@@ -5460,7 +5441,7 @@ fn render_group_card(
                                 .rounded(theme.radius)
                                 .text_xs()
                                 .bg(if is_now {
-                                    theme.accent.opacity(0.14)
+                                    theme_ext::chip_bg(theme)
                                 } else {
                                     theme.muted
                                 })
@@ -5495,7 +5476,6 @@ fn render_group_card(
 fn render_global_card(
     entity: Entity<AppView>,
     theme: &Theme,
-    accent: Hsla,
     now: &str,
     members: &[(String, Option<u32>)],
     delaying: bool,
@@ -5506,8 +5486,9 @@ fn render_global_card(
     busy: bool,
 ) -> impl IntoElement {
     let now_label = global_selection_label(now, connected);
-    let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
+    let hover = theme_ext::row_hover(theme);
+    let selected_border = theme_ext::selection_border(theme);
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     let shown_empty = shown.is_empty();
     v_flex()
@@ -5516,10 +5497,9 @@ fn render_global_card(
         .gap_2()
         .rounded(theme.radius)
         .border_1()
-        .border_color(theme.border)
+        .border_color(if inbound_global { selected_border } else { theme.border })
         .bg(theme.group_box)
-        .when(inbound_global, |this| this.bg(accent.opacity(0.10)))
-        .hover(move |style| style.bg(muted))
+        .hover(move |style| style.bg(hover))
         .child(
             h_flex()
                 .w_full()
@@ -5737,7 +5717,7 @@ fn connection_filter_header(
     }
     let active = current.is_some();
     let color = if active {
-        theme.accent
+        theme.primary
     } else {
         theme.muted_foreground
     };
@@ -5841,7 +5821,7 @@ fn render_connection_row(
     let id = conn.id.clone();
     let process = conn.process.clone();
     let app_matcher = conn.app_matcher.clone();
-    let muted = theme.muted;
+    let hover = theme_ext::row_hover(theme);
     let muted_fg = theme.muted_foreground;
     let fg = theme.foreground;
     let mono = theme.mono_font_family.clone();
@@ -5858,7 +5838,7 @@ fn render_connection_row(
         .border_1()
         .border_color(theme.border)
         .bg(theme.group_box)
-        .hover(move |style| style.bg(muted))
+        .hover(move |style| style.bg(hover))
         .context_menu({
             let entity = entity.clone();
             let process = process.clone();
@@ -5960,14 +5940,14 @@ fn render_rule_set_card(
     selected: bool,
     set: &RuleSet,
     via_choices: Vec<ViaChoice>,
-    accent: Hsla,
 ) -> impl IntoElement {
     let id = set.id.clone();
     let via = set.via.clone();
     let can_up = index > 0;
     let can_down = index + 1 < total;
-    let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
+    let hover = theme_ext::row_hover(theme);
+    let selected_border = theme_ext::selection_border(theme);
     const CHIP_LIMIT: usize = 10;
     let extra = set.matchers.len().saturating_sub(CHIP_LIMIT);
     v_flex()
@@ -5976,11 +5956,10 @@ fn render_rule_set_card(
         .gap_2()
         .rounded(theme.radius)
         .border_1()
-        .border_color(theme.border)
+        .border_color(if selected { selected_border } else { theme.border })
         .bg(theme.group_box)
         .cursor_pointer()
-        .when(selected, |this| this.bg(accent.opacity(0.14)))
-        .hover(move |style| style.bg(muted))
+        .hover(move |style| style.bg(hover))
         .on_click({
             let entity = entity.clone();
             let id = id.clone();
@@ -6070,7 +6049,7 @@ fn render_rule_set_card(
                                 .child(format!("{}", index + 1)),
                         )
                         .child(div().text_sm().font_semibold().child(set.name.clone()))
-                        .child(pill(theme, &via_label(&via), accent)),
+                        .child(pill(theme, &via_label(&via))),
                 )
                 .child({
                     let entity = entity.clone();
@@ -6108,6 +6087,61 @@ fn render_rule_set_card(
                 })
                 .when(set.matchers.is_empty(), |this| {
                     this.child(div().text_xs().text_color(muted_fg).child("没有匹配项"))
+                }),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child({
+                    let entity = entity.clone();
+                    let id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("edit-rule-{id}")))
+                        .small()
+                        .label("编辑")
+                        .accessibility_label(format!("编辑规则 {name}"))
+                        .on_click(move |_, window, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.open_rule_dialog(Some(&id), window, cx);
+                                cx.notify();
+                            });
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    let id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("up-rule-{id}")))
+                        .small()
+                        .label("上移")
+                        .accessibility_label(format!("上移规则 {name}"))
+                        .disabled(!can_up)
+                        .on_click(move |_, _, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.move_selected_rule(&id, -1, cx);
+                                cx.notify();
+                            });
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    let id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("down-rule-{id}")))
+                        .small()
+                        .label("下移")
+                        .accessibility_label(format!("下移规则 {name}"))
+                        .disabled(!can_down)
+                        .on_click(move |_, _, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.move_selected_rule(&id, 1, cx);
+                                cx.notify();
+                            });
+                        })
                 }),
         )
 }
@@ -6155,13 +6189,13 @@ fn panel(theme: &Theme, title: &str, body: impl IntoElement) -> impl IntoElement
         .child(body)
 }
 
-fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
+fn pill(theme: &Theme, text: &str) -> impl IntoElement {
     div()
         .px_2()
         .py(px(2.))
         .rounded(px(999.))
-        .bg(color.opacity(0.16))
-        .text_color(color)
+        .bg(theme_ext::chip_bg(theme))
+        .text_color(theme_ext::chip_fg(theme))
         .text_xs()
         .child(text.to_string())
 }

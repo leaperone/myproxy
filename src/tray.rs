@@ -116,7 +116,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
     let status = MenuItem::with_id("status", "未连接", false, None);
     let toggle = MenuItem::with_id("toggle", "连接", true, None);
     let open = MenuItem::with_id("open", "打开窗口", true, None);
-    let apply = MenuItem::with_id("apply", "更新配置", true, None);
+    let apply = MenuItem::with_id("apply", "应用", true, None);
     let about = MenuItem::with_id("about", "关于 MyProxy", true, None);
     let updates = MenuItem::with_id("updates", "检查更新", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
