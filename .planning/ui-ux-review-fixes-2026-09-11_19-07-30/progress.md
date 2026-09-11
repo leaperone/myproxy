@@ -21,7 +21,14 @@
 
 ## 进行中
 
-- 交付前收敛检查与 PR 流程。
+- 交付前收敛检查与 PR 流程（preflight 五门：构建/冲突探测/领域检查均已 pass）。
+
+## Preflight 证据
+
+- Phase 1 构建：Rust scope（`src/`）`cargo check --quiet` exit=0；`cargo build --quiet --bins --features sparkle` exit=0（worktree 缺 `resources/sparkle/Sparkle.framework`，从主 checkout 复制同一份 fetch 产物后构建）。
+- Phase 1.5：`git merge-tree --write-tree HEAD origin/main` 干净，0 条 CONFLICT（`origin/main` 为 HEAD 的祖先）。
+- Phase 2 领域检查：隔离 `MYPROXY_DATA_DIR` 后 `cargo test --quiet --lib`（按配置跳过 2 例）74 passed。
+- Phase 3 审查：环境无 review-agent skill，由主 agent 直接审查 diff；0 critical / 0 high，4 low（日志面板重复计算 warning_text、`separates` 仅供测试、深色悬停仍偏弱、卡片点击与行内编辑冗余），均不阻塞。
 
 ## 修改文件
 
