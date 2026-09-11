@@ -12,7 +12,7 @@ use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMe
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Disableable, IconName, Root, Selectable, Sizable, StyledExt,
+    h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, StyledExt,
     Theme, TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -1993,14 +1993,33 @@ impl AppView {
         label: &'static str,
         icon: IconName,
     ) -> Button {
+        let compact = self.sidebar_compact;
         Button::new(SharedString::from(format!("nav-{label}")))
             .ghost()
             .w_full()
-            .icon(icon)
             .selected(self.page == page)
             .accessibility_label(label)
             .tooltip(label)
-            .when(!self.sidebar_compact, |button| button.label(label))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .when(compact, |this| this.justify_center())
+                    .when(!compact, |this| this.justify_start())
+                    .child(Icon::new(icon).size_4().flex_shrink_0())
+                    .when(!compact, |this| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                    }),
+            )
             .on_click(self.select_page(cx, page))
     }
 
@@ -2785,41 +2804,58 @@ impl AppView {
             .p_2()
             .w(px(if self.sidebar_compact { 56. } else { 216. }))
             .bg(theme.sidebar)
+            .child(self.sidebar_header(cx, theme))
             .child(
-                Button::new("toggle-sidebar")
-                    .ghost()
-                    .small()
-                    .icon(if self.sidebar_compact {
-                        IconName::PanelLeftOpen
-                    } else {
-                        IconName::PanelLeft
-                    })
-                    .tooltip(if self.sidebar_compact {
-                        "展开侧栏"
-                    } else {
-                        "收起侧栏"
-                    })
-                    .accessibility_label(if self.sidebar_compact {
-                        "展开侧栏"
-                    } else {
-                        "收起侧栏"
-                    })
-                    .on_click({
-                        let entity = cx.entity();
-                        move |_, _, app| {
-                            entity.update(app, |this, cx| {
-                                this.sidebar_compact = !this.sidebar_compact;
-                                cx.notify();
-                            });
-                        }
-                    }),
+                v_flex()
+                    .id("nav-items")
+                    .w_full()
+                    .gap_1()
+                    .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
+                    .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
+                    .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
+                    .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
+                    .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map))
+                    .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
             )
-            .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
-            .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
-            .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
-            .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
-            .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map))
-            .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings))
+    }
+
+    fn sidebar_header(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let compact = self.sidebar_compact;
+        let toggle = Button::new("toggle-sidebar")
+            .ghost()
+            .small()
+            .icon(if compact {
+                IconName::PanelLeftOpen
+            } else {
+                IconName::PanelLeft
+            })
+            .tooltip(if compact { "展开侧栏" } else { "收起侧栏" })
+            .accessibility_label(if compact { "展开侧栏" } else { "收起侧栏" })
+            .on_click({
+                let entity = cx.entity();
+                move |_, _, app| {
+                    entity.update(app, |this, cx| {
+                        this.sidebar_compact = !this.sidebar_compact;
+                        cx.notify();
+                    });
+                }
+            });
+        h_flex()
+            .id("nav-header")
+            .w_full()
+            .h_8()
+            .items_center()
+            .when(compact, |this| this.justify_center())
+            .when(!compact, |this| {
+                this.justify_between().pl_2().child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(theme.muted_foreground)
+                        .child("导航"),
+                )
+            })
+            .child(toggle)
     }
 
     fn page_view(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
