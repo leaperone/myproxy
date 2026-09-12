@@ -12,6 +12,7 @@ pub mod setup;
 pub mod strategy;
 pub mod supervisor;
 pub mod system_proxy;
+pub mod theme_ext;
 pub mod updates;
 
 pub use strategy::{
