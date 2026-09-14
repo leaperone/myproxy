@@ -196,19 +196,21 @@ actor AppleTransparentProxyManager {
             loadedManager = try await loadOwnedManager()
         }
         guard let manager = loadedManager else { return }
-        try await load(manager)
-        try Task.checkCancellation()
         self.manager = manager
-        manager.isEnabled = false
-        try await save(manager)
-        try Task.checkCancellation()
+        // Tear the tunnel down before preference I/O so a hung nehelper
+        // callback cannot leave capture running.
         switch manager.connection.status {
         case .disconnected, .invalid:
-            return
+            break
         default:
             manager.connection.stopVPNTunnel()
             try await waitForConnection(manager.connection, target: .disconnected)
         }
+        try Task.checkCancellation()
+        try await load(manager)
+        try Task.checkCancellation()
+        manager.isEnabled = false
+        try await save(manager)
     }
 
     private func reload() async throws {
@@ -229,12 +231,16 @@ actor AppleTransparentProxyManager {
     }
 
     private func loadOwnedManager() async throws -> NETransparentProxyManager? {
-        let loaded: LoadedManagers = try await withCheckedThrowingContinuation { continuation in
+        let loaded: LoadedManagers = try await awaitOnceReply(
+            timeout: OnceReplyTimeout.preferences,
+            operation: .configureTransparentProxy,
+            timeoutMessage: "Timed out waiting for loadAllFromPreferences"
+        ) { reply in
             NETransparentProxyManager.loadAllFromPreferences { managers, error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    reply.finish(.failure(error))
                 } else {
-                    continuation.resume(returning: LoadedManagers(values: managers ?? []))
+                    reply.finish(.success(LoadedManagers(values: managers ?? [])))
                 }
             }
         }
@@ -249,28 +255,20 @@ actor AppleTransparentProxyManager {
     }
 
     private func save(_ manager: NETransparentProxyManager) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            manager.saveToPreferences { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
+        try await awaitPreferenceCallback(
+            operation: .configureTransparentProxy,
+            api: "saveToPreferences"
+        ) { completion in
+            manager.saveToPreferences(completionHandler: completion)
         }
     }
 
     private func load(_ manager: NETransparentProxyManager) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            manager.loadFromPreferences { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
+        try await awaitPreferenceCallback(
+            operation: .configureTransparentProxy,
+            api: "loadFromPreferences"
+        ) { completion in
+            manager.loadFromPreferences(completionHandler: completion)
         }
     }
 
@@ -329,39 +327,36 @@ actor AppleTransparentProxyManager {
         }
         try Task.checkCancellation()
         let payload = try JSONEncoder().encode(request)
-        let reply = ProviderReply()
-        let responseData: Data = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                reply.attach(continuation)
-                guard !Task.isCancelled else {
-                    reply.finish(.failure(CancellationError()))
-                    return
-                }
-                do {
-                    try session.sendProviderMessage(payload) { response in
-                        if let response {
-                            reply.finish(.success(response))
-                        } else {
-                            reply.finish(.failure(NetworkExtensionControlFailure(
-                                operation: .configureTransparentProxy,
-                                message: "Provider returned an empty control response"
-                            )))
-                        }
+        let responseData: Data = try await awaitOnceReply(
+            timeout: OnceReplyTimeout.providerMessage,
+            operation: .configureTransparentProxy,
+            timeoutMessage: "Timed out waiting for provider status"
+        ) { reply in
+            do {
+                try session.sendProviderMessage(payload) { response in
+                    if let response {
+                        reply.finish(.success(response))
+                    } else {
+                        reply.finish(
+                            .failure(
+                                NetworkExtensionControlFailure(
+                                    operation: .configureTransparentProxy,
+                                    message: "Provider returned an empty control response"
+                                )
+                            )
+                        )
                     }
-                } catch {
-                    reply.finish(.failure(NetworkExtensionControlFailure(
-                        operation: .configureTransparentProxy, underlying: error
-                    )))
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-                    reply.finish(.failure(NetworkExtensionControlFailure(
-                        operation: .configureTransparentProxy,
-                        message: "Timed out waiting for provider status"
-                    )))
-                }
+            } catch {
+                reply.finish(
+                    .failure(
+                        NetworkExtensionControlFailure(
+                            operation: .configureTransparentProxy,
+                            underlying: error
+                        )
+                    )
+                )
             }
-        } onCancel: {
-            reply.finish(.failure(CancellationError()))
         }
         do {
             return try JSONDecoder().decode(
@@ -441,33 +436,4 @@ struct HostProviderControlResponse: Decodable, Sendable {
     let message: String?
     let activityBatch: AppRoutingActivityBatch?
     let dnsRuntimeReport: DNSProxyRuntimeReport?
-}
-
-/// Provider messages have no built-in timeout. Resolve once on response,
-/// cancellation, or deadline, so shutdown cannot hang on an absent reply.
-private final class ProviderReply: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Data, Error>?
-    private var result: Result<Data, Error>?
-
-    func attach(_ continuation: CheckedContinuation<Data, Error>) {
-        lock.lock()
-        if let result {
-            lock.unlock()
-            continuation.resume(with: result)
-        } else {
-            self.continuation = continuation
-            lock.unlock()
-        }
-    }
-
-    func finish(_ result: Result<Data, Error>) {
-        lock.lock()
-        guard self.result == nil else { lock.unlock(); return }
-        self.result = result
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        continuation?.resume(with: result)
-    }
 }
