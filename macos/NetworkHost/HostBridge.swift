@@ -93,6 +93,8 @@ private final class HostSideEffectLock: @unchecked Sendable {
             )
         }
         do {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(10))
             while true {
                 try intent.check()
                 if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
@@ -102,6 +104,12 @@ private final class HostSideEffectLock: @unchecked Sendable {
                 guard errno == EWOULDBLOCK || errno == EINTR else {
                     throw NetworkExtensionControlFailure(
                         operation: .configureTransparentProxy, message: "无法取得系统接管操作锁"
+                    )
+                }
+                if clock.now >= deadline {
+                    throw NetworkExtensionControlFailure(
+                        operation: .configureTransparentProxy,
+                        message: "等待系统接管操作锁超时"
                     )
                 }
                 try await Task.sleep(for: .milliseconds(100))
@@ -237,7 +245,7 @@ private final class HostOperations: @unchecked Sendable {
         previous?.cancel()
         HostRuntime.shared.begin(operation: revision, desired: desired, phase: phase)
         task = Task {
-            await previous?.value
+            await Self.awaitSuperseded(previous)
             do {
                 try intent.check()
                 try await operation(intent)
@@ -261,6 +269,29 @@ private final class HostOperations: @unchecked Sendable {
         task?.cancel()
         self.intent = nil
         HostRuntime.shared.invalidate(operation: latestRevision)
+    }
+
+    /// Wait for a cancelled predecessor, but do not inherit its leaked hang.
+    private static func awaitSuperseded(_ previous: Task<Void, Never>?) async {
+        guard let previous else { return }
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await previous.value
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: OnceReplyTimeout.supersededOperation)
+                return false
+            }
+            let finished = await group.next() ?? false
+            group.cancelAll()
+            if !finished {
+                AppLog.warn(
+                    "ne-host",
+                    "superseded host operation still running after cancel; continuing"
+                )
+            }
+        }
     }
 }
 
@@ -471,14 +502,27 @@ private actor HostController {
                 }
             }
         } catch {
+            let detail = describeProviderStatusError(error)
+            AppLog.error("ne-host", "refreshStatus failed: \(detail)")
             HostRuntime.shared.update(operation: operation, observation: observation) {
                 guard ["running", "disabled", "failed"].contains($0.phase) else { return }
                 $0.phase = "failed"
-                $0.message = "无法读取系统接管 Provider 状态"
+                $0.message = "无法读取系统接管 Provider 状态：\(detail)"
                 $0.dnsPhase = "unknown"
             }
         }
     }
+}
+
+private func describeProviderStatusError(_ error: Error) -> String {
+    if let failure = error as? NetworkExtensionControlFailure {
+        return failure.message
+    }
+    let nsError = error as NSError
+    if nsError.domain == NSCocoaErrorDomain {
+        return error.localizedDescription
+    }
+    return "\(nsError.domain) \(nsError.code) — \(error.localizedDescription)"
 }
 
 private func isRecoverableDNSProxyDisableError(_ error: Error) -> Bool {

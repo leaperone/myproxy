@@ -16,7 +16,7 @@ actor AppleDNSProxyManager {
 
     func configureAndEnable(_ bootstrap: Data) async throws {
         let manager = NEDNSProxyManager.shared()
-        try await load(manager)
+        try await load(manager, operation: .configureDNSProxy)
         try Task.checkCancellation()
         let providerProtocol = NEDNSProxyProviderProtocol()
         providerProtocol.providerBundleIdentifier = providerBundleIdentifier
@@ -27,10 +27,12 @@ actor AppleDNSProxyManager {
         manager.localizedDescription = MyproxyNetworkExtensionIdentifiers.localizedDescription
         manager.isEnabled = true
         do {
-            try await save(manager)
+            try await save(manager, operation: .configureDNSProxy)
         } catch {
             manager.isEnabled = false
-            try? await save(manager)
+            if !isPreferenceTimeout(error) {
+                try? await save(manager, operation: .configureDNSProxy)
+            }
             throw NetworkExtensionControlFailure(
                 operation: .configureDNSProxy,
                 underlying: error
@@ -41,7 +43,7 @@ actor AppleDNSProxyManager {
 
     func disable() async throws {
         let manager = NEDNSProxyManager.shared()
-        try await load(manager)
+        try await load(manager, operation: .stopDNSProxy)
         try Task.checkCancellation()
         guard manager.providerProtocol?.providerBundleIdentifier == providerBundleIdentifier else {
             self.manager = nil
@@ -49,14 +51,17 @@ actor AppleDNSProxyManager {
         }
         do {
             manager.isEnabled = false
-            try await save(manager)
-            try await remove(manager)
+            try await save(manager, operation: .stopDNSProxy)
+            try await remove(manager, operation: .stopDNSProxy)
         } catch {
             // Saving disabled is the important resolver restoration step;
             // remove is best effort because macOS may reject it while the
-            // provider is stopping.
-            manager.isEnabled = false
-            try? await save(manager)
+            // provider is stopping. Skip another round-trip when nehelper
+            // already timed out.
+            if !isPreferenceTimeout(error) {
+                manager.isEnabled = false
+                try? await save(manager, operation: .stopDNSProxy)
+            }
             self.manager = manager
             throw NetworkExtensionControlFailure(
                 operation: .stopDNSProxy,
@@ -66,42 +71,44 @@ actor AppleDNSProxyManager {
         self.manager = nil
     }
 
-    private func load(_ manager: NEDNSProxyManager) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            manager.loadFromPreferences { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
+    private func load(
+        _ manager: NEDNSProxyManager,
+        operation: NetworkExtensionControlOperation
+    ) async throws {
+        try await awaitPreferenceCallback(
+            operation: operation,
+            api: "loadFromPreferences"
+        ) { completion in
+            manager.loadFromPreferences(completionHandler: completion)
         }
     }
 
-    private func save(_ manager: NEDNSProxyManager) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            manager.saveToPreferences { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
+    private func save(
+        _ manager: NEDNSProxyManager,
+        operation: NetworkExtensionControlOperation
+    ) async throws {
+        try await awaitPreferenceCallback(
+            operation: operation,
+            api: "saveToPreferences"
+        ) { completion in
+            manager.saveToPreferences(completionHandler: completion)
         }
     }
 
-    private func remove(_ manager: NEDNSProxyManager) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            manager.removeFromPreferences { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
+    private func remove(
+        _ manager: NEDNSProxyManager,
+        operation: NetworkExtensionControlOperation
+    ) async throws {
+        try await awaitPreferenceCallback(
+            operation: operation,
+            api: "removeFromPreferences"
+        ) { completion in
+            manager.removeFromPreferences(completionHandler: completion)
         }
     }
+}
+
+private func isPreferenceTimeout(_ error: Error) -> Bool {
+    guard let failure = error as? NetworkExtensionControlFailure else { return false }
+    return failure.message.hasPrefix("Timed out waiting for ")
 }
