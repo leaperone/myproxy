@@ -158,13 +158,6 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         guard InitialFlowOwnershipPolicy.owns(plan.decision.disposition) else {
             return false
         }
-        if let destination = plan.initialDestination,
-           destination.address.domain != nil,
-           destination.port == DNSProxyUpstreamResolver.defaultPort {
-            // System-resolver name flows belong to NEDNSProxy. Owning
-            // hostname:53 here SOCKS the QNAME and the lookup never returns.
-            return false
-        }
 
         guard plan.initialDestination != nil else {
             recordUDPDirectRelayUnavailable(plan.activity)
