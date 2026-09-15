@@ -48,9 +48,6 @@ actor AppleDNSProxyManager {
         do {
             try await load(manager, operation: .stopDNSProxy)
         } catch {
-            // nehelper can stall loadFromPreferences after a killed provider.
-            // #68 forbids a bare swallow; only release when getaddrinfo is not
-            // still in the fake-ip path.
             try await releaseIfSystemDNSIsClear(cause: error)
             self.manager = nil
             return
