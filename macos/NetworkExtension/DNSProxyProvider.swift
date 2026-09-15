@@ -765,11 +765,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         for destination: SOCKS5Endpoint,
         resolvers: [SOCKS5Endpoint]
     ) -> SOCKS5Endpoint {
-        guard destination.address.domain != nil,
-              destination.port == DNSProxyUpstreamResolver.defaultPort,
-              let resolver = resolvers.first
-        else { return destination }
-        return resolver
+        DNSProxyUpstreamResolver.relayDestination(
+            for: destination,
+            resolvers: resolvers
+        )
     }
 
     private func directRelayNote(for route: DNSRelayRoute) -> String {

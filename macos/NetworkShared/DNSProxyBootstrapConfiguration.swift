@@ -202,4 +202,23 @@ public enum DNSProxyUpstreamResolver {
         guard port > 0, let address = try? IPAddress(host) else { return nil }
         return SOCKS5Endpoint(address: SOCKS5Address(ipAddress: address), port: port)
     }
+
+    /// SOCKS dest for one DNS UDP datagram. A hostname on port 53 is the
+    /// queried name, not a resolver. Dial a resolver IP instead. The original
+    /// endpoint stays the conversation key and the write-back target.
+    public static func relayDestination(
+        for destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint] = []
+    ) -> SOCKS5Endpoint {
+        if destination.address.ipAddress != nil {
+            return destination
+        }
+        guard destination.port == defaultPort else {
+            return destination
+        }
+        if let resolver = resolvers.first(where: { $0.address.ipAddress != nil }) {
+            return resolver
+        }
+        return endpoint(for: defaults[0])!
+    }
 }
