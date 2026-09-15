@@ -188,7 +188,7 @@ actor AppleTransparentProxyManager {
         ))
     }
 
-    func stop() async throws {
+    func stop(dropWedgedConfiguration: Bool = false) async throws {
         let loadedManager: NETransparentProxyManager?
         if let manager {
             loadedManager = manager
@@ -207,8 +207,10 @@ actor AppleTransparentProxyManager {
             do {
                 try await waitForConnection(manager.connection, target: .disconnected)
             } catch let failure as NetworkExtensionControlFailure {
-                // A session wedged in disconnecting survives stopVPNTunnel, and
-                // every later enable() starts with this stop. Drop the saved
+                // Disconnect must keep this as a failure so wait_disabled
+                // cannot treat an unproven stop as capture-released.
+                guard dropWedgedConfiguration else { throw failure }
+                // Enable restarts through this stop. Drop the saved
                 // configuration instead of failing the whole enable.
                 AppLog.warn(
                     "ne-host",
@@ -312,6 +314,7 @@ actor AppleTransparentProxyManager {
             try Task.checkCancellation()
             let status = connection.status
             if status == target { return }
+            if target == .disconnected, status == .invalid { return }
             if target == .connected {
                 switch status {
                 case .connecting, .connected, .reasserting, .disconnecting:

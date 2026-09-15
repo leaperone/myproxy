@@ -374,7 +374,7 @@ private actor HostController {
         if !applied {
             try await disableDNSProxyAllowingDenied(intent: intent)
             try intent.check()
-            try await transparentProxy.stop()
+            try await transparentProxy.stop(dropWedgedConfiguration: true)
             try intent.check()
             try await transparentProxy.configure(configurations.transparent)
             try intent.check()
