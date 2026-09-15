@@ -13,7 +13,7 @@ use crate::log;
 use crate::login_item;
 use crate::strategy::{InboundMode, Strategy};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnableRequest {
     pub revision: u64,
@@ -76,6 +76,7 @@ struct Session {
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static OPERATION_REVISION: AtomicU64 = AtomicU64::new(0);
+static LAST_SUBMITTED: Mutex<Option<EnableRequest>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -633,6 +634,14 @@ pub fn enable_request_async(request: &EnableRequest) -> Result<()> {
         if !login_item::is_bundled() {
             bail!("系统接管需要包含 Network Extension 的已签名 .app");
         }
+        if capture_is_current(
+            LAST_SUBMITTED.lock().expect("ne last request").as_ref(),
+            request,
+            &status(),
+        ) {
+            return Ok(());
+        }
+        let submitted = request.clone();
         let mut request = request.clone();
         request.operation_revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
         let json = serde_json::to_string(&request)?;
@@ -645,6 +654,7 @@ pub fn enable_request_async(request: &EnableRequest) -> Result<()> {
                 message.unwrap_or_else(|| "系统接管请求提交失败".into())
             );
         }
+        *LAST_SUBMITTED.lock().expect("ne last request") = Some(submitted);
         log::info(
             "ne",
             format!("submitted capture revision={}", request.revision),
@@ -653,7 +663,21 @@ pub fn enable_request_async(request: &EnableRequest) -> Result<()> {
     }
 }
 
+fn capture_is_current(
+    previous: Option<&EnableRequest>,
+    request: &EnableRequest,
+    status: &RuntimeStatus,
+) -> bool {
+    previous == Some(request)
+        && status.observed
+        && status.phase == Phase::Running
+        && status.dns_phase == DnsPhase::Running
+        && status.capture_enabled
+        && status.applied_revision == Some(request.revision)
+}
+
 pub fn disable_async() -> Result<()> {
+    *LAST_SUBMITTED.lock().expect("ne last request") = None;
     let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
     #[cfg(not(target_os = "macos"))]
     {
@@ -923,5 +947,30 @@ mod tests {
         down.phase = Phase::Disabled;
         down.dns_phase = DnsPhase::Disabled;
         assert!(capture_released_for_core_stop(&down));
+    }
+
+    #[test]
+    fn reuse_capture_requires_the_same_plan_and_confirmed_dns() {
+        let request = inbound_plan(&Strategy::default());
+        let mut status = unavailable_status();
+        status.phase = Phase::Running;
+        status.dns_phase = DnsPhase::Running;
+        status.capture_enabled = true;
+        status.applied_revision = Some(request.revision);
+        assert!(capture_is_current(Some(&request), &request, &status));
+        assert!(!capture_is_current(None, &request, &status));
+
+        let mut changed = request.clone();
+        changed.capture_private_networks = !changed.capture_private_networks;
+        assert!(!capture_is_current(Some(&request), &changed, &status));
+        changed = request.clone();
+        changed.password.push('x');
+        assert!(!capture_is_current(Some(&request), &changed, &status));
+
+        status.dns_phase = DnsPhase::Unknown;
+        assert!(!capture_is_current(Some(&request), &request, &status));
+        status.dns_phase = DnsPhase::Running;
+        status.applied_revision = None;
+        assert!(!capture_is_current(Some(&request), &request, &status));
     }
 }

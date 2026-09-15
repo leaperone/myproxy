@@ -1,10 +1,9 @@
-use std::time::Duration;
-
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use myproxy::catalog;
 use myproxy::controller;
-use myproxy::network_extension::{self, DnsPhase, Phase, RuntimeStatus};
+use myproxy::host_control::{self, Request, Snapshot};
+use myproxy::network_extension;
 use myproxy::paths;
 use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy, GLOBAL_GROUP};
 use myproxy::supervisor::Supervisor;
@@ -249,12 +248,10 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Status => {
             let strategy = Strategy::load()?;
             let catalog = catalog::Catalog::load()?;
-            let supervisor = adopted_supervisor(&strategy);
-            let runtime = supervisor.runtime_identity();
-            let controller_ready = runtime
-                .as_ref()
-                .is_some_and(|identity| controller::ready(identity.mixed_port).is_ok());
-            let extension = network_extension::wait_for_settle(Duration::from_secs(5));
+            let snapshot = host_control::request(Request::Status)?;
+            let runtime = snapshot.runtime;
+            let controller_ready = snapshot.controller_ready;
+            let extension = snapshot.extension;
             let unmatched = myproxy::compile::unmatched_target(&strategy);
             emit(json, serde_json::json!({
                 "mixed_port": strategy.mixed_port,
@@ -272,7 +269,7 @@ fn run(cli: Cli) -> Result<()> {
                 "refresh_warnings": catalog.refresh_warnings(),
                 "groups": strategy.groups.len(),
                 "rules": strategy.rule_sets.len(),
-                "operation": supervisor.operation_state(),
+                "operation": snapshot.operation,
                 "runtime": runtime.as_ref().map(|identity| serde_json::json!({
                     "generation": identity.generation,
                     "mixed_port": identity.mixed_port,
@@ -306,58 +303,43 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Apply => {
-            let strategy = Strategy::load()?;
-            let supervisor = adopted_supervisor(&strategy);
-            let catalog = supervisor.apply_cached(&strategy)?;
-            report_applied(json, &supervisor, &catalog)?;
+            report_applied(json, host_control::request(Request::Apply { refresh: false })?)?;
         }
         Commands::Connect => {
             let strategy = Strategy::load()?;
-            let supervisor = adopted_supervisor(&strategy);
-            supervisor.connect(&strategy)?;
-            let (extension, cancelled) = settle_extension()?;
-            let runtime = supervisor.runtime_identity();
+            let snapshot = host_control::request(Request::Connect)?;
+            let extension = &snapshot.extension;
+            let runtime = snapshot.runtime;
             emit(
                 json,
                 serde_json::json!({
                     "status": "core_ready",
                     "mixed_port": runtime.as_ref().map(|identity| identity.mixed_port),
                     "extension_runtime": extension,
-                    "extension_request_cancelled": cancelled,
+                    "extension_request_cancelled": false,
                 }),
                 format!(
-                    "Mihomo ready; Mixed :{}; extension {}; DNS {}{}",
+                    "Mihomo ready; Mixed :{}; extension {}; DNS {}",
                     runtime
                         .as_ref()
                         .map(|identity| identity.mixed_port)
                         .unwrap_or(strategy.mixed_port),
                     extension.phase_label(),
                     extension.dns_label(),
-                    if cancelled {
-                        "; pending enable cancelled; open the signed .app to enable System Extension"
-                    } else {
-                        ""
-                    }
                 ),
             );
-            extension_outcome(&extension, cancelled)?;
+            host_control::check_outcome(&snapshot)?;
         }
         Commands::Disconnect => {
-            let strategy = Strategy::load().unwrap_or_default();
-            let supervisor = adopted_supervisor(&strategy);
-            supervisor.disconnect()?;
-            let (extension, cancelled) = settle_extension()?;
-            let complete = extension.observed
-                && matches!(
-                    extension.phase,
-                    Phase::Disabled | Phase::Unsupported | Phase::Unbundled
-                );
+            let snapshot = host_control::request(Request::Disconnect)?;
+            let extension = &snapshot.extension;
+            let complete = network_extension::capture_released_for_core_stop(extension);
             emit(
                 json,
                 serde_json::json!({
                     "status": if complete { "disconnected" } else { "core_stopped" },
                     "extension_runtime": extension,
-                    "extension_request_cancelled": cancelled,
+                    "extension_request_cancelled": false,
                 }),
                 format!(
                     "Mihomo stopped; extension {}; DNS {}",
@@ -623,10 +605,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Subscription { cmd } => match cmd {
             SubCmd::Refresh => {
-                let strategy = Strategy::load()?;
-                let supervisor = adopted_supervisor(&strategy);
-                let catalog = supervisor.apply(&strategy)?;
-                report_applied(json, &supervisor, &catalog)?;
+                report_applied(json, host_control::request(Request::Apply { refresh: true })?)?;
             }
             SubCmd::List => {
                 let subscriptions: Vec<_> = Strategy::load()?
@@ -981,78 +960,44 @@ fn adopted_supervisor(strategy: &Strategy) -> std::sync::Arc<Supervisor> {
     supervisor
 }
 
-fn settle_extension() -> Result<(RuntimeStatus, bool)> {
-    let status = network_extension::wait_for_settle(Duration::from_secs(30));
-    if status.is_pending() || status.phase == Phase::WaitingApproval {
-        let enabling = matches!(status.phase, Phase::Requesting | Phase::WaitingApproval);
-        let cancelled = network_extension::cancel_pending_for_cli()?;
-        Ok((network_extension::status(), enabling && cancelled))
-    } else {
-        Ok((status, false))
-    }
-}
-
-fn extension_outcome(status: &RuntimeStatus, cancelled: bool) -> Result<()> {
-    if !status.observed {
-        bail!("Mihomo operation completed, but System Extension/DNS status is not confirmed");
-    }
-    if cancelled || status.phase == Phase::RequiresReboot {
-        bail!(
-            "Mihomo is ready, but System Extension is not active; finish setup in the signed .app"
-        );
-    }
-    if status.phase == Phase::Failed || status.dns_phase == DnsPhase::Failed {
-        bail!(
-            "Mihomo is ready, but System Extension/DNS failed: {}",
-            status
-                .message
-                .as_deref()
-                .or(status.dns_message.as_deref())
-                .unwrap_or("see extension_runtime")
-        );
-    }
-    Ok(())
-}
-
-fn report_applied(json: bool, supervisor: &Supervisor, catalog: &catalog::Catalog) -> Result<()> {
-    let (extension, cancelled) = settle_extension()?;
-    let running = supervisor.runtime_identity().is_some();
+fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
+    let catalog = snapshot
+        .catalog
+        .as_ref()
+        .context("Host omitted the applied catalog")?;
+    let extension = &snapshot.extension;
+    let running = snapshot.runtime.is_some();
     emit(
         json,
         serde_json::json!({
             "status": if running { "core_applied" } else { "prepared" },
-            "nodes": catalog.nodes.len(),
-            "excluded": catalog.excluded.len(),
-            "filter_excluded": catalog.filter_excluded_count(),
-            "fetch_failures": catalog.fetch_failure_count(),
-            "refresh_warnings": catalog.refresh_warnings(),
+            "nodes": catalog.nodes,
+            "excluded": catalog.excluded,
+            "filter_excluded": catalog.filter_excluded,
+            "fetch_failures": catalog.fetch_failures,
+            "refresh_warnings": catalog.refresh_warnings,
             "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
-            "extension_runtime": extension, "extension_request_cancelled": cancelled,
+            "extension_runtime": extension, "extension_request_cancelled": false,
         }),
         format!(
-            "{}: {} nodes, {} excluded; extension {}; DNS {}{}",
+            "{}: {} nodes, {} excluded; extension {}; DNS {}",
             if running {
                 "core applied"
             } else {
                 "prepared; core disconnected"
             },
-            catalog.nodes.len(),
-            catalog.excluded.len(),
+            catalog.nodes,
+            catalog.excluded,
             extension.phase_label(),
             extension.dns_label(),
-            if cancelled {
-                "; pending enable cancelled; complete setup in the signed .app"
-            } else {
-                ""
-            }
         ),
     );
     if !json {
-        for warning in catalog.refresh_warnings() {
+        for warning in &catalog.refresh_warnings {
             println!("{warning}");
         }
     }
-    extension_outcome(&extension, cancelled)
+    host_control::check_outcome(&snapshot)
 }
 
 fn emit(json: bool, value: serde_json::Value, human: impl std::fmt::Display) {

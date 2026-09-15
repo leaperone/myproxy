@@ -3,6 +3,7 @@ pub mod cli_install;
 pub mod compile;
 pub mod gfw;
 pub mod controller;
+pub mod host_control;
 pub mod instance;
 pub mod log;
 pub mod login_item;

@@ -26,6 +26,15 @@ const FAIL_BEFORE_RETRY: u32 = 3;
 const RECOVER_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_RECOVERIES: u32 = 5;
 
+#[derive(Debug)]
+struct CaptureStopUnconfirmed;
+
+impl std::fmt::Display for CaptureStopUnconfirmed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("系统接管未关闭，已保留核心以免系统 DNS 被劫持后断网")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreHealth {
     pub wanted: bool,
@@ -481,6 +490,7 @@ impl Supervisor {
         }
         candidate.generation = next_generation(previous.as_ref().map_or(0, |old| old.generation));
         paths::atomic_write(&paths::runtime_yaml_path()?, candidate.yaml.as_bytes())?;
+        let mut core_changed = false;
         let result = (|| -> Result<()> {
             let health = if should_run {
                 let reconnect = previous.as_ref().map_or(true, |old| {
@@ -495,8 +505,10 @@ impl Supervisor {
                 });
                 if reconnect {
                     self.disconnect_inner(None)?;
+                    core_changed = true;
                     Some(self.start_runtime(&mut candidate)?)
                 } else {
+                    core_changed = true;
                     controller::reload(candidate.strategy.mixed_port)?;
                     Some(self.finish_runtime(&mut candidate)?)
                 }
@@ -525,6 +537,18 @@ impl Supervisor {
             Ok(())
         })();
         if let Err(error) = result {
+            // A failed DNS/capture stop has not replaced the running core.
+            // Restore the file without immediately retrying the same stop in
+            // rollback; its system preference request may still be pending.
+            if !core_changed {
+                match previous_yaml {
+                    Some(bytes) => paths::atomic_write(&paths::runtime_yaml_path()?, &bytes)?,
+                    None => {
+                        let _ = fs::remove_file(paths::runtime_yaml_path()?);
+                    }
+                }
+                return Err(error).context("新配置未应用；核心未替换，请检查系统接管和 DNS 状态");
+            }
             // Restore exactly what was applied, never the newly saved draft or
             // the refresh cache, which may already contain different nodes.
             let rollback = (|| -> Result<()> {
@@ -554,9 +578,8 @@ impl Supervisor {
             })();
             return match rollback {
                 Ok(()) => Err(error).context("新配置未应用；已保留上次有效配置"),
-                Err(rollback) => {
-                    Err(error).context(format!("新配置未应用，回退也失败：{rollback:#}"))
-                }
+                Err(rollback) => Err(rollback)
+                    .context(format!("新配置未应用，回退也失败；原始错误：{error:#}")),
             };
         }
         Ok(())
@@ -709,7 +732,7 @@ impl Supervisor {
         }
         crate::network_extension::disable_async()
             .and_then(|()| crate::network_extension::wait_disabled(Duration::from_secs(30)))
-            .context("系统接管未关闭，已保留核心以免系统 DNS 被劫持后断网")?;
+            .context(CaptureStopUnconfirmed)?;
         let port = mixed_port
             .or(*self.running_mixed_port.lock().expect("supervisor lock"))
             .or_else(|| {
@@ -984,7 +1007,13 @@ impl Supervisor {
     }
 
     fn finish_cancelled<T>(&self, result: Result<T>) -> Result<T> {
-        if !is_wanted() {
+        // Preserve cancellation cleanup if disconnect timed out acquiring our
+        // lock, but do not repeat a stop whose completion is still unconfirmed.
+        let stop_unconfirmed = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.downcast_ref::<CaptureStopUnconfirmed>().is_some());
+        if !stop_unconfirmed && !is_wanted() && self.is_running() {
             if let Err(cleanup) = self.disconnect_inner(None) {
                 return match result {
                     Ok(_) => Err(cleanup).context("断开核心失败"),
