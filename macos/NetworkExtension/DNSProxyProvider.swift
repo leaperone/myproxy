@@ -350,7 +350,9 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
-        guard let tcpFlow = flow as? NEAppProxyTCPFlow else { return true }
+        // UDP arrives through `handleNewUDPFlow` / `__handleNewUDPFlow` with
+        // the remote endpoint. Claiming it here swallows the query.
+        guard let tcpFlow = flow as? NEAppProxyTCPFlow else { return false }
         let runtimeState = runtimeDataPlaneSnapshot()
         guard runtimeState.proxy != nil,
               let destination = DNSProxyEndpointCompatibility.tcpDestination(tcpFlow)
