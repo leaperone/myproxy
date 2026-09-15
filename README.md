@@ -105,6 +105,10 @@ application support directory.
   until capture and DNS are down before stopping Mihomo. If NEDNSProxy cannot be
   disabled, the core is kept so system resolution is not blackholed. When the
   private SOCKS backend is down, the DNS provider relays queries directly.
+- macOS hands the DNS provider the queried name as the flow endpoint, not the
+  resolver address, so the provider answers those queries through the resolver list
+  the strategy already uses (`dns.nameserver`). DNS readiness reported in the app
+  proves the private SOCKS relay is reachable, not that every lookup resolves.
 
 Source checks and builds do not verify macOS approval, DNS forwarding, or actual
 traffic. Those require acceptance on the signed installed application.

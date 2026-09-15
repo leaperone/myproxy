@@ -28,6 +28,8 @@ pub struct EnableRequest {
     #[serde(default)]
     pub gfw_ports: Vec<GroupPort>,
     #[serde(default)]
+    pub dns_resolvers: Vec<String>,
+    #[serde(default)]
     pub capture_private_networks: bool,
 }
 
@@ -522,6 +524,10 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         gfw_domains: Vec::new(),
         group_ports,
         gfw_ports,
+        dns_resolvers: compile::DNS_NAMESERVERS
+            .iter()
+            .map(|resolver| (*resolver).to_string())
+            .collect(),
         capture_private_networks: strategy.lan_capture,
     })
 }
@@ -912,6 +918,20 @@ mod tests {
         strategy.lan_capture = true;
         let plan = inbound_plan(&strategy);
         assert!(plan.capture_private_networks);
+    }
+
+    #[test]
+    fn enable_request_carries_the_configured_dns_resolvers() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        let plan = inbound_plan(&strategy);
+        assert_eq!(
+            plan.dns_resolvers,
+            compile::DNS_NAMESERVERS
+                .iter()
+                .map(|resolver| resolver.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
