@@ -94,7 +94,7 @@ private final class HostSideEffectLock: @unchecked Sendable {
         }
         do {
             let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(10))
+            let deadline = clock.now.advanced(by: .seconds(45))
             while true {
                 try intent.check()
                 if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
@@ -271,26 +271,40 @@ private final class HostOperations: @unchecked Sendable {
         HostRuntime.shared.invalidate(operation: latestRevision)
     }
 
-    /// Wait for a cancelled predecessor, but do not inherit its leaked hang.
+    /// Wait for a cancelled predecessor, but do not inherit its hang.
+    /// `TaskGroup.cancelAll` cannot interrupt `await previous.value`, so this
+    /// uses a once-resolve race: predecessor completion or the supersede
+    /// deadline, whichever finishes first.
     private static func awaitSuperseded(_ previous: Task<Void, Never>?) async {
         guard let previous else { return }
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                await previous.value
-                return true
+        let reply = OnceReply<Void>()
+        do {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                reply.attach(continuation)
+                Task {
+                    await previous.value
+                    reply.finish(.success(()))
+                }
+                let parts = OnceReplyTimeout.supersededOperation.components
+                let seconds = TimeInterval(parts.seconds)
+                    + TimeInterval(parts.attoseconds) / 1_000_000_000_000_000_000
+                DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+                    reply.finish(
+                        .failure(
+                            NetworkExtensionControlFailure(
+                                operation: .configureTransparentProxy,
+                                message: "superseded host operation deadline"
+                            )
+                        )
+                    )
+                }
             }
-            group.addTask {
-                try? await Task.sleep(for: OnceReplyTimeout.supersededOperation)
-                return false
-            }
-            let finished = await group.next() ?? false
-            group.cancelAll()
-            if !finished {
-                AppLog.warn(
-                    "ne-host",
-                    "superseded host operation still running after cancel; continuing"
-                )
-            }
+        } catch {
+            AppLog.warn(
+                "ne-host",
+                "superseded host operation still running after cancel; continuing"
+            )
         }
     }
 }
