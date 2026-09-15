@@ -358,7 +358,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             reject(flow, category: .flowConversionFailed)
             return true
         }
-        let relayTarget = relayDestination(for: destination)
+        let relayTarget = relayDestination(
+            for: destination,
+            resolvers: runtimeState.upstreamResolvers
+        )
         let identifier = UUID()
         runtimeState.reporter?.beginFlow(identifier, transportProtocol: .tcp)
         let reporter = runtimeState.reporter
@@ -633,7 +636,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             destination: initialDestination,
             proxy: initialProxy,
             route: initialRoute,
-            parentIdentifier: parentIdentifier
+            parentIdentifier: parentIdentifier,
+            resolvers: runtimeState.upstreamResolvers
         )
         let reporter = runtimeState.reporter
         let started = udpSessions.start(
@@ -660,7 +664,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                     destination: destination,
                     proxy: self.proxy(for: route, in: currentState.proxyCatalog),
                     route: route,
-                    parentIdentifier: parentIdentifier
+                    parentIdentifier: parentIdentifier,
+                    resolvers: currentState.upstreamResolvers
                 )
             },
             revisionProvider: { initialPlan.activity.configurationRevision },
@@ -690,7 +695,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         destination: SOCKS5Endpoint,
         proxy: ProviderSOCKSConfiguration?,
         route: DNSRelayRoute,
-        parentIdentifier: UUID
+        parentIdentifier: UUID,
+        resolvers: [SOCKS5Endpoint]
     ) -> UDPFlowInterceptionPlan {
         let bypassMihomo = route.bypassesMihomo
         let mihomoRoute: MihomoRoute = {
@@ -733,8 +739,14 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         return UDPFlowInterceptionPlan(
             decision: decision,
             initialDestination: destination,
-            mihomoDestination: relayDestination(for: destination),
-            directDestination: relayDestination(for: destination),
+            mihomoDestination: relayDestination(
+                for: destination,
+                resolvers: resolvers
+            ),
+            directDestination: relayDestination(
+                for: destination,
+                resolvers: resolvers
+            ),
             proxy: proxy,
             unavailableFallback: .direct,
             activity: activity,
@@ -747,10 +759,13 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     /// reach. Those flows are answered through the configured upstream
     /// resolvers; the original endpoint stays the conversation key and the
     /// endpoint the app receives its reply from.
-    private func relayDestination(for destination: SOCKS5Endpoint) -> SOCKS5Endpoint {
+    private func relayDestination(
+        for destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint]
+    ) -> SOCKS5Endpoint {
         guard destination.address.domain != nil,
               destination.port == DNSProxyUpstreamResolver.defaultPort,
-              let resolver = upstreamResolvers.first
+              let resolver = resolvers.first
         else { return destination }
         return resolver
     }
@@ -830,10 +845,11 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     private func runtimeDataPlaneSnapshot() -> (
         reporter: DNSProxyRuntimeReporter?,
         proxy: ProviderSOCKSConfiguration?,
-        proxyCatalog: [MihomoRoute: ProviderSOCKSConfiguration]
+        proxyCatalog: [MihomoRoute: ProviderSOCKSConfiguration],
+        upstreamResolvers: [SOCKS5Endpoint]
     ) {
         backendProbeLock.lock()
-        let snapshot = (reporter, proxy, proxyCatalog)
+        let snapshot = (reporter, proxy, proxyCatalog, upstreamResolvers)
         backendProbeLock.unlock()
         return snapshot
     }
