@@ -34,6 +34,14 @@ const DEFAULT_DIRECT_RULES: &[&str] = &[
 
 pub const DNS_LISTEN_PORT: u16 = 1053;
 
+/// Resolvers Mihomo uses for system lookups.
+///
+/// macOS hands the Network Extension DNS provider the *queried name* as the
+/// flow endpoint instead of the resolver address, so the provider cannot dial
+/// the endpoint it sees. It relays those queries to this list instead, which
+/// keeps system answers on the same resolvers as the core.
+pub const DNS_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
+
 /// Health-check URL for fallback / url-test groups.
 const AUTO_GROUP_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// Seconds between member probes. 300 left a dead `now` selected for minutes.
@@ -439,7 +447,7 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
         "default-nameserver".into(),
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
     );
-    dns.insert("nameserver".into(), yaml_strings(&["1.1.1.1", "8.8.8.8"]));
+    dns.insert("nameserver".into(), yaml_strings(&DNS_NAMESERVERS));
     dns.insert(
         "proxy-server-nameserver".into(),
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
@@ -931,6 +939,30 @@ mod tests {
         );
         assert!(!dns.contains_key("dns-hijack"));
         assert!(!root.contains_key("tun"));
+    }
+
+    #[test]
+    fn dns_engine_nameservers_match_the_provider_fallback_list() {
+        let mut root = serde_yaml::Mapping::new();
+        insert_dns(&mut root, false);
+
+        let nameservers = root
+            .get("dns")
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|dns| dns.get("nameserver"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("nameserver list")
+            .iter()
+            .map(|value| value.as_str().expect("nameserver entry").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nameservers,
+            DNS_NAMESERVERS
+                .iter()
+                .map(|resolver| resolver.to_string())
+                .collect::<Vec<_>>(),
+            "the Network Extension relays system DNS to these resolvers, so the lists must agree"
+        );
     }
 
     #[test]

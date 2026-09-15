@@ -95,6 +95,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     private var reporter: DNSProxyRuntimeReporter?
     private var proxy: ProviderSOCKSConfiguration?
     private var proxyCatalog: [MihomoRoute: ProviderSOCKSConfiguration] = [:]
+    private var upstreamResolvers: [SOCKS5Endpoint] = []
     private let backendProbeQueue = DispatchQueue(
         label: "local.harry.myproxy.dns-backend-probe"
     )
@@ -179,6 +180,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             self.reporter = reporter
             self.proxy = dataPlane.proxy
             self.proxyCatalog = dataPlane.proxyCatalog
+            self.upstreamResolvers = dataPlane.upstreamResolvers
             consecutiveBackendProbeFailures = 0
             activeBackendProbe = probe
             pendingStartCompletion = startCompletion
@@ -190,7 +192,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             }
             backendProbeLock.unlock()
             dnsProxyProviderLogger.notice(
-                "Accepted DNS bootstrap revision=\(bootstrap.revision, privacy: .public) schema=\(bootstrap.schemaVersion, privacy: .public) source=\(deliveredBootstrap == nil ? "provider-registry" : "provider-options", privacy: .public) payloadBytes=\(deliveredPayload?.count ?? 0, privacy: .public)"
+                "Accepted DNS bootstrap revision=\(bootstrap.revision, privacy: .public) schema=\(bootstrap.schemaVersion, privacy: .public) source=\(deliveredBootstrap == nil ? "provider-registry" : "provider-options", privacy: .public) resolvers=\(dataPlane.upstreamResolvers.count, privacy: .public) payloadBytes=\(deliveredPayload?.count ?? 0, privacy: .public)"
             )
             startBackendStartupProbe(
                 probe,
@@ -236,6 +238,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                 self.reporter = nil
                 self.proxy = nil
                 self.proxyCatalog = [:]
+                self.upstreamResolvers = []
                 self.backendProbingSuspended = true
                 self.backendProbeGeneration &+= 1
                 let runtime = self.runtime
@@ -262,6 +265,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                 self.reporter = nil
                 self.proxy = nil
                 self.proxyCatalog = [:]
+                self.upstreamResolvers = []
                 self.backendProbingSuspended = true
                 self.backendProbeGeneration &+= 1
                 let runtime = self.runtime
@@ -325,6 +329,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         self.liveUpdaterToken = nil
         proxy = nil
         proxyCatalog = [:]
+        upstreamResolvers = []
         flowDecisionCoordinator.quiesce()
         if let liveUpdaterToken {
             DNSProxyRuntimeRegistry.shared.unregisterLiveUpdater(liveUpdaterToken)
@@ -353,6 +358,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             reject(flow, category: .flowConversionFailed)
             return true
         }
+        let relayTarget = relayDestination(for: destination)
         let identifier = UUID()
         runtimeState.reporter?.beginFlow(identifier, transportProtocol: .tcp)
         let reporter = runtimeState.reporter
@@ -382,7 +388,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             // otherwise recursive DNS→SOCKS→DNS loop.
             tcpRelays.startDirect(
                 flow: tcpFlow,
-                destination: destination,
+                destination: relayTarget,
                 relayNote: directRelayNote(for: route),
                 activityObserver: observer
             )
@@ -395,7 +401,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             tcpRelays.startMihomo(
                 flow: tcpFlow,
                 proxy: proxy,
-                destination: destination,
+                destination: relayTarget,
+                directFallbackDestination: relayTarget,
                 unavailableFallback: .direct,
                 activityObserver: observer
             )
@@ -726,12 +733,26 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         return UDPFlowInterceptionPlan(
             decision: decision,
             initialDestination: destination,
-            mihomoDestination: destination,
+            mihomoDestination: relayDestination(for: destination),
+            directDestination: relayDestination(for: destination),
             proxy: proxy,
             unavailableFallback: .direct,
             activity: activity,
             parentFlowIdentifier: parentIdentifier
         )
+    }
+
+    /// macOS reports the *queried name* as the endpoint of system-resolver DNS
+    /// flows, so the endpoint the provider sees is not the resolver it must
+    /// reach. Those flows are answered through the configured upstream
+    /// resolvers; the original endpoint stays the conversation key and the
+    /// endpoint the app receives its reply from.
+    private func relayDestination(for destination: SOCKS5Endpoint) -> SOCKS5Endpoint {
+        guard destination.address.domain != nil,
+              destination.port == DNSProxyUpstreamResolver.defaultPort,
+              let resolver = upstreamResolvers.first
+        else { return destination }
+        return resolver
     }
 
     private func directRelayNote(for route: DNSRelayRoute) -> String {
@@ -863,6 +884,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         reporter = newReporter
         proxy = dataPlane.proxy
         proxyCatalog = dataPlane.proxyCatalog
+        upstreamResolvers = dataPlane.upstreamResolvers
         runtime.replace(
             revision: bootstrap.revision,
             captureEnabled: true,
@@ -887,6 +909,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         let proxy: ProviderSOCKSConfiguration
         let proxyCatalog: [MihomoRoute: ProviderSOCKSConfiguration]
         let routingConfiguration: [String: Any]
+        let upstreamResolvers: [SOCKS5Endpoint]
     }
 
     private static func dataPlaneConfiguration(
@@ -919,7 +942,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         return DataPlaneConfiguration(
             proxy: proxy,
             proxyCatalog: proxyCatalog,
-            routingConfiguration: routingConfiguration
+            routingConfiguration: routingConfiguration,
+            upstreamResolvers: (bootstrap.upstreamResolvers ?? []).compactMap(
+                DNSProxyUpstreamResolver.endpoint(for:)
+            )
         )
     }
 

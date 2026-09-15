@@ -31,6 +31,8 @@ private struct HostEnableRequest: Decodable, Sendable {
     let gfwDomains: [String]
     let groupPorts: [GroupPort]
     let gfwPorts: [GroupPort]
+    /// Upstream resolvers for system lookups macOS reports as a name endpoint.
+    let dnsResolvers: [String]?
     let capturePrivateNetworks: Bool?
 }
 
@@ -563,6 +565,21 @@ private extension HostController {
     }
 }
 
+/// Resolvers the DNS provider may relay name-endpoint queries to. Entries the
+/// provider cannot dial as a plain address (a hostname or a DoH URL) are
+/// dropped rather than failing activation, because they never reach a resolver.
+private func usableResolvers(from specs: [String]?) -> [String]? {
+    guard let specs else { return nil }
+    let usable = specs.filter(DNSProxyUpstreamResolver.isValid)
+    if usable.count != specs.count {
+        AppLog.warn(
+            "ne-host",
+            "dns resolvers dropped=\(specs.count - usable.count) because they are not plain addresses"
+        )
+    }
+    return usable
+}
+
 private func preservesRouteEndpoints(
     _ previous: [MihomoRouteProxyEndpoint],
     _ next: [MihomoRouteProxyEndpoint]
@@ -596,6 +613,7 @@ private func providerConfigurations(
         activationIdentifier: activationIdentifier,
         profileRulesProxy: endpoints[0],
         routeProxyEndpoints: endpoints,
+        upstreamResolvers: usableResolvers(from: request.dnsResolvers),
         encodedCaptureSnapshot: encodedSnapshot
     ).encoded()
     let transparent: [String: NSObject] = [

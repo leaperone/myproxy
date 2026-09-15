@@ -728,6 +728,10 @@ struct UDPFlowInterceptionPlan: Sendable {
     let initialDestination: SOCKS5Endpoint?
     /// Hostname-preserving SOCKS target used only for Mihomo relay.
     let mihomoDestination: SOCKS5Endpoint?
+    /// Target a Direct or unavailable-fallback relay dials when it differs from
+    /// the original endpoint. The DNS provider sets this when macOS reports the
+    /// queried name instead of the resolver the flow actually addresses.
+    let directDestination: SOCKS5Endpoint?
     let proxy: ProviderSOCKSConfiguration?
     let unavailableFallback: UnavailableFallback
     let activity: AppRoutingActivity
@@ -737,6 +741,7 @@ struct UDPFlowInterceptionPlan: Sendable {
         decision: FlowTrafficDecision,
         initialDestination: SOCKS5Endpoint?,
         mihomoDestination: SOCKS5Endpoint?,
+        directDestination: SOCKS5Endpoint? = nil,
         proxy: ProviderSOCKSConfiguration?,
         unavailableFallback: UnavailableFallback,
         activity: AppRoutingActivity,
@@ -745,6 +750,7 @@ struct UDPFlowInterceptionPlan: Sendable {
         self.decision = decision
         self.initialDestination = initialDestination
         self.mihomoDestination = mihomoDestination
+        self.directDestination = directDestination
         self.proxy = proxy
         self.unavailableFallback = unavailableFallback
         self.activity = activity

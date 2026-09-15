@@ -378,7 +378,7 @@ final class UDPFlowSession: @unchecked Sendable {
             queue: queue,
             flow: flow,
             activityIdentifier: record.plan.activity.flowIdentifier,
-            endpoint: record.key.destination,
+            endpoint: record.plan.directDestination ?? record.key.destination,
             note: note,
             observer: observerFactory(record.plan.activity.flowIdentifier),
             ready: conversationReady,
