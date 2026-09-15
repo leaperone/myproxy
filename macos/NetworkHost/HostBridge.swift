@@ -85,7 +85,9 @@ private final class HostSideEffectLock: @unchecked Sendable {
     private init(descriptor: Int32) { self.descriptor = descriptor }
 
     static func acquire(for intent: HostSharedIntent) async throws -> HostSideEffectLock {
-        let path = try HostSharedIntent.stateURL("network-extension-operation.lock").path
+        // A process stuck in `myproxy_ne_wait` can remain UE-exiting and keep
+        // the old flock forever. A new file lets a recovered host proceed.
+        let path = try HostSharedIntent.stateURL("network-extension-side-effects.lock").path
         let descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else {
             throw NetworkExtensionControlFailure(
@@ -1046,12 +1048,11 @@ public func myproxy_ne_status() -> UnsafeMutablePointer<CChar>? {
     return duplicateString(json)
 }
 
-/// CLI waits service the native run loop so preference/authorization callbacks
-/// can complete before the command exits. GUI reads use myproxy_ne_status only.
+/// Residual FFI wait used by older callers. One source or the deadline, never
+/// `run(until:)`, which can sit inside a blocked NE XPC source and starve the
+/// Rust disable deadline. Host status polling no longer calls this.
 @_cdecl("myproxy_ne_wait")
 public func myproxy_ne_wait(_ milliseconds: UInt32) {
-    let deadline = Date().addingTimeInterval(Double(min(milliseconds, 100)) / 1000)
-    RunLoop.current.run(until: deadline)
-    let remaining = deadline.timeIntervalSinceNow
-    if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+    let timeout = TimeInterval(min(max(milliseconds, 1), 100)) / 1000
+    _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(timeout))
 }

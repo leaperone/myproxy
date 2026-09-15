@@ -284,16 +284,14 @@ pub fn wait_for_settle(timeout: Duration) -> RuntimeStatus {
         if (!status.is_pending() && status.observed) || Instant::now() >= deadline {
             return status;
         }
-        wait_for_callbacks();
+        wait_poll_interval();
     }
 }
 
-fn wait_for_callbacks() {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        ffi::myproxy_ne_wait(100)
-    };
-    #[cfg(not(target_os = "macos"))]
+/// Deadline loops must not pump the process run loop. `RunLoop.run(until:)`
+/// can sit inside a blocked Network Extension source and never return, which
+/// is how a 30s `wait_disabled` became a multi-hour apply.
+fn wait_poll_interval() {
     std::thread::sleep(Duration::from_millis(100));
 }
 
@@ -328,7 +326,7 @@ pub fn wait_disabled(timeout: Duration) -> Result<()> {
                 current.dns_phase.label()
             );
         }
-        wait_for_callbacks();
+        wait_poll_interval();
     }
 }
 
@@ -731,6 +729,7 @@ mod ffi {
         pub fn myproxy_ne_disable(operation_revision: u64, error_out: *mut *mut c_char) -> i32;
         pub fn myproxy_ne_status() -> *mut c_char;
         pub fn myproxy_ne_activity_batch(cursor: u64, limit: u32) -> *mut c_char;
+        #[allow(dead_code)]
         pub fn myproxy_ne_wait(milliseconds: u32);
         pub fn myproxy_ne_free_string(value: *mut c_char);
     }

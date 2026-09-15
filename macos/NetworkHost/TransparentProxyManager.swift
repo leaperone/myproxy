@@ -204,13 +204,42 @@ actor AppleTransparentProxyManager {
             break
         default:
             manager.connection.stopVPNTunnel()
-            try await waitForConnection(manager.connection, target: .disconnected)
+            do {
+                try await waitForConnection(manager.connection, target: .disconnected)
+            } catch let failure as NetworkExtensionControlFailure {
+                // A session wedged in disconnecting survives stopVPNTunnel, and
+                // every later enable() starts with this stop. Drop the saved
+                // configuration instead of failing the whole enable.
+                AppLog.warn(
+                    "ne-host",
+                    "transparent proxy did not stop (\(failure.message)); dropping the configuration"
+                )
+                try await reset(manager)
+                return
+            }
         }
         try Task.checkCancellation()
         try await load(manager)
         try Task.checkCancellation()
         manager.isEnabled = false
         try await save(manager)
+    }
+
+    /// Delete a configuration whose session cannot be driven down, so the next
+    /// `configure` builds a new manager from preferences instead of reusing the
+    /// wedged one.
+    private func reset(_ manager: NETransparentProxyManager) async throws {
+        try await remove(manager)
+        self.manager = nil
+    }
+
+    private func remove(_ manager: NETransparentProxyManager) async throws {
+        try await awaitPreferenceCallback(
+            operation: .stopTransparentProxy,
+            api: "removeFromPreferences"
+        ) { completion in
+            manager.removeFromPreferences(completionHandler: completion)
+        }
     }
 
     private func reload() async throws {
