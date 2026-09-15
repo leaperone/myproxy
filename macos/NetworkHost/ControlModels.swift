@@ -36,7 +36,17 @@ struct NetworkExtensionControlFailure: Error, Sendable, LocalizedError {
         self.init(operation: operation, message: message)
     }
 
+    static let emptyProviderResponseMessage = "Provider returned an empty control response"
+
+    var isEmptyProviderResponse: Bool {
+        message == Self.emptyProviderResponseMessage
+    }
+
     var errorDescription: String? { "\(operation.rawValue): \(message)" }
+}
+
+func isEmptyProviderResponse(_ error: Error) -> Bool {
+    (error as? NetworkExtensionControlFailure)?.isEmptyProviderResponse == true
 }
 
 enum SystemExtensionRequestProgress: Equatable, Sendable {

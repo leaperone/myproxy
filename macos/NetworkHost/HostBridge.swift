@@ -376,7 +376,19 @@ private actor HostController {
             try intent.check()
             try await transparentProxy.configure(configurations.transparent)
             try intent.check()
-            try await transparentProxy.start()
+            do {
+                try await transparentProxy.start()
+            } catch {
+                guard isEmptyProviderResponse(error) else { throw error }
+                try intent.check()
+                AppLog.warn(
+                    "ne-host",
+                    "rebuilding transparent proxy after an empty control channel"
+                )
+                try await transparentProxy.configure(configurations.transparent)
+                try intent.check()
+                try await transparentProxy.start()
+            }
             try intent.check()
         }
         lastEndpoints = endpoints

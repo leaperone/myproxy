@@ -52,6 +52,18 @@ actor AppleTransparentProxyManager {
             )
         }
         try await waitForConnection(manager.connection, target: .connected)
+        do {
+            try await proveControlChannel()
+        } catch {
+            if isEmptyProviderResponse(error) {
+                AppLog.warn(
+                    "ne-host",
+                    "transparent proxy connected but the control channel is empty; dropping the configuration"
+                )
+                try await reset(manager)
+            }
+            throw error
+        }
     }
 
     func isConnected() async -> Bool {
@@ -157,6 +169,16 @@ actor AppleTransparentProxyManager {
                 message: response.message ?? "Transparent provider refused DNS preparation"
             )
         }
+    }
+
+    private func proveControlChannel() async throws {
+        _ = try await send(HostProviderControlRequest(
+            command: "status", revision: nil, activationIdentifier: nil,
+            dnsProxyBootstrap: nil, captureEnabled: nil, failOpen: nil,
+            captureConfigurationSnapshot: nil, mihomoRouteProxyCatalog: nil,
+            mihomoSOCKSHost: nil, mihomoSOCKSPort: nil,
+            mihomoSOCKSUsername: nil, mihomoSOCKSPassword: nil
+        ))
     }
 
     func runtimeStatus() async throws -> HostProviderControlResponse {
@@ -370,7 +392,8 @@ actor AppleTransparentProxyManager {
                             .failure(
                                 NetworkExtensionControlFailure(
                                     operation: .configureTransparentProxy,
-                                    message: "Provider returned an empty control response"
+                                    message: NetworkExtensionControlFailure
+                                        .emptyProviderResponseMessage
                                 )
                             )
                         )
