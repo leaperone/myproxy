@@ -51,6 +51,8 @@ The app's **设置 → 命令行工具** panel can create or update that link la
 
 All commands accept `--json` for one machine-readable success result on stdout. Runtime errors return a JSON `error` on stderr and a non-zero exit. The official [Agent CLI skill](.agents/skills/agent/SKILL.md) explains how to inspect and configure myproxy.
 
+On macOS, the bundled CLI sends `apply`, `subscription refresh`, `connect`, `disconnect`, and runtime status queries to the signed application. Commands that change runtime state open that same app in the background if needed, without triggering its launch-time connection setting. `status` does not launch the app; if the Host is unavailable, System Extension and DNS are reported as unobserved. Pending authorization stays with the application after the CLI exits. If a command loses its reply, check `status` before retrying.
+
 ```sh
 myproxyctl --json capabilities
 myproxyctl --json status

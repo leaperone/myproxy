@@ -18,6 +18,7 @@ use ui::AppView;
 gpui_kit::actions!(app, [About, CheckForUpdates, Quit]);
 
 fn main() {
+    let host_control_launch = std::env::args().any(|arg| arg == "--host-control");
     myproxy::log::init();
     let _instance_guard = match myproxy::instance::InstanceGuard::acquire() {
         Ok(Some(guard)) => guard,
@@ -56,7 +57,7 @@ fn main() {
         strategy.mixed_port,
     );
     Supervisor::shared().sync_wanted_on_launch();
-    let show_window = !lite && !strategy.silent_launch;
+    let show_window = !host_control_launch && !lite && !strategy.silent_launch;
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.on_reopen(show_main_window);
     app.run(move |cx| {
@@ -72,7 +73,10 @@ fn main() {
         }
         sparkle::set_channel(strategy.update_channel.unwrap_or_default());
         sparkle::init();
-        if strategy.connect_on_launch {
+        if let Err(err) = myproxy::host_control::start() {
+            myproxy::log::error("host-control", format!("start failed: {err:#}"));
+        }
+        if strategy.connect_on_launch && !host_control_launch {
             let strategy = strategy.clone();
             cx.background_executor()
                 .spawn(async move {
