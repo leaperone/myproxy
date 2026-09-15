@@ -133,7 +133,8 @@ fn execute(request: Request) -> Result<Snapshot> {
     snapshot.catalog = catalog;
     if !matches!(request, Request::Status)
         && (snapshot.operation.is_busy()
-            || (matches!(request, Request::Connect) && snapshot.runtime.is_none()))
+            || (matches!(request, Request::Connect) && snapshot.runtime.is_none())
+            || (matches!(request, Request::Disconnect) && snapshot.runtime.is_some()))
     {
         bail!("Runtime changed during the command; check status before retrying");
     }
