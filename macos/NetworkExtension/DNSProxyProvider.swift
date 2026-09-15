@@ -959,9 +959,9 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             proxy: proxy,
             proxyCatalog: proxyCatalog,
             routingConfiguration: routingConfiguration,
-            upstreamResolvers: (bootstrap.upstreamResolvers ?? []).compactMap(
-                DNSProxyUpstreamResolver.endpoint(for:)
-            )
+            upstreamResolvers: DNSProxyUpstreamResolver.resolved(
+                bootstrap.upstreamResolvers
+            ).compactMap(DNSProxyUpstreamResolver.endpoint(for:))
         )
     }
 

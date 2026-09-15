@@ -157,9 +157,20 @@ extension DNSProxyBootstrapConfigurationError: LocalizedError {
 /// One upstream resolver the DNS provider relays name-endpoint queries to.
 public enum DNSProxyUpstreamResolver {
     public static let defaultPort: UInt16 = 53
+    /// Same addresses as `compile::DNS_NAMESERVERS`. Used when a schema 1/2
+    /// bootstrap or an empty host list would otherwise leave name-endpoint
+    /// flows pointing at the queried hostname.
+    public static let defaults = ["1.1.1.1", "8.8.8.8"]
 
     public static func isValid(_ spec: String) -> Bool {
         endpoint(for: spec) != nil
+    }
+
+    /// Address specs the provider can dial. An empty or hostname-only list
+    /// becomes `defaults` so a name-endpoint flow always has a resolver.
+    public static func resolved(_ specs: [String]?) -> [String] {
+        let usable = (specs ?? []).filter(isValid)
+        return usable.isEmpty ? Array(defaults) : usable
     }
 
     /// Parses `1.1.1.1`, `1.1.1.1:53`, `[2606:4700:4700::1111]:53`, or a bare

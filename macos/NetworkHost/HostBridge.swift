@@ -401,7 +401,19 @@ private actor HostController {
             try intent.check()
             try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
             try intent.check()
-            // Saving DNS preferences is not a runtime acknowledgement.
+            // Preferences and the SOCKS backend can both look ready while
+            // getaddrinfo is still hung on a name-endpoint flow.
+            let probe = await dnsProxy.proveSystemResolver()
+            AppLog.info("ne-host", "system resolver probe=\(probe)")
+            switch probe {
+            case .intercepted, .clear:
+                break
+            case .unproven:
+                throw NetworkExtensionControlFailure(
+                    operation: .configureDNSProxy,
+                    message: "system resolver did not return after NEDNSProxy enable"
+                )
+            }
         } catch {
             try intent.check()
             HostRuntime.shared.update(operation: operation) {
@@ -568,16 +580,16 @@ private extension HostController {
 /// Resolvers the DNS provider may relay name-endpoint queries to. Entries the
 /// provider cannot dial as a plain address (a hostname or a DoH URL) are
 /// dropped rather than failing activation, because they never reach a resolver.
-private func usableResolvers(from specs: [String]?) -> [String]? {
-    guard let specs else { return nil }
-    let usable = specs.filter(DNSProxyUpstreamResolver.isValid)
-    if usable.count != specs.count {
+/// An empty remainder uses the same defaults as the provider data plane.
+private func usableResolvers(from specs: [String]?) -> [String] {
+    let usable = (specs ?? []).filter(DNSProxyUpstreamResolver.isValid)
+    if let specs, usable.count != specs.count {
         AppLog.warn(
             "ne-host",
             "dns resolvers dropped=\(specs.count - usable.count) because they are not plain addresses"
         )
     }
-    return usable
+    return DNSProxyUpstreamResolver.resolved(usable.isEmpty ? nil : usable)
 }
 
 private func preservesRouteEndpoints(
