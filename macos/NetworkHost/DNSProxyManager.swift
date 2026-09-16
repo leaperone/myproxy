@@ -1,5 +1,12 @@
+@preconcurrency import Darwin
 @preconcurrency import Foundation
 @preconcurrency import NetworkExtension
+
+enum SystemDNSProbe: Sendable, Equatable {
+    case intercepted
+    case clear
+    case unproven
+}
 
 /// Owns myproxy's system DNS proxy configuration. NEDNSProxyManager has no
 /// start method: saving an enabled provider configuration activates it, and
@@ -41,6 +48,19 @@ actor AppleDNSProxyManager {
         self.manager = manager
     }
 
+    /// `getaddrinfo` is the path NEDNSProxy actually intercepts. A SOCKS
+    /// probe of :1053 can succeed while this call hangs.
+    func proveSystemResolver() async -> SystemDNSProbe {
+        var last = await probeSystemResolverOnce()
+        guard last == .clear else { return last }
+        for _ in 0..<3 {
+            try? await Task.sleep(for: .milliseconds(400))
+            last = await probeSystemResolverOnce()
+            if last != .clear { return last }
+        }
+        return last
+    }
+
     func disable() async throws {
         let manager = NEDNSProxyManager.shared()
         try await load(manager, operation: .stopDNSProxy)
@@ -69,6 +89,23 @@ actor AppleDNSProxyManager {
             )
         }
         self.manager = nil
+    }
+
+    private func probeSystemResolverOnce() async -> SystemDNSProbe {
+        let reply = OnceReply<SystemDNSProbe>()
+        do {
+            return try await withCheckedThrowingContinuation { continuation in
+                reply.attach(continuation)
+                Thread.detachNewThread {
+                    reply.finish(.success(resolveExampleComARecord()))
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                    reply.finish(.success(.unproven))
+                }
+            }
+        } catch {
+            return .unproven
+        }
     }
 
     private func load(
@@ -111,4 +148,33 @@ actor AppleDNSProxyManager {
 private func isPreferenceTimeout(_ error: Error) -> Bool {
     guard let failure = error as? NetworkExtensionControlFailure else { return false }
     return failure.message.hasPrefix("Timed out waiting for ")
+}
+
+private func resolveExampleComARecord() -> SystemDNSProbe {
+    var hints = addrinfo()
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_STREAM
+    var result: UnsafeMutablePointer<addrinfo>?
+    let status = getaddrinfo("example.com", nil, &hints, &result)
+    defer {
+        if let result {
+            freeaddrinfo(result)
+        }
+    }
+    guard status == 0 else { return .unproven }
+    var cursor = result
+    var sawAddress = false
+    while let info = cursor {
+        if info.pointee.ai_family == AF_INET, let addr = info.pointee.ai_addr {
+            sawAddress = true
+            let ipv4 = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer in
+                UInt32(bigEndian: pointer.pointee.sin_addr.s_addr)
+            }
+            if ipv4 >> 16 == 0xC612 {
+                return .intercepted
+            }
+        }
+        cursor = info.pointee.ai_next
+    }
+    return sawAddress ? .clear : .unproven
 }

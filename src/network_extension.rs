@@ -935,6 +935,30 @@ mod tests {
     }
 
     #[test]
+    fn enable_request_json_uses_dns_resolvers_camel_case() {
+        let request = EnableRequest {
+            revision: 1,
+            operation_revision: 1,
+            socks_port: 1080,
+            username: "u".into(),
+            password: "p".into(),
+            process_rules: vec![],
+            dest_rules: vec![],
+            gfw_domains: vec![],
+            group_ports: vec![],
+            gfw_ports: vec![],
+            dns_resolvers: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+            capture_private_networks: false,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["dnsResolvers"],
+            serde_json::json!(["1.1.1.1", "8.8.8.8"])
+        );
+        assert!(value.get("dns_resolvers").is_none());
+    }
+
+    #[test]
     fn non_rule_mode_clears_process_pins() {
         let mut strategy = Strategy::default();
         strategy.system_extension = true;

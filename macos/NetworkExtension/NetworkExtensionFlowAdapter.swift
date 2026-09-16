@@ -231,7 +231,12 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         return TCPFlowInterceptionPlan(
             decision: outcome.decision,
             destination: routePlan?.destinations.original,
-            mihomoDestination: routePlan?.destinations.mihomo,
+            mihomoDestination: routePlan.map {
+                DNSProxyUpstreamResolver.relayDestination(
+                    for: $0.destinations.mihomo,
+                    resolvers: [$0.destinations.original]
+                )
+            },
             proxy: routePlan?.proxy,
             unavailableFallback: unavailableFallbackRequested(
                 by: outcome.decision,
@@ -502,7 +507,12 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         return UDPFlowInterceptionPlan(
             decision: outcome.decision,
             initialDestination: routePlan?.destinations.original,
-            mihomoDestination: routePlan?.destinations.mihomo,
+            mihomoDestination: routePlan.map {
+                DNSProxyUpstreamResolver.relayDestination(
+                    for: $0.destinations.mihomo,
+                    resolvers: [$0.destinations.original]
+                )
+            },
             proxy: routePlan?.proxy,
             unavailableFallback: unavailableFallbackRequested(
                 by: outcome.decision,

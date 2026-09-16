@@ -350,7 +350,9 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
-        guard let tcpFlow = flow as? NEAppProxyTCPFlow else { return true }
+        // UDP arrives through `handleNewUDPFlow` / `__handleNewUDPFlow` with
+        // the remote endpoint. Claiming it here swallows the query.
+        guard let tcpFlow = flow as? NEAppProxyTCPFlow else { return false }
         let runtimeState = runtimeDataPlaneSnapshot()
         guard runtimeState.proxy != nil,
               let destination = DNSProxyEndpointCompatibility.tcpDestination(tcpFlow)
@@ -763,11 +765,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         for destination: SOCKS5Endpoint,
         resolvers: [SOCKS5Endpoint]
     ) -> SOCKS5Endpoint {
-        guard destination.address.domain != nil,
-              destination.port == DNSProxyUpstreamResolver.defaultPort,
-              let resolver = resolvers.first
-        else { return destination }
-        return resolver
+        DNSProxyUpstreamResolver.relayDestination(
+            for: destination,
+            resolvers: resolvers
+        )
     }
 
     private func directRelayNote(for route: DNSRelayRoute) -> String {
@@ -959,9 +960,9 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             proxy: proxy,
             proxyCatalog: proxyCatalog,
             routingConfiguration: routingConfiguration,
-            upstreamResolvers: (bootstrap.upstreamResolvers ?? []).compactMap(
-                DNSProxyUpstreamResolver.endpoint(for:)
-            )
+            upstreamResolvers: DNSProxyUpstreamResolver.resolved(
+                bootstrap.upstreamResolvers
+            ).compactMap(DNSProxyUpstreamResolver.endpoint(for:))
         )
     }
 
