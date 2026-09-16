@@ -1,6 +1,6 @@
 ---
 name: release
-description: 发布 myproxy 的 Prod 或 Nightly 版本。用于 /release patch、/release minor、/release major、/release nightly，以及对应的 $release 调用；覆盖版本准备、GitHub Actions 发布和更新源核验。
+description: 发布 myproxy 的 Prod 或 Nightly 版本，或把 Developer ID 应用公证后再装到真机。用于 /release patch、/release minor、/release major、/release nightly、$release、公证、notarize、notarytool、System Extension 安装、Unnotarized Developer ID。
 ---
 
 # myproxy release
@@ -22,9 +22,27 @@ description: 发布 myproxy 的 Prod 或 Nightly 版本。用于 /release patch�
 
 `Cargo.toml` 保存下一目标版本。Nightly 不消费正式版本号；具体版本/tag 由 [release.yml](../../../.github/workflows/release.yml) 生成，Agent 不另造时间戳。Git tag 是 `v` 加应用版本；Sparkle 用 `CFBundleVersion=run_number.run_attempt` 排序。徽章只反映构建：Dev、Nightly 显示，Prod 不显示。
 
+## 公证
+
+要装到 Mac 并激活 System Extension 的 Developer ID `.app`，必须先走仓库里这条公证链路。不要另写签名或 `notarytool` 流程。
+
+正式 Prod 和 Nightly 由 [release.yml](../../../.github/workflows/release.yml) 调用 [release-macos.sh](../../../scripts/release-macos.sh)，脚本再调用 [notarize-macos-app.sh](../../../scripts/notarize-macos-app.sh)。CI 缺 `APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_TEAM_ID` 或 Developer ID 证书时直接失败。Nightly 只构建 `main`。未合并分支不在 Nightly 里。
+
+未合并分支或本地要在真机上跑新的 System Extension 时，用同一套脚本和同一组环境变量名。只检查变量是否存在，不打印值。
+
+1. 确认 `APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_TEAM_ID` 已设置。
+2. 设置 `MYPROXY_HOST_DEVID_PROFILE_PATH` 和 `MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE_PATH`。可从上一份已公证安装的 `myproxy.app` 复制 embedded profile。没有 profile 就不要装。
+3. 钥匙串里有多把 Developer ID Application 时，把 `CODESIGN_IDENTITY` 设成其中一把的 40 位 hash。[select_developer_id_identity.py](../../../scripts/select_developer_id_identity.py) 在未指定时若看到多把会退出。
+4. 运行 `scripts/package-macos-app.sh`。
+5. 运行 `scripts/notarize-macos-app.sh target/release/myproxy.app`。Accepted 之后脚本会 staple。不要设 `SKIP_NOTARIZE=1`。
+6. 用 `spctl -a -vv --type install target/release/myproxy.app` 确认是 Notarized Developer ID。不要用 `stapler validate` 当门禁。Command Line Tools 下它常失败，而 `xcrun stapler staple` 和 `spctl` 仍可用。
+7. 装到设备并启动后，`systemextensionsctl list` 必须显示这次 `CFBundleVersion` 为 activated enabled。主程序版本新、扩展仍是旧版时，还没有跑到新扩展。
+
+不要安装 Unnotarized Developer ID。macOS 会以 `OSSystemExtensionErrorDomain` 8 拒绝新扩展。不要只替换 host 二进制来代替新扩展。不要为了测未合并分支去 dispatch Nightly。
+
 ## 发布前
 
-- 读取仓库规则、当前 [release workflow](../../../.github/workflows/release.yml)、[打包脚本](../../../scripts/release-macos.sh) 与 [产物门禁](../../../scripts/check-release-artifacts.py)。确认 Git remote 指向本仓库、`gh` 可用；只检查 secret 名称/可用性，不输出值。
+- 读取仓库规则、当前 [release workflow](../../../.github/workflows/release.yml)、[打包脚本](../../../scripts/release-macos.sh)、[公证脚本](../../../scripts/notarize-macos-app.sh) 与 [产物门禁](../../../scripts/check-release-artifacts.py)。确认 Git remote 指向本仓库、`gh` 可用；只检查 secret 名称/可用性，不输出值。
 - Fetch `origin/main` 和 tags，读取 `gh api repos/leaperone/myproxy/releases/latest`，确认它是非 draft、非 prerelease 的三段 Prod 版本。读取发布 workflow 的 queued/in_progress run；已有发布在途时先核对，避免重复触发。
 - 需要修改版本时遵循 `worktree` 技能，在任务专用 checkout 操作，保留其他 dirty 修改。版本文件只同步 `Cargo.toml`、`Cargo.lock` 中 myproxy 包、两个 `packaging/macos/**/Info.plist` 的版本字段。按仓库规则 commit、push、PR、`preflight`；最终未合并不得打正式 tag。
 - 将主线已有的目标版本与算出的正式目标按数字元组比较。若正式目标低于主线目标，报告版本冲突并请用户选择发布级别，不静默降版或改选 minor/major。
@@ -49,7 +67,7 @@ description: 发布 myproxy 的 Prod 或 Nightly 版本。用于 /release patch�
 
 ## 核验与恢复
 
-- 跟踪本次 Release run 到结果，等待期间保持简短状态更新。失败先检查对应步骤与必要日志；工作流已成功不等于应用已在设备上验收，不启动 UI 手动测试。
+- 跟踪本次 Release run 到结果，等待期间保持简短状态更新。失败先检查对应步骤与必要日志；工作流已成功只证明 CI 已公证并发布，不证明设备上的 System Extension 已换成这次构建。不启动 UI 手动测试。本地真机核验按「公证」第 6、7 步。
 - 核对 run success、版本 tag 的源 SHA、release 的 draft/prerelease/latest 状态和 zip/appcast 附件。下载本次公开 feed 与 archive 到临时目录，复用 `scripts/check-release-artifacts.py <channel> <version> <build_number> <tag> --dist <dir>`；它校验元数据和签名存在性，不代表密码学验签。
 - Prod 核对 `releases/latest/download/appcast.xml` 指向本次版本。Nightly 核对 `releases/download/nightly/appcast.xml` 指向本次不可变 tag，并确认 latest Prod 未变化。
 - 已有公开 release 时先核验是否已经完成，禁止覆盖资产或强推 tag。已有 tag/draft 时检查源 SHA、run 与资产；不能证明可安全续接就报告具体恢复条件，不删除或盲目重发。

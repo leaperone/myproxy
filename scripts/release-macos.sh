@@ -35,39 +35,14 @@ zip_path="${dist}/${zip_name}"
 
 notarize=0
 if [[ "${SKIP_NOTARIZE:-}" != "1" && -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
-  identity=$(security find-identity -v -p codesigning 2>/dev/null \
-    | awk -F'"' '/Developer ID Application:/ {print $2; exit}')
-  if [[ -n "${identity:-}" ]]; then
+  if security find-identity -v -p codesigning 2>/dev/null | grep -q 'Developer ID Application:'; then
     notarize=1
   fi
 fi
 
 if [[ "$notarize" -eq 1 ]]; then
   echo "submitting app for notarization"
-  ditto -c -k --keepParent "$app" "$zip_path"
-  set +x
-  notary_result="$dist/notarization.json"
-  notary_exit=0
-  xcrun notarytool submit "$zip_path" \
-    --apple-id "$APPLE_ID" \
-    --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-    --team-id "$APPLE_TEAM_ID" \
-    --wait --output-format json > "$notary_result" || notary_exit=$?
-  cat "$notary_result"
-  status=$(plutil -extract status raw -o - "$notary_result" 2>/dev/null) || status=""
-  if [[ "$notary_exit" -ne 0 || "$status" != "Accepted" ]]; then
-    if submission_id=$(plutil -extract id raw -o - "$notary_result" 2>/dev/null); then
-      xcrun notarytool log "$submission_id" \
-        --apple-id "$APPLE_ID" \
-        --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-        --team-id "$APPLE_TEAM_ID" >&2 || true
-    fi
-    echo "Notarization was not accepted (status: ${status:-unavailable}, exit: $notary_exit)" >&2
-    exit 1
-  fi
-  set -euo pipefail
-  xcrun stapler staple "$app"
-  rm -f "$zip_path"
+  scripts/notarize-macos-app.sh "$app" "$dist/notarization.json"
 elif [[ -n "${GITHUB_ACTIONS:-}" ]]; then
   echo "CI release requires notarization (APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID, and a Developer ID identity)" >&2
   exit 1
