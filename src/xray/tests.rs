@@ -36,6 +36,7 @@ fn proxy(label: &'static str) -> (SocketAddr, Arc<AtomicBool>) {
     std::thread::spawn(move || {
         while !stopped.load(Ordering::Acquire) {
             if let Ok((mut socket,_)) = listener.accept() {
+                socket.set_nonblocking(false).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
                 std::thread::spawn(move || {
                     let request = headers(&mut socket);
@@ -78,7 +79,7 @@ fn port()->u16 { TcpListener::bind(("127.0.0.1",0)).unwrap().local_addr().unwrap
 #[test]
 fn mixed_global_rules_and_selection_use_real_xray_and_application_ledger() {
     if std::env::var_os("XRAY_BINARY").is_none() { return; }
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error|error.into_inner());
     let _guard = isolated();
     let (a,stop_a)=proxy("NODE_A");let (b,stop_b)=proxy("NODE_B");
     let mut strategy=default_strategy();strategy.mixed_port=port();strategy.global_selected="A".into();
@@ -108,7 +109,7 @@ fn mixed_global_rules_and_selection_use_real_xray_and_application_ledger() {
 #[test]
 fn occupied_mixed_port_does_not_stop_existing_session() {
     if std::env::var_os("XRAY_BINARY").is_none() { return; }
-    let _serial=TEST_LOCK.lock().unwrap();let _guard=isolated();
+    let _serial=TEST_LOCK.lock().unwrap_or_else(|error|error.into_inner());let _guard=isolated();
     let mut strategy=default_strategy();strategy.mixed_port=port();strategy.mixed_mode=InboundMode::Direct;
     strategy.save().unwrap();activate(&strategy,&Catalog::default()).unwrap();
     let identity=runtime_identity().unwrap();

@@ -66,6 +66,7 @@ impl MixedServer {
             while !shared.stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((client,_)) => {
+                        if client.set_nonblocking(false).is_err() { continue; }
                         if shared.active.fetch_update(Ordering::AcqRel,Ordering::Acquire,|n| (n<MAX_ACTIVE).then_some(n+1)).is_err() { let _=client.shutdown(Shutdown::Both);continue; }
                         let entry=Arc::new(Entry {
                             id:format!("flow-{}",shared.serial.fetch_add(1,Ordering::Relaxed)),started:Instant::now(),

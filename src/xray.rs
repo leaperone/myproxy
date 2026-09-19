@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use crate::{catalog::{self, Catalog}, controller, paths};
 use crate::strategy::{Group, InboundMode, RoutingProfile, Strategy, GLOBAL_GROUP};
 use crate::supervisor::RuntimeIdentity;
