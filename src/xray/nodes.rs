@@ -245,7 +245,7 @@ mod tests {
     fn node(kind: &str) -> Node { Node { name: "fixture".into(), subscription: "test".into(), raw: serde_yaml::from_str(&format!("name: fixture\ntype: {kind}\nserver: example.com\nport: 443\nuuid: 00000000-0000-4000-8000-000000000001\ncipher: aes-128-gcm\npassword: fixture-password\nnetwork: tcp\ntls: true\n")).unwrap() } }
     #[test] fn renders_supported_protocols() { for kind in ["ss","vmess","vless","trojan","socks5","http"] { let value = render(&node(kind), "stable-tag").unwrap(); assert_eq!(value["tag"], "stable-tag"); assert!(!value.to_string().contains("allowInsecure")); } }
     #[test] fn rejects_unpinned_skip_verify() { let mut n = node("vmess"); n.raw["skip-cert-verify"] = true.into(); assert!(render(&n, "tag").is_err()); }
-    #[test] fn validates_pin_and_rejects_plugins() { let mut n = node("ss"); n.raw["skip-cert-verify"] = true.into(); n.raw["pinnedPeerCertSha256"] = serde_yaml::Value::String(base64::engine::general_purpose::STANDARD.encode([0u8; 32])); assert!(render(&n, "tag").is_ok()); n.raw["plugin"] = "obfs".into(); assert!(render(&n, "tag").is_err()); }
+    #[test] fn validates_pin_and_rejects_plugins() { let mut n = node("ss"); n.raw["skip-cert-verify"] = true.into(); n.raw["pinnedPeerCertSha256"] = serde_yaml::Value::String("00".repeat(32)); assert!(render(&n, "tag").is_ok()); n.raw["plugin"] = "obfs".into(); assert!(render(&n, "tag").is_err()); }
     #[test]
     fn xray_binary_schema_hook_is_optional() {
         let Ok(bin) = std::env::var("XRAY_BINARY") else { return };
