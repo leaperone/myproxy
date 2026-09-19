@@ -48,9 +48,8 @@ fn shadowsocks(raw: &YamlValue, address: &str, port: u16) -> Result<Value> {
     // These are the methods understood by Xray's Shadowsocks outbound.  A
     // typo must be isolated here instead of producing a late core error.
     let valid = [
-        "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "xchacha20-ietf-poly1305",
+        "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
         "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305",
-        "none",
     ];
     if !valid.contains(&method.as_str()) {
         bail!("不支持的 Shadowsocks 加密方式：{method}");
@@ -66,6 +65,7 @@ fn vmess(raw: &YamlValue, address: &str, port: u16) -> Result<Value> {
         bail!("不支持的 VMess 加密方式：{security}");
     }
     let alter_id = raw_u32(raw, "alterId").or_else(|| raw_u32(raw, "alter-id")).unwrap_or(0);
+    if alter_id != 0 { bail!("此内核不支持旧版 VMess alterId"); }
     Ok(json!({"vnext": [{"address": address, "port": port, "users": [{
         "id": id, "alterId": alter_id, "security": security
     }]}]}))
@@ -105,11 +105,7 @@ fn http(raw: &YamlValue, address: &str, port: u16) -> Result<Value> {
     socks(raw, address, port)
 }
 
-fn hysteria2(raw: &YamlValue, address: &str, port: u16) -> Result<Value> {
-    // Xray 26.9.9 exposes Hysteria2 as protocol `hysteria`, version 2.  Its
-    // client config has no password/auth field, so accepting one would lie
-    // about the resulting connection.  Fail explicitly until Xray exposes a
-    // representable authentication mapping.
+fn hysteria2(_raw: &YamlValue, address: &str, port: u16) -> Result<Value> {
     Ok(json!({"version": 2, "address": address, "port": port}))
 }
 
@@ -118,42 +114,35 @@ fn stream_settings(raw: &YamlValue, kind: &str) -> Result<Option<Value>> {
         .unwrap_or_else(|| if matches!(kind, "hysteria" | "hysteria2") { "hysteria".into() } else { "tcp".into() })
         .to_ascii_lowercase();
     let reality = raw_map(raw, "reality-opts");
-    let tls = raw_truthy(raw, "tls") || reality.is_some() || kind == "trojan";
+    let is_hysteria = matches!(kind, "hysteria" | "hysteria2");
+    let tls = raw_truthy(raw, "tls") || reality.is_some() || kind == "trojan" || is_hysteria;
     let pin = raw_string(raw, "pinnedPeerCertSha256").or_else(|| raw_string(raw, "pinned-peer-cert-sha256"));
     let verify_name = raw_string(raw, "verifyPeerCertByName").or_else(|| raw_string(raw, "verify-peer-cert-by-name"));
     let skip = raw_truthy(raw, "skip-cert-verify");
     let pin = pin.map(|value| validate_pin(&value)).transpose()?;
     if skip && pin.is_none() { bail!("skip-cert-verify=true 必须提供有效的 pinnedPeerCertSha256；verifyPeerCertByName 不能替代证书固定"); }
-    if matches!(kind, "hysteria" | "hysteria2") {
-        if tls || reality.is_some() { bail!("Hysteria2 的 TLS/Reality 不能通过 Xray 的通用 stream security 表达"); }
-        let mut hysteria = Map::new();
-        hysteria.insert("version".into(), json!(2));
-        if let Some(auth) = raw_string(raw, "password").or_else(|| raw_string(raw, "auth")) {
-            hysteria.insert("auth".into(), auth.into());
-        }
-        if let Some(timeout) = raw_u64(raw, "udp-idle-timeout") {
-            hysteria.insert("udpIdleTimeout".into(), timeout.into());
-        }
-        let mut stream = Map::new();
-        stream.insert("network".into(), "hysteria".into());
-        stream.insert("hysteriaSettings".into(), Value::Object(hysteria));
-        return Ok(Some(Value::Object(stream)));
-    }
-    if !tls && network == "tcp" { return Ok(None); }
+    if !tls && matches!(network.as_str(), "tcp" | "raw") { return Ok(None); }
     let mut stream = Map::new();
-    stream.insert("network".into(), Value::String(match network.as_str() {
-        "ws" | "websocket" => "ws",
-        "grpc" => "grpc",
-        "xhttp" | "splithttp" => "splithttp",
-        "tcp" | "raw" => "raw",
-        other => bail!("传输方式 {other} 尚未映射到 Xray 26.9.9"),
-    }.into()));
-    match network.as_str() {
-        "ws" | "websocket" => stream.insert("wsSettings".into(), json!(ws_settings(raw))),
-        "grpc" => stream.insert("grpcSettings".into(), json!(grpc_settings(raw))),
-        "xhttp" | "splithttp" => stream.insert("splithttpSettings".into(), json!(xhttp_settings(raw))),
-        _ => None,
-    };
+    if is_hysteria {
+        if reality.is_some() { bail!("Hysteria2 不支持 Reality"); }
+        let auth = raw_string(raw, "password").or_else(||raw_string(raw,"auth")).unwrap_or_default();
+        let mut settings = json!({"version":2,"auth":auth});
+        if let Some(timeout) = raw_u64(raw,"udp-idle-timeout") { settings["udpIdleTimeout"]=timeout.into(); }
+        stream.insert("network".into(),"hysteria".into());
+        stream.insert("hysteriaSettings".into(),settings);
+    } else {
+        let name = match network.as_str() {
+            "ws" | "websocket"=>"ws", "grpc"=>"grpc", "xhttp" | "splithttp"=>"splithttp", "tcp" | "raw"=>"raw",
+            other=>bail!("传输方式 {other} 尚未映射到 Xray 26.9.9"),
+        };
+        stream.insert("network".into(),name.into());
+        match network.as_str() {
+            "ws" | "websocket"=>{ stream.insert("wsSettings".into(),ws_settings(raw)); },
+            "grpc"=>{ stream.insert("grpcSettings".into(),grpc_settings(raw)); },
+            "xhttp" | "splithttp"=>{ stream.insert("splithttpSettings".into(),xhttp_settings(raw)); },
+            _=>{},
+        }
+    }
     if tls {
         let mut security = Map::new();
         if let Some(name) = raw_string(raw, "servername").or_else(|| raw_string(raw, "sni")) { security.insert("serverName".into(), name.into()); }
@@ -162,6 +151,7 @@ fn stream_settings(raw: &YamlValue, kind: &str) -> Result<Option<Value>> {
         if let Some(pin) = pin { security.insert("pinnedPeerCertSha256".into(), pin.into()); }
         if let Some(name) = verify_name { security.insert("verifyPeerCertByName".into(), name.into()); }
         if let Some(reality) = reality {
+            security.entry("fingerprint".to_string()).or_insert_with(||Value::String("chrome".into()));
             let public_key = raw_map_string(&reality, "public-key").context("Reality 缺少 public-key")?;
             let short_id = raw_map_string(&reality, "short-id").context("Reality 缺少 short-id")?;
             let public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -266,7 +256,8 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
             let result = std::process::Command::new(&bin).args(["run", "-test", "-config"]).arg(&path).output();
             let _ = std::fs::remove_file(&path);
-            assert!(result.expect("spawn XRAY_BINARY").status.success(), "Xray rejected {kind}");
+            let result=result.expect("spawn XRAY_BINARY");
+            assert!(result.status.success(), "Xray rejected {kind}: {}",String::from_utf8_lossy(&result.stdout));
         }
         for network in ["ws", "grpc", "xhttp", "reality"] {
             let mut fixture = node("trojan");
@@ -299,7 +290,8 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
             let result = std::process::Command::new(&bin).args(["run", "-test", "-config"]).arg(&path).output();
             let _ = std::fs::remove_file(&path);
-            assert!(result.expect("spawn XRAY_BINARY").status.success(), "Xray rejected {network}");
+            let result=result.expect("spawn XRAY_BINARY");
+            assert!(result.status.success(), "Xray rejected {network}: {}",String::from_utf8_lossy(&result.stdout));
         }
     }
 }

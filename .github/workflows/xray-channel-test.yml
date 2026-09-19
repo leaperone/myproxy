@@ -26,8 +26,17 @@ jobs:
         with:
           workspaces: ". -> target/xray-build"
           key: xray-test
+          cache-on-failure: true
       - run: python3 scripts/check-xray-boundary.py
       - run: scripts/fetch-xray.sh
+      - run: rustfmt --edition 2021 src/xray.rs src/backend.rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-formatted-${{ github.sha }}
+          path: |
+            src/xray.rs
+            src/backend.rs
+            src/xray/
       - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
       - run: cargo build --locked --bins --features xray-channel
       - run: scripts/package-xray-test.sh

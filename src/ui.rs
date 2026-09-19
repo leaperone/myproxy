@@ -1326,7 +1326,7 @@ impl AppView {
             external_change_pending: false,
             strategy_stamp: initial_strategy_stamp,
             supervisor,
-            url_input: cx.new(|cx| InputState::new(window, cx).placeholder("https://…/clash.yaml")),
+            url_input: cx.new(|cx| InputState::new(window, cx).placeholder(if backend::is_xray() { "粘贴订阅网址或节点分享链接" } else { "https://…/clash.yaml" })),
             name_input: cx.new(|cx| InputState::new(window, cx).placeholder("订阅名")),
             group_modal_open: false,
             group_edit_id: None,
