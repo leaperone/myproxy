@@ -3841,10 +3841,10 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                &format!(
+                &if backend::is_xray() { "本地代理端口、外观和配置备份。测试版的设置独立保存。".to_string() } else { format!(
                     "系统接管让应用不用自己填代理。第一次请到 {} 允许 myproxy。Mixed 给显式客户端；TUN 与接管互斥。",
                     setup::login_items_path_label()
-                ),
+                ) },
             ))
             .when(backend::is_xray(), |view| view.child(self.backend_panel(cx, theme)))
             .when(!backend::is_xray(), |view| view.child(self.system_extension_panel(cx, theme)))
@@ -4184,12 +4184,12 @@ impl AppView {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(div().text_sm().child("安装 myproxyctl"))
+                                .child(div().text_sm().child(if backend::is_xray() { "安装 myproxy-xrayctl" } else { "安装 myproxyctl" }))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("让 Agent 或终端直接使用 myproxyctl 配置代理。"),
+                                        .child(if backend::is_xray() { "让 Agent 或终端使用 myproxy-xrayctl，只管理这个测试版。" } else { "让 Agent 或终端直接使用 myproxyctl 配置代理。" }),
                                 ),
                         )
                         .child(
