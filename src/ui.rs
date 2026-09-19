@@ -2827,7 +2827,7 @@ impl AppView {
                     .gap_1()
                     .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
                     .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
-                    .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
+                    .child(self.nav_item(cx, Page::Subscriptions, if backend::is_xray() { "添加代理" } else { "订阅" }, IconName::Inbox))
                     .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
                     .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map))
                     .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
@@ -3447,8 +3447,8 @@ impl AppView {
             .gap_4()
             .child(page_title(
                 theme,
-                "订阅",
-                "添加或删除后需应用。规则和模式变更使用匹配的缓存；刷新按钮会重新获取订阅。",
+                if backend::is_xray() { "代理来源" } else { "订阅" },
+                if backend::is_xray() { "粘贴订阅网址或节点分享链接即可添加。名称可以稍后修改。" } else { "添加或删除后需应用。规则和模式变更使用匹配的缓存；刷新按钮会重新获取订阅。" },
             ))
             .child(
                 Button::new("refresh-subscriptions")
@@ -3475,7 +3475,7 @@ impl AppView {
                         v_flex()
                             .gap_1()
                             .w(px(160.))
-                            .child(div().text_xs().child("订阅名"))
+                            .child(div().text_xs().child(if backend::is_xray() { "名称（可选）" } else { "订阅名" }))
                             .child(Input::new(&self.name_input)),
                     )
                     .child(
@@ -3483,7 +3483,7 @@ impl AppView {
                             .gap_1()
                             .flex_1()
                             .min_w(px(180.))
-                            .child(div().text_xs().child("订阅 URL"))
+                            .child(div().text_xs().child(if backend::is_xray() { "订阅网址或节点链接" } else { "订阅 URL" }))
                             .child(Input::new(&self.url_input)),
                     )
                     .child(
@@ -3498,8 +3498,16 @@ impl AppView {
                                         if this.is_busy() {
                                             return;
                                         }
-                                        let name =
+                                        let mut name =
                                             this.name_input.read(cx).value().trim().to_string();
+                                        if name.is_empty() && backend::is_xray() {
+                                            let mut number = this.strategy.subscriptions.len() + 1;
+                                            loop {
+                                                name = format!("代理来源 {number}");
+                                                if !this.strategy.subscriptions.iter().any(|source| source.name == name) { break; }
+                                                number += 1;
+                                            }
+                                        }
                                         let url =
                                             this.url_input.read(cx).value().trim().to_string();
                                         if name.is_empty() || url.is_empty() {
@@ -3517,6 +3525,7 @@ impl AppView {
                                                 this.url_input.update(cx, |input, cx| {
                                                     input.set_value("", window, cx)
                                                 });
+                                                if backend::is_xray() { this.start_apply_with_refresh(true, cx); }
                                             } else {
                                                 this.strategy = previous;
                                             }
