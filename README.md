@@ -85,8 +85,9 @@ cannot be changed by a shared `backend.json` file.
 
 The test app owns one loopback HTTP and SOCKS5 TCP entrance, default port
 **40808**. It chooses the rule and node before passing a connection to an
-explicit, authenticated private Xray outbound. Node selection does not restart
-the core. The app measures node latency, applies ordered fallback and lowest
+explicit, authenticated private Xray outbound. Node selection and rule changes do not restart
+the core. Applying a new route closes old client connections so reconnecting
+clients use the new choice. The app measures node latency, applies ordered fallback and lowest
 latency policies, and records its own traffic and connection history for the
 current session. Auto groups accept a manual node override with a separate
 button to return to automatic selection.

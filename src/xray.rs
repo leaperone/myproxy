@@ -45,6 +45,7 @@ struct Lane {
 struct Runtime {
     strategy: RwLock<Strategy>,
     catalog: Catalog,
+    source_nodes: Vec<crate::catalog::Node>,
     health: RwLock<HashMap<String, NodeHealth>>,
     lanes: HashMap<String, Lane>,
     child: Mutex<Child>,
@@ -185,6 +186,21 @@ fn validate_intent(strategy: &Strategy) -> Result<()> {
 }
 
 fn activate(strategy: &Strategy, catalog: &Catalog) -> Result<()> {
+    if let Ok(runtime) = active() {
+        let previous = runtime.strategy.read().expect("strategy").clone();
+        if runtime.core_alive() && previous.mixed_port == strategy.mixed_port
+            && serde_json::to_value(&runtime.source_nodes)? == serde_json::to_value(&catalog.nodes)? {
+            strategy.validate_catalog(catalog)?;
+            if previous != *strategy {
+                let generation = next_generation();
+                save_snapshot(&runtime, strategy, generation)?;
+                *runtime.strategy.write().expect("strategy") = strategy.clone();
+                runtime.generation.store(generation, Ordering::Release);
+                close_all()?;
+            }
+            return Ok(());
+        }
+    }
     let candidate = prepare(strategy, catalog)?;
     let same_port = service().lock().expect("Xray service").port == Some(strategy.mixed_port);
     let entrance = if same_port {
@@ -321,6 +337,7 @@ fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Res
     let runtime = Arc::new(Runtime {
         strategy: RwLock::new(strategy.clone()),
         catalog: accepted,
+        source_nodes: catalog.nodes.clone(),
         health: RwLock::new(HashMap::new()),
         lanes,
         child: Mutex::new(child),
@@ -541,6 +558,7 @@ pub fn select_proxy(identity: &RuntimeIdentity, group: &str, name: &str) -> Resu
     save_snapshot(&runtime, &strategy, generation)?;
     *runtime.strategy.write().expect("strategy") = strategy;
     runtime.generation.store(generation, Ordering::Release);
+    close_all()?;
     Ok(())
 }
 

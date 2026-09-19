@@ -51,6 +51,12 @@ fn proxy(label: &'static str) -> (SocketAddr, Arc<AtomicBool>) {
                         .unwrap();
                     let request = headers(&mut socket);
                     assert!(request.starts_with("GET /"));
+                    if request.starts_with("GET /hold ") {
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nX").unwrap();
+                        let mut end=[0];
+                        let _=socket.read(&mut end);
+                        return;
+                    }
                     write!(
                         socket,
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -152,9 +158,18 @@ fn mixed_global_rules_and_selection_use_real_xray_and_application_ledger() {
     }
     let identity = runtime_identity().unwrap();
     let core_pid = active().unwrap().child.lock().unwrap().id();
+    let mut held=relay::dial_socks(SocketAddr::from(([127,0,0,1],strategy.mixed_port)),"","","test.invalid",80).unwrap();
+    held.write_all(b"GET /hold HTTP/1.1\r\nHost: test.invalid\r\n\r\n").unwrap();
+    assert!(headers(&mut held).starts_with("HTTP/1.1 200"));
+    let mut initial=[0];held.read_exact(&mut initial).unwrap();assert_eq!(&initial,b"X");
     strategy.global_selected = "B".into();
     strategy.save().unwrap();
     select_proxy(&identity, GLOBAL_GROUP, "B").unwrap();
+    match held.read(&mut initial) {
+        Ok(0)=>{},
+        Err(error) if matches!(error.kind(),std::io::ErrorKind::ConnectionReset|std::io::ErrorKind::ConnectionAborted)=>{},
+        other=>panic!("old global connection still alive: {other:?}"),
+    }
     assert!(request(strategy.mixed_port, "http").ends_with("NODE_B"));
     assert_eq!(
         active().unwrap().child.lock().unwrap().id(),
@@ -181,6 +196,7 @@ fn mixed_global_rules_and_selection_use_real_xray_and_application_ledger() {
     strategy.save().unwrap();
     activate(&strategy, &catalog).unwrap();
     assert!(request(strategy.mixed_port, "http").ends_with("NODE_A"));
+    assert_eq!(active().unwrap().child.lock().unwrap().id(),core_pid,"routing changes must not restart Xray");
     disconnect().unwrap();
     assert!(!is_running());
     activate(&strategy, &catalog).unwrap();

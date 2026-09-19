@@ -2908,7 +2908,7 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(match page {
-                        Page::Overview => self.overview(cx, theme).into_any_element(),
+                        Page::Overview => if backend::is_xray() { self.xray_overview(cx,theme).into_any_element() } else { self.overview(cx, theme).into_any_element() },
                         Page::Subscriptions => self.subscriptions(cx, theme).into_any_element(),
                         Page::Groups => self.groups(cx, theme).into_any_element(),
                         Page::Settings => self.settings(cx, theme).into_any_element(),
@@ -3055,6 +3055,29 @@ impl AppView {
                         .on_click(self.select_page(cx, Page::Subscriptions)),
                 )
             })
+    }
+
+    fn xray_overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let title = if self.connected { "已连接" } else if self.wanted { "连接需要处理" } else { "未连接" };
+        v_flex().gap_4()
+            .child(page_title(theme,"MyProxy Xray","添加代理，选择出口，然后连接。"))
+            .child(panel(theme,"连接",h_flex().items_center().justify_between()
+                .child(v_flex().gap_2()
+                    .child(div().text_lg().font_semibold().child(title))
+                    .child(div().text_sm().child(if self.connected && self.strategy.mixed_mode == InboundMode::Rule { "按规则为每条连接选择出口".to_string() } else if self.connected { format!("当前出口：{}",self.overview_proxy_label()) } else { format!("HTTP 和 SOCKS5 共用 127.0.0.1:{}",self.strategy.mixed_port) })))
+                .child(self.overview_connect_button(cx,true))))
+            .when(self.catalog.nodes.is_empty(), |view| view.child(
+                Button::new("xray-add-proxy").primary().label("添加代理").on_click(self.select_page(cx,Page::Subscriptions))))
+            .child(panel(theme,"使用方式",v_flex().gap_3()
+                .child(self.inbound_mode_buttons(cx,"xray-mode",self.strategy.mixed_mode,Self::set_mixed_mode))
+                .child(div().text_xs().text_color(theme.muted_foreground).child("全局模式使用同一出口；按规则模式会分别选择出口。切换出口时会断开旧连接，让客户端使用新选择。"))))
+            .when(self.strategy.mixed_mode == InboundMode::Global, |view| view.child(panel(theme,"全局出口",
+                self.global_mode_row(cx,theme,true,"overview-xray"))))
+            .child(Button::new("xray-choose-node").label("展开节点组，选择具体节点").on_click(self.select_page(cx,Page::Groups)))
+            .child(h_flex().gap_3().flex_wrap()
+                .child(metric(theme,"活动连接",&self.traffic.connection_count.to_string()))
+                .child(metric(theme,"上传",&controller::format_rate(self.traffic_up)))
+                .child(metric(theme,"下载",&controller::format_rate(self.traffic_down))))
     }
 
     fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -4334,7 +4357,7 @@ impl AppView {
         h_flex()
             .gap_1()
             .flex_wrap()
-            .children(InboundMode::ALL.into_iter().map(move |mode| {
+            .children(InboundMode::ALL.into_iter().filter(|mode| !backend::is_xray() || *mode != InboundMode::Proxy).map(move |mode| {
                 let entity = entity.clone();
                 let mut btn =
                     Button::new(SharedString::from(format!("{id_prefix}-{}", mode.as_str())))
