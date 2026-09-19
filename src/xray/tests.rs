@@ -245,3 +245,45 @@ fn occupied_mixed_port_does_not_stop_existing_session() {
     assert_eq!(runtime_identity(), Some(identity));
     assert!(status().unwrap().ready);
 }
+
+#[test]
+fn disconnect_reaps_xray_while_a_background_task_retains_the_runtime() {
+    if std::env::var_os("XRAY_BINARY").is_none() {
+        return;
+    }
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = isolated();
+    let mut strategy = default_strategy();
+    strategy.mixed_port = port();
+    strategy.mixed_mode = InboundMode::Direct;
+    activate(&strategy, &Catalog::default()).unwrap();
+    let retained = active().unwrap();
+
+    disconnect().unwrap();
+
+    assert!(retained.child.lock().unwrap().try_wait().unwrap().is_some());
+    assert!(!status().unwrap().running);
+    disconnect().unwrap();
+}
+
+#[test]
+fn replacement_reaps_xray_while_a_background_task_retains_the_old_runtime() {
+    if std::env::var_os("XRAY_BINARY").is_none() {
+        return;
+    }
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = isolated();
+    let mut strategy = default_strategy();
+    strategy.mixed_port = port();
+    strategy.mixed_mode = InboundMode::Direct;
+    activate(&strategy, &Catalog::default()).unwrap();
+    let retained = active().unwrap();
+    let old_pid = retained.child.lock().unwrap().id();
+
+    strategy.mixed_port = port();
+    activate(&strategy, &Catalog::default()).unwrap();
+
+    assert!(retained.child.lock().unwrap().try_wait().unwrap().is_some());
+    assert_ne!(active().unwrap().child.lock().unwrap().id(), old_pid);
+    assert!(status().unwrap().ready);
+}

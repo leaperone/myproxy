@@ -225,7 +225,7 @@ fn activate(strategy: &Strategy, catalog: &Catalog) -> Result<()> {
         (old, old_entrance)
     };
     if let Some(previous) = previous {
-        previous.stopped.store(true, Ordering::Release);
+        previous.stop()?;
     }
     drop(previous_entrance);
     if !cfg!(test) {
@@ -376,6 +376,16 @@ pub fn xray_binary() -> Result<PathBuf> {
 }
 
 impl Runtime {
+    fn stop(&self) -> Result<()> {
+        self.stopped.store(true, Ordering::Release);
+        let mut child = self.child.lock().expect("Xray child");
+        if child.try_wait()?.is_none() {
+            child.kill().context("stop owned Xray process")?;
+            child.wait().context("wait for owned Xray process to exit")?;
+        }
+        Ok(())
+    }
+
     fn core_alive(&self) -> bool {
         !self.stopped.load(Ordering::Acquire)
             && matches!(self.child.lock().expect("Xray child").try_wait(), Ok(None))
@@ -566,7 +576,7 @@ pub fn disconnect() -> Result<()> {
     let _operation = OPERATION.lock().expect("Xray operation");
     let previous = std::mem::take(&mut *service().lock().expect("Xray service"));
     if let Some(runtime) = &previous.runtime {
-        runtime.stopped.store(true, Ordering::Release);
+        runtime.stop()?;
     }
     if let Some(entrance) = &previous.entrance {
         entrance.close_all()?;
