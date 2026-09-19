@@ -140,7 +140,9 @@ pub fn decide(
     process: Option<&str>,
 ) -> Decision {
     let mut chain = Vec::new();
-    let mut rule = "unmatched".to_string();
+    let mut rule = match strategy.mixed_mode {
+        InboundMode::Global=>"全局出口",InboundMode::Proxy=>"默认组",InboundMode::Direct=>"全球直连",InboundMode::Rule=>"未匹配规则",
+    }.to_string();
     let route = match strategy.mixed_mode {
         InboundMode::Direct => Route::Direct,
         InboundMode::Global => target(strategy, catalog, health, if strategy.global_selected.trim().is_empty() { crate::compile::default_group(strategy) } else { &strategy.global_selected }, &mut chain),
@@ -235,4 +237,20 @@ mod tests {
         assert!(live[0].members.iter().any(|item| item.name == "DIRECT"));
         assert!(live[0].members.iter().any(|item| item.name == "AUTO"));
     }
+    #[test]
+    fn fallback_keeps_priority_and_manual_override_until_auto_is_restored() {
+        let (mut strategy,catalog)=fixture();
+        strategy.groups[0].kind="fallback".into();
+        let mut health=HashMap::from([("A".into(),NodeHealth { delay_ms:Some(90),failures:0 }), ("B".into(),NodeHealth { delay_ms:Some(10),failures:0 })]);
+        assert_eq!(decide(&strategy,&catalog,&health,"public.invalid",443,None).route,Route::Node("A".into()));
+        health.get_mut("A").unwrap().failures=2;
+        assert_eq!(decide(&strategy,&catalog,&health,"public.invalid",443,None).route,Route::Node("B".into()));
+        for kind in ["select","fallback","url-test"] {
+            strategy.groups[0].kind=kind.into();strategy.groups[0].selected="A".into();
+            assert_eq!(decide(&strategy,&catalog,&health,"public.invalid",443,None).route,Route::Node("A".into()));
+        }
+        strategy.groups[0].selected.clear();
+        assert_eq!(decide(&strategy,&catalog,&health,"public.invalid",443,None).route,Route::Node("B".into()));
+    }
+
 }

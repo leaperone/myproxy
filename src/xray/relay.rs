@@ -135,7 +135,7 @@ fn serve(mut client:TcpStream,dialer:&Dialer,entry:&Arc<Entry>,state:&Arc<State>
         }
     };
     entry.track(&dialed.stream)?;
-    entry.label.lock().expect("flow label").1=if dialed.rule.is_empty() { dialed.chain } else { format!("{} · {}",dialed.chain,dialed.rule) };
+    entry.label.lock().expect("flow label").1=if dialed.rule.is_empty() { dialed.chain } else { format!("{} → {}",dialed.rule,dialed.chain) };
     if !request.handshake.is_empty() { client.write_all(&request.handshake)?; }
     for socket in [&client,&dialed.stream] {
         socket.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -204,6 +204,9 @@ fn http_request(client:&mut TcpStream,first:u8)->Result<Request> {
             _=>{},
         }
         parsed.push((lower,name,value));
+    }
+    if connection_tokens.iter().any(|field| matches!(field.as_str(), "host" | "content-length" | "transfer-encoding")) {
+        bail!("Connection 请求头不能移除请求定界字段");
     }
     let tunnel=method=="CONNECT";
     let (host,port,path)=if tunnel {
@@ -328,4 +331,23 @@ mod tests {
         let snapshot=mixed.snapshot();assert_eq!(snapshot.upload_total,4);assert_eq!(snapshot.download_total,4);assert_eq!(snapshot.connection_count,1);
         mixed.close_one(&snapshot.connections[0].id).unwrap();assert_eq!(client.read(&mut buf).unwrap(),0);echo.join().unwrap();
     }
+    #[test]
+    fn forward_proxy_never_relays_a_second_host_on_the_same_stream() {
+        let upstream=TcpListener::bind(("127.0.0.1",0)).unwrap();let target=upstream.local_addr().unwrap();
+        let listener=TcpListener::bind(("127.0.0.1",0)).unwrap();let address=listener.local_addr().unwrap();
+        let _mixed=MixedServer::start(listener,Arc::new(move |host,_| {
+            assert_eq!(host,"safe.invalid");
+            Ok(Dialed { stream:TcpStream::connect(target)?,chain:"A".into(),rule:"safe".into() })
+        })).unwrap();
+        let capture=thread::spawn(move || {
+            let(mut socket,_)=upstream.accept().unwrap();socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request=String::new();socket.read_to_string(&mut request).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").unwrap();request
+        });
+        let mut client=TcpStream::connect(address).unwrap();client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"POST http://safe.invalid/ HTTP/1.1\r\nHost: safe.invalid\r\nContent-Length: 1\r\n\r\naGET http://other.invalid/ HTTP/1.1\r\nHost: other.invalid\r\n\r\n").unwrap();
+        let mut response=String::new();client.read_to_string(&mut response).unwrap();assert!(response.ends_with("OK"));
+        let request=capture.join().unwrap();assert!(request.starts_with("POST / HTTP/1.1"));assert!(request.ends_with('a'));assert!(!request.contains("other.invalid"));
+    }
+
 }
