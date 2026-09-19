@@ -343,7 +343,7 @@ fn run(cli: Cli) -> Result<()> {
                     "extension_request_cancelled": false,
                 }),
                 format!(
-                    "{} ready; SOCKS :{}; extension {}; DNS {}",
+                    "{} ready; Mixed :{}; extension {}; DNS {}",
                     if selected_backend == BackendKind::Xray { "Xray" } else { "Mihomo" },
                     runtime
                         .as_ref()

@@ -38,6 +38,7 @@ jobs:
             src/xray.rs
             src/backend.rs
             src/xray/
+      - run: cargo test --locked --lib -- --test-threads=1
       - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
       - run: cargo build --locked --bins --features xray-channel
       - run: scripts/package-xray-test.sh

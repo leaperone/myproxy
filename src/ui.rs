@@ -1835,7 +1835,16 @@ impl AppView {
                 "异常".into()
             };
         }
-        self.live_now(self.strategy.default_group_name())
+        if backend::is_xray() {
+            return myproxy::xray::status()
+                .map(|status| match status.current.as_str() {
+                    "DIRECT" => "全球直连".to_string(),
+                    "REJECT" => "没有可用出口".to_string(),
+                    _ => status.current,
+                })
+                .unwrap_or_else(|_| "等待连接状态".into());
+        }
+        self.live_now("PROXY")
             .or_else(|| {
                 self.proxy_groups
                     .iter()
