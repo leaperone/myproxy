@@ -13,7 +13,7 @@ pub const AGENT_SKILL: &str = include_str!("../.agents/skills/agent/SKILL.md");
 
 pub fn copy_agent_skill(cx: &App) {
     let skill = if myproxy::backend::is_xray() {
-        format!("This is the isolated Xray test application. Use myproxy-xrayctl for every command. Do not use the production myproxyctl link. This build supports explicit TCP proxies only; do not enable System Extension, TUN, or system proxy settings.\n\n{}", AGENT_SKILL.replace("myproxyctl","myproxy-xrayctl").replace("Application Support/myproxy/","Application Support/myproxy-xray/"))
+        format!("This is the isolated Xray test application. Use myproxy-xrayctl for every command. Do not use the production myproxyctl link. This build supports explicit TCP proxies only; do not enable System Extension, TUN, or system proxy settings.\n\n{}", AGENT_SKILL.replace("myproxyctl","myproxy-xrayctl").replace("Contents/MacOS/myproxy-xrayctl","Contents/MacOS/myproxyctl").replace("Application Support/myproxy/","Application Support/myproxy-xray/"))
     } else { AGENT_SKILL.to_string() };
     cx.write_to_clipboard(ClipboardItem::new_string(skill));
 }
