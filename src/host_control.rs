@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
+use crate::backend;
 use crate::network_extension::{self, DnsPhase, Phase, RuntimeStatus};
 use crate::strategy::Strategy;
 use crate::supervisor::{OperationState, RuntimeIdentity, Supervisor};
@@ -145,8 +146,9 @@ fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
     let runtime = supervisor.runtime_identity();
     Snapshot {
         operation: supervisor.operation_state(),
-        controller_ready: runtime
-            .is_some_and(|identity| crate::controller::ready(identity.mixed_port).is_ok()),
+        controller_ready: backend::load().unwrap_or_default() == backend::BackendKind::Mihomo
+            && runtime
+                .is_some_and(|identity| crate::controller::ready(identity.mixed_port).is_ok()),
         extension_required: runtime.is_some()
             && supervisor
                 .applied_strategy()
@@ -158,6 +160,9 @@ fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
 }
 
 pub fn check_outcome(snapshot: &Snapshot) -> Result<()> {
+    if backend::load()? == backend::BackendKind::Xray {
+        return Ok(());
+    }
     let status = &snapshot.extension;
     if !status.observed {
         bail!("System Extension/DNS status is not confirmed; check status in myproxy");
