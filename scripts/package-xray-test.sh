@@ -27,7 +27,7 @@ info = {
     'CFBundleExecutable': 'myproxy', 'CFBundlePackageType': 'APPL',
     'CFBundleShortVersionString': version, 'CFBundleVersion': '1',
     'CFBundleIconFile': 'AppIcon', 'NSHighResolutionCapable': True,
-    'LSMinimumSystemVersion': '13.0', 'MyproxyBuildChannel': 'xray-test',
+    'LSMinimumSystemVersion': '14.0', 'MyproxyBuildChannel': 'xray-test',
 }
 (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
 PYINFO

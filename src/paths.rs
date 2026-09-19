@@ -25,12 +25,6 @@ pub fn strategy_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("strategy.json"))
 }
 
-/// Backend selection is intentionally separate from strategy.json. Older
-/// installations therefore continue to select Mihomo when this file is absent.
-pub fn backend_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("backend.json"))
-}
-
 pub fn catalog_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("catalog.json"))
 }
@@ -49,14 +43,6 @@ pub fn xray_runtime_state_path() -> Result<PathBuf> {
 
 pub fn candidate_yaml_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("runtime.candidate.yaml"))
-}
-
-pub fn xray_config_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("xray-config.json"))
-}
-
-pub fn xray_candidate_config_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("xray-config.candidate.json"))
 }
 
 /// Runtime files contain subscription credentials. Never publish a partial or
@@ -95,16 +81,8 @@ pub fn pid_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mihomo.pid"))
 }
 
-pub fn xray_pid_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("xray.pid"))
-}
-
 pub fn wanted_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("core.wanted"))
-}
-
-pub fn xray_wanted_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("xray.wanted"))
 }
 
 pub fn operation_lock_path() -> Result<PathBuf> {
@@ -113,10 +91,6 @@ pub fn operation_lock_path() -> Result<PathBuf> {
 
 pub fn mihomo_log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mihomo.log"))
-}
-
-pub fn xray_log_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("xray.log"))
 }
 
 pub fn app_log_path() -> Result<PathBuf> {

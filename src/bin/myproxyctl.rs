@@ -1025,7 +1025,7 @@ fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
             "backend": selected_backend.as_str(),
             "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
             "runtime_config": if selected_backend == BackendKind::Xray {
-                paths::xray_config_path()?.display().to_string()
+                paths::xray_runtime_state_path()?.display().to_string()
             } else {
                 paths::runtime_yaml_path()?.display().to_string()
             },

@@ -11,10 +11,16 @@ pub enum BackendKind {
 
 impl BackendKind {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Mihomo => "mihomo", Self::Xray => "xray" }
+        match self {
+            Self::Mihomo => "mihomo",
+            Self::Xray => "xray",
+        }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Mihomo => "Mihomo", Self::Xray => "Xray 测试版" }
+        match self {
+            Self::Mihomo => "Mihomo",
+            Self::Xray => "Xray 测试版",
+        }
     }
     pub fn parse(raw: &str) -> Result<Self> {
         match raw.trim() {
@@ -25,10 +31,16 @@ impl BackendKind {
     }
 }
 
-pub const fn is_xray() -> bool { cfg!(feature = "xray-channel") }
+pub const fn is_xray() -> bool {
+    cfg!(feature = "xray-channel")
+}
 
 pub fn load() -> Result<BackendKind> {
-    Ok(if is_xray() { BackendKind::Xray } else { BackendKind::Mihomo })
+    Ok(if is_xray() {
+        BackendKind::Xray
+    } else {
+        BackendKind::Mihomo
+    })
 }
 
 pub fn save(kind: BackendKind) -> Result<()> {
