@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use myproxy::backend::{self, BackendKind};
 use myproxy::catalog;
 use myproxy::controller;
 use myproxy::host_control::{self, Request, Snapshot};
@@ -21,6 +22,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Capabilities,
+    /// Read or switch the opt-in runtime channel: `mihomo` or `xray`.
+    Backend {
+        kind: Option<String>,
+    },
     Log,
     Status,
     Apply,
@@ -190,6 +195,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Capabilities => {
             let commands = [
                 "status",
+                "backend",
                 "apply",
                 "connect",
                 "disconnect",
@@ -214,6 +220,37 @@ fn run(cli: Cli) -> Result<()> {
                 serde_json::json!({"commands": commands, "json": true, "version": myproxy::updates::VERSION}),
                 commands.join(" "),
             );
+        }
+        Commands::Backend { kind } => {
+            let current = backend::load()?;
+            if let Some(raw) = kind {
+                let next = BackendKind::parse(&raw)?;
+                if next == BackendKind::Xray && !paths::bundled_xray().is_file() {
+                    bail!(
+                        "Xray binary is unavailable at {}; run scripts/fetch-xray.sh or use the Xray test package",
+                        paths::bundled_xray().display()
+                    );
+                }
+                let running = match current {
+                    BackendKind::Mihomo => adopted_supervisor(&Strategy::load()?).is_running(),
+                    BackendKind::Xray => myproxy::xray::is_running(),
+                };
+                if running && next != current {
+                    bail!("请先 disconnect，再切换运行通道");
+                }
+                backend::save(next)?;
+                emit(
+                    json,
+                    serde_json::json!({"backend": next.as_str(), "status": "saved"}),
+                    format!("backend {} ({})", next.as_str(), next.label()),
+                );
+            } else {
+                emit(
+                    json,
+                    serde_json::json!({"backend": current.as_str(), "label": current.label()}),
+                    format!("backend {} ({})", current.as_str(), current.label()),
+                );
+            }
         }
         Commands::Log => {
             let path = paths::app_log_path()?;
@@ -248,13 +285,27 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Status => {
             let strategy = Strategy::load()?;
             let catalog = catalog::Catalog::load()?;
+            let selected_backend = backend::load()?;
             let snapshot = host_control::request(Request::Status)?;
             let runtime = snapshot.runtime;
-            let controller_ready = snapshot.controller_ready;
+            let controller_ready = selected_backend == BackendKind::Mihomo
+                && snapshot.controller_ready;
             let extension = snapshot.extension;
+            let xray_status = if selected_backend == BackendKind::Xray {
+                Some(myproxy::xray::status()?)
+            } else {
+                None
+            };
             let unmatched = myproxy::compile::unmatched_target(&strategy);
+            let status_prefix = if selected_backend == BackendKind::Xray {
+                "backend xray  "
+            } else {
+                ""
+            };
             emit(json, serde_json::json!({
                 "mixed_port": strategy.mixed_port,
+                "backend": selected_backend.as_str(),
+                "backend_label": selected_backend.label(),
                 "mixed_mode": strategy.mixed_mode.as_str(),
                 "global": strategy.global_selected,
                 "tun": strategy.tun,
@@ -275,11 +326,12 @@ fn run(cli: Cli) -> Result<()> {
                     "mixed_port": identity.mixed_port,
                     "controller_ready": controller_ready,
                 })),
+                "xray": xray_status,
                 "extension_runtime": extension,
                 "strategy": paths::strategy_path()?.display().to_string(),
             }), format!(
-                "saved mixed-port {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
-                strategy.mixed_port, strategy.mixed_mode.as_str(), strategy.tun,
+                "{}saved mixed-port {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
+                status_prefix, strategy.mixed_port, strategy.mixed_mode.as_str(), strategy.tun,
                 strategy.system_extension, strategy.routing_profile.as_str(), unmatched,
                 runtime.as_ref().map(|identity| format!("mixed-port {} (generation {})", identity.mixed_port, identity.generation))
                     .unwrap_or_else(|| "disconnected / unverified".into()),
@@ -308,6 +360,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Connect => {
             let strategy = Strategy::load()?;
             let snapshot = host_control::request(Request::Connect)?;
+            let selected_backend = backend::load()?;
             let extension = &snapshot.extension;
             let runtime = snapshot.runtime;
             emit(
@@ -319,7 +372,8 @@ fn run(cli: Cli) -> Result<()> {
                     "extension_request_cancelled": false,
                 }),
                 format!(
-                    "Mihomo ready; Mixed :{}; extension {}; DNS {}",
+                    "{} ready; SOCKS :{}; extension {}; DNS {}",
+                    if selected_backend == BackendKind::Xray { "Xray" } else { "Mihomo" },
                     runtime
                         .as_ref()
                         .map(|identity| identity.mixed_port)
@@ -332,6 +386,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Disconnect => {
             let snapshot = host_control::request(Request::Disconnect)?;
+            let selected_backend = backend::load()?;
             let extension = &snapshot.extension;
             let complete = network_extension::capture_released_for_core_stop(extension);
             emit(
@@ -342,7 +397,8 @@ fn run(cli: Cli) -> Result<()> {
                     "extension_request_cancelled": false,
                 }),
                 format!(
-                    "Mihomo stopped; extension {}; DNS {}",
+                    "{} stopped; extension {}; DNS {}",
+                    if selected_backend == BackendKind::Xray { "Xray" } else { "Mihomo" },
                     extension.phase_label(),
                     extension.dns_label()
                 ),
@@ -443,6 +499,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut strategy = Strategy::load()?;
             let supervisor = adopted_supervisor(&strategy);
             let runtime = supervisor.runtime_identity();
+            let selected_backend = backend::load()?;
             let mut live = None;
             if let Some(name) = name {
                 let name = name.trim();
@@ -453,27 +510,37 @@ fn run(cli: Cli) -> Result<()> {
                     bail!("another core operation is in progress");
                 }
                 if let Some(identity) = runtime.as_ref() {
-                    let groups = controller::fetch_proxies(identity.mixed_port)?;
-                    let global = groups
-                        .iter()
-                        .find(|group| group.name == GLOBAL_GROUP)
-                        .context("GLOBAL selector missing from the running core")?;
-                    if !global.members.iter().any(|member| member.name == name) {
-                        bail!("{name} is not a member of the running GLOBAL selector");
+                    if selected_backend == BackendKind::Mihomo {
+                        let groups = controller::fetch_proxies(identity.mixed_port)?;
+                        let global = groups
+                            .iter()
+                            .find(|group| group.name == GLOBAL_GROUP)
+                            .context("GLOBAL selector missing from the running core")?;
+                        if !global.members.iter().any(|member| member.name == name) {
+                            bail!("{name} is not a member of the running GLOBAL selector");
+                        }
+                    } else if !xray_global_member_exists(&strategy, name)? {
+                        bail!("{name} is not available to the running Xray channel");
                     }
                 } else {
-                    let catalog = catalog::Catalog::load()?;
-                    if !matches!(name, "DIRECT" | "REJECT")
-                        && !strategy.groups.iter().any(|group| group.name == name)
-                        && !catalog.nodes.iter().any(|node| {
-                            node.name == name
-                                && strategy
-                                    .subscriptions
-                                    .iter()
-                                    .any(|sub| sub.name == node.subscription)
-                        })
-                    {
-                        bail!("GLOBAL member does not exist: {name}");
+                    if selected_backend == BackendKind::Xray {
+                        if !xray_global_member_exists(&strategy, name)? {
+                            bail!("GLOBAL member does not exist: {name}");
+                        }
+                    } else {
+                        let catalog = catalog::Catalog::load()?;
+                        if !matches!(name, "DIRECT" | "REJECT")
+                            && !strategy.groups.iter().any(|group| group.name == name)
+                            && !catalog.nodes.iter().any(|node| {
+                                node.name == name
+                                    && strategy
+                                        .subscriptions
+                                        .iter()
+                                        .any(|sub| sub.name == node.subscription)
+                            })
+                        {
+                            bail!("GLOBAL member does not exist: {name}");
+                        }
                     }
                 }
                 strategy.set_global_selected(name.to_string());
@@ -485,12 +552,16 @@ fn run(cli: Cli) -> Result<()> {
                     live = Some(name.to_string());
                 }
             } else if let Some(identity) = runtime {
-                let groups = controller::fetch_proxies(identity.mixed_port)?;
-                let global = groups
-                    .into_iter()
-                    .find(|group| group.name == GLOBAL_GROUP)
-                    .context("GLOBAL selector missing from the running core")?;
-                live = Some(global.now);
+                if selected_backend == BackendKind::Mihomo {
+                    let groups = controller::fetch_proxies(identity.mixed_port)?;
+                    let global = groups
+                        .into_iter()
+                        .find(|group| group.name == GLOBAL_GROUP)
+                        .context("GLOBAL selector missing from the running core")?;
+                    live = Some(global.now);
+                } else {
+                    live = Some(myproxy::xray::status()?.current);
+                }
             }
             emit(
                 json,
@@ -961,6 +1032,7 @@ fn adopted_supervisor(strategy: &Strategy) -> std::sync::Arc<Supervisor> {
 }
 
 fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
+    let selected_backend = backend::load()?;
     let catalog = snapshot
         .catalog
         .as_ref()
@@ -976,7 +1048,13 @@ fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
             "filter_excluded": catalog.filter_excluded,
             "fetch_failures": catalog.fetch_failures,
             "refresh_warnings": catalog.refresh_warnings,
+            "backend": selected_backend.as_str(),
             "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
+            "runtime_config": if selected_backend == BackendKind::Xray {
+                paths::xray_config_path()?.display().to_string()
+            } else {
+                paths::runtime_yaml_path()?.display().to_string()
+            },
             "extension_runtime": extension, "extension_request_cancelled": false,
         }),
         format!(
@@ -997,7 +1075,11 @@ fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
             println!("{warning}");
         }
     }
-    host_control::check_outcome(&snapshot)
+    if selected_backend == BackendKind::Xray {
+        Ok(())
+    } else {
+        host_control::check_outcome(&snapshot)
+    }
 }
 
 fn emit(json: bool, value: serde_json::Value, human: impl std::fmt::Display) {
@@ -1014,4 +1096,15 @@ fn infer_name(_url: &str) -> String {
         "subscription-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     )
+}
+
+fn xray_global_member_exists(strategy: &Strategy, name: &str) -> Result<bool> {
+    if matches!(name, "DIRECT" | "REJECT") {
+        return Ok(true);
+    }
+    if strategy.groups.iter().any(|group| group.name == name) {
+        return Ok(true);
+    }
+    let catalog = catalog::Catalog::load()?;
+    Ok(catalog.nodes.iter().any(|node| node.name == name))
 }

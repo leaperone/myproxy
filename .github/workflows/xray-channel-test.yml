@@ -1,0 +1,56 @@
+name: Xray channel test package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or commit to package"
+        required: true
+        default: feat/xray-channel-1.6
+        type: string
+      publish:
+        description: "Publish a separate prerelease under the xray channel"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: myproxy-xray-channel-test
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Build disposable Xray package
+        run: scripts/package-xray-test.sh
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myproxy-xray-channel-${{ github.run_number }}
+          path: dist/xray-channel/*.zip
+          if-no-files-found: error
+      - name: Publish separate Xray prerelease
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="xray-1.6-test.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          archive="$(find dist/xray-channel -name '*.zip' -maxdepth 1 -print -quit)"
+          gh release create "$tag" "$archive" \
+            --draft --prerelease --latest=false \
+            --target "$GITHUB_SHA" \
+            --title "myproxy Xray channel test ${GITHUB_RUN_NUMBER}" \
+            --notes "Disposable Xray channel test package. Source: ${GITHUB_SHA}. This release is separate from Prod and Nightly feeds."
+          gh release edit "$tag" --draft=false --prerelease --latest=false

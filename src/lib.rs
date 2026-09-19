@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod backend;
 pub mod cli_install;
 pub mod compile;
 pub mod gfw;
@@ -14,6 +15,7 @@ pub mod strategy;
 pub mod supervisor;
 pub mod system_proxy;
 pub mod updates;
+pub mod xray;
 
 pub use strategy::{
     Group, InboundMode, Matcher, RoutingProfile, Rule, RuleSet, Strategy, GLOBAL_GROUP,

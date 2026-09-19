@@ -18,6 +18,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::KeyDownEvent;
 use gpui_kit::*;
+use myproxy::backend::{self, BackendKind};
 use myproxy::catalog::{self, Catalog};
 use myproxy::controller::{
     self, ConnectionColumn, ConnectionFilters, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals,
@@ -1648,7 +1649,16 @@ impl AppView {
                 dirty = true;
             }
         } else if became_ready {
-            self.status = format!("Mixed 已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
+            self.status = if backend::is_xray() {
+                let http = self
+                    .runtime
+                    .map(|runtime| myproxy::xray::http_port(runtime.mixed_port))
+                    .map(|port| format!("127.0.0.1:{port}"))
+                    .unwrap_or_else(|| "HTTP 入口未监听".into());
+                format!("Xray 已就绪 · SOCKS {} · HTTP {}", self.mixed_endpoint(), http)
+            } else {
+                format!("Mixed 已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint())
+            };
             dirty = true;
         }
         dirty
@@ -1688,7 +1698,7 @@ impl AppView {
     }
 
     fn live_page_job(&mut self) -> Option<LivePageJob> {
-        if !self.window_active || !self.connected || self.is_busy() {
+        if !self.window_active || !self.connected || self.is_busy() || backend::is_xray() {
             return None;
         }
         let runtime = self.supervisor.runtime_identity()?;
@@ -2612,6 +2622,11 @@ impl AppView {
     }
 
     fn start_group_delay(&mut self, group_name: &str, cx: &mut Context<Self>) {
+        if backend::is_xray() {
+            self.status = "Xray 通道的节点组由内核自动探测，暂不提供 Mihomo 延迟按钮。".into();
+            cx.notify();
+            return;
+        }
         if !self.connected || self.is_busy() {
             self.status = "核心空闲且连接后再测延迟。".into();
             cx.notify();
@@ -3230,7 +3245,9 @@ impl AppView {
             .child(page_title(
                 theme,
                 "连接",
-                if self.strategy.system_extension {
+                if backend::is_xray() {
+                    "Xray 通道当前只显示入口状态。连接明细接口接入后会在此显示节点、目标和流量。"
+                } else if self.strategy.system_extension {
                     "经过 Mihomo 的连接。系统接管中继后会尽量显示真实进程；扩展直接放行或拒绝的活动不在此表。"
                 } else {
                     "经过 Mihomo 的连接。当前只看到主动指定 Mixed 的客户端。打开系统接管后，未填代理的应用也会出现。"
@@ -3797,6 +3814,7 @@ impl AppView {
                     setup::login_items_path_label()
                 ),
             ))
+            .child(self.backend_panel(cx, theme))
             .child(self.system_extension_panel(cx, theme))
             .child(panel(
                 theme,
@@ -3895,6 +3913,50 @@ impl AppView {
             .child(self.strategy_backup_panel(cx, theme))
             .child(self.logs_panel(theme))
             .child(self.developer_panel(cx, theme))
+    }
+
+    fn backend_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        let current = backend::load().unwrap_or_default();
+        let xray_available = myproxy::paths::bundled_xray().is_file();
+        panel(
+            theme,
+            "运行通道",
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("兼容通道保持现有行为。Xray 通道是独立测试入口，使用同一套订阅、节点组和规则。"),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(BackendKind::ALL.into_iter().filter(move |kind| {
+                            *kind == BackendKind::Mihomo || xray_available || *kind == current
+                        }).map(move |kind| {
+                            let entity = entity.clone();
+                            let selected = kind == current;
+                            Button::new(SharedString::from(format!("backend-{}", kind.as_str())))
+                                .small()
+                                .label(kind.label())
+                                .when(selected, |button| button.primary())
+                                .disabled(self.is_busy() || self.wanted)
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        if let Err(error) = backend::save(kind) {
+                                            this.status = format!("运行通道保存失败：{error:#}");
+                                        } else {
+                                            this.status = format!("已选择{}。断开后重新连接才会启动它。", kind.label());
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                        })),
+                ),
+        )
     }
 
     fn strategy_backup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
