@@ -4,8 +4,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+pub const fn data_dir_env() -> &'static str {
+    if crate::backend::is_xray() {
+        "MYPROXY_XRAY_DATA_DIR"
+    } else {
+        "MYPROXY_DATA_DIR"
+    }
+}
+
 pub fn data_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("MYPROXY_DATA_DIR") {
+    let dir = match std::env::var_os(data_dir_env()) {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         _ => dirs::data_dir()
             .context("no application support directory")?

@@ -9,7 +9,7 @@ struct Guard(PathBuf);
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = disconnect();
-        std::env::remove_var("MYPROXY_DATA_DIR");
+        std::env::remove_var(crate::paths::data_dir_env());
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -17,9 +17,30 @@ fn isolated() -> Guard {
     let directory =
         std::env::temp_dir().join(format!("myproxy-xray-test-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&directory).unwrap();
-    std::env::set_var("MYPROXY_DATA_DIR", &directory);
+    std::env::set_var(crate::paths::data_dir_env(), &directory);
     Guard(directory)
 }
+
+#[test]
+#[cfg(feature = "xray-channel")]
+fn xray_data_ignores_inherited_production_override() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let isolated = isolated();
+    let production = isolated.0.join("production");
+    fs::create_dir(&production).unwrap();
+    let strategy = production.join("strategy.json");
+    fs::write(&strategy, b"preserved production configuration").unwrap();
+    let previous = std::env::var_os("MYPROXY_DATA_DIR");
+    std::env::set_var("MYPROXY_DATA_DIR", &production);
+    let selected = crate::paths::data_dir();
+    match previous {
+        Some(value) => std::env::set_var("MYPROXY_DATA_DIR", value),
+        None => std::env::remove_var("MYPROXY_DATA_DIR"),
+    }
+    assert_eq!(selected.unwrap(), isolated.0);
+    assert_eq!(fs::read(strategy).unwrap(), b"preserved production configuration");
+}
+
 fn headers(stream: &mut TcpStream) -> String {
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {

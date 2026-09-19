@@ -336,8 +336,9 @@ mod transport {
         if connection.is_err() {
             let mut launch = std::process::Command::new("/usr/bin/open");
             launch.arg("-g").arg("-a").arg(bundle()?);
-            if let Some(directory) = std::env::var_os("MYPROXY_DATA_DIR") {
-                let mut assignment = std::ffi::OsString::from("MYPROXY_DATA_DIR=");
+            if let Some(directory) = std::env::var_os(crate::paths::data_dir_env()) {
+                let mut assignment = std::ffi::OsString::from(crate::paths::data_dir_env());
+                assignment.push("=");
                 assignment.push(directory);
                 launch.arg("--env").arg(assignment);
             }

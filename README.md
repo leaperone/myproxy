@@ -82,6 +82,8 @@ under `~/Library/Application Support/myproxy-xray/`, and installs an optional
 `myproxy-xrayctl` link. The normal build continues to use the original core,
 configuration, app identity, CLI link, and update feeds. Backend selection
 cannot be changed by a shared `backend.json` file.
+Isolated Xray checks use `MYPROXY_XRAY_DATA_DIR`; the production
+`MYPROXY_DATA_DIR` override is ignored by this build.
 
 The test app owns one loopback HTTP and SOCKS5 TCP entrance, default port
 **40808**. It chooses the rule and node before passing a connection to an
