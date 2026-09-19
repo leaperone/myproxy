@@ -1796,6 +1796,7 @@ impl AppView {
             }
             names
         };
+        if backend::is_xray() { names.retain(|name| name != "REJECT"); }
         if !query.is_empty() {
             names.retain(|name| name.to_lowercase().contains(&query));
         }
@@ -4311,7 +4312,7 @@ impl AppView {
         let now_label = global_selection_label(&now, self.connected);
         let entity = cx.entity();
         let muted_fg = theme.muted_foreground;
-        let mut shortcuts: Vec<String> = vec!["DIRECT".into(), "REJECT".into()];
+        let mut shortcuts: Vec<String> = if backend::is_xray() { vec!["DIRECT".into()] } else { vec!["DIRECT".into(), "REJECT".into()] };
         for group in &self.strategy.groups {
             if !shortcuts.iter().any(|name| name == &group.name) {
                 shortcuts.push(group.name.clone());
@@ -4320,7 +4321,7 @@ impl AppView {
         v_flex()
             .gap_1()
             .child(div().text_xs().text_color(muted_fg).child(if active {
-                format!("GLOBAL 当前 {now_label} · 点下方组或到节点组选节点")
+                format!("当前选择 {now_label} · 也可以在节点组中固定一个节点")
             } else {
                 format!("内置 GLOBAL 当前 {now_label} · 仅「全局」模式整段走它")
             }))
@@ -4332,7 +4333,7 @@ impl AppView {
                         let mut button =
                             Button::new(SharedString::from(format!("{id_prefix}-global-{name}")))
                                 .small()
-                                .label(name.clone());
+                                .label(if backend::is_xray() && name == "DIRECT" { "全球直连".to_string() } else { name.clone() });
                         if name == now {
                             button = button.primary();
                         }
