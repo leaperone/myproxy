@@ -1,0 +1,49 @@
+name: Xray channel tests
+on:
+  push:
+    branches: [feat/xray-channel-1.6]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: myproxy-xray-channel-test
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/xray-build
+      XRAY_BINARY: ${{ github.workspace }}/resources/xray/xray
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/xray-build"
+          key: xray-test
+          cache-on-failure: true
+      - run: python3 scripts/check-xray-boundary.py
+      - run: scripts/fetch-xray.sh
+      - run: rustfmt --edition 2021 src/xray.rs src/backend.rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-formatted-${{ github.sha }}
+          path: |
+            src/xray.rs
+            src/backend.rs
+            src/xray/
+      - run: cargo test --locked --lib -- --test-threads=1
+      - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
+      - run: cargo build --locked --bins --features xray-channel
+      - run: scripts/package-xray-test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: myproxy-xray-${{ github.sha }}
+          path: dist/xray-channel/*
+          if-no-files-found: error

@@ -6,16 +6,18 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
+use crate::backend;
 use crate::network_extension::{self, DnsPhase, Phase, RuntimeStatus};
 use crate::strategy::Strategy;
 use crate::supervisor::{OperationState, RuntimeIdentity, Supervisor};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Status,
     Apply { refresh: bool },
     Connect,
     Disconnect,
+    Select { group: String, name: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,10 +49,15 @@ pub struct Snapshot {
     pub extension: RuntimeStatus,
     pub extension_required: bool,
     pub catalog: Option<AppliedCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray: Option<crate::xray::XrayStatus>,
 }
 
 /// Bundled macOS clients must never fall back to executing NE calls themselves.
 pub fn request(request: Request) -> Result<Snapshot> {
+    if backend::is_xray() && !crate::login_item::is_bundled() && !matches!(request,Request::Status) {
+        bail!("请使用 MyProxy Xray.app 内的命令行工具，运行连接由应用持有");
+    }
     #[cfg(target_os = "macos")]
     {
         if crate::login_item::is_bundled() {
@@ -95,9 +102,15 @@ fn execute(request: Request) -> Result<Snapshot> {
     };
     let supervisor = Supervisor::shared();
     supervisor.adopt_running(strategy.tun, strategy.system_extension, strategy.mixed_port);
-    let catalog = match request {
+    let catalog = match &request {
         Request::Status => None,
-        Request::Apply { refresh } => Some(AppliedCatalog::from(&if refresh {
+        Request::Select { group, name } => {
+            if !backend::is_xray() { bail!("此操作仅适用于 Xray 测试版"); }
+            let identity = supervisor.runtime_identity().context("尚未连接")?;
+            supervisor.select_proxy(identity, group, name)?;
+            None
+        },
+        Request::Apply { refresh } => Some(AppliedCatalog::from(&if *refresh {
             supervisor.apply(&strategy)?
         } else {
             supervisor.apply_cached(&strategy)?
@@ -145,8 +158,9 @@ fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
     let runtime = supervisor.runtime_identity();
     Snapshot {
         operation: supervisor.operation_state(),
-        controller_ready: runtime
-            .is_some_and(|identity| crate::controller::ready(identity.mixed_port).is_ok()),
+        controller_ready: backend::load().unwrap_or_default() == backend::BackendKind::Mihomo
+            && runtime
+                .is_some_and(|identity| crate::controller::ready(identity.mixed_port).is_ok()),
         extension_required: runtime.is_some()
             && supervisor
                 .applied_strategy()
@@ -154,10 +168,15 @@ fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
         runtime,
         extension,
         catalog: None,
+        xray: if backend::is_xray() { crate::xray::status().ok() } else { None },
     }
 }
 
 pub fn check_outcome(snapshot: &Snapshot) -> Result<()> {
+    if let Some(xray) = &snapshot.xray {
+        if xray.wanted && !xray.ready { bail!("Xray 入口未就绪"); }
+        return Ok(());
+    }
     let status = &snapshot.extension;
     if !status.observed {
         bail!("System Extension/DNS status is not confirmed; check status in myproxy");
@@ -205,6 +224,7 @@ mod tests {
             controller_ready: true,
             extension_required: true,
             catalog: None,
+            xray: None,
             extension: RuntimeStatus {
                 phase: Phase::Running,
                 dns_phase: DnsPhase::Running,
@@ -316,8 +336,9 @@ mod transport {
         if connection.is_err() {
             let mut launch = std::process::Command::new("/usr/bin/open");
             launch.arg("-g").arg("-a").arg(bundle()?);
-            if let Some(directory) = std::env::var_os("MYPROXY_DATA_DIR") {
-                let mut assignment = std::ffi::OsString::from("MYPROXY_DATA_DIR=");
+            if let Some(directory) = std::env::var_os(crate::paths::data_dir_env()) {
+                let mut assignment = std::ffi::OsString::from(crate::paths::data_dir_env());
+                assignment.push("=");
                 assignment.push(directory);
                 launch.arg("--env").arg(assignment);
             }

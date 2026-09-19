@@ -261,6 +261,7 @@ pub fn activity_process_by_port(
 /// Reads a bounded in-memory host snapshot. The host refreshes its existing
 /// provider status channel at most once per two seconds without reconnecting.
 pub fn status() -> RuntimeStatus {
+    if crate::backend::is_xray() { return unavailable_status(); }
     #[cfg(target_os = "macos")]
     if login_item::is_bundled() {
         let value = unsafe { ffi::myproxy_ne_status() };

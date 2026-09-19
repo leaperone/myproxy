@@ -9,6 +9,7 @@ repository = "https://github.com/leaperone/myproxy"
 [features]
 default = []
 sparkle = []
+xray-channel = []
 
 [lib]
 name = "myproxy"

@@ -18,6 +18,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::KeyDownEvent;
 use gpui_kit::*;
+use myproxy::backend;
 use myproxy::catalog::{self, Catalog};
 use myproxy::controller::{
     self, ConnectionColumn, ConnectionFilters, LiveGroup, LiveNeed, TrafficSnapshot, TrafficTotals,
@@ -852,7 +853,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。"),
+                    .child(if backend::is_xray() { "同一规则中任一条件匹配就使用所选出口，规则从上到下依次匹配。" } else { "逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。" }),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
@@ -935,7 +936,7 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
             section: 1,
         });
     }
-    for group in &strategy.groups {
+    for group in strategy.groups.iter().filter(|_| !backend::is_xray()) {
         let value = format!("gfw:{}", group.name);
         if out.iter().any(|c| c.value.eq_ignore_ascii_case(&value)) {
             continue;
@@ -1325,7 +1326,7 @@ impl AppView {
             external_change_pending: false,
             strategy_stamp: initial_strategy_stamp,
             supervisor,
-            url_input: cx.new(|cx| InputState::new(window, cx).placeholder("https://…/clash.yaml")),
+            url_input: cx.new(|cx| InputState::new(window, cx).placeholder(if backend::is_xray() { "粘贴订阅网址或节点分享链接" } else { "https://…/clash.yaml" })),
             name_input: cx.new(|cx| InputState::new(window, cx).placeholder("订阅名")),
             group_modal_open: false,
             group_edit_id: None,
@@ -1648,7 +1649,7 @@ impl AppView {
                 dirty = true;
             }
         } else if became_ready {
-            self.status = format!("Mixed 已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
+            self.status = format!("代理已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
             dirty = true;
         }
         dirty
@@ -1795,6 +1796,7 @@ impl AppView {
             }
             names
         };
+        if backend::is_xray() { names.retain(|name| name != "REJECT"); }
         if !query.is_empty() {
             names.retain(|name| name.to_lowercase().contains(&query));
         }
@@ -1833,6 +1835,15 @@ impl AppView {
             } else {
                 "异常".into()
             };
+        }
+        if backend::is_xray() {
+            return myproxy::xray::status()
+                .map(|status| match status.current.as_str() {
+                    "DIRECT" => "全球直连".to_string(),
+                    "REJECT" => "没有可用出口".to_string(),
+                    _ => status.current,
+                })
+                .unwrap_or_else(|_| "等待连接状态".into());
         }
         self.live_now("PROXY")
             .or_else(|| {
@@ -2490,7 +2501,12 @@ impl AppView {
             self.strategy.set_global_selected(node.to_string());
             GLOBAL_GROUP.to_string()
         } else {
-            if !self.strategy.set_group_selected(group_id, node.to_string()) {
+            let picked = if backend::is_xray() {
+                if let Some(group) = self.strategy.groups.iter_mut().find(|group| group.id == group_id || group.name == group_id) {
+                    group.selected = node.to_string(); true
+                } else { false }
+            } else { self.strategy.set_group_selected(group_id, node.to_string()) };
+            if !picked {
                 self.status = "只能在手动选择组里点选节点。".into();
                 cx.notify();
                 return;
@@ -2812,7 +2828,7 @@ impl AppView {
                     .gap_1()
                     .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
                     .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
-                    .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
+                    .child(self.nav_item(cx, Page::Subscriptions, if backend::is_xray() { "添加代理" } else { "订阅" }, IconName::Inbox))
                     .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
                     .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map))
                     .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
@@ -2893,7 +2909,7 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(match page {
-                        Page::Overview => self.overview(cx, theme).into_any_element(),
+                        Page::Overview => if backend::is_xray() { self.xray_overview(cx,theme).into_any_element() } else { self.overview(cx, theme).into_any_element() },
                         Page::Subscriptions => self.subscriptions(cx, theme).into_any_element(),
                         Page::Groups => self.groups(cx, theme).into_any_element(),
                         Page::Settings => self.settings(cx, theme).into_any_element(),
@@ -2986,11 +3002,11 @@ impl AppView {
         let has_sub = !self.strategy.subscriptions.is_empty();
         let has_nodes = !self.catalog.nodes.is_empty();
         let muted = theme.muted_foreground;
-        let inbound = format!(
+        let inbound = if backend::is_xray() { format!("将客户端的 HTTP 或 SOCKS5 代理设为 127.0.0.1:{}。全局出口统一控制这些流量。",self.strategy.mixed_port) } else { format!(
             "规则只处理进入代理的流量。Mixed 把客户端代理设为 {}（HTTP + SOCKS5）。系统接管在设置里打开，并到 {} 允许 myproxy。TUN 与接管互斥，首次要管理员密码。",
             self.mixed_endpoint(),
             setup::login_items_path_label()
-        );
+        ) };
         v_flex()
             .w_full()
             .p_4()
@@ -3040,6 +3056,29 @@ impl AppView {
                         .on_click(self.select_page(cx, Page::Subscriptions)),
                 )
             })
+    }
+
+    fn xray_overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let title = if self.connected { "已连接" } else if self.wanted { "连接需要处理" } else { "未连接" };
+        v_flex().gap_4()
+            .child(page_title(theme,"MyProxy Xray","添加代理，选择出口，然后连接。"))
+            .child(panel(theme,"连接",h_flex().items_center().justify_between()
+                .child(v_flex().gap_2()
+                    .child(div().text_lg().font_semibold().child(title))
+                    .child(div().text_sm().child(if self.connected && self.strategy.mixed_mode == InboundMode::Rule { "按规则为每条连接选择出口".to_string() } else if self.connected { format!("当前出口：{}",self.overview_proxy_label()) } else { format!("HTTP 和 SOCKS5 共用 127.0.0.1:{}",self.strategy.mixed_port) })))
+                .child(self.overview_connect_button(cx,true))))
+            .when(self.catalog.nodes.is_empty(), |view| view.child(
+                Button::new("xray-add-proxy").primary().label("添加代理").on_click(self.select_page(cx,Page::Subscriptions))))
+            .child(panel(theme,"使用方式",v_flex().gap_3()
+                .child(self.inbound_mode_buttons(cx,"xray-mode",self.strategy.mixed_mode,Self::set_mixed_mode))
+                .child(div().text_xs().text_color(theme.muted_foreground).child("全局模式使用同一出口；按规则模式会分别选择出口。切换出口时会断开旧连接，让客户端使用新选择。"))))
+            .when(self.strategy.mixed_mode == InboundMode::Global, |view| view.child(panel(theme,"全局出口",
+                self.global_mode_row(cx,theme,true,"overview-xray"))))
+            .child(Button::new("xray-choose-node").label("展开节点组，选择具体节点").on_click(self.select_page(cx,Page::Groups)))
+            .child(h_flex().gap_3().flex_wrap()
+                .child(metric(theme,"活动连接",&self.traffic.connection_count.to_string()))
+                .child(metric(theme,"上传",&controller::format_rate(self.traffic_up)))
+                .child(metric(theme,"下载",&controller::format_rate(self.traffic_down))))
     }
 
     fn overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -3230,7 +3269,9 @@ impl AppView {
             .child(page_title(
                 theme,
                 "连接",
-                if self.strategy.system_extension {
+                if backend::is_xray() {
+                    "本次连接经过 MyProxy 的目标、所选节点和流量。测速不计入连接记录。"
+                } else if self.strategy.system_extension {
                     "经过 Mihomo 的连接。系统接管中继后会尽量显示真实进程；扩展直接放行或拒绝的活动不在此表。"
                 } else {
                     "经过 Mihomo 的连接。当前只看到主动指定 Mixed 的客户端。打开系统接管后，未填代理的应用也会出现。"
@@ -3318,7 +3359,7 @@ impl AppView {
                                                 .danger()
                                                 .label("关闭核心全部连接")
                                                 .disabled(self.is_busy())
-                                                .tooltip("关闭 Mihomo 全部连接，包含当前筛选外的连接")
+                                                .tooltip("关闭全部代理连接，包含当前筛选外的连接")
                                                 .on_click(move |_, _, app| {
                                                     entity.update(app, |this, cx| this.close_connections(None, cx));
                                                 })
@@ -3331,7 +3372,7 @@ impl AppView {
             .when(!connected && !self.wanted, |this| {
                 this.child(empty_hint_action(
                     theme,
-                    "核心未连接。到总览连接后，这里显示经过 Mihomo 的连接。",
+                    if backend::is_xray() { "尚未连接。连接后，经过本地代理的访问会显示在这里。" } else { "核心未连接。到总览连接后，这里显示经过 Mihomo 的连接。" },
                     Button::new("connections-go-overview")
                         .primary()
                         .label("去总览连接")
@@ -3341,7 +3382,7 @@ impl AppView {
             .when(!connected && self.wanted, |this| {
                 this.child(empty_hint(
                     theme,
-                    "核心未就绪。恢复后显示经过 Mihomo 的连接。",
+                    if backend::is_xray() { "代理未就绪，请重新连接。" } else { "核心未就绪。恢复后显示经过 Mihomo 的连接。" },
                 ))
             })
             .when(
@@ -3430,8 +3471,8 @@ impl AppView {
             .gap_4()
             .child(page_title(
                 theme,
-                "订阅",
-                "添加或删除后需应用。规则和模式变更使用匹配的缓存；刷新按钮会重新获取订阅。",
+                if backend::is_xray() { "代理来源" } else { "订阅" },
+                if backend::is_xray() { "粘贴订阅网址或节点分享链接即可添加。名称可以稍后修改。" } else { "添加或删除后需应用。规则和模式变更使用匹配的缓存；刷新按钮会重新获取订阅。" },
             ))
             .child(
                 Button::new("refresh-subscriptions")
@@ -3458,7 +3499,7 @@ impl AppView {
                         v_flex()
                             .gap_1()
                             .w(px(160.))
-                            .child(div().text_xs().child("订阅名"))
+                            .child(div().text_xs().child(if backend::is_xray() { "名称（可选）" } else { "订阅名" }))
                             .child(Input::new(&self.name_input)),
                     )
                     .child(
@@ -3466,7 +3507,7 @@ impl AppView {
                             .gap_1()
                             .flex_1()
                             .min_w(px(180.))
-                            .child(div().text_xs().child("订阅 URL"))
+                            .child(div().text_xs().child(if backend::is_xray() { "订阅网址或节点链接" } else { "订阅 URL" }))
                             .child(Input::new(&self.url_input)),
                     )
                     .child(
@@ -3481,8 +3522,16 @@ impl AppView {
                                         if this.is_busy() {
                                             return;
                                         }
-                                        let name =
+                                        let mut name =
                                             this.name_input.read(cx).value().trim().to_string();
+                                        if name.is_empty() && backend::is_xray() {
+                                            let mut number = this.strategy.subscriptions.len() + 1;
+                                            loop {
+                                                name = format!("代理来源 {number}");
+                                                if !this.strategy.subscriptions.iter().any(|source| source.name == name) { break; }
+                                                number += 1;
+                                            }
+                                        }
                                         let url =
                                             this.url_input.read(cx).value().trim().to_string();
                                         if name.is_empty() || url.is_empty() {
@@ -3500,6 +3549,7 @@ impl AppView {
                                                 this.url_input.update(cx, |input, cx| {
                                                     input.set_value("", window, cx)
                                                 });
+                                                if backend::is_xray() { this.start_apply_with_refresh(true, cx); }
                                             } else {
                                                 this.strategy = previous;
                                             }
@@ -3591,7 +3641,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "节点组",
-                "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件，卡片边框仅表示编辑中。来源约束名称匹配，钉住优先，精确排除最终生效。",
+                if backend::is_xray() { "直接点击节点即可切换。自动组也可以固定节点，或恢复自动选择。全局出口控制全部代理流量。" } else { "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件。" },
             ))
             .child(
                 h_flex().child({
@@ -3677,10 +3727,10 @@ impl AppView {
                     accent,
                     &now,
                     &members,
-                    group.kind == "select",
+                    group.kind == "select" || backend::is_xray(),
                     self.delaying.contains(&group.name),
                     self.connected,
-                    *self.member_limits.get(&group.id).unwrap_or(&36),
+                    *self.member_limits.get(&group.id).unwrap_or(if backend::is_xray() { &0 } else { &36 }),
                     self.is_busy(),
                 )
             }))
@@ -3792,12 +3842,13 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                &format!(
+                &if backend::is_xray() { "本地代理端口、外观和配置备份。测试版的设置独立保存。".to_string() } else { format!(
                     "系统接管让应用不用自己填代理。第一次请到 {} 允许 myproxy。Mixed 给显式客户端；TUN 与接管互斥。",
                     setup::login_items_path_label()
-                ),
+                ) },
             ))
-            .child(self.system_extension_panel(cx, theme))
+            .when(backend::is_xray(), |view| view.child(self.backend_panel(cx, theme)))
+            .when(!backend::is_xray(), |view| view.child(self.system_extension_panel(cx, theme)))
             .child(panel(
                 theme,
                 "外观",
@@ -3859,7 +3910,7 @@ impl AppView {
                         "mixed",
                     )),
             ))
-            .child(self.updates_panel(cx, theme))
+            .when(!backend::is_xray(), |view| view.child(self.updates_panel(cx, theme)))
             .child(panel(
                 theme,
                 "排除过滤器",
@@ -3890,11 +3941,25 @@ impl AppView {
                         )
                     }),
             ))
-            .child(self.startup_panel(cx, theme))
+            .when(!backend::is_xray(), |view| view.child(self.startup_panel(cx, theme)))
             .child(self.cli_install_panel(cx, theme))
             .child(self.strategy_backup_panel(cx, theme))
             .child(self.logs_panel(theme))
             .child(self.developer_panel(cx, theme))
+    }
+
+    fn backend_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        panel(theme, "Xray 测试版", v_flex().gap_2()
+            .child(div().text_sm().child("配置独立保存。本地 HTTP 和 SOCKS5 共用同一端口，默认 40808。"))
+            .when(self.strategy.tun || self.strategy.system_extension || self.strategy.system_proxy, |view| {
+                view.child(Button::new("xray-explicit-mode").label("将导入配置改为本地代理入口").on_click(move |_,_,app| {
+                    entity.update(app, |this,cx| {
+                        this.strategy.tun=false; this.strategy.system_extension=false; this.strategy.system_proxy=false;
+                        this.persist(); cx.notify();
+                    });
+                }))
+            }))
     }
 
     fn strategy_backup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -4120,12 +4185,12 @@ impl AppView {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(div().text_sm().child("安装 myproxyctl"))
+                                .child(div().text_sm().child(if backend::is_xray() { "安装 myproxy-xrayctl" } else { "安装 myproxyctl" }))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("让 Agent 或终端直接使用 myproxyctl 配置代理。"),
+                                        .child(if backend::is_xray() { "让 Agent 或终端使用 myproxy-xrayctl，只管理这个测试版。" } else { "让 Agent 或终端直接使用 myproxyctl 配置代理。" }),
                                 ),
                         )
                         .child(
@@ -4230,6 +4295,7 @@ impl AppView {
     }
 
     fn inbound_modes_subtitle(&self) -> String {
+        if backend::is_xray() { return format!("当前为{}。在节点组中点击出口即可切换，HTTP 和 SOCKS5 共用 {} 端口。",self.strategy.mixed_mode.label(),self.strategy.mixed_port); }
         format!("已保存模式：Mixed {} · 系统接管 {}。规则模式先绕过本机/私网再匹配策略；代理、全局、直连绕过用户规则。TUN 固定按策略规则。{}",
             self.strategy.mixed_mode.label(), self.strategy.extension_mode.label(),
             if self.is_dirty() { " 当前有待应用修改。" } else { "" })
@@ -4246,7 +4312,7 @@ impl AppView {
         let now_label = global_selection_label(&now, self.connected);
         let entity = cx.entity();
         let muted_fg = theme.muted_foreground;
-        let mut shortcuts: Vec<String> = vec!["DIRECT".into(), "REJECT".into()];
+        let mut shortcuts: Vec<String> = if backend::is_xray() { vec!["DIRECT".into()] } else { vec!["DIRECT".into(), "REJECT".into()] };
         for group in &self.strategy.groups {
             if !shortcuts.iter().any(|name| name == &group.name) {
                 shortcuts.push(group.name.clone());
@@ -4255,7 +4321,7 @@ impl AppView {
         v_flex()
             .gap_1()
             .child(div().text_xs().text_color(muted_fg).child(if active {
-                format!("GLOBAL 当前 {now_label} · 点下方组或到节点组选节点")
+                format!("当前选择 {now_label} · 也可以在节点组中固定一个节点")
             } else {
                 format!("内置 GLOBAL 当前 {now_label} · 仅「全局」模式整段走它")
             }))
@@ -4267,7 +4333,7 @@ impl AppView {
                         let mut button =
                             Button::new(SharedString::from(format!("{id_prefix}-global-{name}")))
                                 .small()
-                                .label(name.clone());
+                                .label(if backend::is_xray() && name == "DIRECT" { "全球直连".to_string() } else { name.clone() });
                         if name == now {
                             button = button.primary();
                         }
@@ -4292,7 +4358,7 @@ impl AppView {
         h_flex()
             .gap_1()
             .flex_wrap()
-            .children(InboundMode::ALL.into_iter().map(move |mode| {
+            .children(InboundMode::ALL.into_iter().filter(|mode| !backend::is_xray() || *mode != InboundMode::Proxy).map(move |mode| {
                 let entity = entity.clone();
                 let mut btn =
                     Button::new(SharedString::from(format!("{id_prefix}-{}", mode.as_str())))
@@ -4397,10 +4463,10 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("规则入口先绕过本机与私网，再按用户规则、GFWList 或国内直连、未命中走向处理。GFWList 整包装卸。国内直连的 GEOIP 在 Mihomo 里求值，系统接管不做 IP 库。"),
+                        .child(if backend::is_xray() { "按规则模式会使用下方规则。没有匹配的流量，可以统一交给节点选择，或直接连接。" } else { "规则入口先绕过本机与私网，再按用户规则、GFWList 或国内直连、未命中走向处理。GFWList 整包装卸。国内直连的 GEOIP 在 Mihomo 里求值，系统接管不做 IP 库。" }),
                 )
                 .child(
-                    h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().map(
+                    h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().filter(|profile| !backend::is_xray() || matches!(profile,RoutingProfile::Allowlist|RoutingProfile::Group)).map(
                         |profile| {
                             let entity = entity.clone();
                             let mut btn = Button::new(SharedString::from(format!(
@@ -5348,6 +5414,13 @@ fn render_group_card(
             let entity = entity.clone();
             let id = id.clone();
             move |_, window, app| {
+                if backend::is_xray() {
+                    entity.update(app, |this, cx| {
+                        if this.member_limits.remove(&id).is_none() { this.member_limits.insert(id.clone(),36); }
+                        cx.notify();
+                    });
+                    return;
+                }
                 entity.update(app, |this, cx| {
                     this.open_group_dialog(Some(&id), window, cx);
                     cx.notify();
@@ -5453,6 +5526,12 @@ fn render_group_card(
             now,
             group.policy_label()
         )))
+        .when(backend::is_xray() && group.kind != "select" && !group.selected.is_empty(), |view| {
+            let entity = entity.clone();
+            let group_id = id.clone();
+            view.child(Button::new(SharedString::from(format!("auto-{id}"))).small().label("恢复自动选择").disabled(busy)
+                .on_click(move |_, _, app| { app.stop_propagation(); entity.update(app, |view,cx| view.select_group_member(&group_id,"",cx)); }))
+        })
         .when(!shown.is_empty(), |this| {
             this.child(
                 h_flex()
@@ -5510,7 +5589,7 @@ fn render_group_card(
                     })),
             )
         })
-        .when(members.len() > limit, |this| {
+        .when(members.len() > limit && (!backend::is_xray() || limit > 0), |this| {
             let entity = entity.clone();
             let id = id.clone();
             this.child(
@@ -5565,7 +5644,7 @@ fn render_global_card(
                     div()
                         .text_sm()
                         .font_semibold()
-                        .child(format!("GLOBAL  ·  内置选择  ·  {} 个成员", members.len())),
+                        .child(format!("{} · {} 个可选出口", if backend::is_xray() { "全局出口" } else { "GLOBAL" }, members.len())),
                 )
                 .child({
                     let entity = entity.clone();

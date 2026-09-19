@@ -259,6 +259,9 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
 }
 
 fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
+    if crate::backend::is_xray() && ["vless://","vmess://","trojan://","ss://"].iter().any(|scheme|url.trim().starts_with(scheme)) {
+        return crate::xray::import::parse_links(url);
+    }
     let body = if let Some(path) = url.strip_prefix("file://") {
         fs::read_to_string(path).with_context(|| format!("read {name}"))?
     } else if url.starts_with("http://") || url.starts_with("https://") {
@@ -319,6 +322,7 @@ fn parse_subscription(body: &str) -> Result<Vec<serde_yaml::Value>> {
             }
         }
     }
+    if crate::backend::is_xray() { return crate::xray::import::parse_links(trimmed); }
     bail!("subscription is not Clash YAML or base64 YAML");
 }
 

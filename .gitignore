@@ -11,6 +11,7 @@
 *.cert
 *.mobileprovision
 *.pem
+__pycache__/
 
 # Local planning artifacts (canonical: ~/.vibe/planning/<abs-path>/)
 /.planning/
@@ -23,6 +24,9 @@
 
 # Fetched mihomo binary (GPL-3.0); fetch with scripts/fetch-mihomo.sh
 /resources/mihomo/mihomo
+
+# Fetched Xray binary for the opt-in local test channel.
+/resources/xray/xray
 
 # Fetched Sparkle.framework + tools; fetch with scripts/fetch-sparkle.sh
 /resources/sparkle/

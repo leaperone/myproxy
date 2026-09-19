@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use anyhow::{bail, Context, Result};
 
 use crate::catalog::{self, Catalog};
+use crate::backend;
 use crate::compile;
 use crate::controller;
 use crate::log;
@@ -289,6 +290,9 @@ impl Supervisor {
         if !self.is_running() {
             return None;
         }
+        if backend::is_xray() {
+            return crate::xray::status().ok().and_then(|status| status.mixed_port);
+        }
         RuntimeConfig::load()
             .ok()
             .flatten()
@@ -307,6 +311,13 @@ impl Supervisor {
         if self.is_busy() || !self.is_running() {
             return None;
         }
+        if backend::is_xray() {
+            let identity = crate::xray::runtime_identity()?;
+            return Some(RuntimeIdentity {
+                generation: identity.generation,
+                mixed_port: identity.mixed_port,
+            });
+        }
         let runtime = RuntimeConfig::load().ok().flatten()?;
         if !pid_file_alive(Some(runtime.strategy.mixed_port)) {
             return None;
@@ -315,6 +326,9 @@ impl Supervisor {
     }
 
     pub fn applied_strategy(&self) -> Option<Strategy> {
+        if backend::is_xray() {
+            return crate::xray::applied_strategy();
+        }
         RuntimeConfig::load()
             .ok()
             .flatten()
@@ -340,6 +354,13 @@ impl Supervisor {
     }
 
     pub fn adopt_running(&self, _tun: bool, _system_extension: bool, _mixed_port: u16) {
+        if backend::is_xray() {
+            if let Some(identity) = crate::xray::runtime_identity() {
+                self.remember_mixed_port(Some(identity.mixed_port));
+                self.mark_ready(crate::xray::status().map(|status| status.current).unwrap_or_default());
+            }
+            return;
+        }
         let Ok(Some(runtime)) = RuntimeConfig::load() else {
             return;
         };
@@ -351,6 +372,12 @@ impl Supervisor {
     }
 
     pub fn sync_wanted_on_launch(&self) {
+        if backend::is_xray() {
+            if let Err(error) = crate::xray::sync_wanted_on_launch() {
+                log::warn("xray", format!("reconcile wanted state failed: {error:#}"));
+            }
+            return;
+        }
         // A disable request may be waiting for another process's operation.
         // Never overwrite that request while adopting its still-running core.
         if !self.is_running() && !self.is_busy() {
@@ -360,11 +387,14 @@ impl Supervisor {
     }
 
     pub fn wanted(&self) -> bool {
+        if backend::is_xray() {
+            return crate::xray::wanted();
+        }
         is_wanted()
     }
 
     pub fn last_health(&self) -> CoreHealth {
-        if !is_wanted() {
+        if !self.wanted() {
             return CoreHealth::idle();
         }
         let mut health = self
@@ -378,6 +408,16 @@ impl Supervisor {
     }
 
     pub fn connect(&self, strategy: &Strategy) -> Result<()> {
+        if backend::is_xray() {
+            let result = crate::xray::connect(strategy);
+            if result.is_ok() {
+                if let Ok(status) = crate::xray::status() {
+                    self.remember_mixed_port(status.mixed_port);
+                    self.mark_ready(status.current);
+                }
+            }
+            return result;
+        }
         let cancellation = cancellation_revision()?;
         let mut operation = acquire_operation()?;
         if *operation._state {
@@ -404,9 +444,33 @@ impl Supervisor {
     }
 
     pub fn apply(&self, strategy: &Strategy) -> Result<Catalog> {
+        if backend::is_xray() {
+            let result = crate::xray::apply(strategy, true);
+            if result.is_ok() {
+                if let Ok(status) = crate::xray::status() {
+                    self.remember_mixed_port(status.mixed_port);
+                    if status.running {
+                        self.mark_ready(status.current);
+                    }
+                }
+            }
+            return result;
+        }
         self.apply_inner(strategy, true)
     }
     pub fn apply_cached(&self, strategy: &Strategy) -> Result<Catalog> {
+        if backend::is_xray() {
+            let result = crate::xray::apply(strategy, false);
+            if result.is_ok() {
+                if let Ok(status) = crate::xray::status() {
+                    self.remember_mixed_port(status.mixed_port);
+                    if status.running {
+                        self.mark_ready(status.current);
+                    }
+                }
+            }
+            return result;
+        }
         self.apply_inner(strategy, false)
     }
 
@@ -699,6 +763,13 @@ impl Supervisor {
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        if backend::is_xray() {
+            let result = crate::xray::disconnect();
+            self.reset_health();
+            self.remember_mixed_port(None);
+            self.record_result(&result);
+            return result;
+        }
         cancel_pending_connect()?;
         set_wanted(false)?;
         self.reset_health();
@@ -710,6 +781,13 @@ impl Supervisor {
     }
 
     pub fn shutdown(&self) -> Result<()> {
+        if backend::is_xray() {
+            let result = crate::xray::disconnect();
+            self.reset_health();
+            self.remember_mixed_port(None);
+            self.record_result(&result);
+            return result;
+        }
         cancel_pending_connect()?;
         set_wanted(false)?;
         self.reset_health();
@@ -761,6 +839,9 @@ impl Supervisor {
     }
 
     pub fn is_running(&self) -> bool {
+        if backend::is_xray() {
+            return crate::xray::is_running();
+        }
         {
             let mut slot = self.child.lock().expect("supervisor lock");
             if let Some(child) = slot.as_mut() {
@@ -795,6 +876,16 @@ impl Supervisor {
     }
 
     pub fn select_proxy(&self, identity: RuntimeIdentity, group: &str, name: &str) -> Result<()> {
+        if backend::is_xray() {
+            let result = crate::xray::select_proxy(&identity, group, name);
+            if result.is_ok() {
+                if let Ok(status) = crate::xray::status() {
+                    self.remember_mixed_port(status.mixed_port);
+                    self.mark_ready(status.current);
+                }
+            }
+            return result;
+        }
         let mut operation = acquire_operation_with_timeout(Duration::ZERO)?;
         if *operation._state {
             bail!("application is shutting down");
@@ -839,6 +930,10 @@ impl Supervisor {
     }
 
     pub fn close_one(&self, identity: RuntimeIdentity, id: &str) -> Result<()> {
+        if backend::is_xray() {
+            if crate::xray::runtime_identity() != Some(identity) { bail!("运行配置已变化"); }
+            return crate::xray::close_one(id);
+        }
         let mut operation = acquire_operation_with_timeout(Duration::ZERO)?;
         if *operation._state {
             bail!("application is shutting down");
@@ -849,6 +944,10 @@ impl Supervisor {
     }
 
     pub fn close_all(&self, identity: RuntimeIdentity) -> Result<()> {
+        if backend::is_xray() {
+            if crate::xray::runtime_identity() != Some(identity) { bail!("运行配置已变化"); }
+            return crate::xray::close_all();
+        }
         let mut operation = acquire_operation_with_timeout(Duration::ZERO)?;
         if *operation._state {
             bail!("application is shutting down");
@@ -871,6 +970,33 @@ impl Supervisor {
     }
 
     pub fn observe(&self, _draft: &Strategy) -> CoreHealth {
+        if backend::is_xray() {
+            let Ok(status) = crate::xray::status() else {
+                let health = CoreHealth::failing("无法读取 Xray 运行状态");
+                self.store_health(health.clone());
+                return health;
+            };
+            if !status.wanted {
+                self.reset_health();
+                return CoreHealth::idle();
+            }
+            let health = if status.ready {
+                let mut health = CoreHealth::ready(status.current);
+                if !status.warnings.is_empty() {
+                    health.note = Some(format!("已连接；{} 个节点配置需要处理。{}", status.warnings.len(),status.warnings[0]));
+                }
+                health
+            } else {
+                CoreHealth::failing(
+                    status
+                        .note
+                        .as_deref()
+                        .unwrap_or("Xray 入口尚未就绪"),
+                )
+            };
+            self.store_health(health.clone());
+            return health;
+        }
         if !is_wanted() {
             self.reset_health();
             return CoreHealth::idle();

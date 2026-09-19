@@ -334,7 +334,7 @@ impl Strategy {
     pub fn load() -> Result<Self> {
         let path = paths::strategy_path()?;
         if !path.exists() {
-            let strategy = Self::default();
+            let strategy = if crate::backend::is_xray() { crate::xray::default_strategy() } else { Self::default() };
             strategy.save()?;
             log::info("strategy", "created default strategy.json");
             return Ok(strategy);

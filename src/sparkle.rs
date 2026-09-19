@@ -21,10 +21,11 @@ static FEED_PORT: AtomicU16 = AtomicU16::new(0);
 static REMOTE_FEED: Mutex<Option<(String, bool)>> = Mutex::new(None);
 
 pub fn available() -> bool {
-    cfg!(all(target_os = "macos", feature = "sparkle"))
+    !myproxy::backend::is_xray() && cfg!(all(target_os = "macos", feature = "sparkle"))
 }
 
 pub fn init() {
+    if myproxy::backend::is_xray() { return; }
     Supervisor::shared().set_update_proxy_hook(note_mixed_port);
     start_local_feed();
     note_mixed_port(Supervisor::shared().update_download_port());
@@ -35,6 +36,7 @@ pub fn init() {
 }
 
 pub fn set_channel(channel: UpdateChannel) {
+    if myproxy::backend::is_xray() { return; }
     let remote = channel.feed_url().to_string();
     let nightly = channel == UpdateChannel::Nightly;
     *REMOTE_FEED.lock().expect("sparkle feed") = Some((remote, nightly));
