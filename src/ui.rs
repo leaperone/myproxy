@@ -853,7 +853,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。"),
+                    .child(if backend::is_xray() { "同一规则中任一条件匹配就使用所选出口，规则从上到下依次匹配。" } else { "逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。" }),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
@@ -936,7 +936,7 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
             section: 1,
         });
     }
-    for group in &strategy.groups {
+    for group in strategy.groups.iter().filter(|_| !backend::is_xray()) {
         let value = format!("gfw:{}", group.name);
         if out.iter().any(|c| c.value.eq_ignore_ascii_case(&value)) {
             continue;
@@ -2992,11 +2992,11 @@ impl AppView {
         let has_sub = !self.strategy.subscriptions.is_empty();
         let has_nodes = !self.catalog.nodes.is_empty();
         let muted = theme.muted_foreground;
-        let inbound = format!(
+        let inbound = if backend::is_xray() { format!("将客户端的 HTTP 或 SOCKS5 代理设为 127.0.0.1:{}。全局出口统一控制这些流量。",self.strategy.mixed_port) } else { format!(
             "规则只处理进入代理的流量。Mixed 把客户端代理设为 {}（HTTP + SOCKS5）。系统接管在设置里打开，并到 {} 允许 myproxy。TUN 与接管互斥，首次要管理员密码。",
             self.mixed_endpoint(),
             setup::login_items_path_label()
-        );
+        ) };
         v_flex()
             .w_full()
             .p_4()
@@ -3906,8 +3906,18 @@ impl AppView {
             .child(self.developer_panel(cx, theme))
     }
 
-    fn backend_panel(&self, _cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        panel(theme, "Xray 测试版", div().text_sm().child("配置独立保存。本地 HTTP 和 SOCKS5 共用同一端口，默认 40808。"))
+    fn backend_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let entity = cx.entity();
+        panel(theme, "Xray 测试版", v_flex().gap_2()
+            .child(div().text_sm().child("配置独立保存。本地 HTTP 和 SOCKS5 共用同一端口，默认 40808。"))
+            .when(self.strategy.tun || self.strategy.system_extension || self.strategy.system_proxy, |view| {
+                view.child(Button::new("xray-explicit-mode").label("将导入配置改为本地代理入口").on_click(move |_,_,app| {
+                    entity.update(app, |this,cx| {
+                        this.strategy.tun=false; this.strategy.system_extension=false; this.strategy.system_proxy=false;
+                        this.persist(); cx.notify();
+                    });
+                }))
+            }))
     }
 
     fn strategy_backup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -4243,6 +4253,7 @@ impl AppView {
     }
 
     fn inbound_modes_subtitle(&self) -> String {
+        if backend::is_xray() { return format!("当前为{}。在节点组中点击出口即可切换，HTTP 和 SOCKS5 共用 {} 端口。",self.strategy.mixed_mode.label(),self.strategy.mixed_port); }
         format!("已保存模式：Mixed {} · 系统接管 {}。规则模式先绕过本机/私网再匹配策略；代理、全局、直连绕过用户规则。TUN 固定按策略规则。{}",
             self.strategy.mixed_mode.label(), self.strategy.extension_mode.label(),
             if self.is_dirty() { " 当前有待应用修改。" } else { "" })
@@ -4410,10 +4421,10 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("规则入口先绕过本机与私网，再按用户规则、GFWList 或国内直连、未命中走向处理。GFWList 整包装卸。国内直连的 GEOIP 在 Mihomo 里求值，系统接管不做 IP 库。"),
+                        .child(if backend::is_xray() { "按规则模式会使用下方规则。没有匹配的流量，可以统一交给节点选择，或直接连接。" } else { "规则入口先绕过本机与私网，再按用户规则、GFWList 或国内直连、未命中走向处理。GFWList 整包装卸。国内直连的 GEOIP 在 Mihomo 里求值，系统接管不做 IP 库。" }),
                 )
                 .child(
-                    h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().map(
+                    h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().filter(|profile| !backend::is_xray() || matches!(profile,RoutingProfile::Allowlist|RoutingProfile::Group)).map(
                         |profile| {
                             let entity = entity.clone();
                             let mut btn = Button::new(SharedString::from(format!(

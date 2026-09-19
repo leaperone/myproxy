@@ -55,6 +55,9 @@ pub struct Snapshot {
 
 /// Bundled macOS clients must never fall back to executing NE calls themselves.
 pub fn request(request: Request) -> Result<Snapshot> {
+    if backend::is_xray() && !crate::login_item::is_bundled() && !matches!(request,Request::Status) {
+        bail!("请使用 MyProxy Xray.app 内的命令行工具，运行连接由应用持有");
+    }
     #[cfg(target_os = "macos")]
     {
         if crate::login_item::is_bundled() {
