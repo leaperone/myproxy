@@ -291,7 +291,7 @@ impl Supervisor {
             return None;
         }
         if backend::is_xray() {
-            return crate::xray::status().ok().and_then(|status| status.http_port);
+            return crate::xray::status().ok().and_then(|status| status.mixed_port);
         }
         RuntimeConfig::load()
             .ok()
@@ -315,7 +315,7 @@ impl Supervisor {
             let identity = crate::xray::runtime_identity()?;
             return Some(RuntimeIdentity {
                 generation: identity.generation,
-                mixed_port: identity.socks_port,
+                mixed_port: identity.mixed_port,
             });
         }
         let runtime = RuntimeConfig::load().ok().flatten()?;
@@ -356,7 +356,7 @@ impl Supervisor {
     pub fn adopt_running(&self, _tun: bool, _system_extension: bool, _mixed_port: u16) {
         if backend::is_xray() {
             if let Some(identity) = crate::xray::runtime_identity() {
-                self.remember_mixed_port(Some(identity.socks_port));
+                self.remember_mixed_port(Some(identity.mixed_port));
                 self.mark_ready(crate::xray::status().map(|status| status.current).unwrap_or_default());
             }
             return;
@@ -412,7 +412,7 @@ impl Supervisor {
             let result = crate::xray::connect(strategy);
             if result.is_ok() {
                 if let Ok(status) = crate::xray::status() {
-                    self.remember_mixed_port(status.socks_port);
+                    self.remember_mixed_port(status.mixed_port);
                     self.mark_ready(status.current);
                 }
             }
@@ -448,7 +448,7 @@ impl Supervisor {
             let result = crate::xray::apply(strategy, true);
             if result.is_ok() {
                 if let Ok(status) = crate::xray::status() {
-                    self.remember_mixed_port(status.socks_port);
+                    self.remember_mixed_port(status.mixed_port);
                     if status.running {
                         self.mark_ready(status.current);
                     }
@@ -463,7 +463,7 @@ impl Supervisor {
             let result = crate::xray::apply(strategy, false);
             if result.is_ok() {
                 if let Ok(status) = crate::xray::status() {
-                    self.remember_mixed_port(status.socks_port);
+                    self.remember_mixed_port(status.mixed_port);
                     if status.running {
                         self.mark_ready(status.current);
                     }
@@ -880,7 +880,7 @@ impl Supervisor {
             let result = crate::xray::select_proxy(&identity, group, name);
             if result.is_ok() {
                 if let Ok(status) = crate::xray::status() {
-                    self.remember_mixed_port(status.socks_port);
+                    self.remember_mixed_port(status.mixed_port);
                     self.mark_ready(status.current);
                 }
             }
@@ -931,8 +931,8 @@ impl Supervisor {
 
     pub fn close_one(&self, identity: RuntimeIdentity, id: &str) -> Result<()> {
         if backend::is_xray() {
-            let _ = (identity, id);
-            bail!("Xray 通道暂不提供连接单条关闭控制");
+            if crate::xray::runtime_identity() != Some(identity) { bail!("运行配置已变化"); }
+            return crate::xray::close_one(id);
         }
         let mut operation = acquire_operation_with_timeout(Duration::ZERO)?;
         if *operation._state {
@@ -945,8 +945,8 @@ impl Supervisor {
 
     pub fn close_all(&self, identity: RuntimeIdentity) -> Result<()> {
         if backend::is_xray() {
-            let _ = identity;
-            bail!("Xray 通道暂不提供连接列表控制");
+            if crate::xray::runtime_identity() != Some(identity) { bail!("运行配置已变化"); }
+            return crate::xray::close_all();
         }
         let mut operation = acquire_operation_with_timeout(Duration::ZERO)?;
         if *operation._state {

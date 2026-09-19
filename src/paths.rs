@@ -9,8 +9,14 @@ pub fn data_dir() -> Result<PathBuf> {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         _ => dirs::data_dir()
             .context("no application support directory")?
-            .join("myproxy"),
+            .join(if crate::backend::is_xray() { "myproxy-xray" } else { "myproxy" }),
     };
+    if crate::backend::is_xray() {
+        let legacy = dirs::data_dir().context("no application support directory")?.join("myproxy");
+        if dir == legacy || (dir.exists() && legacy.exists() && fs::canonicalize(&dir)? == fs::canonicalize(&legacy)?) {
+            anyhow::bail!("Xray 测试版不能使用正式版的数据目录");
+        }
+    }
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
 }

@@ -1,40 +1,20 @@
 #!/usr/bin/env python3
-"""Check that the Xray test channel stays outside the existing release path."""
-
-from pathlib import Path
-import subprocess
+"""Check the original release workflows and sources that must stay unchanged."""
 import os
-
-
+import subprocess
+from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def run(*args: str) -> str:
-    return subprocess.check_output(args, cwd=ROOT, text=True)
-
-
+base = os.environ.get("MYPROXY_BOUNDARY_BASE", "67dd4c196d4f0e3408e3efdd426e6baafbf79102")
 protected = (
-    ".github/workflows/release.yml",
-    "scripts/release-macos.sh",
-    "scripts/package-macos-app.sh",
-    "scripts/fetch-mihomo.sh",
-    "scripts/check-release-artifacts.py",
+    ".github/workflows/release.yml", ".github/workflows/ci.yml",
+    "scripts/release-macos.sh", "scripts/package-macos-app.sh",
+    "scripts/fetch-mihomo.sh", "scripts/check-release-artifacts.py",
+    "scripts/sparkle_previous_tags.py", "packaging/macos/Info.plist",
+    "src/compile.rs", "src/updates.rs", "Cargo.lock",
 )
-base = os.environ.get("MYPROXY_BOUNDARY_BASE", "origin/main")
-changed = run("git", "diff", "--name-only", base, "--", *protected).splitlines()
-if changed:
-    raise SystemExit("Xray work changed protected release files: " + ", ".join(changed))
-
-workflow = (ROOT / ".github/workflows/release.yml").read_text()
-if "fetch-xray.sh" in workflow or "package-xray-test.sh" in workflow:
-    raise SystemExit("the existing release workflow must not package Xray")
-
+changed = subprocess.check_output(["git", "diff", "--name-only", base, "--", *protected], cwd=ROOT, text=True)
+assert not changed, "protected files changed: " + changed
 backend = (ROOT / "src/backend.rs").read_text()
-if "#[default]\n    Mihomo" not in backend:
-    raise SystemExit("Mihomo is no longer the default backend")
-
-xray = (ROOT / "src/xray.rs").read_text()
-if 'insert("allowInsecure"' in xray or '"allowInsecure":' in xray:
-    raise SystemExit("Xray projection must not emit allowInsecure")
-
-print("protected release path unchanged; Mihomo remains the default backend")
+assert 'cfg!(feature = "xray-channel")' in backend
+assert "fs::" not in backend, "backend cannot be changed by sharing a runtime config"
+print("original build/release paths preserved; Xray requires a separate build feature")

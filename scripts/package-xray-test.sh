@@ -2,38 +2,45 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Build a disposable Xray-channel package without touching dist/, appcast, or
-# any stable/nightly release asset. The normal package script is reused only
-# to produce the host application; this script copies Xray into a new bundle.
-scripts/fetch-xray.sh
-if [[ ! -d target/release/myproxy.app ]]; then
-  # The regular script is kept byte-for-byte out of the Xray test diff. Its
-  # ad-hoc path uses an empty Bash array, so create a disposable copy with the
-  # nounset-safe expansion needed on the CI shell.
-  patched_script="scripts/.package-macos-app-xray-test.sh"
-  trap 'rm -f "$patched_script"' EXIT
-  sed 's/"${extra\[@\]}"/${extra[@]+"${extra[@]}"}/g' \
-    scripts/package-macos-app.sh > "$patched_script"
-  chmod +x "$patched_script"
-  GITHUB_ACTIONS= CODESIGN_ADHOC=1 MYPROXY_BUILD_CHANNEL=dev "$patched_script"
-fi
+version="${MYPROXY_XRAY_TEST_VERSION:-1.6.0-xray-test}"
+export MYPROXY_BUILD_CHANNEL=dev
+export MYPROXY_VERSION="$version"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/xray-build}"
+./scripts/fetch-xray.sh
+cargo build --locked --release --bins --features xray-channel
 
-version="${MYPROXY_XRAY_TEST_VERSION:-$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)}"
-out="target/xray-channel/myproxy-xray-channel.app"
-rm -rf "$(dirname "$out")"
-mkdir -p "$(dirname "$out")"
-cp -R target/release/myproxy.app "$out"
-cp resources/xray/xray "$out/Contents/MacOS/xray"
-chmod +x "$out/Contents/MacOS/xray"
-
-# Adding a binary invalidates the copied app signature. Re-sign this disposable
-# test bundle ad hoc so macOS can launch it. Prod/Nightly signing stays in the
-# existing release workflow.
-if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$out"
-fi
+stage="$(mktemp -d "${TMPDIR:-/tmp}/myproxy-xray-package.XXXXXX")"
+trap 'rm -rf "$stage"' EXIT
+app="$stage/MyProxy Xray.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$CARGO_TARGET_DIR/release/myproxy" "$app/Contents/MacOS/myproxy"
+cp "$CARGO_TARGET_DIR/release/myproxyctl" "$app/Contents/MacOS/myproxyctl"
+cp resources/xray/xray "$app/Contents/MacOS/xray"
+cp packaging/macos/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
+python3 - "$app" "$version" <<'PYINFO'
+import plistlib, sys
+from pathlib import Path
+app, version = Path(sys.argv[1]), sys.argv[2]
+info = {
+    'CFBundleIdentifier': 'one.leaper.myproxy.xray-test',
+    'CFBundleName': 'MyProxy Xray', 'CFBundleDisplayName': 'MyProxy Xray',
+    'CFBundleExecutable': 'myproxy', 'CFBundlePackageType': 'APPL',
+    'CFBundleShortVersionString': version, 'CFBundleVersion': '1',
+    'CFBundleIconFile': 'AppIcon', 'NSHighResolutionCapable': True,
+    'LSMinimumSystemVersion': '13.0', 'MyproxyBuildChannel': 'xray-test',
+}
+(app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+PYINFO
+for executable in xray myproxyctl myproxy; do
+    chmod +x "$app/Contents/MacOS/$executable"
+    codesign --force --sign - "$app/Contents/MacOS/$executable"
+done
+codesign --force --sign - "$app"
+codesign --verify --deep --strict "$app"
 mkdir -p dist/xray-channel
 archive="dist/xray-channel/myproxy-xray-${version}.zip"
-rm -f "$archive"
-ditto -c -k --keepParent "$out" "$archive"
-echo "wrote disposable Xray test package $archive"
+test ! -e "$archive" || { echo "artifact already exists: $archive" >&2; exit 1; }
+ditto -c -k --keepParent "$app" "$archive"
+python3 scripts/check-xray-package.py "$archive"
+shasum -a 256 "$archive" > "$archive.sha256"
+echo "Xray test artifact: $archive"

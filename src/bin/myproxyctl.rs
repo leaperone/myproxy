@@ -106,6 +106,8 @@ enum SubCmd {
 #[derive(Subcommand)]
 enum GroupCmd {
     List,
+    Select { group: String, node: String },
+    Auto { group: String },
     Add {
         name: String,
         #[arg(long, default_value = "select", value_parser = ["select", "fallback", "url-test"])]
@@ -222,35 +224,8 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Commands::Backend { kind } => {
-            let current = backend::load()?;
-            if let Some(raw) = kind {
-                let next = BackendKind::parse(&raw)?;
-                if next == BackendKind::Xray && !paths::bundled_xray().is_file() {
-                    bail!(
-                        "Xray binary is unavailable at {}; run scripts/fetch-xray.sh or use the Xray test package",
-                        paths::bundled_xray().display()
-                    );
-                }
-                let running = match current {
-                    BackendKind::Mihomo => adopted_supervisor(&Strategy::load()?).is_running(),
-                    BackendKind::Xray => myproxy::xray::is_running(),
-                };
-                if running && next != current {
-                    bail!("请先 disconnect，再切换运行通道");
-                }
-                backend::save(next)?;
-                emit(
-                    json,
-                    serde_json::json!({"backend": next.as_str(), "status": "saved"}),
-                    format!("backend {} ({})", next.as_str(), next.label()),
-                );
-            } else {
-                emit(
-                    json,
-                    serde_json::json!({"backend": current.as_str(), "label": current.label()}),
-                    format!("backend {} ({})", current.as_str(), current.label()),
-                );
-            }
+            if let Some(kind) = kind { backend::save(BackendKind::parse(&kind)?)?; }
+            emit(json, serde_json::json!({"backend":backend::load()?.as_str(),"isolated":backend::is_xray()}), backend::load()?.label());
         }
         Commands::Log => {
             let path = paths::app_log_path()?;
@@ -291,11 +266,7 @@ fn run(cli: Cli) -> Result<()> {
             let controller_ready = selected_backend == BackendKind::Mihomo
                 && snapshot.controller_ready;
             let extension = snapshot.extension;
-            let xray_status = if selected_backend == BackendKind::Xray {
-                Some(myproxy::xray::status()?)
-            } else {
-                None
-            };
+            let xray_status = snapshot.xray;
             let unmatched = myproxy::compile::unmatched_target(&strategy);
             let status_prefix = if selected_backend == BackendKind::Xray {
                 "backend xray  "
@@ -496,6 +467,7 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Commands::Global { name } => {
+            if backend::is_xray() { return xray_select(json, GLOBAL_GROUP, name); }
             let mut strategy = Strategy::load()?;
             let supervisor = adopted_supervisor(&strategy);
             let runtime = supervisor.runtime_identity();
@@ -722,6 +694,8 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Commands::Group { cmd } => match cmd {
+            GroupCmd::Select { group, node } => return xray_select(json, &group, Some(node)),
+            GroupCmd::Auto { group } => return xray_select(json, &group, Some(String::new())),
             GroupCmd::List => {
                 let strategy = Strategy::load()?;
                 let catalog = catalog::Catalog::load()?;
@@ -1107,4 +1081,24 @@ fn xray_global_member_exists(strategy: &Strategy, name: &str) -> Result<bool> {
     }
     let catalog = catalog::Catalog::load()?;
     Ok(catalog.nodes.iter().any(|node| node.name == name))
+}
+
+fn xray_select(json: bool, group: &str, name: Option<String>) -> Result<()> {
+    if !backend::is_xray() { bail!("请使用 Xray 测试版的命令行工具"); }
+    let mut strategy = Strategy::load()?;
+    if let Some(name) = name {
+        if group == GLOBAL_GROUP {
+            if !xray_global_member_exists(&strategy, &name)? { bail!("节点或节点组不存在"); }
+            strategy.global_selected = name.clone();
+        } else {
+            let item = strategy.groups.iter_mut().find(|item|item.name==group).context("节点组不存在")?;
+            item.selected = name.clone();
+        }
+        strategy.save()?;
+        let snapshot = host_control::request(Request::Status)?;
+        if snapshot.runtime.is_some() { host_control::request(Request::Select { group:group.into(), name })?; }
+    }
+    let snapshot = host_control::request(Request::Status)?;
+    emit(json, serde_json::json!({"group":group,"xray":snapshot.xray,"global":strategy.global_selected}), format!("已保存选择，入口模式 {}",strategy.mixed_mode.label()));
+    Ok(())
 }

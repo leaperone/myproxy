@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 pub fn destination() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".cargo/bin/myproxyctl"))
+    dirs::home_dir().map(|home| home.join(if crate::backend::is_xray() { ".cargo/bin/myproxy-xrayctl" } else { ".cargo/bin/myproxyctl" }))
 }
 
 fn bundled_cli() -> Option<PathBuf> {

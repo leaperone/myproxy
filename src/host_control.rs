@@ -11,12 +11,13 @@ use crate::network_extension::{self, DnsPhase, Phase, RuntimeStatus};
 use crate::strategy::Strategy;
 use crate::supervisor::{OperationState, RuntimeIdentity, Supervisor};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Status,
     Apply { refresh: bool },
     Connect,
     Disconnect,
+    Select { group: String, name: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,6 +49,8 @@ pub struct Snapshot {
     pub extension: RuntimeStatus,
     pub extension_required: bool,
     pub catalog: Option<AppliedCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray: Option<crate::xray::XrayStatus>,
 }
 
 /// Bundled macOS clients must never fall back to executing NE calls themselves.
@@ -96,9 +99,15 @@ fn execute(request: Request) -> Result<Snapshot> {
     };
     let supervisor = Supervisor::shared();
     supervisor.adopt_running(strategy.tun, strategy.system_extension, strategy.mixed_port);
-    let catalog = match request {
+    let catalog = match &request {
         Request::Status => None,
-        Request::Apply { refresh } => Some(AppliedCatalog::from(&if refresh {
+        Request::Select { group, name } => {
+            if !backend::is_xray() { bail!("此操作仅适用于 Xray 测试版"); }
+            let identity = supervisor.runtime_identity().context("尚未连接")?;
+            supervisor.select_proxy(identity, group, name)?;
+            None
+        },
+        Request::Apply { refresh } => Some(AppliedCatalog::from(&if *refresh {
             supervisor.apply(&strategy)?
         } else {
             supervisor.apply_cached(&strategy)?
@@ -156,11 +165,13 @@ fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
         runtime,
         extension,
         catalog: None,
+        xray: if backend::is_xray() { crate::xray::status().ok() } else { None },
     }
 }
 
 pub fn check_outcome(snapshot: &Snapshot) -> Result<()> {
-    if backend::load()? == backend::BackendKind::Xray {
+    if let Some(xray) = &snapshot.xray {
+        if xray.wanted && !xray.ready { bail!("Xray 入口未就绪"); }
         return Ok(());
     }
     let status = &snapshot.extension;
@@ -210,6 +221,7 @@ mod tests {
             controller_ready: true,
             extension_required: true,
             catalog: None,
+            xray: None,
             extension: RuntimeStatus {
                 phase: Phase::Running,
                 dns_phase: DnsPhase::Running,

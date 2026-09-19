@@ -76,41 +76,47 @@ Default Mixed port is **7890**.
 
 ## Xray test channel
 
-The `xray` channel is opt-in and is stored in `backend.json`. Existing
-installations use Mihomo when that file does not exist. The stable and Nightly
-release workflows do not fetch, package, or select Xray.
+The Xray build uses the explicit Cargo feature `xray-channel`. It runs as
+`MyProxy Xray.app` with bundle ID `one.leaper.myproxy.xray-test`, stores data
+under `~/Library/Application Support/myproxy-xray/`, and installs an optional
+`myproxy-xrayctl` link. The normal build continues to use the original core,
+configuration, app identity, CLI link, and update feeds. Backend selection
+cannot be changed by a shared `backend.json` file.
 
-Install the pinned Xray binary for a local test build, then select the channel:
+The test app owns one loopback HTTP and SOCKS5 TCP entrance, default port
+**40808**. It chooses the rule and node before passing a connection to an
+explicit, authenticated private Xray outbound. Node selection does not restart
+the core. The app measures node latency, applies ordered fallback and lowest
+latency policies, and records its own traffic and connection history for the
+current session. Auto groups accept a manual node override with a separate
+button to return to automatic selection.
+
+New test configurations start in global mode with 节点选择, 美国优先,
+日本优先, and 香港优先 groups. DIRECT provides a global direct option.
+Global mode applies the chosen group or node to all traffic entering the
+proxy. Rule mode evaluates domain, suffix, keyword, and IP rules in order,
+then uses the configured unmatched target. Unsupported nodes are diagnosed
+individually and never cause direct fallback.
+
+This test build handles explicit TCP proxy clients. It does not activate the
+production System Extension, TUN, system proxy settings, login items, or
+Sparkle updates. SOCKS UDP, process rules, GFWList, and geographic IP rules
+are not enabled in this channel yet; unsupported routing modes are rejected
+before applying them. HTTP clients using chunked uploads should use HTTPS
+CONNECT. Existing applications keep running if 40808 is already occupied.
+
+Build and verify the test artifact independently:
 
 ```sh
 scripts/fetch-xray.sh
-cargo run --bin myproxyctl -- backend xray
-cargo run --bin myproxyctl -- connect
-```
-
-The Xray channel exposes SOCKS5 on the configured Mixed port and HTTP on the
-next port. With the default port, the entries are `127.0.0.1:7890` for SOCKS5
-and `127.0.0.1:7891` for HTTP. Xray receives the node groups and domain, CIDR,
-process, and fallback rules from the existing strategy. `select` groups use
-their saved member. `fallback` and `url-test` groups use Xray's `leastping`
-balancer with a reject fallback. XHTTP is supported. Removed transports such
-as HTTP and mKCP remain in the catalog and appear as per-node warnings; they
-do not make the whole configuration invalid.
-
-Xray 26.9.9 rejects `tlsSettings.allowInsecure`. The Xray projection never
-writes that key. A node with `skip-cert-verify: true` is accepted only when it
-also supplies `pinnedPeerCertSha256` or `verifyPeerCertByName`; otherwise that
-node is excluded with a readable warning.
-
-The channel currently handles explicit SOCKS and HTTP clients. TUN and System
-Extension capture stay on the existing Mihomo path. To return to the existing
-runtime, disconnect first and run `myproxyctl backend mihomo`.
-
-The disposable package command writes only `dist/xray-channel/`:
-
-```sh
+XRAY_BINARY="$PWD/resources/xray/xray" scripts/test-xray-channel.sh
 scripts/package-xray-test.sh
 ```
+
+The Xray workflow builds only the feature branch. Packages go to
+`dist/xray-channel/`; the original CI and Prod/Nightly workflow are unchanged.
+The test artifact is ad-hoc signed and has no automatic updater. It is not a
+replacement for the production app.
 
 ## Routing and runtime state
 
