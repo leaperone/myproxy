@@ -92,6 +92,7 @@ impl AdmissionService {
             let broker = thread::Builder::new().name("myproxy-admission".into()).spawn(move || {
                 while !service_stop.load(Ordering::Acquire) {
                     let Ok((mut stream, _)) = broker_listener.accept() else { thread::sleep(Duration::from_millis(2)); continue; };
+                    if stream.set_nonblocking(false).is_err() { continue; }
                     if service_active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_IN_FLIGHT).then_some(n + 1)).is_err() { continue; }
                     let state = service_state.clone(); let routing = service_routing.clone(); let activation = activation_for_thread.clone(); let active = service_active.clone();
                     let relay_port_for_thread = relay_port;
@@ -329,16 +330,32 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     fn broker_request(bootstrap: &Bootstrap, request: &FlowRequest) -> Result<AdmissionReply> {
+        broker_request_delayed(bootstrap, request, Duration::ZERO)
+    }
+    #[cfg(target_os = "macos")]
+    fn broker_request_delayed(bootstrap: &Bootstrap, request: &FlowRequest, delay: Duration) -> Result<AdmissionReply> {
         let key = B64.decode(bootstrap.key.as_bytes())?;
         let payload = serde_json::to_string(request)?;
         let envelope = Envelope { mac: sign_mac(&key, payload.as_bytes())?, payload };
         let mut stream = TcpStream::connect(("127.0.0.1", bootstrap.port))?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        thread::sleep(delay);
         write_frame(&mut stream, &serde_json::to_vec(&envelope)?)?;
         let body = read_frame(&mut stream, MAX_FRAME)?;
         let response: Envelope = serde_json::from_slice(&body)?;
         if !verify_mac(&key, response.payload.as_bytes(), &response.mac)? { bail!("fixture response MAC invalid"); }
         Ok(serde_json::from_str(&response.payload)?)
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admission_waits_for_metadata_after_accept_on_macos() {
+        let routing = Arc::new(MockRouting { generation: AtomicU64::new(1), dial_calls: AtomicUsize::new(0), tcp_target: SocketAddr::from(([127,0,0,1],9)) });
+        let service = AdmissionService::start(routing.clone()).unwrap();
+        for delay in [30, 150] {
+            let request = fixture_request(service.bootstrap(), "direct.test", "tcp");
+            assert_eq!(broker_request_delayed(service.bootstrap(), &request, Duration::from_millis(delay)).unwrap().action, "direct");
+        }
+        assert_eq!(routing.dial_calls.load(Ordering::Acquire), 0);
     }
     #[cfg(target_os = "macos")]
     fn socks_connect(port: u16, user: &str, password: &str, host: &str, target_port: u16) -> Result<TcpStream> {

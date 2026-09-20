@@ -473,6 +473,8 @@ private actor HostController {
             $0.phase = "disabled"
             $0.dnsPhase = "disabled"
             $0.appliedRevision = nil
+            $0.captureEnabled = false
+            $0.failOpen = true
         }
     }
 
