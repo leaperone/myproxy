@@ -4395,10 +4395,13 @@ impl AppView {
             return;
         }
         self.strategy.mixed_mode = mode;
+        if backend::is_xray() { self.strategy.extension_mode = mode; }
         if mode == InboundMode::Global {
             self.strategy.ensure_global_selected();
         }
-        self.persist_inbound_mode(cx, format!("Mixed 已保存为{}。", mode.label()));
+        self.persist_inbound_mode(cx, if backend::is_xray() {
+            format!("本地代理和系统接管已切换为{}。", mode.label())
+        } else { format!("Mixed 已保存为{}。", mode.label()) });
     }
 
     fn set_extension_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
