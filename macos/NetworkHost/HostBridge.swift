@@ -642,7 +642,7 @@ private func providerConfigurations(
         "activationIdentifier": activationIdentifier.uuidString as NSString,
         "dnsProxyBootstrap": bootstrap as NSData,
         "captureEnabled": NSNumber(value: true),
-        "failOpen": NSNumber(value: true),
+        "failOpen": NSNumber(value: captureFailureOpensDirectly),
         "captureConfigurationSnapshot": encodedSnapshot as NSData,
         "mihomoRouteProxyCatalog": catalog as NSData,
         "mihomoSOCKSHost": "127.0.0.1" as NSString,
@@ -729,7 +729,7 @@ private func captureSnapshot(
         id: "default-profile-rules",
         priority: rules.count,
         action: .mihomo(.profileRules),
-        unavailableFallback: .direct
+        unavailableFallback: captureFailureOpensDirectly ? .direct : .reject
     ))
     return try CaptureConfigurationSnapshot(
         revision: request.revision,
@@ -853,7 +853,18 @@ private func captureAction(via: String) -> CaptureAction {
     }
 }
 
+private var captureFailureOpensDirectly: Bool {
+    #if MYPROXY_XRAY
+    return false
+    #else
+    return true
+    #endif
+}
+
 private func captureFallback(via: String) -> UnavailableFallback {
+    #if MYPROXY_XRAY
+    return via.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "direct" ? .direct : .reject
+    #else
     switch via.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "direct":
         return .direct
@@ -862,6 +873,7 @@ private func captureFallback(via: String) -> UnavailableFallback {
     default:
         return .profileRules
     }
+    #endif
 }
 
 private func routeEndpoints(

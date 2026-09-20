@@ -174,7 +174,7 @@ fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
 
 pub fn check_outcome(snapshot: &Snapshot) -> Result<()> {
     if let Some(xray) = &snapshot.xray {
-        if xray.wanted && !xray.ready { bail!("Xray 入口未就绪"); }
+        if xray.wanted && !xray.ready && !snapshot.extension_required { bail!("Xray 入口未就绪"); }
         if !snapshot.extension_required { return Ok(()); }
     }
     let status = &snapshot.extension;

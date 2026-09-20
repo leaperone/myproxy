@@ -413,7 +413,7 @@ impl Supervisor {
             if result.is_ok() {
                 if let Ok(status) = crate::xray::status() {
                     self.remember_mixed_port(status.mixed_port);
-                    self.mark_ready(status.current);
+                    if status.ready { self.mark_ready(status.current); }
                 }
             }
             return result;
@@ -449,7 +449,7 @@ impl Supervisor {
             if result.is_ok() {
                 if let Ok(status) = crate::xray::status() {
                     self.remember_mixed_port(status.mixed_port);
-                    if status.running {
+                    if status.ready {
                         self.mark_ready(status.current);
                     }
                 }
@@ -464,7 +464,7 @@ impl Supervisor {
             if result.is_ok() {
                 if let Ok(status) = crate::xray::status() {
                     self.remember_mixed_port(status.mixed_port);
-                    if status.running {
+                    if status.ready {
                         self.mark_ready(status.current);
                     }
                 }

@@ -27,6 +27,7 @@ struct Entry {
     started: Instant,
     source_port: u16,
     udp: AtomicBool,
+    visible: AtomicBool,
     label: Mutex<(String, String)>,
     sockets: Mutex<Vec<TcpStream>>,
     closed: AtomicBool,
@@ -70,6 +71,9 @@ impl Drop for FlowGuard {
         self.entry.sockets.lock().expect("flow sockets").clear();
         self.entry.finished.store(true, Ordering::Release);
         self.state.active.fetch_sub(1, Ordering::AcqRel);
+        if !self.entry.visible.load(Ordering::Acquire) {
+            self.state.rows.lock().expect("flow rows").retain(|row| row.id != self.entry.id);
+        }
     }
 }
 
@@ -123,6 +127,7 @@ impl MixedServer {
                                 started: Instant::now(),
                                 source_port: client.peer_addr().map(|peer| peer.port()).unwrap_or(0),
                                 udp: AtomicBool::new(false),
+                                visible: AtomicBool::new(false),
                                 label: Mutex::new(("等待请求".into(), "待路由".into())),
                                 sockets: Mutex::new(vec![]),
                                 closed: AtomicBool::new(false),
@@ -200,13 +205,11 @@ impl MixedServer {
     }
 
     pub fn snapshot_with_processes(&self, processes: &std::collections::HashMap<u16, crate::network_extension::ActivityProcess>) -> TrafficSnapshot {
-        let connections = self
-            .state
-            .rows
-            .lock()
-            .expect("flow rows")
-            .iter()
+        let rows = self.state.rows.lock().expect("flow rows");
+        let connection_count = rows.iter().filter(|entry| entry.visible.load(Ordering::Acquire) && !entry.finished.load(Ordering::Acquire)).count();
+        let connections = rows.iter()
             .rev()
+            .filter(|entry| entry.visible.load(Ordering::Acquire))
             .map(|entry| {
                 let (destination, chain) = entry.label.lock().expect("flow label").clone();
                 LiveConnection {
@@ -228,7 +231,7 @@ impl MixedServer {
             .collect();
         TrafficSnapshot {
             connections,
-            connection_count: self.state.active.load(Ordering::Acquire),
+            connection_count,
             upload_total: self.state.up.load(Ordering::Relaxed),
             download_total: self.state.down.load(Ordering::Relaxed),
         }
@@ -293,6 +296,7 @@ fn serve(
         entry.udp.store(true, Ordering::Release);
         entry.label.lock().expect("flow label").0 = "DNS / UDP".into();
         return udp::serve_association(client, request.port, router.clone(), |host, port, route, up, down| {
+            entry.visible.store(true, Ordering::Release);
             let target = match route {
                 udp::DatagramRoute::Direct => "DIRECT",
                 udp::DatagramRoute::Socks { label, .. } => label.as_str(),
@@ -304,6 +308,7 @@ fn serve(
             state.down.fetch_add(down, Ordering::Relaxed);
         });
     }
+    entry.visible.store(true, Ordering::Release);
     entry.label.lock().expect("flow label").0 = format!("{}:{}", request.host, request.port);
     let mut dialed = match dialer(&request.host, request.port) {
         Ok(value) => value,

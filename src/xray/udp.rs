@@ -274,6 +274,17 @@ mod tests {
     }
 
     #[test]
+    fn capture_readiness_probes_do_not_create_connection_history() {
+        let (server,address)=server(DatagramRoute::Direct);
+        let(control,_)=associate(address,"fixture","password").unwrap();
+        assert_eq!(server.snapshot().connection_count,0);
+        assert!(server.snapshot().connections.is_empty());
+        drop(control);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(server.snapshot().connections.is_empty());
+    }
+
+    #[test]
     fn authenticated_udp_can_chain_through_an_authenticated_upstream() {
         let (_upstream, address) = server(DatagramRoute::Direct);
         let (_capture, capture) = server(DatagramRoute::Socks { address, username: "fixture".into(), password: "password".into(), label: "fixture node".into(), fallback_direct: false });

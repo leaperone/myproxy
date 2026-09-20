@@ -76,6 +76,13 @@ fn main() {
         if let Err(err) = myproxy::host_control::start() {
             myproxy::log::error("host-control", format!("start failed: {err:#}"));
         }
+        if myproxy::backend::is_xray() {
+            cx.background_executor().spawn(async {
+                if let Err(error) = myproxy::xray::recover_after_launch() {
+                    myproxy::log::error("xray", format!("recover previous network session: {error:#}"));
+                }
+            }).detach();
+        }
         if strategy.connect_on_launch && !host_control_launch {
             let strategy = strategy.clone();
             cx.background_executor()

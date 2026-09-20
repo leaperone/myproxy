@@ -18,6 +18,7 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 | --- | --- | --- |
 | Prod | `https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml` | Push a `vMAJOR.MINOR.PATCH` tag, or run Release with channel `prod` and that existing tag. |
 | Nightly | `https://github.com/leaperone/myproxy/releases/download/nightly/appcast.xml` | Builds `main` daily at 18:00 UTC, or run Release with channel `nightly`. |
+| Xray | `https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml` | Publish a verified `xray-vVERSION` tag through the Xray workflow. |
 
 Nightly builds are GitHub prereleases with immutable build tags. The `nightly` prerelease points to the latest Nightly feed. Both channels generate Sparkle deltas from recent same-channel archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow. While the core is connected, Check for Updates and archive/delta downloads use Mixed as an HTTP proxy.
 
@@ -25,7 +26,7 @@ Nightly builds are GitHub prereleases with immutable build tags. The `nightly` p
 
 Both channels use the Release workflow's run number and attempt as `CFBundleVersion`, so Sparkle can compare builds across channels. The display version, build number, feed, and channel are validated against the packaged app before publication. A manually dispatched Prod release checks out the requested tag; its version must match `Cargo.toml` at that commit.
 
-The title shows **Dev** for development builds and **Nightly** for Nightly builds; Prod has no badge. This identifies the installed build, independently of the selected update channel or developer logging. Local debug builds default to Dev and release builds to Prod; `MYPROXY_BUILD_CHANNEL=dev|prod|nightly` overrides this at build time.
+The title shows **Dev** for development builds and **Nightly** for Nightly builds; Prod has no badge. This identifies the installed build, independently of the selected update channel or developer logging. Local debug builds default to Dev and release builds to Prod; `MYPROXY_BUILD_CHANNEL=dev|prod|nightly|xray` overrides this at build time.
 
 The repository's [release skill](.agents/skills/release/SKILL.md) handles `/release patch`, `/release minor`, `/release major`, and `/release nightly` (`$release` in Codex). Stable increments start from the latest published Prod version, so an already-advanced development version is not incremented twice. Creating or reviewing the skill does not publish a release.
 
@@ -74,52 +75,55 @@ cargo run --bin myproxyctl -- connect
 
 Default Mixed port is **7890**.
 
-## Xray test channel
+## Xray channel
 
-The Xray build uses the explicit Cargo feature `xray-channel`. It runs as
-`MyProxy Xray.app` with bundle ID `one.leaper.myproxy.xray-test`, stores data
-under `~/Library/Application Support/myproxy-xray/`, and installs an optional
-`myproxy-xrayctl` link. The normal build continues to use the original core,
-configuration, app identity, CLI link, and update feeds. Backend selection
-cannot be changed by a shared `backend.json` file.
-Isolated Xray checks use `MYPROXY_XRAY_DATA_DIR`; the production
-`MYPROXY_DATA_DIR` override is ignored by this build.
+Xray is a separate release channel alongside Prod and Nightly. It uses the same
+MyProxy application identity and the existing signed Network Extension. The title
+shows an Xray badge. Its Sparkle feed is
+`https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml`; Xray
+releases never update the Prod or Nightly feeds or GitHub's latest stable release.
+The application stores Xray settings under
+`~/Library/Application Support/myproxy-xray/`. Existing configurations imported
+into earlier Xray builds remain there. `MYPROXY_XRAY_DATA_DIR` overrides this
+location for isolated checks; the original backend still uses `MYPROXY_DATA_DIR`.
 
-The test app owns one loopback HTTP and SOCKS5 TCP entrance, default port
-**40808**. It chooses the rule and node before passing a connection to an
-explicit, authenticated private Xray outbound. Node selection and rule changes do not restart
-the core. Applying a new route closes old client connections so reconnecting
-clients use the new choice. The app measures node latency, applies ordered fallback and lowest
-latency policies, and records its own traffic and connection history for the
-current session. Auto groups accept a manual node override with a separate
-button to return to automatic selection.
+The app owns routing, manual node selection, ordered fallback, latency selection,
+and connection accounting. HTTP and SOCKS share one public loopback entrance,
+default **40808**. The existing System Extension captures applications and DNS
+through authenticated app-owned TCP/UDP entrances. Xray receives private
+per-node SOCKS entrances and performs the final proxy connection. A signed Xray
+host and core bypass their own capture path to avoid proxy and DNS recursion.
 
-New test configurations start in global mode with 节点选择, 美国优先,
-日本优先, and 香港优先 groups. DIRECT provides a global direct option.
-Global mode applies the chosen group or node to all traffic entering the
-proxy. Rule mode evaluates domain, suffix, keyword, and IP rules in order,
-then uses the configured unmatched target. Unsupported nodes are diagnosed
-individually and never cause direct fallback.
+New configurations start in global mode through 节点选择, with 美国优先,
+日本优先, 香港优先, and a direct choice. Groups expand to show their nodes;
+automatic groups support a manual pin and a return to automatic selection.
+Routing changes close old flows without restarting Xray. Disconnect confirms
+both capture and DNS are disabled before stopping their relay or core.
 
-This test build handles explicit TCP proxy clients. It does not activate the
-production System Extension, TUN, system proxy settings, login items, or
-Sparkle updates. SOCKS UDP, process rules, GFWList, and geographic IP rules
-are not enabled in this channel yet; unsupported routing modes are rejected
-before applying them. HTTP clients using chunked uploads should use HTTPS
-CONNECT. Existing applications keep running if 40808 is already occupied.
+Rule mode supports application rules for captured traffic, exact/suffix/keyword/
+wildcard domains, CIDRs, optional TCP/UDP qualifiers, and imported geographic or
+domain categories. Domain and IP data are evaluated in the app. The local
+`rulesets/mclash-geodata.json` snapshot preserves the imported categories;
+missing or invalid data rejects activation. Explicit proxy requests do not carry
+a trustworthy process identity, so application rules require system capture.
+TUN is not used in this channel. Plain HTTP chunked uploads remain unsupported;
+HTTPS uses CONNECT.
 
-Build and verify the test artifact independently:
+`scripts/export-mclash-geodata.py` copies the selected installed routing databases
+into the private Xray configuration directory.
+`scripts/import-mclash-rules.py` prepares a private migration candidate and receipt,
+preserving current ports, modes, subscriptions, node selections and unrelated rules.
+`--apply` imports through the bundled CLI after the channel supports the required
+matchers. An old application's loopback DNS self-protection is replaced by the
+new application's signed-component bypass, not copied as a broad user-ID rule.
 
-```sh
-scripts/fetch-xray.sh
-XRAY_BINARY="$PWD/resources/xray/xray" scripts/test-xray-channel.sh
-scripts/package-xray-test.sh
-```
-
-The Xray workflow builds only the feature branch. Packages go to
-`dist/xray-channel/`; the original CI and Prod/Nightly workflow are unchanged.
-The test artifact is ad-hoc signed and has no automatic updater. It is not a
-replacement for the production app.
+The Xray workflow tests feature-branch pushes. A commit marked `[xray-package]`
+also produces a signed, notarized candidate artifact for local acceptance, without
+publishing. An immutable `xray-vVERSION` tag builds and publishes an Xray release
+and updates only the `xray` feed pointer. Distribution requires Developer ID
+signing, the host and extension provisioning profiles, Apple notarization,
+stapling, Gatekeeper acceptance, and a signed Xray appcast. There is no ad-hoc
+fallback. Original Prod/Nightly release scripts and workflow remain unchanged.
 
 ## Routing and runtime state
 

@@ -144,9 +144,13 @@ pub fn apply(strategy: &Strategy, refresh: bool) -> Result<Catalog> {
     validate_intent(strategy)?;
     let catalog = current_catalog(strategy, refresh)?;
     if wanted() {
+        let previous = rollback_state();
         let capture = prepare_capture(strategy)?;
         activate(strategy, &catalog)?;
-        sync_capture(strategy, capture)?;
+        if let Err(error) = sync_capture(strategy, capture) {
+            rollback_activation(previous).context("系统接管切换失败，恢复原连接失败")?;
+            return Err(error);
+        }
     } else {
         let candidate = prepare(strategy, &catalog)?;
         save_applied(&candidate)?;
@@ -161,9 +165,40 @@ pub fn connect(strategy: &Strategy) -> Result<()> {
     if SHUTTING_DOWN.load(Ordering::Acquire) { bail!("应用正在退出"); }
     validate_intent(strategy)?;
     let catalog = current_catalog(strategy, false)?;
+    let previous = rollback_state();
     let capture = prepare_capture(strategy)?;
     activate(strategy, &catalog)?;
-    sync_capture(strategy, capture)
+    if let Err(error) = sync_capture(strategy, capture) {
+        rollback_activation(previous).context("系统接管启动失败，恢复原连接失败")?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn rollback_state() -> Option<(Strategy, Catalog)> {
+    active().ok().map(|runtime| {
+        let strategy = runtime.strategy.read().expect("strategy").clone();
+        let mut catalog = runtime.catalog.clone();
+        catalog.nodes = runtime.source_nodes.clone();
+        (strategy, catalog)
+    })
+}
+
+fn rollback_activation(previous: Option<(Strategy, Catalog)>) -> Result<()> {
+    release_capture()?;
+    crate::system_proxy::restore()?;
+    {
+        let mut state = service().lock().expect("Xray service");
+        state.capture = None;
+        state.retired_capture.clear();
+    }
+    if let Some((strategy, catalog)) = previous {
+        let capture = prepare_capture(&strategy)?;
+        activate(&strategy, &catalog)?;
+        sync_capture(&strategy, capture)
+    } else {
+        stop_service()
+    }
 }
 
 fn current_catalog(strategy: &Strategy, refresh: bool) -> Result<Catalog> {
@@ -659,6 +694,10 @@ pub fn disconnect() -> Result<()> {
     let _operation = OPERATION.lock().expect("Xray operation");
     release_capture()?;
     crate::system_proxy::restore()?;
+    stop_service()
+}
+
+fn stop_service() -> Result<()> {
     let previous = std::mem::take(&mut *service().lock().expect("Xray service"));
     if let Some(runtime) = &previous.runtime {
         runtime.stop()?;
@@ -684,6 +723,38 @@ pub fn wanted() -> bool {
     service().lock().expect("Xray service").runtime.is_some()
 }
 pub fn sync_wanted_on_launch() -> Result<()> {
+    Ok(())
+}
+
+pub fn recover_after_launch() -> Result<()> {
+    let _operation = OPERATION.lock().expect("Xray operation");
+    if wanted() { return Ok(()); }
+    release_capture()?;
+    crate::system_proxy::restore()?;
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(bytes) = fs::read(paths::xray_runtime_state_path()?) else { return Ok(()); };
+        let Ok(saved) = serde_json::from_slice::<SavedRuntime>(&bytes) else { return Ok(()); };
+        let process = Command::new("ps").args(["-p", &saved.core_pid.to_string(), "-o", "uid=,comm="]).output()?;
+        if !process.status.success() { return Ok(()); }
+        let row = String::from_utf8_lossy(&process.stdout);
+        let Some((uid, executable)) = row.trim().split_once(char::is_whitespace) else { return Ok(()); };
+        if uid.parse::<u32>().ok() != Some(unsafe { libc::geteuid() }) { return Ok(()); }
+        let Ok(executable) = fs::canonicalize(executable.trim()) else { return Ok(()); };
+        if executable != fs::canonicalize(xray_binary()?)? { return Ok(()); }
+        let files = Command::new("lsof").args(["-p", &saved.core_pid.to_string(), "-a", "-d", "1", "-Fn"]).output()?;
+        let root = fs::canonicalize(paths::data_dir()?)?;
+        let owned = String::from_utf8_lossy(&files.stdout).lines().filter_map(|line| line.strip_prefix('n'))
+            .filter_map(|path| fs::canonicalize(path).ok()).any(|path| path.starts_with(&root)
+                && path.file_name().is_some_and(|name| name == "core.log")
+                && path.parent().and_then(|parent| parent.file_name()).is_some_and(|name| name.to_string_lossy().starts_with("xray-session-")));
+        if owned {
+            if unsafe { libc::kill(saved.core_pid as i32, libc::SIGTERM) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("stop previous Xray session");
+            }
+            crate::log::info("xray", "stopped an orphan owned by the previous application session");
+        }
+    }
     Ok(())
 }
 pub fn runtime_identity() -> Option<RuntimeIdentity> {
@@ -726,6 +797,12 @@ pub fn status() -> Result<XrayStatus> {
     };
     let running = runtime.core_alive();
     let strategy = runtime.strategy.read().expect("strategy");
+    let capture_ready = !strategy.system_extension || state.capture.as_ref().is_some_and(|capture|
+        capture_status.observed
+            && capture_status.capture_enabled
+            && capture_status.phase == crate::network_extension::Phase::Running
+            && capture_status.dns_phase == crate::network_extension::DnsPhase::Running
+            && capture_status.applied_revision == Some(capture.request.revision));
     let decision = policy::decide(
         &strategy,
         &runtime.catalog,
@@ -738,12 +815,12 @@ pub fn status() -> Result<XrayStatus> {
     Ok(XrayStatus {
         wanted: true,
         running,
-        ready: running && state.entrance.is_some(),
+        ready: running && state.entrance.is_some() && capture_ready,
         generation: Some(runtime.generation.load(Ordering::Acquire)),
         mixed_port: Some(strategy.mixed_port),
         current,
         warnings: runtime.warnings.clone(),
-        note: (!running).then(|| "Xray 已退出，请重新连接".into()),
+        note: if !running { Some("Xray 已退出，请重新连接".into()) } else if !capture_ready { Some("代理入口已启动，系统接管或 DNS 尚未就绪".into()) } else { None },
     })
 }
 pub fn groups() -> Result<Vec<controller::LiveGroup>> {
