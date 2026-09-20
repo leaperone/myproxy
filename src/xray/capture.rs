@@ -12,7 +12,11 @@ pub struct CaptureService {
 
 impl CaptureService {
     pub fn prepare() -> Result<Self> {
-        let admission = admission::AdmissionService::start(Arc::new(ApplicationRouting))?;
+        let resolvers = std::process::Command::new("/usr/sbin/scutil").arg("--dns").output()
+            .context("无法读取当前系统 DNS 设置")?;
+        let direct_dns_resolver = system_resolver(&String::from_utf8_lossy(&resolvers.stdout))
+            .context("当前网络没有可用的系统 DNS 服务器")?;
+        let admission = admission::AdmissionService::start(Arc::new(ApplicationRouting { direct_dns_resolver }))?;
         let (username, password) = admission.probe_credentials();
         let request = EnableRequest {
             revision: super::next_generation(), operation_revision: 0,
@@ -42,7 +46,15 @@ impl CaptureService {
     pub fn close_all(&self) -> Result<()> { self.admission.close_all() }
 }
 
-struct ApplicationRouting;
+fn system_resolver(output: &str) -> Option<String> {
+    output.lines().filter_map(|line| {
+        let (key, value) = line.trim().split_once(" : ")?;
+        if !key.starts_with("nameserver[") { return None; }
+        value.trim().parse::<std::net::IpAddr>().ok().map(|address| address.to_string())
+    }).next()
+}
+
+struct ApplicationRouting { direct_dns_resolver: String }
 impl admission::Routing for ApplicationRouting {
     fn decide(&self, request: &admission::FlowRequest) -> Result<admission::AdmittedRoute> {
         let runtime = super::active()?;
@@ -65,6 +77,7 @@ impl admission::Routing for ApplicationRouting {
         };
         let host = if request.kind == "dns" {
             if request.host.parse::<std::net::IpAddr>().is_ok() { request.host.clone() }
+            else if decision.route == policy::Route::Direct { self.direct_dns_resolver.clone() }
             else { crate::compile::DNS_NAMESERVERS[0].to_string() }
         } else {
             request.hostname.as_ref().filter(|name| !name.is_empty()).unwrap_or(&request.host).clone()
@@ -94,5 +107,15 @@ impl admission::Routing for ApplicationRouting {
         let target = udp::DatagramRoute::Socks { address: lane.address, username: lane.username.clone(), password: lane.password.clone(), label: route.decision.chain.join(" → "), fallback_direct: false };
         runtime.check_admission_generation(route.generation)?;
         Ok(target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn xray_direct_dns_preserves_the_current_system_resolver() {
+        assert_eq!(super::system_resolver("DNS configuration\nresolver #1\n  nameserver[0] : 119.29.29.29\n  nameserver[1] : 223.5.5.5\n"), Some("119.29.29.29".into()));
+        assert_eq!(super::system_resolver("nameserver[0] : 2606:4700:4700::1111"), Some("2606:4700:4700::1111".into()));
+        assert_eq!(super::system_resolver("No DNS configuration available"), None);
     }
 }
