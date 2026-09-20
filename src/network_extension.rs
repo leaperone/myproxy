@@ -23,6 +23,8 @@ pub struct EnableRequest {
     pub password: String,
     pub process_rules: Vec<ProcessRule>,
     pub dest_rules: Vec<DestRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qualified_rules: Vec<QualifiedRule>,
     pub gfw_domains: Vec<String>,
     pub group_ports: Vec<GroupPort>,
     #[serde(default)]
@@ -60,11 +62,23 @@ pub struct GroupPort {
     pub port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualifiedRule {
+    pub order: u64,
+    pub via: String,
+    pub user_ids: Vec<u32>,
+    pub ports: Vec<u16>,
+    pub destinations: Vec<DestRule>,
+    pub protocols: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureFace {
     socks_port: u16,
     process_rules: Vec<ProcessRule>,
     dest_rules: Vec<DestRule>,
+    qualified_rules: Vec<QualifiedRule>,
     gfw_domains: Vec<String>,
     group_ports: Vec<GroupPort>,
     gfw_ports: Vec<GroupPort>,
@@ -433,6 +447,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
 
     let mut process_rules = Vec::new();
     let mut dest_rules = Vec::new();
+    let mut qualified_rules = Vec::new();
     let mut order = 0u64;
     let mut needed = Vec::new();
     let mut gfw_needed = Vec::new();
@@ -453,6 +468,22 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
             } else {
                 compile::via_target(via, strategy)
             };
+            if crate::backend::is_xray() && set.matchers.iter().any(|matcher| matches!(matcher.kind.as_str(), "uid" | "port")) {
+                let mut qualified = QualifiedRule { order, via: capture_via.clone(), user_ids: vec![], ports: vec![], destinations: vec![], protocols: protocols.clone() };
+                for matcher in &set.matchers {
+                    match matcher.kind.as_str() {
+                        "uid" => qualified.user_ids.push(matcher.value.parse()?),
+                        "port" => qualified.ports.push(matcher.value.parse()?),
+                        "network" => {},
+                        "domain" | "suffix" | "keyword" | "wildcard" | "cidr" => qualified.destinations.push(DestRule { order, kind: matcher.kind.clone(), value: matcher.value.clone(), via: capture_via.clone(), protocols: vec![] }),
+                        _ => bail!("用户或端口规则包含不支持的组合条件"),
+                    }
+                }
+                qualified_rules.push(qualified);
+                if !needed.contains(&capture_via) { needed.push(capture_via); }
+                order = order.saturating_add(1);
+                continue;
+            }
             let mut pins_inlet = false;
             for matcher in &set.matchers {
                 let value = matcher.value.trim();
@@ -515,6 +546,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         socks_port,
         process_rules: process_rules.clone(),
         dest_rules: dest_rules.clone(),
+        qualified_rules: qualified_rules.clone(),
         gfw_domains: Vec::new(),
         group_ports: group_ports.clone(),
         gfw_ports: gfw_ports.clone(),
@@ -532,6 +564,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         password: session.password.clone(),
         process_rules,
         dest_rules,
+        qualified_rules,
         gfw_domains: Vec::new(),
         group_ports,
         gfw_ports,
@@ -759,6 +792,22 @@ mod tests {
 
     #[test]
     #[cfg(feature = "xray-channel")]
+    fn xray_user_destination_and_port_conditions_remain_one_qualified_rule() {
+        let mut strategy=crate::xray::default_strategy();
+        strategy.extension_mode=crate::strategy::InboundMode::Rule;
+        strategy.rule_sets=vec![crate::strategy::RuleSet {
+            unavailable_fallback: None,
+            id:"dns-guard".into(),name:"DNS guard".into(),via:"DIRECT".into(),
+            matchers:vec![crate::strategy::Matcher {kind:"uid".into(),value:"0".into()},crate::strategy::Matcher::cidr("192.0.2.0/24".into()),crate::strategy::Matcher {kind:"port".into(),value:"53".into()}],
+        }];
+        let plan=super::try_inbound_plan(&strategy).unwrap();
+        assert!(plan.process_rules.is_empty() && plan.dest_rules.is_empty());
+        assert_eq!(plan.qualified_rules.len(),1);
+        let rule=&plan.qualified_rules[0];assert_eq!(rule.user_ids,vec![0]);assert_eq!(rule.ports,vec![53]);assert_eq!(rule.destinations[0].value,"192.0.2.0/24");assert_eq!(rule.via,"@rule:dns-guard");
+    }
+
+    #[test]
+    #[cfg(feature = "xray-channel")]
     fn xray_capture_preserves_protocol_and_routes_through_the_rule_inlet() {
         let mut strategy = crate::xray::default_strategy();
         strategy.extension_mode = crate::strategy::InboundMode::Rule;
@@ -978,6 +1027,7 @@ mod tests {
             password: "p".into(),
             process_rules: vec![],
             dest_rules: vec![],
+            qualified_rules: vec![],
             gfw_domains: vec![],
             group_ports: vec![],
             gfw_ports: vec![],

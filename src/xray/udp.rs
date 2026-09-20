@@ -21,6 +21,7 @@ struct Destination {
     socket: UdpSocket,
     control: Option<TcpStream>,
     last_used: Instant,
+    last_routed: Instant,
 }
 
 pub fn serve_association(
@@ -47,7 +48,13 @@ pub fn serve_association(
             Ok((size, source)) => {
                 if source.ip() != peer_ip || peer.is_some_and(|expected| expected != source) { continue; }
                 let Ok((host, port, offset)) = decode_target(&packet[..size]) else { continue; };
-                let Ok(route) = router(&host, port) else { continue; };
+                let cached = destinations.iter().position(|target| target.host == host && target.port == port && target.last_routed.elapsed() < Duration::from_secs(1));
+                let route = if let Some(index) = cached {
+                    destinations[index].requested_route.clone()
+                } else {
+                    let Ok(route) = router(&host, port) else { continue; };
+                    route
+                };
                 peer.get_or_insert(source);
                 let index = destinations.iter().position(|target| target.host == host && target.port == port && target.requested_route == route);
                 let index = if let Some(index) = index { index } else {
@@ -60,6 +67,7 @@ pub fn serve_association(
                     destinations.len() - 1
                 };
                 let target = &mut destinations[index];
+                if cached.is_none() { target.last_routed = Instant::now(); }
                 let bytes = if matches!(target.route, DatagramRoute::Direct) { &packet[offset..size] } else { &packet[..size] };
                 if target.socket.send(bytes).is_ok() {
                     target.last_used = Instant::now();
@@ -135,7 +143,7 @@ impl Destination {
             }
         };
         socket.set_nonblocking(true)?;
-        Ok(Self { host, port, requested_route: route.clone(), route, socket, control, last_used: Instant::now() })
+        Ok(Self { host, port, requested_route: route.clone(), route, socket, control, last_used: Instant::now(), last_routed: Instant::now() })
     }
 }
 

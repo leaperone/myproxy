@@ -36,7 +36,7 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
             details = subprocess.run(["codesign", "-d", "--verbose=4", str(signed_bundle)], check=True, capture_output=True, text=True).stderr
             assert "Authority=Developer ID Application:" in details and "(runtime)" in details
             assert "TeamIdentifier=5UAHRS482C" in details and "Identifier=" + identifier in details
-            entitlements = plistlib.loads(subprocess.run(["codesign", "--display", "--entitlements", "-", str(signed_bundle)], check=True, capture_output=True).stdout)
+            entitlements = plistlib.loads(subprocess.run(["codesign", "--display", "--entitlements", "-", "--xml", str(signed_bundle)], check=True, capture_output=True).stdout)
             profile = plistlib.loads(subprocess.run(["security", "cms", "-D", "-i", str(signed_bundle / "Contents/embedded.provisionprofile")], check=True, capture_output=True).stdout)
             expiry = profile["ExpirationDate"].replace(tzinfo=datetime.timezone.utc)
             assert expiry > datetime.datetime.now(datetime.timezone.utc), "expired provisioning profile"

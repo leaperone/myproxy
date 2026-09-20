@@ -1205,6 +1205,11 @@ impl Matcher {
             }
             "network" if crate::backend::is_xray() && matches!(self.value.as_str(), "tcp" | "udp") => Ok(()),
             "geo-site" | "geo-ip" if crate::backend::is_xray() => Ok(()),
+            "uid" if crate::backend::is_xray() => self.value.parse::<u32>().map(|_| ()).context("无效的用户编号"),
+            "port" if crate::backend::is_xray() => {
+                if self.value.parse::<u16>().ok().is_none_or(|port| port == 0) { anyhow::bail!("无效的目标端口"); }
+                Ok(())
+            }
             _ => anyhow::bail!("unsupported matcher kind: {}", self.kind),
         }
     }
@@ -1275,6 +1280,8 @@ impl Matcher {
             "network" => "协议",
             "geo-site" => "域名规则集",
             "geo-ip" => "地区网段",
+            "uid" => "用户编号",
+            "port" => "目标端口",
             _ => "—",
         }
     }

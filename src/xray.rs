@@ -299,7 +299,8 @@ fn activate(strategy: &Strategy, catalog: &Catalog) -> Result<()> {
                 )
             })?;
         let dialer: Dialer = Arc::new(|host, port| active()?.dial(host, port));
-        Some(Arc::new(MixedServer::start(listener, dialer)?))
+        let udp_router: relay::UdpRouter = Arc::new(|host, port| active()?.datagram_route(host, port, &Ingress::Mixed));
+        Some(Arc::new(MixedServer::start_with_udp(listener, dialer, udp_router)?))
     };
     save_applied(&candidate)?;
     let (previous, previous_entrance) = {
@@ -501,7 +502,7 @@ impl Runtime {
                     return policy::decide_capture(&strategy, &self.catalog, &health, host, port, network);
                 }
                 if let Some(rule_id) = name.strip_prefix("@rule:") {
-                    policy::decide_captured_rule(&strategy, &self.catalog, &health, rule_id, host, network)
+                    policy::decide_captured_rule(&strategy, &self.catalog, &health, rule_id, host, port, network)
                 } else {
                     policy::decide_target(&strategy, &self.catalog, &health, name)
                 }

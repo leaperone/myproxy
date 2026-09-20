@@ -35,6 +35,8 @@ def rule_name(matchers, position):
     for key, title in [('cursor', 'Cursor'), ('claude', 'Claude'), ('telegram', 'Telegram'), ('chatgpt', 'ChatGPT'), ('openai', 'OpenAI'), ('chrome', 'Chrome'), ('firefox', 'Firefox'), ('safari', 'Safari'), ('github', 'GitHub'), ('google', 'Google')]:
         if key in values and len(matchers) < 100:
             return f'{title} · {position}'
+    if any(item['kind'] == 'uid' for item in matchers) and any(item['kind'] == 'port' and item['value'] == '53' for item in matchers):
+        return 'DNS 直连保护'
     first = next(item for item in matchers if item['kind'] != 'network')
     if first['kind'] == 'cidr':
         return f'网络直连 · {first["value"]}'
@@ -59,21 +61,13 @@ def prepare(source, current):
     active = {identifier(value) for value in workspace['ruleIDs']}
     existing = {rule['id']: rule for rule in candidate['rule_sets']}
     migrated = []
-    replaced = []
     unsupported = []
-    kind_map = {'application': 'app', 'processPath': 'app', 'processName': 'app', 'domainExact': 'domain', 'domainSuffix': 'suffix', 'domainWildcard': 'wildcard', 'ipCIDR': 'cidr', 'transport': 'network'}
+    kind_map = {'application': 'app', 'processPath': 'app', 'processName': 'app', 'domainExact': 'domain', 'domainSuffix': 'suffix', 'domainWildcard': 'wildcard', 'ipCIDR': 'cidr', 'transport': 'network', 'userID': 'uid', 'port': 'port'}
     for position, rule in enumerate(sorted(source['rules'], key=lambda item: item['priority'])):
         source_id = identifier(rule['id'])
         if source_id not in active or not rule['enabled']:
             continue
         kinds = {next(iter(item)) for item in rule['matchers']}
-        # A former app's UID+loopback-DNS bypass is not a user route. The new
-        # signed host/core identities have their own built-in recursion bypass.
-        if kinds == {'userID', 'ipCIDR', 'port'} and 'direct' in rule['action'] and rule['priority'] < 0:
-            ports = [item['port']['_0'] for item in rule['matchers'] if 'port' in item]
-            if ports == [53]:
-                replaced.append({'source_id': source_id, 'reason': '旧应用的 DNS 自保护由 MyProxy 签名组件旁路替代'})
-                continue
         if not kinds <= kind_map.keys():
             unsupported.append({'source_id': source_id, 'matcher_types': sorted(kinds)})
             continue
@@ -107,7 +101,7 @@ def prepare(source, current):
     candidate['rule_sets'] = list(existing.values()) + migrated
     if unsupported:
         raise RuntimeError('Some rules cannot yet be represented without changing behavior; migration was not applied')
-    return candidate, {'imported_rules': len(migrated), 'preserved_user_rules': len(existing), 'replaced_internal_rules': replaced}
+    return candidate, {'imported_rules': len(migrated), 'preserved_user_rules': len(existing)}
 
 
 def main():
@@ -138,7 +132,7 @@ def main():
         receipt['applied'] = True
         run(args.cli, 'export', str(backup / 'after.json'))
     (backup / 'receipt.json').write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
-    print(json.dumps({'rules': receipt['imported_rules'], 'preserved': receipt['preserved_user_rules'], 'replaced_internal': len(receipt['replaced_internal_rules']), 'applied': receipt['applied'], 'backup': str(backup)}, ensure_ascii=False))
+    print(json.dumps({'rules': receipt['imported_rules'], 'preserved': receipt['preserved_user_rules'], 'applied': receipt['applied'], 'backup': str(backup)}, ensure_ascii=False))
 
 
 if __name__ == '__main__':

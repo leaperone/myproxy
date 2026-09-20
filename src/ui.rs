@@ -872,7 +872,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child(if backend::is_xray() { "规则从上到下匹配。目标或应用条件任一命中即可；如果指定了协议，也必须同时满足。" } else { "逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。" }),
+                    .child(if backend::is_xray() { "规则从上到下匹配。目标或应用条件任一命中即可；指定的协议、端口或用户条件也必须同时满足。" } else { "逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。" }),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))

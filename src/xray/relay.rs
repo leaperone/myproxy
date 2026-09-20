@@ -86,6 +86,10 @@ impl MixedServer {
         Self::start_inner(listener, dialer, None, None)
     }
 
+    pub fn start_with_udp(listener: TcpListener, dialer: Dialer, udp_router: UdpRouter) -> Result<Self> {
+        Self::start_inner(listener, dialer, None, Some(udp_router))
+    }
+
     fn start_inner(listener: TcpListener, dialer: Dialer, credentials: Option<(String, String)>, udp_router: Option<UdpRouter>) -> Result<Self> {
         if !listener.local_addr()?.ip().is_loopback() {
             bail!("混合入口必须绑定本机地址");

@@ -114,8 +114,9 @@ into the private Xray configuration directory.
 `scripts/import-mclash-rules.py` prepares a private migration candidate and receipt,
 preserving current ports, modes, subscriptions, node selections and unrelated rules.
 `--apply` imports through the bundled CLI after the channel supports the required
-matchers. An old application's loopback DNS self-protection is replaced by the
-new application's signed-component bypass, not copied as a broad user-ID rule.
+matchers. Imported user-ID and destination-port conditions remain joint
+constraints on their original destination rules; they are not widened into
+standalone user or network rules.
 
 The Xray workflow tests feature-branch pushes. A commit marked `[xray-package]`
 also produces a signed, notarized candidate artifact for local acceptance, without

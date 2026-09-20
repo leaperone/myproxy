@@ -182,6 +182,7 @@ pub fn rule_matches(
     host: &str,
     process: Option<&str>,
     network: &str,
+    port: u16,
 ) -> anyhow::Result<bool> {
     let has_network = set.matchers.iter().any(|matcher| matcher.kind == "network");
     if has_network && !set.matchers.iter().any(|matcher| {
@@ -189,8 +190,16 @@ pub fn rule_matches(
         }) {
         return Ok(false);
     }
+    if set.matchers.iter().any(|matcher| matcher.kind == "uid") { return Ok(false); }
+    let ports = set.matchers.iter().filter(|matcher| matcher.kind == "port").collect::<Vec<_>>();
+    if !ports.is_empty() && !ports.iter().any(|matcher| matcher.value.parse::<u16>().ok() == Some(port)) { return Ok(false); }
+    let mut has_target = false;
+    let literal_ip = host.parse::<IpAddr>().is_ok();
     for matcher in &set.matchers {
-        if matcher.kind == "network" { continue; }
+        if matches!(matcher.kind.as_str(), "network" | "port") { continue; }
+        has_target = true;
+        if literal_ip && matches!(matcher.kind.as_str(), "domain" | "suffix" | "wildcard" | "keyword" | "geo-site") { continue; }
+        if !literal_ip && matches!(matcher.kind.as_str(), "cidr" | "geo-ip") { continue; }
         let matched = if matches!(matcher.kind.as_str(), "geo-site" | "geo-ip") {
             super::geo::matches(&matcher.kind, &matcher.value, host)?
         } else {
@@ -198,7 +207,7 @@ pub fn rule_matches(
         };
         if matched { return Ok(true); }
     }
-    Ok(false)
+    Ok(!has_target)
 }
 
 fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
@@ -307,6 +316,7 @@ pub fn decide_captured_rule(
     health: &HashMap<String, NodeHealth>,
     rule_id: &str,
     host: &str,
+    port: u16,
     network: &str,
 ) -> Decision {
     let Some(forced_rule) = strategy.rule_sets.iter().find(|set| set.id == rule_id) else {
@@ -316,9 +326,13 @@ pub fn decide_captured_rule(
     if !protocols.is_empty() && !protocols.iter().any(|matcher| matcher.value == network) {
         return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则协议已变更".into() };
     }
+    let ports = forced_rule.matchers.iter().filter(|matcher| matcher.kind == "port").collect::<Vec<_>>();
+    if !ports.is_empty() && !ports.iter().any(|matcher| matcher.value.parse::<u16>().ok() == Some(port)) {
+        return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则端口已变更".into() };
+    }
     for set in &strategy.rule_sets {
         let forced = set.id == rule_id;
-        let matched = match rule_matches(set, host, None, network) {
+        let matched = match rule_matches(set, host, None, network, port) {
             Ok(value) => value,
             Err(_) => return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "规则数据库不可用".into() },
         };
@@ -370,7 +384,7 @@ fn decide_with_mode(
             ),
             InboundMode::Rule => {
                 for set in &strategy.rule_sets {
-                    let matched = match rule_matches(set, host, process, network) {
+                    let matched = match rule_matches(set, host, process, network, _port) {
                         Ok(matched) => matched,
                         Err(_) => return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "规则数据库不可用".into() },
                     };
@@ -466,6 +480,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn imported_user_rules_cannot_match_clients_without_source_identity() {
+        let set=crate::strategy::RuleSet {unavailable_fallback:None,id:"dns".into(),name:"DNS guard".into(),via:"DIRECT".into(),matchers:vec![crate::strategy::Matcher {kind:"uid".into(),value:"0".into()},crate::strategy::Matcher::cidr("192.0.2.0/24".into()),crate::strategy::Matcher {kind:"port".into(),value:"53".into()}]};
+        assert!(!rule_matches(&set,"192.0.2.1",None,"udp",53).unwrap());
+        let mut strategy=crate::xray::default_strategy();strategy.rule_sets=vec![set];
+        assert_eq!(decide_captured_rule(&strategy,&Catalog::default(),&HashMap::new(),"dns","192.0.2.1",53,"udp").route,Route::Direct);
+        assert_eq!(decide_captured_rule(&strategy,&Catalog::default(),&HashMap::new(),"dns","192.0.2.1",443,"tcp").route,Route::Reject);
+    }
+
+    #[test]
     fn imported_domain_masks_preserve_literal_suffix_and_apex_boundaries() {
         for (pattern, host, expected) in [
             ("*.example.com", "example.com", false),
@@ -493,9 +516,9 @@ mod tests {
                 crate::strategy::Matcher { kind: "network".into(), value: "tcp".into() },
             ],
         };
-        assert!(rule_matches(&set, "www.example.com", None, "tcp").unwrap());
-        assert!(!rule_matches(&set, "www.example.com", None, "udp").unwrap());
-        assert!(!rule_matches(&set, "other.invalid", None, "tcp").unwrap());
+        assert!(rule_matches(&set, "www.example.com", None, "tcp", 443).unwrap());
+        assert!(!rule_matches(&set, "www.example.com", None, "udp", 443).unwrap());
+        assert!(!rule_matches(&set, "other.invalid", None, "tcp", 443).unwrap());
     }
     use crate::catalog::Node;
     use crate::strategy::{Matcher, RuleSet};

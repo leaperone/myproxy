@@ -23,6 +23,15 @@ private struct HostEnableRequest: Decodable, Sendable {
         let protocols: [TransportProtocol]?
     }
 
+    struct QualifiedRule: Decodable, Sendable {
+        let order: UInt64
+        let via: String
+        let userIds: [UInt32]
+        let ports: [UInt16]
+        let destinations: [DestRule]
+        let protocols: [TransportProtocol]
+    }
+
     let revision: UInt64
     let operationRevision: UInt64
     let socksPort: UInt16
@@ -30,6 +39,7 @@ private struct HostEnableRequest: Decodable, Sendable {
     let password: String
     let processRules: [ProcessRule]
     let destRules: [DestRule]
+    let qualifiedRules: [QualifiedRule]?
     let gfwDomains: [String]
     let groupPorts: [GroupPort]
     let gfwPorts: [GroupPort]
@@ -670,6 +680,7 @@ private func captureSnapshot(
         sources: [SourceMatcher] = [],
         destinations: [DestinationMatcher] = [],
         protocols: [TransportProtocol] = [],
+        portRanges: [PortRange] = [],
         via: String
     ) throws {
         rules.append(try CaptureRule(
@@ -678,6 +689,7 @@ private func captureSnapshot(
             sources: sources,
             destinations: destinations,
             protocols: Set(protocols),
+            portRanges: portRanges,
             action: captureAction(via: via),
             unavailableFallback: captureFallback(via: via)
         ))
@@ -686,21 +698,31 @@ private func captureSnapshot(
     enum OrderedInput {
         case process(Int, HostEnableRequest.ProcessRule)
         case destination(Int, HostEnableRequest.DestRule)
+        case qualified(Int, HostEnableRequest.QualifiedRule)
         var order: UInt64 {
             switch self {
             case .process(_, let rule): rule.order
             case .destination(_, let rule): rule.order
+            case .qualified(_, let rule): rule.order
             }
         }
     }
     let inputs = request.processRules.enumerated().map { OrderedInput.process($0.offset, $0.element) }
         + request.destRules.enumerated().map { OrderedInput.destination($0.offset, $0.element) }
+        + (request.qualifiedRules ?? []).enumerated().map { OrderedInput.qualified($0.offset, $0.element) }
     let ordered = inputs.enumerated().sorted {
         if $0.element.order == $1.element.order { return $0.offset < $1.offset }
         return $0.element.order < $1.element.order
     }
     for input in ordered.map(\.element) {
         switch input {
+        case .qualified(let index, let rule):
+            let destinations = rule.destinations.flatMap { destinationMatchers(kind: $0.kind, value: $0.value) }
+            guard rule.destinations.isEmpty || !destinations.isEmpty else {
+                throw NetworkExtensionControlFailure(operation: .configureTransparentProxy, message: "无效的组合目标条件")
+            }
+            try append("qualified-\(index)", sources: rule.userIds.map { .userID($0) }, destinations: destinations,
+                protocols: rule.protocols, portRanges: try rule.ports.map { try PortRange($0) }, via: rule.via)
         case .process(let index, let rule):
             let sources = sourceMatchers(from: rule.pattern)
             guard !sources.isEmpty else {

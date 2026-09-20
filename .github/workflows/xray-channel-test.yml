@@ -1,7 +1,7 @@
 name: Xray channel
 on:
   push:
-    branches: [feat/xray-channel-1.6]
+    branches: [feat/xray-channel-1.6, xray]
     tags: ["xray-v*"]
   workflow_dispatch:
 permissions:
