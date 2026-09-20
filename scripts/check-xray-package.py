@@ -46,9 +46,12 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
             allowed_id = grants.get("com.apple.application-identifier", grants.get("application-identifier", ""))
             assert fnmatch.fnmatchcase(app_id, allowed_id), "profile does not authorize bundle"
             assert not entitlements.get("com.apple.security.get-task-allow", False)
-            for key in ("com.apple.developer.networking.networkextension", "com.apple.security.application-groups"):
-                assert entitlements.get(key), "missing required entitlement"
-                assert all(any(fnmatch.fnmatchcase(value, grant) for grant in grants.get(key, [])) for value in entitlements[key]), "profile does not authorize required entitlement"
+            key = "com.apple.developer.networking.networkextension"
+            assert entitlements.get(key), "missing Network Extension entitlement"
+            assert all(any(fnmatch.fnmatchcase(value, grant) for grant in grants.get(key, [])) for value in entitlements[key]), "profile does not authorize Network Extension capabilities"
+            # macOS Team-ID app groups do not require developer-portal registration:
+            # https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.application-groups
+            assert entitlements.get("com.apple.security.application-groups") == ["5UAHRS482C.local.harry.myproxy"], "wrong shared app group"
         core_details = subprocess.run(["codesign", "-d", "--verbose=4", str(app / "Contents/MacOS/xray")], check=True, capture_output=True, text=True).stderr
         assert "Identifier=local.harry.myproxy.xray" in core_details
         assert "TeamIdentifier=5UAHRS482C" in core_details
