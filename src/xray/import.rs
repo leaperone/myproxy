@@ -58,7 +58,7 @@ fn parse_one(input: &str) -> Result<Value> {
     } else if lower.starts_with("ss://") {
         parse_ss(&input[5..])
     } else if lower.starts_with("tuic://") || lower.starts_with("hysteria2://") {
-        bail!("该链接协议暂未纳入 Xray 测试通道")
+        bail!("暂不支持这种节点链接。支持 VLESS、VMess、Trojan 和 Shadowsocks 链接")
     } else {
         bail!("链接格式不受支持");
     }

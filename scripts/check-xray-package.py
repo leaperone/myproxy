@@ -25,6 +25,8 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     assert extension + "embedded.provisionprofile" in names
     assert extension + "MacOS/MyproxyNetworkExtension" in names
     assert root + "embedded.provisionprofile" in names
+    assert archive.read(root + "Resources/ThirdParty/xray/LICENSE").startswith(b"Mozilla Public License Version 2.0")
+    assert b"v26.9.9" in archive.read(root + "Resources/ThirdParty/xray/NOTICE.md")
     assert not any(name.endswith("/mihomo") for name in names)
     with tempfile.TemporaryDirectory() as directory:
         app = Path(directory) / "MyProxy.app"
