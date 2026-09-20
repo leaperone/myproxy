@@ -24,6 +24,7 @@ public struct DNSProxyBootstrapConfiguration: Codable, Equatable, Sendable {
     /// so those flows can only be answered by an upstream the provider knows.
     public let upstreamResolvers: [String]?
     public let encodedCaptureSnapshot: Data?
+    public let appAdmission: AppAdmissionBootstrap?
 
     public init(
         revision: UInt64,
@@ -31,7 +32,8 @@ public struct DNSProxyBootstrapConfiguration: Codable, Equatable, Sendable {
         profileRulesProxy: MihomoRouteProxyEndpoint,
         routeProxyEndpoints: [MihomoRouteProxyEndpoint]? = nil,
         upstreamResolvers: [String]? = nil,
-        encodedCaptureSnapshot: Data? = nil
+        encodedCaptureSnapshot: Data? = nil,
+        appAdmission: AppAdmissionBootstrap? = nil
     ) throws {
         schemaVersion = Self.currentSchemaVersion
         self.revision = revision
@@ -40,6 +42,7 @@ public struct DNSProxyBootstrapConfiguration: Codable, Equatable, Sendable {
         self.routeProxyEndpoints = routeProxyEndpoints
         self.upstreamResolvers = upstreamResolvers
         self.encodedCaptureSnapshot = encodedCaptureSnapshot
+        self.appAdmission = appAdmission
         try validate()
     }
 

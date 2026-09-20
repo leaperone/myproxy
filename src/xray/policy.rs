@@ -26,6 +26,43 @@ pub struct Decision {
     pub rule: String,
 }
 
+pub struct FlowContext<'a> {
+    pub host: &'a str,
+    pub hostname: Option<&'a str>,
+    pub port: u16,
+    pub network: &'a str,
+    pub user_id: Option<u32>,
+    pub applications: &'a [String],
+}
+
+pub fn application_identifiers(path: Option<&str>, bundle: Option<&str>, signing: Option<&str>) -> Vec<String> {
+    let mut values = Vec::new();
+    for value in [path, bundle, signing].into_iter().flatten() {
+        let value = value.trim().to_lowercase();
+        if !value.is_empty() && !values.contains(&value) { values.push(value); }
+    }
+    if let Some(path) = path {
+        for component in path.split('/').filter(|part| !part.is_empty()) {
+            if component.to_ascii_lowercase().ends_with(".app") {
+                values.push(component.to_lowercase());
+                values.push(component[..component.len()-4].to_lowercase());
+            }
+        }
+        if let Some(name) = std::path::Path::new(path).file_name().and_then(|name| name.to_str()) {
+            values.push(name.to_lowercase());
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn application_matches(pattern: &str, applications: &[String]) -> bool {
+    let patterns = application_identifiers(Some(pattern.trim()), None, None);
+    patterns.iter().any(|pattern| applications.iter().any(|value|
+        catalog::wildcard_match(&pattern.chars().collect::<Vec<_>>(), &value.to_lowercase().chars().collect::<Vec<_>>())))
+}
+
 fn group<'a>(strategy: &'a Strategy, name: &str) -> Option<&'a Group> {
     strategy
         .groups
@@ -184,26 +221,43 @@ pub fn rule_matches(
     network: &str,
     port: u16,
 ) -> anyhow::Result<bool> {
+    let applications = process.map(|value| vec![value.to_lowercase()]).unwrap_or_default();
+    rule_matches_context(set, &FlowContext { host, hostname: None, port, network, user_id: None, applications: &applications })
+}
+
+fn rule_matches_context(set: &crate::strategy::RuleSet, context: &FlowContext<'_>) -> anyhow::Result<bool> {
     let has_network = set.matchers.iter().any(|matcher| matcher.kind == "network");
     if has_network && !set.matchers.iter().any(|matcher| {
-            matcher.kind == "network" && matcher.value.eq_ignore_ascii_case(network)
+            matcher.kind == "network" && matcher.value.eq_ignore_ascii_case(context.network)
         }) {
         return Ok(false);
     }
-    if set.matchers.iter().any(|matcher| matcher.kind == "uid") { return Ok(false); }
+    let users = set.matchers.iter().filter(|matcher| matcher.kind == "uid").collect::<Vec<_>>();
+    if !users.is_empty() && !users.iter().any(|matcher| context.user_id.is_some_and(|uid| matcher.value.parse::<u32>().ok() == Some(uid))) { return Ok(false); }
     let ports = set.matchers.iter().filter(|matcher| matcher.kind == "port").collect::<Vec<_>>();
-    if !ports.is_empty() && !ports.iter().any(|matcher| matcher.value.parse::<u16>().ok() == Some(port)) { return Ok(false); }
+    if !ports.is_empty() && !ports.iter().any(|matcher| matcher.value.parse::<u16>().ok() == Some(context.port)) { return Ok(false); }
     let mut has_target = false;
-    let literal_ip = host.parse::<IpAddr>().is_ok();
+    let literal_ip = context.host.parse::<IpAddr>().ok();
+    let hostname = context.hostname.filter(|name| name.parse::<IpAddr>().is_err())
+        .or_else(|| literal_ip.is_none().then_some(context.host));
     for matcher in &set.matchers {
-        if matches!(matcher.kind.as_str(), "network" | "port") { continue; }
+        if matches!(matcher.kind.as_str(), "network" | "port" | "uid") { continue; }
         has_target = true;
-        if literal_ip && matches!(matcher.kind.as_str(), "domain" | "suffix" | "wildcard" | "keyword" | "geo-site") { continue; }
-        if !literal_ip && matches!(matcher.kind.as_str(), "cidr" | "geo-ip") { continue; }
+        if matches!(matcher.kind.as_str(), "app" | "process") {
+            if application_matches(&matcher.value, context.applications) { return Ok(true); }
+            continue;
+        }
+        let host = if matches!(matcher.kind.as_str(), "cidr" | "ip" | "geo-ip") {
+            if literal_ip.is_none() { continue; }
+            context.host
+        } else {
+            let Some(hostname) = hostname else { continue; };
+            hostname
+        };
         let matched = if matches!(matcher.kind.as_str(), "geo-site" | "geo-ip") {
             super::geo::matches(&matcher.kind, &matcher.value, host)?
         } else {
-            matcher_matches(&matcher.kind, &matcher.value, host, process)
+            matcher_matches(&matcher.kind, &matcher.value, host, None)
         };
         if matched { return Ok(true); }
     }
@@ -310,37 +364,27 @@ fn decide_rule(strategy: &Strategy, catalog: &Catalog, health: &HashMap<String, 
     decision
 }
 
-pub fn decide_captured_rule(
+pub fn decide_application(
     strategy: &Strategy,
     catalog: &Catalog,
     health: &HashMap<String, NodeHealth>,
-    rule_id: &str,
-    host: &str,
-    port: u16,
-    network: &str,
+    context: &FlowContext<'_>,
 ) -> Decision {
-    let Some(forced_rule) = strategy.rule_sets.iter().find(|set| set.id == rule_id) else {
-        return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则已失效".into() };
+    let native = match context.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_link_local() || ip.is_broadcast()
+            || (!strategy.lan_capture && ip.is_private()),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local()
+            || (!strategy.lan_capture && ip.is_unique_local()),
+        Err(_) => false,
     };
-    let protocols = forced_rule.matchers.iter().filter(|matcher| matcher.kind == "network").collect::<Vec<_>>();
-    if !protocols.is_empty() && !protocols.iter().any(|matcher| matcher.value == network) {
-        return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则协议已变更".into() };
+    let local_name = [Some(context.host), context.hostname].into_iter().flatten().any(|name| {
+        let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        name == "localhost" || [".local", ".lan", ".localdomain", ".home.arpa"].iter().any(|suffix| name.ends_with(suffix))
+    });
+    if native || local_name {
+        return Decision { allow_direct_fallback: false, route: Route::Direct, chain: vec!["DIRECT".into()], rule: "本机与局域网".into() };
     }
-    let ports = forced_rule.matchers.iter().filter(|matcher| matcher.kind == "port").collect::<Vec<_>>();
-    if !ports.is_empty() && !ports.iter().any(|matcher| matcher.value.parse::<u16>().ok() == Some(port)) {
-        return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则端口已变更".into() };
-    }
-    for set in &strategy.rule_sets {
-        let forced = set.id == rule_id;
-        let matched = match rule_matches(set, host, None, network, port) {
-            Ok(value) => value,
-            Err(_) => return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "规则数据库不可用".into() },
-        };
-        if forced || matched {
-            return decide_rule(strategy, catalog, health, set);
-        }
-    }
-    Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则已失效".into() }
+    decide_context(strategy, catalog, health, context, strategy.extension_mode)
 }
 
 fn decide_with_mode(
@@ -351,6 +395,18 @@ fn decide_with_mode(
     _port: u16,
     process: Option<&str>,
     network: &str,
+    mode: InboundMode,
+) -> Decision {
+    let applications = process.map(|value| vec![value.to_lowercase()]).unwrap_or_default();
+    let context = FlowContext { host, hostname: None, port: _port, network, user_id: None, applications: &applications };
+    decide_context(strategy, catalog, health, &context, mode)
+}
+
+fn decide_context(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    health: &HashMap<String, NodeHealth>,
+    context: &FlowContext<'_>,
     mode: InboundMode,
 ) -> Decision {
     let mut chain = Vec::new();
@@ -384,7 +440,7 @@ fn decide_with_mode(
             ),
             InboundMode::Rule => {
                 for set in &strategy.rule_sets {
-                    let matched = match rule_matches(set, host, process, network, _port) {
+                    let matched = match rule_matches_context(set, context) {
                         Ok(matched) => matched,
                         Err(_) => return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "规则数据库不可用".into() },
                     };
@@ -480,12 +536,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xray_application_decisions_preserve_source_target_order_and_qualifiers() {
+        use crate::strategy::{Matcher, RuleSet};
+        let mut strategy = crate::xray::default_strategy();
+        strategy.extension_mode = InboundMode::Rule;
+        strategy.routing_profile = RoutingProfile::Allowlist;
+        strategy.rule_sets = vec![RuleSet {
+            id:"combined".into(), name:"Application or website".into(), via:"REJECT".into(), unavailable_fallback:None,
+            matchers:vec![Matcher::app("*cursor*".into()), Matcher {kind:"suffix".into(),value:"example.com".into()}, Matcher {kind:"network".into(),value:"tcp".into()}, Matcher {kind:"port".into(),value:"443".into()}],
+        }];
+        let apps = application_identifiers(Some("/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"), Some("com.todesktop.cursor"), Some("com.cursor.helper"));
+        let catalog = Catalog::default(); let health = HashMap::new();
+        for (source, hostname, port, network, expected) in [
+            (true,"other.test",443,"tcp",Route::Reject),
+            (false,"www.example.com",443,"tcp",Route::Reject),
+            (false,"other.test",443,"tcp",Route::Direct),
+            (true,"www.example.com",80,"tcp",Route::Direct),
+            (true,"www.example.com",443,"udp",Route::Direct),
+        ] {
+            let context = FlowContext {host:"203.0.113.8",hostname:Some(hostname),port,network,user_id:Some(501),applications:if source {&apps} else {&[]}};
+            assert_eq!(decide_application(&strategy,&catalog,&health,&context).route,expected);
+        }
+        strategy.rule_sets.insert(0, RuleSet {id:"first".into(),name:"Website direct".into(),via:"DIRECT".into(),unavailable_fallback:None,matchers:vec![Matcher {kind:"suffix".into(),value:"example.com".into()}]});
+        let context = FlowContext {host:"203.0.113.8",hostname:Some("www.example.com"),port:443,network:"tcp",user_id:Some(501),applications:&apps};
+        assert_eq!(decide_application(&strategy,&catalog,&health,&context).route,Route::Direct);
+    }
+
+    #[test]
+    fn xray_uid_rules_use_verified_uid_and_keep_both_ip_and_hostname() {
+        use crate::strategy::{Matcher, RuleSet};
+        let set = RuleSet {id:"qualified".into(),name:"Qualified".into(),via:"REJECT".into(),unavailable_fallback:None,
+            matchers:vec![Matcher {kind:"uid".into(),value:"501".into()},Matcher::cidr("203.0.113.0/24".into()),Matcher {kind:"port".into(),value:"443".into()}]};
+        let mut context = FlowContext {host:"203.0.113.8",hostname:Some("example.com"),port:443,network:"tcp",user_id:Some(501),applications:&[]};
+        assert!(rule_matches_context(&set,&context).unwrap());
+        context.user_id = None;
+        assert!(!rule_matches_context(&set,&context).unwrap());
+        context.user_id = Some(502);
+        assert!(!rule_matches_context(&set,&context).unwrap());
+        context.user_id = Some(501); context.host="198.51.100.8";
+        assert!(!rule_matches_context(&set,&context).unwrap());
+        let kernel_identifiers = application_identifiers(None,None,Some("com.example.app"));
+        assert!(application_matches("com.example.app",&kernel_identifiers));
+        assert!(!application_matches("/Applications/Other.app/Contents/MacOS/Other",&kernel_identifiers));
+    }
+
+    #[test]
     fn imported_user_rules_cannot_match_clients_without_source_identity() {
         let set=crate::strategy::RuleSet {unavailable_fallback:None,id:"dns".into(),name:"DNS guard".into(),via:"DIRECT".into(),matchers:vec![crate::strategy::Matcher {kind:"uid".into(),value:"0".into()},crate::strategy::Matcher::cidr("192.0.2.0/24".into()),crate::strategy::Matcher {kind:"port".into(),value:"53".into()}]};
         assert!(!rule_matches(&set,"192.0.2.1",None,"udp",53).unwrap());
-        let mut strategy=crate::xray::default_strategy();strategy.rule_sets=vec![set];
-        assert_eq!(decide_captured_rule(&strategy,&Catalog::default(),&HashMap::new(),"dns","192.0.2.1",53,"udp").route,Route::Direct);
-        assert_eq!(decide_captured_rule(&strategy,&Catalog::default(),&HashMap::new(),"dns","192.0.2.1",443,"tcp").route,Route::Reject);
+        let mut context = FlowContext { host:"192.0.2.1", hostname:None, port:53, network:"udp", user_id:Some(0), applications:&[] };
+        assert!(rule_matches_context(&set, &context).unwrap());
+        context.host = "198.51.100.1";
+        assert!(!rule_matches_context(&set, &context).unwrap());
+        context.host = "192.0.2.1";
+        context.port = 443;
+        assert!(!rule_matches_context(&set, &context).unwrap());
+        context.port = 53;
+        context.user_id = None;
+        assert!(!rule_matches_context(&set, &context).unwrap());
     }
 
     #[test]

@@ -37,6 +37,7 @@ private struct HostEnableRequest: Decodable, Sendable {
     let socksPort: UInt16
     let username: String
     let password: String
+    let appAdmission: AppAdmissionBootstrap?
     let processRules: [ProcessRule]
     let destRules: [DestRule]
     let qualifiedRules: [QualifiedRule]?
@@ -371,6 +372,8 @@ private actor HostController {
         defer { withExtendedLifetime(sideEffects) {} }
         try intent.check()
         HostRuntime.shared.update(operation: operation) { $0.phase = "requesting" }
+        var applied = false
+        #if !MYPROXY_XRAY
         let connected = await transparentProxy.isConnected()
         try intent.check()
         let canLiveUpdate = connected
@@ -378,7 +381,6 @@ private actor HostController {
             && lastUsername == request.username
             && lastPassword == request.password
             && preservesRouteEndpoints(lastEndpoints, endpoints)
-        var applied = false
         if canLiveUpdate {
             do {
                 try await transparentProxy.configureAndApplyRunning(
@@ -392,6 +394,7 @@ private actor HostController {
                 AppLog.warn("ne-host", "live capture update failed; restarting provider")
             }
         }
+        #endif
         if !applied {
             try await disableDNSProxyAllowingDenied(intent: intent)
             try intent.check()
@@ -634,6 +637,29 @@ private func providerConfigurations(
     endpoints: [MihomoRouteProxyEndpoint],
     activationIdentifier: UUID
 ) throws -> HostProviderConfigurations {
+    #if MYPROXY_XRAY
+    let admission = try applicationAdmission(from: request)
+    let bootstrap = try DNSProxyBootstrapConfiguration(
+        revision: request.revision,
+        activationIdentifier: activationIdentifier,
+        profileRulesProxy: endpoints[0],
+        upstreamResolvers: usableResolvers(from: request.dnsResolvers),
+        appAdmission: admission
+    ).encoded()
+    let transparent: [String: NSObject] = [
+        "revision": NSNumber(value: request.revision),
+        "activationIdentifier": activationIdentifier.uuidString as NSString,
+        "dnsProxyBootstrap": bootstrap as NSData,
+        "captureEnabled": NSNumber(value: true),
+        "failOpen": NSNumber(value: false),
+        "appAdmission": try JSONEncoder().encode(admission) as NSData,
+        "mihomoSOCKSHost": "127.0.0.1" as NSString,
+        "mihomoSOCKSPort": NSNumber(value: request.socksPort),
+        "mihomoSOCKSUsername": request.username as NSString,
+        "mihomoSOCKSPassword": request.password as NSString,
+    ]
+    return HostProviderConfigurations(transparent: transparent, dnsBootstrap: bootstrap)
+    #else
     let snapshot = try captureSnapshot(from: request)
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
@@ -661,6 +687,30 @@ private func providerConfigurations(
         "mihomoSOCKSPassword": request.password as NSString,
     ]
     return HostProviderConfigurations(transparent: transparent, dnsBootstrap: bootstrap)
+    #endif
+}
+
+private func applicationAdmission(from request: HostEnableRequest) throws -> AppAdmissionBootstrap {
+    guard let admission = request.appAdmission,
+          admission.version == 1, admission.port > 0,
+          UUID(uuidString: admission.activation) != nil,
+          Data(base64Encoded: admission.key)?.count == 32,
+          request.processRules.isEmpty, request.destRules.isEmpty,
+          (request.qualifiedRules ?? []).isEmpty, request.groupPorts.isEmpty,
+          request.gfwPorts.isEmpty, request.gfwDomains.isEmpty else {
+        throw NetworkExtensionControlFailure(operation: .configureTransparentProxy,
+            message: "系统接管需要应用决策服务，不能包含路由规则")
+    }
+    return admission
+}
+
+private func validateHostRequest(_ request: HostEnableRequest) throws {
+    #if MYPROXY_XRAY
+    _ = try applicationAdmission(from: request)
+    #else
+    _ = try captureSnapshot(from: request)
+    #endif
+    _ = try routeEndpoints(from: request)
 }
 
 private func captureSnapshot(
@@ -953,8 +1003,7 @@ public func myproxy_ne_validate(
         let request = try JSONDecoder().decode(
             HostEnableRequest.self, from: Data(String(cString: json).utf8)
         )
-        _ = try captureSnapshot(from: request)
-        _ = try routeEndpoints(from: request)
+        try validateHostRequest(request)
         return 0
     } catch {
         errorOut?.pointee = duplicateString(error.localizedDescription)
@@ -977,8 +1026,7 @@ public func myproxy_ne_enable(
             HostEnableRequest.self, from: Data(String(cString: json).utf8)
         )
         // Validate before scheduling side effects or cancelling a working plan.
-        _ = try captureSnapshot(from: request)
-        _ = try routeEndpoints(from: request)
+        try validateHostRequest(request)
         let submitted = try HostOperations.shared.submit(
             revision: request.operationRevision,
             desired: request.revision,

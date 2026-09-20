@@ -21,6 +21,8 @@ pub struct EnableRequest {
     pub socks_port: u16,
     pub username: String,
     pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_admission: Option<crate::xray::admission::Bootstrap>,
     pub process_rules: Vec<ProcessRule>,
     pub dest_rules: Vec<DestRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -409,6 +411,23 @@ pub fn prepare_request(request: &EnableRequest) -> Result<()> {
 }
 
 fn validate_request(request: &EnableRequest) -> Result<()> {
+    if crate::backend::is_xray() {
+        if request.app_admission.is_none()
+            || !request.process_rules.is_empty() || !request.dest_rules.is_empty()
+            || !request.qualified_rules.is_empty() || !request.group_ports.is_empty()
+            || !request.gfw_ports.is_empty() || !request.gfw_domains.is_empty()
+        {
+            bail!("Xray 系统接管只接受应用决策服务，不下发路由规则");
+        }
+        if let Some(admission) = &request.app_admission {
+            use base64::Engine;
+            if admission.version != 1 || admission.port == 0 || Uuid::parse_str(&admission.activation).is_err()
+                || !base64::engine::general_purpose::STANDARD.decode(&admission.key).is_ok_and(|key| key.len() == 32)
+            {
+                bail!("应用决策服务的连接信息无效");
+            }
+        }
+    }
     if !request.gfw_domains.is_empty() {
         bail!("系统接管不再嵌入 GFWList 域名");
     }
@@ -427,6 +446,9 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
 }
 
 pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
+    if crate::backend::is_xray() {
+        bail!("Xray 系统接管由应用决策服务创建，不编译网络扩展规则");
+    }
     let socks_port = compile::network_extension_socks_port(strategy.mixed_port);
     let controller = compile::controller_port(strategy.mixed_port);
     let mut session = SESSION.lock().expect("ne session");
@@ -453,37 +475,16 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
     let mut gfw_needed = Vec::new();
     if strategy.extension_mode == InboundMode::Rule {
         for set in &strategy.rule_sets {
-            let protocols: Vec<String> = if crate::backend::is_xray() {
-                set.matchers.iter().filter(|matcher| matcher.kind == "network")
-                    .map(|matcher| matcher.value.clone()).collect()
-            } else { Vec::new() };
+            let protocols: Vec<String> = Vec::new();
             let via = set.via.trim();
             if via.is_empty() {
                 continue;
             }
-            let capture_via = if crate::backend::is_xray() {
-                format!("@rule:{}", set.id)
-            } else if let Some(group) = gfw::gfw_group(via) {
+            let capture_via = if let Some(group) = gfw::gfw_group(via) {
                 format!("gfw:{}", compile::via_target(group, strategy))
             } else {
                 compile::via_target(via, strategy)
             };
-            if crate::backend::is_xray() && set.matchers.iter().any(|matcher| matches!(matcher.kind.as_str(), "uid" | "port")) {
-                let mut qualified = QualifiedRule { order, via: capture_via.clone(), user_ids: vec![], ports: vec![], destinations: vec![], protocols: protocols.clone() };
-                for matcher in &set.matchers {
-                    match matcher.kind.as_str() {
-                        "uid" => qualified.user_ids.push(matcher.value.parse()?),
-                        "port" => qualified.ports.push(matcher.value.parse()?),
-                        "network" => {},
-                        "domain" | "suffix" | "keyword" | "wildcard" | "cidr" => qualified.destinations.push(DestRule { order, kind: matcher.kind.clone(), value: matcher.value.clone(), via: capture_via.clone(), protocols: vec![] }),
-                        _ => bail!("用户或端口规则包含不支持的组合条件"),
-                    }
-                }
-                qualified_rules.push(qualified);
-                if !needed.contains(&capture_via) { needed.push(capture_via); }
-                order = order.saturating_add(1);
-                continue;
-            }
             let mut pins_inlet = false;
             for matcher in &set.matchers {
                 let value = matcher.value.trim();
@@ -562,6 +563,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         socks_port,
         username: session.username.clone(),
         password: session.password.clone(),
+        app_admission: None,
         process_rules,
         dest_rules,
         qualified_rules,
@@ -623,7 +625,7 @@ fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &s
             protocols: protocols.to_vec(),
         });
     }
-    if crate::backend::is_xray() || pattern.contains('*') || pattern.contains('?') {
+    if pattern.contains('*') || pattern.contains('?') {
         return;
     }
     let wildcard = format!("{pattern}*");
@@ -790,42 +792,29 @@ mod ffi {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    #[cfg(feature = "xray-channel")]
-    fn xray_user_destination_and_port_conditions_remain_one_qualified_rule() {
-        let mut strategy=crate::xray::default_strategy();
-        strategy.extension_mode=crate::strategy::InboundMode::Rule;
-        strategy.rule_sets=vec![crate::strategy::RuleSet {
-            unavailable_fallback: None,
-            id:"dns-guard".into(),name:"DNS guard".into(),via:"DIRECT".into(),
-            matchers:vec![crate::strategy::Matcher {kind:"uid".into(),value:"0".into()},crate::strategy::Matcher::cidr("192.0.2.0/24".into()),crate::strategy::Matcher {kind:"port".into(),value:"53".into()}],
-        }];
-        let plan=super::try_inbound_plan(&strategy).unwrap();
-        assert!(plan.process_rules.is_empty() && plan.dest_rules.is_empty());
-        assert_eq!(plan.qualified_rules.len(),1);
-        let rule=&plan.qualified_rules[0];assert_eq!(rule.user_ids,vec![0]);assert_eq!(rule.ports,vec![53]);assert_eq!(rule.destinations[0].value,"192.0.2.0/24");assert_eq!(rule.via,"@rule:dns-guard");
-    }
+    use super::*;
+    use crate::strategy::{InboundMode, RoutingProfile, Strategy};
 
     #[test]
     #[cfg(feature = "xray-channel")]
-    fn xray_capture_preserves_protocol_and_routes_through_the_rule_inlet() {
-        let mut strategy = crate::xray::default_strategy();
-        strategy.extension_mode = crate::strategy::InboundMode::Rule;
-        strategy.rule_sets = vec![crate::strategy::RuleSet {
-            unavailable_fallback: None,
-            id: "application-rule".into(), name: "Example app".into(), via: "节点选择".into(),
-            matchers: vec![crate::strategy::Matcher::app("Example".into()), crate::strategy::Matcher {kind:"network".into(),value:"tcp".into()}],
-        }];
-        let plan = super::try_inbound_plan(&strategy).unwrap();
-        assert_eq!(plan.process_rules.len(),1);
-        assert_eq!(plan.process_rules[0].pattern,"Example");
-        assert_eq!(plan.process_rules[0].protocols,vec!["tcp"]);
-        assert_eq!(plan.process_rules[0].via,"@rule:application-rule");
-        assert!(plan.group_ports.iter().any(|port|port.name=="@rule:application-rule"));
-        assert!(plan.dest_rules.is_empty());
+    fn xray_capture_requires_application_admission_and_rejects_rule_tables() {
+        let mut request = EnableRequest {
+            revision: 1, operation_revision: 0, socks_port: 49152,
+            username: "probe".into(), password: "probe-password".into(),
+            app_admission: Some(crate::xray::admission::Bootstrap {
+                version: 1, activation: Uuid::new_v4().to_string(), port: 49153, key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            }),
+            process_rules: vec![], dest_rules: vec![], qualified_rules: vec![], group_ports: vec![],
+            gfw_ports: vec![], gfw_domains: vec![], dns_resolvers: vec!["1.1.1.1".into()], capture_private_networks: true,
+        };
+        assert!(validate_request(&request).is_ok());
+        assert!(serde_json::to_vec(&request).unwrap().len() < 2048);
+        request.dest_rules.push(DestRule { order: 0, kind: "suffix".into(), value: "example.com".into(), via: "DIRECT".into(), protocols: vec![] });
+        assert!(validate_request(&request).is_err());
+        request.dest_rules.clear(); request.app_admission = None;
+        assert!(validate_request(&request).is_err());
+        assert!(try_inbound_plan(&Strategy::default()).is_err());
     }
-    use super::*;
-    use crate::strategy::{InboundMode, RoutingProfile, Strategy};
 
     #[test]
     fn rule_mode_pins_app_matchers() {
@@ -1025,6 +1014,7 @@ mod tests {
             socks_port: 1080,
             username: "u".into(),
             password: "p".into(),
+            app_admission: None,
             process_rules: vec![],
             dest_rules: vec![],
             qualified_rules: vec![],

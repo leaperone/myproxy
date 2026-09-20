@@ -1,4 +1,5 @@
 pub mod import;
+pub mod admission;
 pub mod geo;
 mod capture;
 pub mod nodes;
@@ -46,7 +47,6 @@ struct Service {
 enum Ingress {
     Mixed,
     Capture,
-    Group(String),
 }
 
 struct Lane {
@@ -243,7 +243,10 @@ fn release_capture() -> Result<()> {
 fn prepare_capture(strategy: &Strategy) -> Result<Option<Arc<capture::CaptureService>>> {
     if strategy.system_extension {
         let previous = service().lock().expect("Xray service").capture.clone();
-        Ok(Some(Arc::new(capture::CaptureService::prepare(strategy, previous.as_deref())?)))
+        Ok(Some(match previous {
+            Some(capture) => capture,
+            None => Arc::new(capture::CaptureService::prepare()?),
+        }))
     } else {
         let has_capture = service().lock().expect("Xray service").capture.is_some();
         if has_capture { release_capture()?; }
@@ -256,8 +259,8 @@ fn sync_capture(strategy: &Strategy, candidate: Option<Arc<capture::CaptureServi
         let request = candidate.request.clone();
         {
             let mut state = service().lock().expect("Xray service");
-            if let Some(previous) = state.capture.replace(candidate) {
-                state.retired_capture.push(previous);
+            if let Some(previous) = state.capture.replace(candidate.clone()) {
+                if !Arc::ptr_eq(&previous, &candidate) { state.retired_capture.push(previous); }
             }
         }
         crate::network_extension::enable_request_async(&request)?;
@@ -279,8 +282,11 @@ fn activate(strategy: &Strategy, catalog: &Catalog) -> Result<()> {
             if previous != *strategy {
                 let generation = next_generation();
                 save_snapshot(&runtime, strategy, generation)?;
-                *runtime.strategy.write().expect("strategy") = strategy.clone();
-                runtime.generation.store(generation, Ordering::Release);
+                {
+                    let mut applied = runtime.strategy.write().expect("strategy");
+                    *applied = strategy.clone();
+                    runtime.generation.store(generation, Ordering::Release);
+                }
                 close_all()?;
             }
             return Ok(());
@@ -480,6 +486,13 @@ fn dial_direct(host: &str, port: u16) -> Result<std::net::TcpStream> {
 }
 
 impl Runtime {
+    fn check_admission_generation(&self, generation: u64) -> Result<()> {
+        if !self.core_alive() || self.generation.load(Ordering::Acquire) != generation {
+            bail!("路由已更新，请重新建立连接");
+        }
+        Ok(())
+    }
+
     fn stop(&self) -> Result<()> {
         self.stopped.store(true, Ordering::Release);
         let mut child = self.child.lock().expect("Xray child");
@@ -504,16 +517,6 @@ impl Runtime {
         match ingress {
             Ingress::Mixed => policy::decide_network(&strategy, &self.catalog, &health, host, port, None, network),
             Ingress::Capture => policy::decide_capture(&strategy, &self.catalog, &health, host, port, network),
-            Ingress::Group(name) => {
-                if strategy.extension_mode != InboundMode::Rule {
-                    return policy::decide_capture(&strategy, &self.catalog, &health, host, port, network);
-                }
-                if let Some(rule_id) = name.strip_prefix("@rule:") {
-                    policy::decide_captured_rule(&strategy, &self.catalog, &health, rule_id, host, port, network)
-                } else {
-                    policy::decide_target(&strategy, &self.catalog, &health, name)
-                }
-            },
         }
     }
 
@@ -692,8 +695,11 @@ pub fn select_proxy(identity: &RuntimeIdentity, group: &str, name: &str) -> Resu
     }
     let generation = next_generation();
     save_snapshot(&runtime, &strategy, generation)?;
-    *runtime.strategy.write().expect("strategy") = strategy;
-    runtime.generation.store(generation, Ordering::Release);
+    {
+        let mut applied = runtime.strategy.write().expect("strategy");
+        *applied = strategy;
+        runtime.generation.store(generation, Ordering::Release);
+    }
     close_all()?;
     Ok(())
 }
@@ -811,13 +817,18 @@ pub fn status() -> Result<XrayStatus> {
             && capture_status.phase == crate::network_extension::Phase::Running
             && capture_status.dns_phase == crate::network_extension::DnsPhase::Running
             && capture_status.applied_revision == Some(capture.request.revision));
-    let decision = policy::decide(
+    let default_target = match strategy.mixed_mode {
+        InboundMode::Direct => "DIRECT",
+        InboundMode::Rule if strategy.routing_profile == RoutingProfile::Allowlist => "DIRECT",
+        InboundMode::Rule => strategy.unmatched_via.as_str(),
+        InboundMode::Global if !strategy.global_selected.is_empty() => strategy.global_selected.as_str(),
+        _ => crate::compile::default_group(&strategy),
+    };
+    let decision = policy::decide_target(
         &strategy,
         &runtime.catalog,
         &runtime.health.read().expect("health"),
-        "example.invalid",
-        443,
-        None,
+        default_target,
     );
     let current = decision.chain.last().cloned().unwrap_or_default();
     Ok(XrayStatus {

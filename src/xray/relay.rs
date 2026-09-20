@@ -19,6 +19,24 @@ pub struct Dialed {
     pub chain: String,
     pub rule: String,
 }
+/// Authorization returned by the Xray application admission broker after a
+/// SOCKS credential has been checked.  The target is copied into the
+/// authorization so a relay cannot silently re-route a lease.
+#[derive(Clone, Debug)]
+pub struct DynamicAuthorization {
+    pub lease: String,
+    pub host: String,
+    pub port: u16,
+    pub label: String,
+    pub process: String,
+    pub app_matcher: String,
+    pub network: String,
+    pub route: Arc<crate::xray::admission::AdmittedRoute>,
+    pub probe: bool,
+}
+pub type DynamicAuthenticator = Arc<dyn Fn(&str, &str) -> Result<DynamicAuthorization> + Send + Sync>;
+pub type DynamicDialer = Arc<dyn Fn(&DynamicAuthorization) -> Result<Dialed> + Send + Sync>;
+pub type DynamicUdpRouter = Arc<dyn Fn(&DynamicAuthorization, &str, u16) -> Result<udp::DatagramRoute> + Send + Sync>;
 pub type Dialer = Arc<dyn Fn(&str, u16) -> Result<Dialed> + Send + Sync>;
 pub type UdpRouter = Arc<dyn Fn(&str, u16) -> Result<udp::DatagramRoute> + Send + Sync>;
 
@@ -29,6 +47,8 @@ struct Entry {
     udp: AtomicBool,
     visible: AtomicBool,
     label: Mutex<(String, String)>,
+    process: Mutex<String>,
+    app_matcher: Mutex<String>,
     sockets: Mutex<Vec<TcpStream>>,
     closed: AtomicBool,
     finished: AtomicBool,
@@ -90,6 +110,59 @@ impl MixedServer {
         Self::start_inner(listener, dialer, None, Some(udp_router))
     }
 
+    /// Starts the application-owned admission relay.  Unlike the legacy
+    /// listener this endpoint accepts only SOCKS5 and resolves the credential
+    /// to one bounded, lease-bearing authorization before any payload dial.
+    pub fn start_dynamic(
+        listener: TcpListener,
+        authenticator: DynamicAuthenticator,
+        dialer: DynamicDialer,
+        udp_router: DynamicUdpRouter,
+    ) -> Result<Self> {
+        if !listener.local_addr()?.ip().is_loopback() { bail!("动态入口必须绑定本机地址"); }
+        listener.set_nonblocking(true)?;
+        let state = Arc::new(State {
+            stop: AtomicBool::new(false), active: AtomicUsize::new(0), serial: AtomicU64::new(1),
+            up: AtomicU64::new(0), down: AtomicU64::new(0), rows: Mutex::new(VecDeque::new()),
+        });
+        let shared = state.clone();
+        let acceptor = thread::Builder::new().name("myproxy-admission-relay".into()).spawn(move || {
+            while !shared.stop.load(Ordering::Acquire) {
+                let Ok((client, _)) = listener.accept() else { thread::sleep(Duration::from_millis(2)); continue; };
+                if client.set_nonblocking(false).is_err() { continue; }
+                if shared.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_ACTIVE).then_some(n + 1)).is_err() {
+                    let _ = client.shutdown(Shutdown::Both); continue;
+                }
+                let entry = Arc::new(Entry {
+                    id: format!("flow-{}", shared.serial.fetch_add(1, Ordering::Relaxed)), started: Instant::now(),
+                    source_port: client.peer_addr().map(|p| p.port()).unwrap_or(0), udp: AtomicBool::new(false), visible: AtomicBool::new(false),
+                    label: Mutex::new(("等待请求".into(), "待路由".into())), process: Mutex::new(String::new()), app_matcher: Mutex::new(String::new()), sockets: Mutex::new(vec![]), closed: AtomicBool::new(false),
+                    finished: AtomicBool::new(false), up: AtomicU64::new(0), down: AtomicU64::new(0), last_activity: AtomicU64::new(0),
+                });
+                let guard = FlowGuard { state: shared.clone(), entry: entry.clone() };
+                if entry.track(&client).is_err() { drop(guard); continue; }
+                {
+                    let mut rows = shared.rows.lock().expect("flow rows");
+                    while rows.len() >= UI_CONNECTION_CAP {
+                        if let Some(index) = rows.iter().position(|row| row.finished.load(Ordering::Acquire)) { rows.remove(index); } else { break; }
+                    }
+                    rows.push_back(entry.clone());
+                }
+                let worker_state = shared.clone();
+                let worker_authenticator = authenticator.clone();
+                let worker_dialer = dialer.clone();
+                let worker_udp_router = udp_router.clone();
+                let _ = thread::Builder::new().name("myproxy-admission-flow".into()).spawn(move || {
+                    let _guard = guard;
+                    if let Err(error) = serve_dynamic(client, &entry, &worker_state, &worker_authenticator, &worker_dialer, &worker_udp_router) {
+                        *entry.label.lock().expect("flow label") = ("失败".into(), format!("失败：{error}"));
+                    }
+                });
+            }
+        })?;
+        Ok(Self { state, acceptor: Some(acceptor) })
+    }
+
     fn start_inner(listener: TcpListener, dialer: Dialer, credentials: Option<(String, String)>, udp_router: Option<UdpRouter>) -> Result<Self> {
         if !listener.local_addr()?.ip().is_loopback() {
             bail!("混合入口必须绑定本机地址");
@@ -133,6 +206,8 @@ impl MixedServer {
                                 udp: AtomicBool::new(false),
                                 visible: AtomicBool::new(false),
                                 label: Mutex::new(("等待请求".into(), "待路由".into())),
+                                process: Mutex::new(String::new()),
+                                app_matcher: Mutex::new(String::new()),
                                 sockets: Mutex::new(vec![]),
                                 closed: AtomicBool::new(false),
                                 finished: AtomicBool::new(false),
@@ -218,8 +293,11 @@ impl MixedServer {
                 let (destination, chain) = entry.label.lock().expect("flow label").clone();
                 LiveConnection {
                     id: entry.id.clone(),
-                    process: processes.get(&entry.source_port).map(|process| process.display.clone()).unwrap_or_else(|| "本地代理".into()),
-                    app_matcher: processes.get(&entry.source_port).map(|process| process.matcher.clone()).unwrap_or_default(),
+                    process: processes.get(&entry.source_port).map(|process| process.display.clone()).filter(|value| !value.is_empty()).unwrap_or_else(|| {
+                        let value = entry.process.lock().expect("flow process").clone();
+                        if value.is_empty() { "本地代理".into() } else { value }
+                    }),
+                    app_matcher: processes.get(&entry.source_port).map(|process| process.matcher.clone()).filter(|value| !value.is_empty()).unwrap_or_else(|| entry.app_matcher.lock().expect("flow app matcher").clone()),
                     destination,
                     network: if entry.udp.load(Ordering::Relaxed) { "udp".into() } else { "tcp".into() },
                     chain,
@@ -268,11 +346,94 @@ impl Drop for MixedServer {
 struct Request {
     host: String,
     port: u16,
+    network: String,
     handshake: Vec<u8>,
     initial: Vec<u8>,
     body_limit: Option<u64>,
     socks: bool,
     udp_associate: bool,
+}
+
+fn serve_dynamic(
+    mut client: TcpStream,
+    entry: &Arc<Entry>,
+    state: &Arc<State>,
+    authenticator: &DynamicAuthenticator,
+    dialer: &DynamicDialer,
+    udp_router: &DynamicUdpRouter,
+) -> Result<()> {
+    client.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    client.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let (request, authorization) = socks_request_dynamic(&mut client, authenticator)?;
+    if authorization.probe {
+        if request.udp_associate {
+            return udp::serve_association(client, 0, Arc::new(|_, _| bail!("readiness probe cannot forward payload")), |_,_,_,_,_| {});
+        }
+        client.write_all(&request.handshake)?;
+        let mut byte = [0];
+        let _ = client.read(&mut byte);
+        bail!("admission probe cannot carry payload");
+    }
+    if authorization.network != request.network { bail!("协议与连接凭据不匹配"); }
+    *entry.process.lock().expect("flow process") = authorization.process.clone();
+    *entry.app_matcher.lock().expect("flow app matcher") = authorization.app_matcher.clone();
+    if request.udp_associate {
+        entry.udp.store(true, Ordering::Release);
+        entry.label.lock().expect("flow label").0 = "DNS / UDP".into();
+        let route = udp_router.clone();
+        return udp::serve_association(client, 0, Arc::new(move |host, port| {
+            if authorization.host != host || authorization.port != port { bail!("UDP target does not match admitted lease"); }
+            route(&authorization, host, port)
+        }), |host, port, routed, up, down| {
+            entry.visible.store(true, Ordering::Release);
+            let target = match routed { udp::DatagramRoute::Direct => "DIRECT", udp::DatagramRoute::Socks { label, .. } => label.as_str() };
+            *entry.label.lock().expect("flow label") = (format!("{host}:{port}"), target.into());
+            entry.up.fetch_add(up, Ordering::Relaxed); entry.down.fetch_add(down, Ordering::Relaxed);
+            state.up.fetch_add(up, Ordering::Relaxed); state.down.fetch_add(down, Ordering::Relaxed);
+        });
+    }
+    if authorization.host != request.host || authorization.port != request.port {
+        bail!("admission target binding mismatch");
+    }
+    entry.visible.store(true, Ordering::Release);
+    entry.label.lock().expect("flow label").0 = format!("{}:{}", request.host, request.port);
+    let mut dialed = dialer(&authorization)?;
+    entry.track(&dialed.stream)?;
+    entry.label.lock().expect("flow label").1 = if dialed.rule.is_empty() { dialed.chain.clone() } else { format!("{} → {}", dialed.rule, dialed.chain) };
+    client.write_all(&request.handshake)?;
+    for socket in [&client, &dialed.stream] { socket.set_read_timeout(Some(Duration::from_secs(1)))?; socket.set_write_timeout(Some(Duration::from_secs(15)))?; }
+    let mut upload_client = client.try_clone()?; let mut upload_target = dialed.stream.try_clone()?;
+    thread::scope(|scope| {
+        let upload = scope.spawn(|| pump(&mut upload_client, &mut upload_target, &request.initial, request.body_limit, entry, state, true));
+        let download = pump(&mut dialed.stream, &mut client, &[], None, entry, state, false);
+        let sent = upload.join().map_err(|_| anyhow::anyhow!("连接转发线程异常"))?;
+        sent.and(download)
+    })
+}
+
+fn socks_request_dynamic(client: &mut TcpStream, authenticator: &DynamicAuthenticator) -> Result<(Request, DynamicAuthorization)> {
+    let mut greeting = [0; 2]; client.read_exact(&mut greeting)?;
+    if greeting[0] != 5 || greeting[1] == 0 { bail!("无效的 SOCKS5 请求"); }
+    let mut methods = vec![0; greeting[1] as usize]; client.read_exact(&mut methods)?;
+    if !methods.contains(&2) { client.write_all(&[5, 255])?; bail!("动态入口需要 SOCKS 认证"); }
+    client.write_all(&[5, 2])?;
+    let mut header = [0; 2]; client.read_exact(&mut header)?;
+    if header[0] != 1 || header[1] == 0 { client.write_all(&[1, 1])?; bail!("无效的动态 SOCKS 用户名"); }
+    let mut user = vec![0; header[1] as usize]; client.read_exact(&mut user)?;
+    let mut length = [0]; client.read_exact(&mut length)?;
+    if length[0] == 0 { client.write_all(&[1, 1])?; bail!("无效的动态 SOCKS 密码"); }
+    let mut pass = vec![0; length[0] as usize]; client.read_exact(&mut pass)?;
+    let username = String::from_utf8(user).context("动态 SOCKS 用户名不是 UTF-8")?;
+    let password = String::from_utf8(pass).context("动态 SOCKS 密码不是 UTF-8")?;
+    let authorization = match authenticator(&username, &password) {
+        Ok(authorization) => authorization,
+        Err(error) => { client.write_all(&[1, 1])?; return Err(error); }
+    };
+    client.write_all(&[1, 0])?;
+    let mut command = [0; 4]; client.read_exact(&mut command)?;
+    if command[0] != 5 || command[2] != 0 || !matches!(command[1], 1 | 3) { client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])?; bail!("动态入口仅支持 CONNECT/UDP ASSOCIATE"); }
+    let (host, port) = socks_address_with_zero(client, command[3], command[1] == 3)?;
+    Ok((Request { host, port, network: if command[1] == 3 { "udp".into() } else { "tcp".into() }, initial: vec![], body_limit: None, socks: true, udp_associate: command[1] == 3, handshake: vec![5, 0, 0, 1, 0, 0, 0, 0, 0, 0] }, authorization))
 }
 fn serve(
     mut client: TcpStream,
@@ -584,6 +745,7 @@ fn http_request(client: &mut TcpStream, first: u8) -> Result<Request> {
     Ok(Request {
         host,
         port,
+        network: "tcp".into(),
         initial,
         body_limit,
         socks: false,
@@ -662,6 +824,7 @@ fn socks_request(client: &mut TcpStream, credentials: Option<&(String, String)>)
     Ok(Request {
         host,
         port,
+        network: if header[1] == 3 { "udp".into() } else { "tcp".into() },
         initial: vec![],
         body_limit: None,
         socks: true,

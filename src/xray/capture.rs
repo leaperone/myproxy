@@ -1,74 +1,98 @@
-use std::collections::HashMap;
-use std::net::TcpListener;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-
+use anyhow::{bail, Context, Result};
 use crate::controller::TrafficSnapshot;
 use crate::network_extension::{self, EnableRequest};
-use crate::strategy::Strategy;
-
-use super::relay::{Dialer, MixedServer, UdpRouter};
-use super::Ingress;
+use super::{admission, policy, relay, udp};
 
 pub struct CaptureService {
     pub request: EnableRequest,
-    listeners: HashMap<u16, Arc<MixedServer>>,
-    policies: HashMap<u16, Ingress>,
+    admission: admission::AdmissionService,
 }
 
 impl CaptureService {
-    pub fn prepare(strategy: &Strategy, previous: Option<&Self>) -> Result<Self> {
-        let request = network_extension::try_inbound_plan(strategy)?;
+    pub fn prepare() -> Result<Self> {
+        let admission = admission::AdmissionService::start(Arc::new(ApplicationRouting))?;
+        let (username, password) = admission.probe_credentials();
+        let request = EnableRequest {
+            revision: super::next_generation(), operation_revision: 0,
+            socks_port: admission.relay_port(), username: username.into(), password: password.into(),
+            app_admission: Some(admission.bootstrap().clone()),
+            process_rules: vec![], dest_rules: vec![], qualified_rules: vec![],
+            gfw_domains: vec![], group_ports: vec![], gfw_ports: vec![],
+            dns_resolvers: crate::compile::DNS_NAMESERVERS.iter().map(|value| (*value).to_string()).collect(),
+            capture_private_networks: true,
+        };
         network_extension::prepare_request(&request)?;
-        let mut required = vec![(request.socks_port, Ingress::Capture)];
-        required.extend(request.group_ports.iter().map(|group| (group.port, Ingress::Group(group.name.clone()))));
-        let mut listeners = HashMap::new();
-        let mut policies = HashMap::new();
-        for (port, ingress) in required {
-            policies.insert(port, ingress.clone());
-            if let Some(existing) = previous.and_then(|old| old.listeners.get(&port)) {
-                if previous.is_some_and(|old| old.request.username == request.username && old.request.password == request.password && old.policies.get(&port) == Some(&ingress)) {
-                    listeners.insert(port, existing.clone());
-                    continue;
-                }
-            }
-            let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("系统接管入口 {port} 被占用"))?;
-            let tcp_ingress = ingress.clone();
-            let dialer: Dialer = Arc::new(move |host, port| super::active()?.dial_for(host, port, &tcp_ingress));
-            let udp_router: UdpRouter = Arc::new(move |host, port| super::active()?.datagram_route(host, port, &ingress));
-            let server = MixedServer::start_authenticated(listener, dialer, request.username.clone(), request.password.clone(), udp_router)?;
-            listeners.insert(port, Arc::new(server));
-        }
-        Ok(Self { request, listeners, policies })
+        Ok(Self { request, admission })
     }
 
     pub fn snapshot(&self) -> TrafficSnapshot {
-        let mut snapshot = TrafficSnapshot { connections: vec![], connection_count: 0, upload_total: 0, download_total: 0 };
-        let processes = network_extension::activity_process_by_port(true);
-        for (port, listener) in &self.listeners {
-            let mut part = listener.snapshot_with_processes(&processes);
-            for connection in &mut part.connections {
-                connection.id = format!("capture:{port}:{}", connection.id);
-                if connection.app_matcher.is_empty() { connection.process = "系统接管".into(); }
-            }
-            snapshot.connection_count += part.connection_count;
-            snapshot.upload_total = snapshot.upload_total.saturating_add(part.upload_total);
-            snapshot.download_total = snapshot.download_total.saturating_add(part.download_total);
-            snapshot.connections.extend(part.connections);
+        let mut snapshot = self.admission.snapshot();
+        for connection in &mut snapshot.connections {
+            connection.id = format!("capture:{}", connection.id);
         }
         snapshot
     }
 
     pub fn close_one(&self, id: &str) -> Result<()> {
-        let (_, rest) = id.split_once(':').context("无效的系统接管连接标识")?;
-        let (port, local_id) = rest.split_once(':').context("无效的系统接管连接标识")?;
-        self.listeners.get(&port.parse::<u16>()?).context("系统接管入口已关闭")?.close_one(local_id)
+        self.admission.close_one(id.strip_prefix("capture:").context("无效的系统接管连接标识")?)
     }
 
-    pub fn close_all(&self) -> Result<()> {
-        for listener in self.listeners.values() { listener.close_all()?; }
-        Ok(())
+    pub fn close_all(&self) -> Result<()> { self.admission.close_all() }
+}
+
+struct ApplicationRouting;
+impl admission::Routing for ApplicationRouting {
+    fn decide(&self, request: &admission::FlowRequest) -> Result<admission::AdmittedRoute> {
+        let runtime = super::active()?;
+        if !runtime.core_alive() { bail!("代理内核未运行"); }
+        let strategy = runtime.strategy.read().expect("strategy");
+        let generation = runtime.generation.load(std::sync::atomic::Ordering::Acquire);
+        let applications = policy::application_identifiers(request.source.executable_path.as_deref(), request.source.bundle_id.as_deref(), request.source.signing_id.as_deref());
+        let context = policy::FlowContext {
+            host: &request.host, hostname: request.hostname.as_deref(), port: request.port,
+            network: &request.network, user_id: request.source.user_id, applications: &applications,
+        };
+        let trusted_dns = request.kind == "dns"
+            && matches!(request.source.signing_id.as_deref(), Some("local.harry.myproxy" | "local.harry.myproxy.xray"))
+            && (request.source.team_id.as_deref() == Some("5UAHRS482C")
+                || (request.source.process_id.is_none() && request.source.team_id.is_none()));
+        let decision = if trusted_dns {
+            policy::Decision { allow_direct_fallback: false, route: policy::Route::Direct, chain: vec!["DIRECT".into()], rule: "代理自身的域名解析".into() }
+        } else {
+            policy::decide_application(&strategy, &runtime.catalog, &runtime.health.read().expect("health"), &context)
+        };
+        let host = if request.kind == "dns" {
+            if request.host.parse::<std::net::IpAddr>().is_ok() { request.host.clone() }
+            else { crate::compile::DNS_NAMESERVERS[0].to_string() }
+        } else {
+            request.hostname.as_ref().filter(|name| !name.is_empty()).unwrap_or(&request.host).clone()
+        };
+        Ok(admission::AdmittedRoute { generation, decision, host, port: request.port })
     }
 
+    fn generation(&self) -> Result<u64> {
+        Ok(super::active()?.generation.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn dial(&self, route: &admission::AdmittedRoute) -> Result<relay::Dialed> {
+        let runtime = super::active()?;
+        runtime.check_admission_generation(route.generation)?;
+        let policy::Route::Node(name) = &route.decision.route else { bail!("此连接未获准进入代理转发"); };
+        let lane = runtime.lanes.get(name).context("所选节点已不可用")?;
+        let stream = relay::dial_socks(lane.address, &lane.username, &lane.password, &route.host, route.port)?;
+        runtime.check_admission_generation(route.generation)?;
+        Ok(relay::Dialed { stream, chain: route.decision.chain.join(" → "), rule: route.decision.rule.clone() })
+    }
+
+    fn datagram_route(&self, route: &admission::AdmittedRoute) -> Result<udp::DatagramRoute> {
+        let runtime = super::active()?;
+        runtime.check_admission_generation(route.generation)?;
+        let policy::Route::Node(name) = &route.decision.route else { bail!("此数据报未获准进入代理转发"); };
+        let lane = runtime.lanes.get(name).context("所选节点已不可用")?;
+        let target = udp::DatagramRoute::Socks { address: lane.address, username: lane.username.clone(), password: lane.password.clone(), label: route.decision.chain.join(" → "), fallback_direct: false };
+        runtime.check_admission_generation(route.generation)?;
+        Ok(target)
+    }
 }

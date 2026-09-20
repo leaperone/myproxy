@@ -89,10 +89,20 @@ location for isolated checks; the original backend still uses `MYPROXY_DATA_DIR`
 
 The app owns routing, manual node selection, ordered fallback, latency selection,
 and connection accounting. HTTP and SOCKS share one public loopback entrance,
-default **40808**. The existing System Extension captures applications and DNS
-through authenticated app-owned TCP/UDP entrances. Xray receives private
-per-node SOCKS entrances and performs the final proxy connection. A signed Xray
-host and core bypass their own capture path to avoid proxy and DNS recursion.
+default **40808**. The System Extension sends connection metadata to the
+application before accepting a connection. The application evaluates every
+rule and returns Direct, Proxy, or Reject. The extension receives no routing
+rules, domain lists, groups, or node configuration. Direct TCP and initial UDP
+decisions return the original connection to macOS. Proxy decisions use a
+short-lived authenticated relay credential bound to the selected route; the
+application forwards those bytes to Xray's private per-node entrances. A signed
+Xray host and core bypass their own capture path to avoid proxy and DNS recursion.
+
+macOS cannot return an already-owned UDP destination or a DNS proxy flow to
+the original system path. For these cases, an application Direct decision uses
+the extension's direct transport, without sending payload through the app or
+Xray. Failure to contact the application rejects the captured request; it does
+not silently bypass the configured policy.
 Proxied DNS requests on UDP port 53 use TCP through that same selected node and
 keep the requested resolver. This supports nodes that relay TCP but reject UDP
 DNS. Other UDP traffic still requires UDP support from the selected node.
