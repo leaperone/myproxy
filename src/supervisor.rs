@@ -765,8 +765,10 @@ impl Supervisor {
     pub fn disconnect(&self) -> Result<()> {
         if backend::is_xray() {
             let result = crate::xray::disconnect();
-            self.reset_health();
-            self.remember_mixed_port(None);
+            if result.is_ok() {
+                self.reset_health();
+                self.remember_mixed_port(None);
+            }
             self.record_result(&result);
             return result;
         }
@@ -782,9 +784,11 @@ impl Supervisor {
 
     pub fn shutdown(&self) -> Result<()> {
         if backend::is_xray() {
-            let result = crate::xray::disconnect();
-            self.reset_health();
-            self.remember_mixed_port(None);
+            let result = crate::xray::shutdown();
+            if result.is_ok() {
+                self.reset_health();
+                self.remember_mixed_port(None);
+            }
             self.record_result(&result);
             return result;
         }

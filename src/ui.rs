@@ -42,16 +42,24 @@ enum RuleDraftKind {
     Suffix,
     Keyword,
     Cidr,
+    Wildcard,
+    Network,
 }
 
 impl RuleDraftKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::App,
         Self::Exact,
         Self::Suffix,
         Self::Keyword,
         Self::Cidr,
+        Self::Wildcard,
+        Self::Network,
     ];
+
+    fn available() -> &'static [Self] {
+        if backend::is_xray() { &Self::ALL } else { &Self::ALL[..5] }
+    }
 
     fn from_matcher(matcher: &Matcher) -> Self {
         match matcher.kind.as_str() {
@@ -59,6 +67,8 @@ impl RuleDraftKind {
             "keyword" => Self::Keyword,
             "domain" => Self::Exact,
             "cidr" => Self::Cidr,
+            "wildcard" => Self::Wildcard,
+            "network" => Self::Network,
             _ => Self::Suffix,
         }
     }
@@ -70,6 +80,8 @@ impl RuleDraftKind {
             Self::Suffix => "后缀",
             Self::Keyword => "关键字",
             Self::Cidr => "网段",
+            Self::Wildcard => "域名通配",
+            Self::Network => "协议",
         }
     }
 
@@ -80,6 +92,8 @@ impl RuleDraftKind {
             Self::Suffix => "apple.com，匹配其子域",
             Self::Keyword => "关键字，例如 google",
             Self::Cidr => "149.154.160.0/20",
+            Self::Wildcard => "例如 *.example.com",
+            Self::Network => "tcp 或 udp",
         }
     }
 
@@ -90,6 +104,8 @@ impl RuleDraftKind {
             Self::Suffix => Matcher::suffix(match_value),
             Self::Keyword => Matcher::keyword(match_value),
             Self::Cidr => Matcher::cidr(match_value),
+            Self::Wildcard => Matcher { kind: "wildcard".into(), value: match_value },
+            Self::Network => Matcher { kind: "network".into(), value: match_value.to_ascii_lowercase() },
         }
     }
 }
@@ -598,6 +614,7 @@ impl Render for GroupEditor {
 }
 
 struct RuleSetEditor {
+    unavailable_fallback: Option<myproxy::strategy::UnavailableFallback>,
     parent: Entity<AppView>,
     edit_id: Option<String>,
     notice: String,
@@ -640,6 +657,7 @@ impl RuleSetEditor {
         let match_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(draft_kind.placeholder()));
         Self {
+            unavailable_fallback: existing.as_ref().and_then(|set| set.unavailable_fallback),
             parent,
             edit_id: existing.as_ref().map(|s| s.id.clone()),
             notice: String::new(),
@@ -653,6 +671,7 @@ impl RuleSetEditor {
 
     fn draft(&self, cx: &App) -> RuleSet {
         RuleSet {
+            unavailable_fallback: self.unavailable_fallback,
             id: self.edit_id.clone().unwrap_or_default(),
             name: self.name.read(cx).value().trim().to_string(),
             via: self.via.trim().to_string(),
@@ -810,7 +829,7 @@ impl Render for RuleSetEditor {
                     .child({
                         let entity = entity.clone();
                         let mut group = ButtonGroup::new("rule-kind").compact().outline().small();
-                        for kind in RuleDraftKind::ALL {
+                        for &kind in RuleDraftKind::available() {
                             group = group.child(
                                 Button::new(SharedString::from(format!(
                                     "rule-kind-{}",
@@ -825,7 +844,7 @@ impl Render for RuleSetEditor {
                             let Some(&ix) = ixs.first() else {
                                 return;
                             };
-                            let Some(kind) = RuleDraftKind::ALL.get(ix).copied() else {
+                            let Some(kind) = RuleDraftKind::available().get(ix).copied() else {
                                 return;
                             };
                             entity.update(app, |this, cx| {
@@ -853,7 +872,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child(if backend::is_xray() { "同一规则中任一条件匹配就使用所选出口，规则从上到下依次匹配。" } else { "逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。" }),
+                    .child(if backend::is_xray() { "规则从上到下匹配。目标或应用条件任一命中即可；如果指定了协议，也必须同时满足。" } else { "逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。" }),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
@@ -2182,6 +2201,7 @@ impl AppView {
         }
         self.present_rule_dialog(
             Some(RuleSet {
+                unavailable_fallback: Default::default(),
                 id: String::new(),
                 name: process.trim().to_string(),
                 via: default_via(&self.strategy),
@@ -2215,6 +2235,7 @@ impl AppView {
             set.via = via.to_string();
         } else {
             self.strategy.add_rule_set(RuleSet {
+                unavailable_fallback: Default::default(),
                 id: uuid::Uuid::new_v4().to_string(),
                 name: process.trim().to_string(),
                 via: via.to_string(),
@@ -3061,7 +3082,7 @@ impl AppView {
     fn xray_overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let title = if self.connected { "已连接" } else if self.wanted { "连接需要处理" } else { "未连接" };
         v_flex().gap_4()
-            .child(page_title(theme,"MyProxy Xray","添加代理，选择出口，然后连接。"))
+            .child(page_title(theme,"MyProxy","添加代理，选择出口，然后连接。"))
             .child(panel(theme,"连接",h_flex().items_center().justify_between()
                 .child(v_flex().gap_2()
                     .child(div().text_lg().font_semibold().child(title))
@@ -3842,13 +3863,13 @@ impl AppView {
             .child(page_title(
                 theme,
                 "设置",
-                &if backend::is_xray() { "本地代理端口、外观和配置备份。测试版的设置独立保存。".to_string() } else { format!(
+                &if backend::is_xray() { "系统接管、本地代理端口、更新和配置备份。Xray 通道的配置独立保存。".to_string() } else { format!(
                     "系统接管让应用不用自己填代理。第一次请到 {} 允许 myproxy。Mixed 给显式客户端；TUN 与接管互斥。",
                     setup::login_items_path_label()
                 ) },
             ))
             .when(backend::is_xray(), |view| view.child(self.backend_panel(cx, theme)))
-            .when(!backend::is_xray(), |view| view.child(self.system_extension_panel(cx, theme)))
+            .child(self.system_extension_panel(cx, theme))
             .child(panel(
                 theme,
                 "外观",
@@ -3910,7 +3931,7 @@ impl AppView {
                         "mixed",
                     )),
             ))
-            .when(!backend::is_xray(), |view| view.child(self.updates_panel(cx, theme)))
+            .child(self.updates_panel(cx, theme))
             .child(panel(
                 theme,
                 "排除过滤器",
@@ -3941,25 +3962,17 @@ impl AppView {
                         )
                     }),
             ))
-            .when(!backend::is_xray(), |view| view.child(self.startup_panel(cx, theme)))
+            .child(self.startup_panel(cx, theme))
             .child(self.cli_install_panel(cx, theme))
             .child(self.strategy_backup_panel(cx, theme))
             .child(self.logs_panel(theme))
             .child(self.developer_panel(cx, theme))
     }
 
-    fn backend_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        let entity = cx.entity();
-        panel(theme, "Xray 测试版", v_flex().gap_2()
-            .child(div().text_sm().child("配置独立保存。本地 HTTP 和 SOCKS5 共用同一端口，默认 40808。"))
-            .when(self.strategy.tun || self.strategy.system_extension || self.strategy.system_proxy, |view| {
-                view.child(Button::new("xray-explicit-mode").label("将导入配置改为本地代理入口").on_click(move |_,_,app| {
-                    entity.update(app, |this,cx| {
-                        this.strategy.tun=false; this.strategy.system_extension=false; this.strategy.system_proxy=false;
-                        this.persist(); cx.notify();
-                    });
-                }))
-            }))
+    fn backend_panel(&self, _cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        panel(theme, "Xray 通道", v_flex().gap_2()
+            .child(div().text_sm().child("MyProxy 管理分流和连接记录，Xray 负责建立代理连接。"))
+            .child(div().text_xs().text_color(theme.muted_foreground).child("配置与其他通道分别保存。更新只从当前选择的通道获取。")))
     }
 
     fn strategy_backup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -4190,7 +4203,7 @@ impl AppView {
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child(if backend::is_xray() { "让 Agent 或终端使用 myproxy-xrayctl，只管理这个测试版。" } else { "让 Agent 或终端直接使用 myproxyctl 配置代理。" }),
+                                        .child(if backend::is_xray() { "让 Agent 或终端使用 myproxy-xrayctl，管理 Xray 通道的配置。" } else { "让 Agent 或终端直接使用 myproxyctl 配置代理。" }),
                                 ),
                         )
                         .child(
@@ -4772,7 +4785,7 @@ impl AppView {
                     self.strategy.extension_mode == InboundMode::Global,
                     "extension",
                 ))
-                .child(
+                .when(!backend::is_xray(), |view| view.child(
                     h_flex()
                         .w_full()
                         .items_center()
@@ -4804,7 +4817,7 @@ impl AppView {
                                     });
                                 })
                         }),
-                ),
+                )),
         )
     }
 
@@ -4993,6 +5006,7 @@ impl AppView {
             UpdateChannel::Nightly => {
                 "接收 main 分支的每日构建，可能包含尚未稳定的改动。相邻 Nightly 走增量包。"
             }
+            UpdateChannel::Xray => "接收 Xray 通道更新，使用 Xray 内核和独立配置。切换通道会在安装对应版本后生效。",
         };
         panel(
             theme,
@@ -5024,10 +5038,17 @@ impl AppView {
                                         .selected(channel == UpdateChannel::Nightly)
                                         .disabled(self.is_busy()),
                                 )
+                                .child(
+                                    Button::new("update-xray")
+                                        .label(UpdateChannel::Xray.label())
+                                        .selected(channel == UpdateChannel::Xray)
+                                        .disabled(self.is_busy()),
+                                )
                                 .on_click(move |indices, _, app| {
                                     let next = match indices.first() {
                                         Some(0) => UpdateChannel::Prod,
                                         Some(1) => UpdateChannel::Nightly,
+                                        Some(2) => UpdateChannel::Xray,
                                         _ => return,
                                     };
                                     entity.update(app, |this, cx| {

@@ -20,6 +20,7 @@ pub enum Route {
 
 #[derive(Clone, Debug)]
 pub struct Decision {
+    pub allow_direct_fallback: bool,
     pub route: Route,
     pub chain: Vec<String>,
     pub rule: String,
@@ -140,6 +141,18 @@ fn target(
 fn matcher_matches(kind: &str, value: &str, host: &str, process: Option<&str>) -> bool {
     let wildcard_domain = value.trim().starts_with("*.");
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if kind == "wildcard" {
+        let pattern = value.trim().trim_end_matches('.').to_ascii_lowercase();
+        if let Some(suffix) = pattern.strip_prefix('*') {
+            if !suffix.contains(['*', '?']) {
+                return host.ends_with(suffix);
+            }
+        }
+        return catalog::wildcard_match(
+            &pattern.chars().collect::<Vec<_>>(),
+            &host.chars().collect::<Vec<_>>(),
+        );
+    }
     let value = value
         .trim()
         .trim_end_matches('.')
@@ -162,6 +175,30 @@ fn matcher_matches(kind: &str, value: &str, host: &str, process: Option<&str>) -
             .unwrap_or(false),
         _ => false,
     }
+}
+
+pub fn rule_matches(
+    set: &crate::strategy::RuleSet,
+    host: &str,
+    process: Option<&str>,
+    network: &str,
+) -> anyhow::Result<bool> {
+    let has_network = set.matchers.iter().any(|matcher| matcher.kind == "network");
+    if has_network && !set.matchers.iter().any(|matcher| {
+            matcher.kind == "network" && matcher.value.eq_ignore_ascii_case(network)
+        }) {
+        return Ok(false);
+    }
+    for matcher in &set.matchers {
+        if matcher.kind == "network" { continue; }
+        let matched = if matches!(matcher.kind.as_str(), "geo-site" | "geo-ip") {
+            super::geo::matches(&matcher.kind, &matcher.value, host)?
+        } else {
+            matcher_matches(&matcher.kind, &matcher.value, host, process)
+        };
+        if matched { return Ok(true); }
+    }
+    Ok(false)
 }
 
 fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
@@ -213,8 +250,97 @@ pub fn decide(
     _port: u16,
     process: Option<&str>,
 ) -> Decision {
+    decide_network(strategy, catalog, health, host, _port, process, "tcp")
+}
+
+pub fn decide_network(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    health: &HashMap<String, NodeHealth>,
+    host: &str,
+    _port: u16,
+    process: Option<&str>,
+    network: &str,
+) -> Decision {
+    decide_with_mode(strategy, catalog, health, host, _port, process, network, strategy.mixed_mode)
+}
+
+pub fn decide_capture(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    health: &HashMap<String, NodeHealth>,
+    host: &str,
+    port: u16,
+    network: &str,
+) -> Decision {
+    decide_with_mode(strategy, catalog, health, host, port, None, network, strategy.extension_mode)
+}
+
+pub fn decide_target(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    health: &HashMap<String, NodeHealth>,
+    value: &str,
+) -> Decision {
     let mut chain = Vec::new();
-    let mut rule = match strategy.mixed_mode {
+    let route = target(strategy, catalog, health, value, &mut chain);
+    append_route(&mut chain, &route);
+    Decision { allow_direct_fallback: false, route, chain, rule: "应用规则".into() }
+}
+
+fn decide_rule(strategy: &Strategy, catalog: &Catalog, health: &HashMap<String, NodeHealth>, set: &crate::strategy::RuleSet) -> Decision {
+    let mut decision = decide_target(strategy, catalog, health, &set.via);
+    decision.rule = set.name.clone();
+    decision.allow_direct_fallback = set.unavailable_fallback == Some(crate::strategy::UnavailableFallback::Direct)
+        && !set.via.eq_ignore_ascii_case("reject");
+    if decision.route == Route::Reject && decision.allow_direct_fallback {
+        decision.route = Route::Direct;
+        decision.chain.pop();
+        decision.chain.push("DIRECT".into());
+    }
+    decision
+}
+
+pub fn decide_captured_rule(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    health: &HashMap<String, NodeHealth>,
+    rule_id: &str,
+    host: &str,
+    network: &str,
+) -> Decision {
+    let Some(forced_rule) = strategy.rule_sets.iter().find(|set| set.id == rule_id) else {
+        return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则已失效".into() };
+    };
+    let protocols = forced_rule.matchers.iter().filter(|matcher| matcher.kind == "network").collect::<Vec<_>>();
+    if !protocols.is_empty() && !protocols.iter().any(|matcher| matcher.value == network) {
+        return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则协议已变更".into() };
+    }
+    for set in &strategy.rule_sets {
+        let forced = set.id == rule_id;
+        let matched = match rule_matches(set, host, None, network) {
+            Ok(value) => value,
+            Err(_) => return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "规则数据库不可用".into() },
+        };
+        if forced || matched {
+            return decide_rule(strategy, catalog, health, set);
+        }
+    }
+    Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "捕获规则已失效".into() }
+}
+
+fn decide_with_mode(
+    strategy: &Strategy,
+    catalog: &Catalog,
+    health: &HashMap<String, NodeHealth>,
+    host: &str,
+    _port: u16,
+    process: Option<&str>,
+    network: &str,
+    mode: InboundMode,
+) -> Decision {
+    let mut chain = Vec::new();
+    let rule = match mode {
         InboundMode::Global => "全局出口",
         InboundMode::Proxy => "默认组",
         InboundMode::Direct => "全球直连",
@@ -222,7 +348,7 @@ pub fn decide(
     }
     .to_string();
     let route =
-        match strategy.mixed_mode {
+        match mode {
             InboundMode::Direct => Route::Direct,
             InboundMode::Global => target(
                 strategy,
@@ -243,17 +369,16 @@ pub fn decide(
                 &mut chain,
             ),
             InboundMode::Rule => {
-                let mut selected = None;
                 for set in &strategy.rule_sets {
-                    if set.matchers.iter().any(|matcher| {
-                        matcher_matches(&matcher.kind, &matcher.value, host, process)
-                    }) {
-                        rule = set.name.clone();
-                        selected = Some(target(strategy, catalog, health, &set.via, &mut chain));
-                        break;
+                    let matched = match rule_matches(set, host, process, network) {
+                        Ok(matched) => matched,
+                        Err(_) => return Decision { allow_direct_fallback: false, route: Route::Reject, chain: vec!["REJECT".into()], rule: "规则数据库不可用".into() },
+                    };
+                    if matched {
+                        return decide_rule(strategy, catalog, health, set);
                     }
                 }
-                selected.unwrap_or_else(|| match strategy.routing_profile {
+                match strategy.routing_profile {
                     RoutingProfile::Allowlist => Route::Direct,
                     RoutingProfile::Group => target(
                         strategy,
@@ -263,11 +388,11 @@ pub fn decide(
                         &mut chain,
                     ),
                     RoutingProfile::Gfwlist | RoutingProfile::Chinadirect => Route::Reject,
-                })
+                }
             }
         };
     append_route(&mut chain, &route);
-    Decision { route, chain, rule }
+    Decision { allow_direct_fallback: false, route, chain, rule }
 }
 
 pub fn groups(
@@ -339,6 +464,39 @@ pub fn groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_domain_masks_preserve_literal_suffix_and_apex_boundaries() {
+        for (pattern, host, expected) in [
+            ("*.example.com", "example.com", false),
+            ("*.example.com", "www.example.com", true),
+            ("*example.com", "example.com", true),
+            ("*example.com", "prefixexample.com", true),
+            ("*example.com", "example.com.evil.invalid", false),
+            ("*example*", "www.example.invalid", true),
+            ("api?.example.com", "api1.example.com", true),
+            ("api?.example.com", "api12.example.com", false),
+        ] {
+            assert_eq!(matcher_matches("wildcard", pattern, host, None), expected, "{pattern} / {host}");
+        }
+    }
+
+    #[test]
+    fn transport_qualifies_a_rule_instead_of_matching_every_tcp_destination() {
+        let set = crate::strategy::RuleSet {
+            unavailable_fallback: Default::default(),
+            id: "qualified".into(),
+            name: "Qualified destination".into(),
+            via: "DIRECT".into(),
+            matchers: vec![
+                crate::strategy::Matcher { kind: "wildcard".into(), value: "*example.com".into() },
+                crate::strategy::Matcher { kind: "network".into(), value: "tcp".into() },
+            ],
+        };
+        assert!(rule_matches(&set, "www.example.com", None, "tcp").unwrap());
+        assert!(!rule_matches(&set, "www.example.com", None, "udp").unwrap());
+        assert!(!rule_matches(&set, "other.invalid", None, "tcp").unwrap());
+    }
     use crate::catalog::Node;
     use crate::strategy::{Matcher, RuleSet};
     use serde_yaml::Value;
@@ -437,6 +595,7 @@ mod tests {
         strategy.mixed_mode = InboundMode::Rule;
         strategy.routing_profile = RoutingProfile::Allowlist;
         strategy.rule_sets = vec![RuleSet {
+            unavailable_fallback: Default::default(),
             id: "r".into(),
             name: "test".into(),
             via: "AUTO".into(),

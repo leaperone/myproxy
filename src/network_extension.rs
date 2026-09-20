@@ -39,6 +39,8 @@ pub struct ProcessRule {
     pub order: u64,
     pub pattern: String,
     pub via: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +50,8 @@ pub struct DestRule {
     pub kind: String,
     pub value: String,
     pub via: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,7 +265,6 @@ pub fn activity_process_by_port(
 /// Reads a bounded in-memory host snapshot. The host refreshes its existing
 /// provider status channel at most once per two seconds without reconnecting.
 pub fn status() -> RuntimeStatus {
-    if crate::backend::is_xray() { return unavailable_status(); }
     #[cfg(target_os = "macos")]
     if login_item::is_bundled() {
         let value = unsafe { ffi::myproxy_ne_status() };
@@ -435,11 +438,17 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
     let mut gfw_needed = Vec::new();
     if strategy.extension_mode == InboundMode::Rule {
         for set in &strategy.rule_sets {
+            let protocols: Vec<String> = if crate::backend::is_xray() {
+                set.matchers.iter().filter(|matcher| matcher.kind == "network")
+                    .map(|matcher| matcher.value.clone()).collect()
+            } else { Vec::new() };
             let via = set.via.trim();
             if via.is_empty() {
                 continue;
             }
-            let capture_via = if let Some(group) = gfw::gfw_group(via) {
+            let capture_via = if crate::backend::is_xray() {
+                format!("@rule:{}", set.id)
+            } else if let Some(group) = gfw::gfw_group(via) {
                 format!("gfw:{}", compile::via_target(group, strategy))
             } else {
                 compile::via_target(via, strategy)
@@ -453,9 +462,9 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
                 match matcher.kind.as_str() {
                     "app" => {
                         pins_inlet = true;
-                        push_app_patterns(&mut process_rules, order, value, &capture_via);
+                        push_app_patterns(&mut process_rules, order, value, &capture_via, &protocols);
                     }
-                    "domain" | "suffix" | "keyword" | "cidr" => {
+                    "domain" | "suffix" | "keyword" | "cidr" | "wildcard" => {
                         if matcher.kind == "cidr" && gfw::gfw_group(&capture_via).is_some() {
                             bail!("GFWList 无法与网段规则求交，请改用节点组或域名条件");
                         }
@@ -465,6 +474,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
                             kind: matcher.kind.clone(),
                             value: value.to_string(),
                             via: capture_via.clone(),
+                            protocols: protocols.clone(),
                         });
                     }
                     _ => {}
@@ -564,33 +574,35 @@ fn allocate_named_ports(
     Ok(ports)
 }
 
-fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &str, via: &str) {
+fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &str, via: &str, protocols: &[String]) {
     let pattern = value.trim();
     if pattern.is_empty() {
         return;
     }
     if !process_rules
         .iter()
-        .any(|rule| rule.pattern == pattern && rule.via == via)
+        .any(|rule| rule.pattern == pattern && rule.via == via && rule.protocols == protocols)
     {
         process_rules.push(ProcessRule {
             order,
             pattern: pattern.to_string(),
             via: via.to_string(),
+            protocols: protocols.to_vec(),
         });
     }
-    if pattern.contains('*') || pattern.contains('?') {
+    if crate::backend::is_xray() || pattern.contains('*') || pattern.contains('?') {
         return;
     }
     let wildcard = format!("{pattern}*");
     if !process_rules
         .iter()
-        .any(|rule| rule.pattern == wildcard && rule.via == via)
+        .any(|rule| rule.pattern == wildcard && rule.via == via && rule.protocols == protocols)
     {
         process_rules.push(ProcessRule {
             order,
             pattern: wildcard,
             via: via.to_string(),
+            protocols: protocols.to_vec(),
         });
     }
 }
@@ -744,6 +756,25 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[cfg(feature = "xray-channel")]
+    fn xray_capture_preserves_protocol_and_routes_through_the_rule_inlet() {
+        let mut strategy = crate::xray::default_strategy();
+        strategy.extension_mode = crate::strategy::InboundMode::Rule;
+        strategy.rule_sets = vec![crate::strategy::RuleSet {
+            unavailable_fallback: None,
+            id: "application-rule".into(), name: "Example app".into(), via: "节点选择".into(),
+            matchers: vec![crate::strategy::Matcher::app("Example".into()), crate::strategy::Matcher {kind:"network".into(),value:"tcp".into()}],
+        }];
+        let plan = super::try_inbound_plan(&strategy).unwrap();
+        assert_eq!(plan.process_rules.len(),1);
+        assert_eq!(plan.process_rules[0].pattern,"Example");
+        assert_eq!(plan.process_rules[0].protocols,vec!["tcp"]);
+        assert_eq!(plan.process_rules[0].via,"@rule:application-rule");
+        assert!(plan.group_ports.iter().any(|port|port.name=="@rule:application-rule"));
+        assert!(plan.dest_rules.is_empty());
+    }
     use super::*;
     use crate::strategy::{InboundMode, RoutingProfile, Strategy};
 
@@ -802,6 +833,7 @@ mod tests {
         strategy.system_extension = true;
         strategy.extension_mode = InboundMode::Rule;
         strategy.rule_sets = vec![crate::strategy::RuleSet {
+            unavailable_fallback: Default::default(),
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
@@ -843,6 +875,7 @@ mod tests {
             }];
         }
         strategy.rule_sets.push(crate::strategy::RuleSet {
+            unavailable_fallback: Default::default(),
             id: "cpa".into(),
             name: "CPA".into(),
             via: "AI Proxy".into(),

@@ -19,7 +19,7 @@ impl BackendKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Mihomo => "Mihomo",
-            Self::Xray => "Xray 测试版",
+            Self::Xray => "Xray",
         }
     }
     pub fn parse(raw: &str) -> Result<Self> {
@@ -45,7 +45,7 @@ pub fn load() -> Result<BackendKind> {
 
 pub fn save(kind: BackendKind) -> Result<()> {
     if kind != load()? {
-        bail!("运行内核由应用版本决定。请打开对应的应用，测试版和正式版各用独立配置。");
+        bail!("运行内核由发布通道决定。请安装对应通道，Xray 配置独立保存。");
     }
     Ok(())
 }

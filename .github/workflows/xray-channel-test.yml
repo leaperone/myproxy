@@ -1,13 +1,14 @@
-name: Xray channel tests
+name: Xray channel
 on:
   push:
     branches: [feat/xray-channel-1.6]
+    tags: ["xray-v*"]
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: myproxy-xray-channel-test
-  cancel-in-progress: true
+  group: myproxy-xray-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/xray-v') }}
 jobs:
   test:
     runs-on: macos-15
@@ -15,6 +16,14 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/xray-build
       XRAY_BINARY: ${{ github.workspace }}/resources/xray/xray
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+      MYPROXY_HOST_DEVID_PROFILE: ${{ secrets.MYPROXY_HOST_DEVID_PROFILE }}
+      MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE: ${{ secrets.MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE }}
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,10 +49,115 @@ jobs:
             src/xray/
       - run: cargo test --locked --lib -- --test-threads=1
       - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
-      - run: cargo build --locked --bins --features xray-channel
+      - run: scripts/fetch-sparkle.sh
+      - run: cargo build --locked --bins --features sparkle,xray-channel
+      - name: Set Xray release metadata
+        if: startsWith(github.ref, 'refs/tags/xray-v') || contains(github.event.head_commit.message, '[xray-package]')
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/xray-v* ]]; then
+            version="${GITHUB_REF_NAME#xray-v}"
+            release_tag="$GITHUB_REF_NAME"
+          else
+            version="1.6.0-xray.1"
+            release_tag="xray-v${version}"
+          fi
+          echo "MYPROXY_XRAY_VERSION=${version}" >> "${GITHUB_ENV}"
+          echo "MYPROXY_RELEASE_TAG=${release_tag}" >> "${GITHUB_ENV}"
+          echo "MYPROXY_XRAY_BUILD_NUMBER=1.6.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_ENV}"
+      - name: Import Developer ID certificate
+        if: startsWith(github.ref, 'refs/tags/xray-v') || contains(github.event.head_commit.message, '[xray-package]')
+        run: |
+          set -euo pipefail
+          certificate_path="${RUNNER_TEMP}/myproxy-xray-developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/myproxy-xray-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_data="${CSC_LINK}"
+          if [[ "${certificate_data}" == data:*base64,* ]]; then certificate_data="${certificate_data#*,}"; fi
+          printf '%s' "${certificate_data}" | base64 --decode > "${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" -k "${keychain_path}" -P "${CSC_KEY_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain_path}" >/dev/null
+          security list-keychains -d user -s "${keychain_path}"
+          identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+          [[ -n "${identity}" ]] || { echo "No Developer ID Application identity" >&2; exit 1; }
+          echo "CODESIGN_IDENTITY=${identity}" >> "${GITHUB_ENV}"
+          echo "MYPROXY_XRAY_KEYCHAIN_PATH=${keychain_path}" >> "${GITHUB_ENV}"
+          echo "MYPROXY_XRAY_CERTIFICATE_PATH=${certificate_path}" >> "${GITHUB_ENV}"
+      - name: Decode Developer ID profiles
+        if: startsWith(github.ref, 'refs/tags/xray-v') || contains(github.event.head_commit.message, '[xray-package]')
+        run: |
+          set -euo pipefail
+          [[ -n "${MYPROXY_HOST_DEVID_PROFILE}" && -n "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE}" ]] || { echo "Developer ID profiles are required" >&2; exit 1; }
+          mkdir -p "${RUNNER_TEMP}/myproxy-xray-profiles"
+          printf '%s' "${MYPROXY_HOST_DEVID_PROFILE}" | base64 --decode > "${RUNNER_TEMP}/myproxy-xray-profiles/host.provisionprofile"
+          printf '%s' "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE}" | base64 --decode > "${RUNNER_TEMP}/myproxy-xray-profiles/network-extension.provisionprofile"
+          echo "MYPROXY_HOST_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/host.provisionprofile" >> "${GITHUB_ENV}"
+          echo "MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/network-extension.provisionprofile" >> "${GITHUB_ENV}"
       - run: scripts/package-xray-test.sh
+        if: startsWith(github.ref, 'refs/tags/xray-v') || contains(github.event.head_commit.message, '[xray-package]')
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/xray-v') || contains(github.event.head_commit.message, '[xray-package]')
         with:
           name: myproxy-xray-${{ github.sha }}
           path: dist/xray-channel/*
           if-no-files-found: error
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          set +e
+          [[ -f "${MYPROXY_XRAY_KEYCHAIN_PATH:-}" ]] && security delete-keychain "${MYPROXY_XRAY_KEYCHAIN_PATH}"
+          [[ -f "${MYPROXY_XRAY_CERTIFICATE_PATH:-}" ]] && rm -f "${MYPROXY_XRAY_CERTIFICATE_PATH}"
+          exit 0
+
+  publish:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/xray-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: myproxy-xray-${{ github.sha }}
+          path: release-assets
+      - name: Publish immutable Xray release and update Xray feed pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#xray-v}"
+          assets="release-assets"
+          archive="${assets}/myproxy-xray-${version}.sparkle.zip"
+          checksum="${archive}.sha256"
+          appcast="${assets}/appcast.xml"
+          test -s "$archive" -a -s "$checksum" -a -s "$appcast"
+          body="$(mktemp)"
+          pointer_body="$(mktemp)"
+          remote="$(mktemp -d)"
+          trap 'rm -f "$body" "$pointer_body"; rm -rf "$remote"' EXIT
+          printf 'MyProxy Xray %s\n\nSource: %s\n' "$version" "$GITHUB_SHA" > "$body"
+          printf 'Xray channel feed pointer for immutable release %s.\n' "$tag" > "$pointer_body"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release download "$tag" --pattern "myproxy-xray-${version}.sparkle.zip.sha256" --dir "$remote"
+            cmp -s "$checksum" "$remote/myproxy-xray-${version}.sparkle.zip.sha256" || {
+              echo "immutable Xray release exists with a different digest" >&2
+              exit 1
+            }
+          else
+            gh release create "$tag" "$archive" "$appcast" "$checksum" \
+              --target "$GITHUB_SHA" --latest=false --title "MyProxy Xray $version" --notes-file "$body"
+          fi
+          if gh release view xray >/dev/null 2>&1; then
+            gh release upload xray "$appcast" --clobber
+            gh release edit xray --latest=false --notes-file "$pointer_body"
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/xray" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh release create xray "$appcast" --target "$GITHUB_SHA" --latest=false \
+              --title "MyProxy Xray update channel" --notes-file "$pointer_body"
+          fi

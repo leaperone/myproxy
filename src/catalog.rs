@@ -420,7 +420,7 @@ fn name_matches_pattern(text: &str, pattern: &str) -> bool {
     )
 }
 
-fn wildcard_match(pattern: &[char], value: &[char]) -> bool {
+pub(crate) fn wildcard_match(pattern: &[char], value: &[char]) -> bool {
     let (mut p, mut v) = (0usize, 0usize);
     let (mut star, mut star_v) = (None, 0usize);
     while v < value.len() {

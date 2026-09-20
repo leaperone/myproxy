@@ -154,6 +154,7 @@ impl RoutingProfile {
 
 fn telegram_rule_set() -> RuleSet {
     RuleSet {
+        unavailable_fallback: Default::default(),
         id: Uuid::new_v4().to_string(),
         name: TELEGRAM_GROUP.into(),
         via: TELEGRAM_GROUP.into(),
@@ -289,8 +290,17 @@ pub struct Matcher {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnavailableFallback {
+    Direct,
+    Reject,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuleSet {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_fallback: Option<UnavailableFallback>,
     pub id: String,
     pub name: String,
     pub via: String,
@@ -838,6 +848,7 @@ impl Strategy {
         }
         matcher.validate()?;
         Ok(self.add_rule_set(RuleSet {
+            unavailable_fallback: Default::default(),
             id: Uuid::new_v4().to_string(),
             name,
             via,
@@ -1183,6 +1194,17 @@ impl Matcher {
         match self.kind.as_str() {
             "cidr" => validate_cidr(&self.value),
             "app" | "domain" | "suffix" | "keyword" => Ok(()),
+            "wildcard" if crate::backend::is_xray() => {
+                if self.value.len() > 253
+                    || self.value.chars().any(|c| !c.is_alphanumeric() && !".-_*?".contains(c))
+                    || !self.value.chars().any(|c| c.is_alphanumeric())
+                {
+                    anyhow::bail!("无效的域名通配条件");
+                }
+                Ok(())
+            }
+            "network" if crate::backend::is_xray() && matches!(self.value.as_str(), "tcp" | "udp") => Ok(()),
+            "geo-site" | "geo-ip" if crate::backend::is_xray() => Ok(()),
             _ => anyhow::bail!("unsupported matcher kind: {}", self.kind),
         }
     }
@@ -1249,6 +1271,10 @@ impl Matcher {
             "domain" => "域名",
             "suffix" => "后缀",
             "cidr" => "网段",
+            "wildcard" => "域名通配",
+            "network" => "协议",
+            "geo-site" => "域名规则集",
+            "geo-ip" => "地区网段",
             _ => "—",
         }
     }
@@ -1267,6 +1293,7 @@ impl RuleSet {
         let name = rule.match_value().to_string();
         let matcher = Matcher::from_rule(&rule);
         Self {
+            unavailable_fallback: None,
             id: rule.id,
             name,
             via: rule.via,

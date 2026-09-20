@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::xray::udp;
+
 const MAX_ACTIVE: usize = 128;
 const HEADER_LIMIT: usize = 32 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -18,10 +20,13 @@ pub struct Dialed {
     pub rule: String,
 }
 pub type Dialer = Arc<dyn Fn(&str, u16) -> Result<Dialed> + Send + Sync>;
+pub type UdpRouter = Arc<dyn Fn(&str, u16) -> Result<udp::DatagramRoute> + Send + Sync>;
 
 struct Entry {
     id: String,
     started: Instant,
+    source_port: u16,
+    udp: AtomicBool,
     label: Mutex<(String, String)>,
     sockets: Mutex<Vec<TcpStream>>,
     closed: AtomicBool,
@@ -74,6 +79,10 @@ pub struct MixedServer {
 }
 impl MixedServer {
     pub fn start(listener: TcpListener, dialer: Dialer) -> Result<Self> {
+        Self::start_inner(listener, dialer, None, None)
+    }
+
+    fn start_inner(listener: TcpListener, dialer: Dialer, credentials: Option<(String, String)>, udp_router: Option<UdpRouter>) -> Result<Self> {
         if !listener.local_addr()?.ip().is_loopback() {
             bail!("混合入口必须绑定本机地址");
         }
@@ -112,6 +121,8 @@ impl MixedServer {
                                     shared.serial.fetch_add(1, Ordering::Relaxed)
                                 ),
                                 started: Instant::now(),
+                                source_port: client.peer_addr().map(|peer| peer.port()).unwrap_or(0),
+                                udp: AtomicBool::new(false),
                                 label: Mutex::new(("等待请求".into(), "待路由".into())),
                                 sockets: Mutex::new(vec![]),
                                 closed: AtomicBool::new(false),
@@ -144,11 +155,13 @@ impl MixedServer {
                             }
                             let dialer = dialer.clone();
                             let worker_state = shared.clone();
+                            let credentials = credentials.clone();
+                            let udp_router = udp_router.clone();
                             let _ = thread::Builder::new().name("myproxy-flow".into()).spawn(
                                 move || {
                                     let _guard = guard;
                                     if let Err(error) =
-                                        serve(client, &dialer, &entry, &worker_state)
+                                        serve(client, &dialer, &entry, &worker_state, credentials.as_ref(), udp_router.as_ref())
                                     {
                                         entry.label.lock().expect("flow label").1 =
                                             format!("失败：{error}");
@@ -168,7 +181,25 @@ impl MixedServer {
             acceptor: Some(acceptor),
         })
     }
+
+    pub fn start_authenticated(
+        listener: TcpListener,
+        dialer: Dialer,
+        username: String,
+        password: String,
+        udp_router: UdpRouter,
+    ) -> Result<Self> {
+        if username.is_empty() || username.len() > 255 || password.is_empty() || password.len() > 255 {
+            bail!("系统接管入口需要有效的认证信息");
+        }
+        Self::start_inner(listener, dialer, Some((username, password)), Some(udp_router))
+    }
+
     pub fn snapshot(&self) -> TrafficSnapshot {
+        self.snapshot_with_processes(&std::collections::HashMap::new())
+    }
+
+    pub fn snapshot_with_processes(&self, processes: &std::collections::HashMap<u16, crate::network_extension::ActivityProcess>) -> TrafficSnapshot {
         let connections = self
             .state
             .rows
@@ -180,10 +211,10 @@ impl MixedServer {
                 let (destination, chain) = entry.label.lock().expect("flow label").clone();
                 LiveConnection {
                     id: entry.id.clone(),
-                    process: "显式代理".into(),
-                    app_matcher: String::new(),
+                    process: processes.get(&entry.source_port).map(|process| process.display.clone()).unwrap_or_else(|| "本地代理".into()),
+                    app_matcher: processes.get(&entry.source_port).map(|process| process.matcher.clone()).unwrap_or_default(),
                     destination,
-                    network: "tcp".into(),
+                    network: if entry.udp.load(Ordering::Relaxed) { "udp".into() } else { "tcp".into() },
                     chain,
                     upload: entry.up.load(Ordering::Relaxed),
                     download: entry.down.load(Ordering::Relaxed),
@@ -234,22 +265,45 @@ struct Request {
     initial: Vec<u8>,
     body_limit: Option<u64>,
     socks: bool,
+    udp_associate: bool,
 }
 fn serve(
     mut client: TcpStream,
     dialer: &Dialer,
     entry: &Arc<Entry>,
     state: &Arc<State>,
+    auth: Option<&(String, String)>,
+    udp_router: Option<&UdpRouter>,
 ) -> Result<()> {
     client.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     client.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let mut first = [0];
     client.read_exact(&mut first)?;
     let request = if first[0] == 5 {
-        socks_request(&mut client)?
+        socks_request(&mut client, auth)?
     } else {
+        if auth.is_some() { bail!("系统接管入口只接受经过认证的 SOCKS5 请求"); }
         http_request(&mut client, first[0])?
     };
+    if request.udp_associate {
+        let Some(router) = udp_router else {
+            client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])?;
+            bail!("此入口没有启用 UDP");
+        };
+        entry.udp.store(true, Ordering::Release);
+        entry.label.lock().expect("flow label").0 = "DNS / UDP".into();
+        return udp::serve_association(client, request.port, router.clone(), |host, port, route, up, down| {
+            let target = match route {
+                udp::DatagramRoute::Direct => "DIRECT",
+                udp::DatagramRoute::Socks { label, .. } => label.as_str(),
+            };
+            *entry.label.lock().expect("flow label") = (format!("{host}:{port}"), target.into());
+            entry.up.fetch_add(up, Ordering::Relaxed);
+            entry.down.fetch_add(down, Ordering::Relaxed);
+            state.up.fetch_add(up, Ordering::Relaxed);
+            state.down.fetch_add(down, Ordering::Relaxed);
+        });
+    }
     entry.label.lock().expect("flow label").0 = format!("{}:{}", request.host, request.port);
     let mut dialed = match dialer(&request.host, request.port) {
         Ok(value) => value,
@@ -524,6 +578,7 @@ fn http_request(client: &mut TcpStream, first: u8) -> Result<Request> {
         initial,
         body_limit,
         socks: false,
+        udp_associate: false,
         handshake: if tunnel {
             b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec()
         } else {
@@ -566,33 +621,50 @@ fn authority(value: &str, default_port: u16) -> Result<(String, u16)> {
     }
     Ok((host, port))
 }
-fn socks_request(client: &mut TcpStream) -> Result<Request> {
+fn socks_request(client: &mut TcpStream, credentials: Option<&(String, String)>) -> Result<Request> {
     let mut count = [0];
     client.read_exact(&mut count)?;
     let mut methods = vec![0; count[0] as usize];
     client.read_exact(&mut methods)?;
-    if !methods.contains(&0) {
+    let required = credentials.map_or(0, |_| 2);
+    if !methods.contains(&required) {
         client.write_all(&[5, 255])?;
         bail!("SOCKS 认证方式不支持");
     }
-    client.write_all(&[5, 0])?;
+    client.write_all(&[5, required])?;
+    if required == 2 {
+        let mut header = [0; 2];
+        client.read_exact(&mut header)?;
+        if header[0] != 1 || header[1] == 0 { client.write_all(&[1, 1])?; bail!("无效的 SOCKS 认证请求"); }
+        let mut len = [header[1]];
+        let mut user = vec![0; len[0] as usize]; client.read_exact(&mut user)?;
+        client.read_exact(&mut len)?; let mut pass=vec![0;len[0] as usize]; client.read_exact(&mut pass)?;
+        let (expected_user, expected_pass)=credentials.unwrap();
+        if user != expected_user.as_bytes() || pass != expected_pass.as_bytes() { client.write_all(&[1,1])?; bail!("SOCKS credentials rejected"); }
+        client.write_all(&[1,0])?;
+    }
     let mut header = [0; 4];
     client.read_exact(&mut header)?;
-    if header[0] != 5 || header[1] != 1 || header[2] != 0 {
+    if header[0] != 5 || header[2] != 0 || !matches!(header[1], 1 | 3) {
         client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0])?;
         bail!("此入口支持 SOCKS5 TCP CONNECT");
     }
-    let (host, port) = socks_address(client, header[3])?;
+    let (host, port) = socks_address_with_zero(client, header[3], header[1] == 3)?;
     Ok(Request {
         host,
         port,
         initial: vec![],
         body_limit: None,
         socks: true,
+        udp_associate: header[1] == 3,
         handshake: vec![5, 0, 0, 1, 0, 0, 0, 0, 0, 0],
     })
 }
-fn socks_address(stream: &mut TcpStream, atyp: u8) -> Result<(String, u16)> {
+pub(crate) fn socks_address(stream: &mut TcpStream, atyp: u8) -> Result<(String, u16)> {
+    socks_address_with_zero(stream, atyp, false)
+}
+
+fn socks_address_with_zero(stream: &mut TcpStream, atyp: u8, allow_zero: bool) -> Result<(String, u16)> {
     let host = match atyp {
         1 => {
             let mut ip = [0; 4];
@@ -619,7 +691,7 @@ fn socks_address(stream: &mut TcpStream, atyp: u8) -> Result<(String, u16)> {
     let mut port = [0; 2];
     stream.read_exact(&mut port)?;
     let port = u16::from_be_bytes(port);
-    if port == 0 || host.chars().any(char::is_control) {
+    if (port == 0 && !allow_zero) || host.chars().any(char::is_control) {
         bail!("SOCKS 目标无效");
     }
     Ok((host, port))

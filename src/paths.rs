@@ -22,7 +22,7 @@ pub fn data_dir() -> Result<PathBuf> {
     if crate::backend::is_xray() {
         let legacy = dirs::data_dir().context("no application support directory")?.join("myproxy");
         if dir == legacy || (dir.exists() && legacy.exists() && fs::canonicalize(&dir)? == fs::canonicalize(&legacy)?) {
-            anyhow::bail!("Xray 测试版不能使用正式版的数据目录");
+            anyhow::bail!("Xray 通道使用独立配置目录，不能直接覆盖原内核的配置");
         }
     }
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;

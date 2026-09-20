@@ -3,7 +3,7 @@
 
 static SPUStandardUpdaterController *gController;
 static NSString *gFeedURL;
-static BOOL gNightly;
+static NSInteger gChannel;
 
 @interface MyproxyUpdaterDelegate : NSObject <SPUUpdaterDelegate>
 @end
@@ -15,20 +15,22 @@ static BOOL gNightly;
 }
 - (NSSet<NSString *> *)allowedChannelsForUpdater:(SPUUpdater *)updater {
     (void)updater;
-    return gNightly ? [NSSet setWithObject:@"nightly"] : [NSSet set];
+    if (gChannel == 1) return [NSSet setWithObject:@"nightly"];
+    if (gChannel == 2) return [NSSet setWithObject:@"xray"];
+    return [NSSet set];
 }
 @end
 
 static MyproxyUpdaterDelegate *gDelegate;
 
-void myproxy_sparkle_set_channel(const char *feedURL, int nightly) {
+void myproxy_sparkle_set_channel(const char *feedURL, int channel) {
     @autoreleasepool {
         NSString *next = [NSString stringWithUTF8String:feedURL];
-        if ([gFeedURL isEqualToString:next] && gNightly == (nightly != 0)) {
+        if ([gFeedURL isEqualToString:next] && gChannel == channel) {
             return;
         }
         gFeedURL = next;
-        gNightly = nightly != 0;
+        gChannel = channel;
         [gController.updater resetUpdateCycleAfterShortDelay];
     }
 }

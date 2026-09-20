@@ -916,6 +916,7 @@ fn run(cli: Cli) -> Result<()> {
                     bail!("duplicate rule name: {name}; edit the existing rule instead");
                 }
                 let set = strategy.add_rule_set(strategy::RuleSet {
+                    unavailable_fallback: Default::default(),
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     via: via.trim().to_string(),
@@ -1084,7 +1085,7 @@ fn xray_global_member_exists(strategy: &Strategy, name: &str) -> Result<bool> {
 }
 
 fn xray_select(json: bool, group: &str, name: Option<String>) -> Result<()> {
-    if !backend::is_xray() { bail!("请使用 Xray 测试版的命令行工具"); }
+    if !backend::is_xray() { bail!("请使用 Xray 通道的命令行工具"); }
     let mut strategy = Strategy::load()?;
     if let Some(name) = name {
         if group == GLOBAL_GROUP {

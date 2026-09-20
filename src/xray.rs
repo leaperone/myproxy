@@ -1,7 +1,10 @@
 pub mod import;
+pub mod geo;
+mod capture;
 pub mod nodes;
 pub mod policy;
 pub mod relay;
+pub mod udp;
 
 use std::collections::HashMap;
 use std::fs;
@@ -27,6 +30,7 @@ use serde_json::json;
 static OPERATION: Mutex<()> = Mutex::new(());
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SERVICE: OnceLock<Mutex<Service>> = OnceLock::new();
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
 #[derive(Default)]
@@ -34,6 +38,15 @@ struct Service {
     runtime: Option<Arc<Runtime>>,
     entrance: Option<Arc<MixedServer>>,
     port: Option<u16>,
+    capture: Option<Arc<capture::CaptureService>>,
+    retired_capture: Vec<Arc<capture::CaptureService>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum Ingress {
+    Mixed,
+    Capture,
+    Group(String),
 }
 
 struct Lane {
@@ -127,10 +140,13 @@ pub fn default_strategy() -> Strategy {
 
 pub fn apply(strategy: &Strategy, refresh: bool) -> Result<Catalog> {
     let _operation = OPERATION.lock().expect("Xray operation");
+    if SHUTTING_DOWN.load(Ordering::Acquire) { bail!("应用正在退出"); }
     validate_intent(strategy)?;
     let catalog = current_catalog(strategy, refresh)?;
     if wanted() {
+        let capture = prepare_capture(strategy)?;
         activate(strategy, &catalog)?;
+        sync_capture(strategy, capture)?;
     } else {
         let candidate = prepare(strategy, &catalog)?;
         save_applied(&candidate)?;
@@ -142,9 +158,12 @@ pub fn apply(strategy: &Strategy, refresh: bool) -> Result<Catalog> {
 
 pub fn connect(strategy: &Strategy) -> Result<()> {
     let _operation = OPERATION.lock().expect("Xray operation");
+    if SHUTTING_DOWN.load(Ordering::Acquire) { bail!("应用正在退出"); }
     validate_intent(strategy)?;
     let catalog = current_catalog(strategy, false)?;
-    activate(strategy, &catalog)
+    let capture = prepare_capture(strategy)?;
+    activate(strategy, &catalog)?;
+    sync_capture(strategy, capture)
 }
 
 fn current_catalog(strategy: &Strategy, refresh: bool) -> Result<Catalog> {
@@ -160,8 +179,9 @@ fn current_catalog(strategy: &Strategy, refresh: bool) -> Result<Catalog> {
 
 fn validate_intent(strategy: &Strategy) -> Result<()> {
     strategy.validate()?;
-    if strategy.tun || strategy.system_extension || strategy.system_proxy {
-        bail!("Xray 测试版使用本地混合入口。请关闭 TUN、系统接管和系统代理后再连接。");
+    geo::validate_rules(strategy)?;
+    if strategy.tun {
+        bail!("Xray 通道使用系统接管，请关闭 TUN 后再连接。");
     }
     if strategy.mixed_mode == InboundMode::Rule {
         if matches!(
@@ -172,16 +192,46 @@ fn validate_intent(strategy: &Strategy) -> Result<()> {
             .iter()
             .any(|set| crate::gfw::gfw_group(&set.via).is_some())
         {
-            bail!("此测试通道尚未加载地区 IP 库或 GFWList。请选择未匹配走组或直连。");
-        }
-        if strategy
-            .rule_sets
-            .iter()
-            .any(|set| set.matchers.iter().any(|matcher| matcher.kind == "app"))
-        {
-            bail!("混合入口没有可靠的进程身份，无法应用进程规则。请使用域名或 IP 规则。");
+            bail!("请将地区和域名规则集添加到规则列表，并选择未匹配走向。");
         }
     }
+    Ok(())
+}
+
+fn release_capture() -> Result<()> {
+    if cfg!(test) { return Ok(()); }
+    crate::network_extension::disable_async()?;
+    crate::network_extension::wait_disabled(Duration::from_secs(30))
+        .context("系统接管或 DNS 尚未关闭，保留代理入口以维持网络")
+}
+
+fn prepare_capture(strategy: &Strategy) -> Result<Option<Arc<capture::CaptureService>>> {
+    if strategy.system_extension {
+        let previous = service().lock().expect("Xray service").capture.clone();
+        Ok(Some(Arc::new(capture::CaptureService::prepare(strategy, previous.as_deref())?)))
+    } else {
+        let has_capture = service().lock().expect("Xray service").capture.is_some();
+        if has_capture { release_capture()?; }
+        Ok(None)
+    }
+}
+
+fn sync_capture(strategy: &Strategy, candidate: Option<Arc<capture::CaptureService>>) -> Result<()> {
+    if let Some(candidate) = candidate {
+        let request = candidate.request.clone();
+        {
+            let mut state = service().lock().expect("Xray service");
+            if let Some(previous) = state.capture.replace(candidate) {
+                state.retired_capture.push(previous);
+            }
+        }
+        crate::network_extension::enable_request_async(&request)?;
+    } else {
+        let mut state = service().lock().expect("Xray service");
+        state.capture = None;
+        state.retired_capture.clear();
+    }
+    crate::system_proxy::sync(strategy.system_proxy, strategy.mixed_port)?;
     Ok(())
 }
 
@@ -225,6 +275,7 @@ fn activate(strategy: &Strategy, catalog: &Catalog) -> Result<()> {
         (old, old_entrance)
     };
     if let Some(previous) = previous {
+        close_all()?;
         previous.stop()?;
     }
     drop(previous_entrance);
@@ -289,7 +340,7 @@ fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Res
         let password = uuid::Uuid::new_v4().simple().to_string();
         let inbound_tag = format!("private-{index}");
         inbounds.push(json!({"tag":inbound_tag,"listen":"127.0.0.1","port":address.port(),"protocol":"socks",
-            "settings":{"auth":"password","accounts":[{"user":username,"pass":password}],"udp":false}}));
+            "settings":{"auth":"password","accounts":[{"user":username,"pass":password}],"udp":true}}));
         rules.push(json!({"inboundTag":[inbound_tag],"outboundTag":tag}));
         outbounds.push(outbound);
         lanes.insert(
@@ -370,9 +421,19 @@ pub fn xray_binary() -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(paths::bundled_xray);
     if !binary.is_file() {
-        bail!("找不到 Xray 内核，请重新下载完整的 Xray 测试应用");
+        bail!("找不到 Xray 内核，请重新下载完整的 MyProxy Xray 通道应用");
     }
     Ok(binary)
+}
+
+fn dial_direct(host: &str, port: u16) -> Result<std::net::TcpStream> {
+    use std::net::ToSocketAddrs;
+    for address in (host, port).to_socket_addrs().context("域名解析失败")?.take(4) {
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+            return Ok(stream);
+        }
+    }
+    bail!("直连失败")
 }
 
 impl Runtime {
@@ -391,33 +452,49 @@ impl Runtime {
             && matches!(self.child.lock().expect("Xray child").try_wait(), Ok(None))
     }
     fn dial(&self, host: &str, port: u16) -> Result<Dialed> {
+        self.dial_for(host, port, &Ingress::Mixed)
+    }
+
+    fn decision(&self, host: &str, port: u16, network: &str, ingress: &Ingress) -> policy::Decision {
+        let strategy = self.strategy.read().expect("strategy");
+        let health = self.health.read().expect("health");
+        match ingress {
+            Ingress::Mixed => policy::decide_network(&strategy, &self.catalog, &health, host, port, None, network),
+            Ingress::Capture => policy::decide_capture(&strategy, &self.catalog, &health, host, port, network),
+            Ingress::Group(name) => {
+                if strategy.extension_mode != InboundMode::Rule {
+                    return policy::decide_capture(&strategy, &self.catalog, &health, host, port, network);
+                }
+                if let Some(rule_id) = name.strip_prefix("@rule:") {
+                    policy::decide_captured_rule(&strategy, &self.catalog, &health, rule_id, host, network)
+                } else {
+                    policy::decide_target(&strategy, &self.catalog, &health, name)
+                }
+            },
+        }
+    }
+
+    fn datagram_route(&self, host: &str, port: u16, ingress: &Ingress) -> Result<udp::DatagramRoute> {
+        if !self.core_alive() { bail!("Xray 内核已退出"); }
+        let decision = self.decision(host, port, "udp", ingress);
+        match decision.route {
+            Route::Direct => Ok(udp::DatagramRoute::Direct),
+            Route::Reject => bail!("UDP 请求被规则拒绝，或所选节点不可用"),
+            Route::Node(name) => {
+                let lane = self.lanes.get(&name).context("所选 UDP 节点不可用")?;
+                Ok(udp::DatagramRoute::Socks { address: lane.address, username: lane.username.clone(), password: lane.password.clone(), label: decision.chain.join(" → "), fallback_direct: decision.allow_direct_fallback })
+            }
+        }
+    }
+
+    fn dial_for(&self, host: &str, port: u16, ingress: &Ingress) -> Result<Dialed> {
         if !self.core_alive() {
             bail!("Xray 内核已退出，请重新连接");
         }
-        let decision = policy::decide(
-            &self.strategy.read().expect("strategy"),
-            &self.catalog,
-            &self.health.read().expect("health"),
-            host,
-            port,
-            None,
-        );
+        let mut decision = self.decision(host, port, "tcp", ingress);
         let stream = match decision.route {
             Route::Reject => bail!("规则拒绝连接，或所选组中没有可用节点"),
-            Route::Direct => {
-                use std::net::ToSocketAddrs;
-                let addresses = (host, port).to_socket_addrs().context("域名解析失败")?;
-                let mut connected = None;
-                for address in addresses.take(4) {
-                    if let Ok(stream) =
-                        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
-                    {
-                        connected = Some(stream);
-                        break;
-                    }
-                }
-                connected.context("直连失败")?
-            }
+            Route::Direct => dial_direct(host, port)?,
             Route::Node(name) => {
                 let lane = self.lanes.get(&name).context("所选节点不可用")?;
                 match relay::dial_socks(lane.address, &lane.username, &lane.password, host, port) {
@@ -427,7 +504,13 @@ impl Runtime {
                         let item = health.entry(name).or_default();
                         item.failures = item.failures.saturating_add(1);
                         item.delay_ms = None;
-                        return Err(error).context("代理节点连接失败");
+                        drop(health);
+                        if decision.allow_direct_fallback {
+                            decision.chain.push("DIRECT".into());
+                            dial_direct(host, port)?
+                        } else {
+                            return Err(error).context("代理节点连接失败");
+                        }
                     }
                 }
             }
@@ -574,6 +657,8 @@ pub fn select_proxy(identity: &RuntimeIdentity, group: &str, name: &str) -> Resu
 
 pub fn disconnect() -> Result<()> {
     let _operation = OPERATION.lock().expect("Xray operation");
+    release_capture()?;
+    crate::system_proxy::restore()?;
     let previous = std::mem::take(&mut *service().lock().expect("Xray service"));
     if let Some(runtime) = &previous.runtime {
         runtime.stop()?;
@@ -583,6 +668,13 @@ pub fn disconnect() -> Result<()> {
     }
     drop(previous);
     Ok(())
+}
+
+pub fn shutdown() -> Result<()> {
+    SHUTTING_DOWN.store(true, Ordering::Release);
+    let result = disconnect();
+    if result.is_err() { SHUTTING_DOWN.store(false, Ordering::Release); }
+    result
 }
 
 pub fn is_running() -> bool {
@@ -611,7 +703,15 @@ pub fn applied_strategy() -> Option<Strategy> {
     Some(strategy)
 }
 pub fn status() -> Result<XrayStatus> {
-    let state = service().lock().expect("Xray service");
+    let capture_status = crate::network_extension::status();
+    let mut state = service().lock().expect("Xray service");
+    if state.capture.as_ref().is_some_and(|capture|
+        capture_status.observed
+            && capture_status.phase == crate::network_extension::Phase::Running
+            && capture_status.dns_phase == crate::network_extension::DnsPhase::Running
+            && capture_status.applied_revision == Some(capture.request.revision)) {
+        state.retired_capture.clear();
+    }
     let Some(runtime) = &state.runtime else {
         return Ok(XrayStatus {
             wanted: false,
@@ -653,15 +753,26 @@ pub fn groups() -> Result<Vec<controller::LiveGroup>> {
     Ok(policy::groups(&strategy, &runtime.catalog, &health))
 }
 pub fn traffic() -> Result<controller::TrafficSnapshot> {
-    let entrance = service()
-        .lock()
-        .expect("Xray service")
-        .entrance
-        .clone()
-        .context("尚未连接")?;
-    Ok(entrance.snapshot())
+    let (entrance, capture) = {
+        let state = service().lock().expect("Xray service");
+        (state.entrance.clone().context("尚未连接")?, state.capture.clone())
+    };
+    let mut snapshot = entrance.snapshot();
+    if let Some(capture) = capture {
+        let extra = capture.snapshot();
+        snapshot.connection_count += extra.connection_count;
+        snapshot.upload_total = snapshot.upload_total.saturating_add(extra.upload_total);
+        snapshot.download_total = snapshot.download_total.saturating_add(extra.download_total);
+        snapshot.connections.extend(extra.connections);
+        snapshot.connections.truncate(controller::UI_CONNECTION_CAP);
+    }
+    Ok(snapshot)
 }
 pub fn close_one(id: &str) -> Result<()> {
+    if id.starts_with("capture:") {
+        let capture = service().lock().expect("Xray service").capture.clone().context("系统接管入口未启动")?;
+        return capture.close_one(id);
+    }
     let entrance = service()
         .lock()
         .expect("Xray service")
@@ -671,6 +782,11 @@ pub fn close_one(id: &str) -> Result<()> {
     entrance.close_one(id)
 }
 pub fn close_all() -> Result<()> {
+    let captures = {
+        let state = service().lock().expect("Xray service");
+        state.capture.iter().chain(state.retired_capture.iter()).cloned().collect::<Vec<_>>()
+    };
+    for capture in captures { capture.close_all()?; }
     let entrance = service()
         .lock()
         .expect("Xray service")

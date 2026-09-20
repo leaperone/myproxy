@@ -205,6 +205,7 @@ fn mixed_global_rules_and_selection_use_real_xray_and_application_ledger() {
         .any(|row| row.chain.contains("B") && row.destination.contains("test.invalid")));
     strategy.mixed_mode = InboundMode::Rule;
     strategy.rule_sets = vec![crate::strategy::RuleSet {
+        unavailable_fallback: Default::default(),
         id: "test".into(),
         name: "网站走A".into(),
         via: "A".into(),
@@ -286,4 +287,33 @@ fn replacement_reaps_xray_while_a_background_task_retains_the_old_runtime() {
     assert!(retained.child.lock().unwrap().try_wait().unwrap().is_some());
     assert_ne!(active().unwrap().child.lock().unwrap().id(), old_pid);
     assert!(status().unwrap().ready);
+}
+
+#[test]
+fn xray_authenticated_capture_udp_traverses_real_core_and_app_owned_upstream() {
+    if std::env::var_os("XRAY_BINARY").is_none() { return; }
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = isolated();
+    let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    echo.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    let target_port = echo.local_addr().unwrap().port();
+    let echo_worker = std::thread::spawn(move || {
+        let mut payload=[0;1024];let(size,peer)=echo.recv_from(&mut payload).unwrap();
+        assert_eq!(&payload[..size], b"XRAY_UDP_PAYLOAD");
+        echo.send_to(&payload[..size], peer).unwrap();
+    });
+    let upstream_listener=TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream_port=upstream_listener.local_addr().unwrap().port();
+    let direct: Dialer=Arc::new(|host,port| Ok(Dialed {stream:TcpStream::connect((host,port))?,chain:"DIRECT".into(),rule:String::new()}));
+    let _upstream=MixedServer::start_authenticated(upstream_listener,direct.clone(),"fixture".into(),"password".into(),Arc::new(|_,_| Ok(udp::DatagramRoute::Direct))).unwrap();
+    let catalog=Catalog {nodes:vec![Node {name:"UDP node".into(),subscription:"fixture".into(),raw:serde_yaml::from_str(&format!("name: UDP node\ntype: socks5\nserver: 127.0.0.1\nport: {upstream_port}\nusername: fixture\npassword: password\n")).unwrap()}],..Catalog::default()};
+    let mut strategy=default_strategy();strategy.mixed_port=port();strategy.global_selected="UDP node".into();strategy.extension_mode=InboundMode::Global;
+    activate(&strategy,&catalog).unwrap();
+    let capture_listener=TcpListener::bind("127.0.0.1:0").unwrap();let capture_address=capture_listener.local_addr().unwrap();
+    let _capture=MixedServer::start_authenticated(capture_listener,direct,"capture".into(),"secret".into(),Arc::new(|host,port| active()?.datagram_route(host,port,&Ingress::Capture))).unwrap();
+    let (control,relay)=udp::associate(capture_address,"capture","secret").unwrap();
+    let socket=std::net::UdpSocket::bind("127.0.0.1:0").unwrap();socket.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    socket.send_to(&udp::encode_target("127.0.0.1",target_port,b"XRAY_UDP_PAYLOAD").unwrap(),relay).unwrap();
+    let mut response=[0;2048];let(size,_)=socket.recv_from(&mut response).unwrap();let(_,_,offset)=udp::decode_target(&response[..size]).unwrap();assert_eq!(&response[offset..size],b"XRAY_UDP_PAYLOAD");
+    drop(control);echo_worker.join().unwrap();
 }

@@ -186,10 +186,17 @@ public enum ProcessIdentityResolution: Codable, Hashable, Sendable {
 public struct TrustedMyproxyComponentPolicy: Sendable {
     public static let teamIdentifier = "5UAHRS482C"
 
-    private static let signingIdentifiers: Set<String> = [
+    private static let signingIdentifiers: Set<String> = {
+        var identifiers: Set<String> = [
         "local.harry.myproxy.mihomo",
         "local.harry.myproxy.network-extension",
-    ]
+        ]
+        #if MYPROXY_XRAY
+        identifiers.insert("local.harry.myproxy")
+        identifiers.insert("local.harry.myproxy.xray")
+        #endif
+        return identifiers
+    }()
 
     public init() {}
 

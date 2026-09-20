@@ -56,7 +56,7 @@ pub struct Snapshot {
 /// Bundled macOS clients must never fall back to executing NE calls themselves.
 pub fn request(request: Request) -> Result<Snapshot> {
     if backend::is_xray() && !crate::login_item::is_bundled() && !matches!(request,Request::Status) {
-        bail!("请使用 MyProxy Xray.app 内的命令行工具，运行连接由应用持有");
+        bail!("请使用 MyProxy.app 内的命令行工具，运行连接由应用持有");
     }
     #[cfg(target_os = "macos")]
     {
@@ -105,7 +105,7 @@ fn execute(request: Request) -> Result<Snapshot> {
     let catalog = match &request {
         Request::Status => None,
         Request::Select { group, name } => {
-            if !backend::is_xray() { bail!("此操作仅适用于 Xray 测试版"); }
+            if !backend::is_xray() { bail!("此操作仅适用于 Xray 通道"); }
             let identity = supervisor.runtime_identity().context("尚未连接")?;
             supervisor.select_proxy(identity, group, name)?;
             None
@@ -175,7 +175,7 @@ fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
 pub fn check_outcome(snapshot: &Snapshot) -> Result<()> {
     if let Some(xray) = &snapshot.xray {
         if xray.wanted && !xray.ready { bail!("Xray 入口未就绪"); }
-        return Ok(());
+        if !snapshot.extension_required { return Ok(()); }
     }
     let status = &snapshot.extension;
     if !status.observed {

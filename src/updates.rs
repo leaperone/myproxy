@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub const VERSION: &str = env!("MYPROXY_VERSION");
 
 pub fn build_badge() -> Option<&'static str> {
+    if crate::backend::is_xray() {
+        return Some("Xray");
+    }
     match env!("MYPROXY_BUILD_CHANNEL") {
         "nightly" => Some("Nightly"),
         "dev" => Some("Dev"),
@@ -18,11 +21,14 @@ pub fn build_badge() -> Option<&'static str> {
 pub enum UpdateChannel {
     Prod,
     Nightly,
+    Xray,
 }
 
 impl Default for UpdateChannel {
     fn default() -> Self {
-        if env!("MYPROXY_BUILD_CHANNEL") == "nightly" {
+        if crate::backend::is_xray() || env!("MYPROXY_BUILD_CHANNEL") == "xray" {
+            Self::Xray
+        } else if env!("MYPROXY_BUILD_CHANNEL") == "nightly" {
             Self::Nightly
         } else {
             Self::Prod
@@ -35,6 +41,7 @@ impl UpdateChannel {
         match self {
             Self::Prod => "正式版（Prod）",
             Self::Nightly => "Nightly",
+            Self::Xray => "Xray",
         }
     }
 
@@ -45,6 +52,9 @@ impl UpdateChannel {
             }
             Self::Nightly => {
                 "https://github.com/leaperone/myproxy/releases/download/nightly/appcast.xml"
+            }
+            Self::Xray => {
+                "https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml"
             }
         }
     }
@@ -272,6 +282,14 @@ pub fn fetch_release_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_channels_keep_independent_release_feeds() {
+        assert_eq!(UpdateChannel::Prod.feed_url(), "https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml");
+        assert_eq!(UpdateChannel::Nightly.feed_url(), "https://github.com/leaperone/myproxy/releases/download/nightly/appcast.xml");
+        assert_eq!(UpdateChannel::Xray.feed_url(), "https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml");
+        assert_eq!(serde_json::to_string(&UpdateChannel::Xray).unwrap(), "\"xray\"");
+    }
 
     #[test]
     fn allow_github_release_hosts() {

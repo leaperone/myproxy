@@ -27,7 +27,6 @@ pub fn is_bundled() -> bool {
 
 /// Apply `launch_at_login` via `SMAppService`. No-op when turning off outside a bundle.
 pub fn sync(enable: bool) -> Result<()> {
-    if crate::backend::is_xray() { return Ok(()); }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = enable;

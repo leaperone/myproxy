@@ -7,6 +7,7 @@ private struct HostEnableRequest: Decodable, Sendable {
         let order: UInt64
         let pattern: String
         let via: String
+        let protocols: [TransportProtocol]?
     }
 
     struct GroupPort: Decodable, Sendable {
@@ -19,6 +20,7 @@ private struct HostEnableRequest: Decodable, Sendable {
         let kind: String
         let value: String
         let via: String
+        let protocols: [TransportProtocol]?
     }
 
     let revision: UInt64
@@ -62,7 +64,14 @@ private struct HostSharedIntent: Sendable {
     }
 
     static func stateURL(_ name: String) throws -> URL {
-        if let override = ProcessInfo.processInfo.environment["MYPROXY_DATA_DIR"], !override.isEmpty {
+        #if MYPROXY_XRAY
+        let environmentKey = "MYPROXY_XRAY_DATA_DIR"
+        let directoryName = "myproxy-xray"
+        #else
+        let environmentKey = "MYPROXY_DATA_DIR"
+        let directoryName = "myproxy"
+        #endif
+        if let override = ProcessInfo.processInfo.environment[environmentKey], !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true).appendingPathComponent(name)
         }
         guard let root = FileManager.default.urls(
@@ -73,7 +82,7 @@ private struct HostSharedIntent: Sendable {
                 message: "无法定位系统接管共享状态目录"
             )
         }
-        return root.appendingPathComponent("myproxy", isDirectory: true)
+        return root.appendingPathComponent(directoryName, isDirectory: true)
             .appendingPathComponent(name)
     }
 }
@@ -660,6 +669,7 @@ private func captureSnapshot(
         _ id: String,
         sources: [SourceMatcher] = [],
         destinations: [DestinationMatcher] = [],
+        protocols: [TransportProtocol] = [],
         via: String
     ) throws {
         rules.append(try CaptureRule(
@@ -667,6 +677,7 @@ private func captureSnapshot(
             priority: rules.count,
             sources: sources,
             destinations: destinations,
+            protocols: Set(protocols),
             action: captureAction(via: via),
             unavailableFallback: captureFallback(via: via)
         ))
@@ -697,7 +708,7 @@ private func captureSnapshot(
                     operation: .configureTransparentProxy, message: "无效的应用匹配条件"
                 )
             }
-            try append("process-\(index)", sources: sources, via: rule.via)
+            try append("process-\(index)", sources: sources, protocols: rule.protocols ?? [], via: rule.via)
         case .destination(let index, let rule):
             if rule.kind == "cidr" && gfwGroup(via: rule.via) != nil {
                 throw NetworkExtensionControlFailure(
@@ -711,7 +722,7 @@ private func captureSnapshot(
                     operation: .configureTransparentProxy, message: "无效的目标匹配条件"
                 )
             }
-            try append("dest-\(index)", destinations: destinations, via: rule.via)
+            try append("dest-\(index)", destinations: destinations, protocols: rule.protocols ?? [], via: rule.via)
         }
     }
     rules.append(try CaptureRule(
@@ -753,6 +764,9 @@ private func destinationMatchers(kind: String, value: String) -> [DestinationMat
         return (try? DestinationMatcher.host(HostMatcher(kind: .exact, value: trimmed))).map { [$0] } ?? []
     case "keyword":
         return (try? DestinationMatcher.hostPattern(HostPatternMatcher(pattern: "*\(trimmed)*")))
+            .map { [$0] } ?? []
+    case "wildcard":
+        return (try? DestinationMatcher.hostPattern(HostPatternMatcher(pattern: trimmed)))
             .map { [$0] } ?? []
     case "cidr":
         return (try? DestinationMatcher.network(IPNetwork(trimmed))).map { [$0] } ?? []
