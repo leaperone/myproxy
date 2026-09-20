@@ -377,7 +377,14 @@ fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Res
         let inbound_tag = format!("private-{index}");
         inbounds.push(json!({"tag":inbound_tag,"listen":"127.0.0.1","port":address.port(),"protocol":"socks",
             "settings":{"auth":"password","accounts":[{"user":username,"pass":password}],"udp":true}}));
+        let dns_tag = format!("dns-{index}");
+        rules.push(json!({"inboundTag":[inbound_tag],"network":"udp","port":"53","outboundTag":dns_tag}));
         rules.push(json!({"inboundTag":[inbound_tag],"outboundTag":tag}));
+        // Preserve the chosen node and resolver when it supports TCP but cannot relay UDP DNS.
+        // The direct rule prevents Xray's DNS outbound from resolving A/AAAA with its internal client.
+        outbounds.push(json!({"tag":dns_tag,"protocol":"dns",
+            "settings":{"network":"tcp","rules":[{"action":"direct"}]},
+            "streamSettings":{"sockopt":{"dialerProxy":tag}}}));
         outbounds.push(outbound);
         lanes.insert(
             node.name.clone(),

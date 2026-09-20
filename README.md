@@ -93,6 +93,9 @@ default **40808**. The existing System Extension captures applications and DNS
 through authenticated app-owned TCP/UDP entrances. Xray receives private
 per-node SOCKS entrances and performs the final proxy connection. A signed Xray
 host and core bypass their own capture path to avoid proxy and DNS recursion.
+Proxied DNS requests on UDP port 53 use TCP through that same selected node and
+keep the requested resolver. This supports nodes that relay TCP but reject UDP
+DNS. Other UDP traffic still requires UDP support from the selected node.
 
 New configurations start in global mode through 节点选择, with 美国优先,
 日本优先, 香港优先, and a direct choice. Groups expand to show their nodes;

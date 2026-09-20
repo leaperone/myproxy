@@ -317,3 +317,65 @@ fn xray_authenticated_capture_udp_traverses_real_core_and_app_owned_upstream() {
     let mut response=[0;2048];let(size,_)=socket.recv_from(&mut response).unwrap();let(_,_,offset)=udp::decode_target(&response[..size]).unwrap();assert_eq!(&response[offset..size],b"XRAY_UDP_PAYLOAD");
     drop(control);echo_worker.join().unwrap();
 }
+
+#[test]
+fn xray_udp_dns_preserves_queries_and_resolver_through_selected_tcp_node() {
+    if std::env::var_os("XRAY_BINARY").is_none() { return; }
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = isolated();
+    let resolver = TcpListener::bind("127.0.0.1:0").unwrap();
+    let resolver_address = resolver.local_addr().unwrap();
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = resolver.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        for qtype in [1u16, 28, 16] {
+            let mut size = [0; 2];
+            stream.read_exact(&mut size).unwrap();
+            let mut query = vec![0; u16::from_be_bytes(size) as usize];
+            stream.read_exact(&mut query).unwrap();
+            assert_eq!(&query[12..25], b"\x07example\x03com\x00");
+            assert_eq!(&query[25..27], &qtype.to_be_bytes());
+            query[2] = 0x81;
+            query[3] = 0x80;
+            stream.write_all(&size).unwrap();
+            stream.write_all(&query).unwrap();
+        }
+    });
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream_port = upstream_listener.local_addr().unwrap().port();
+    let dialer: Dialer = Arc::new(move |host, port| {
+        assert_eq!((host, port), ("resolver.invalid", 53));
+        Ok(Dialed { stream: TcpStream::connect(resolver_address)?, chain: "fixture".into(), rule: String::new() })
+    });
+    let _upstream = MixedServer::start_authenticated(upstream_listener, dialer, "fixture".into(), "password".into(),
+        Arc::new(|_, _| bail!("this node only supports TCP"))).unwrap();
+    let catalog = Catalog { nodes: vec![Node {
+        name: "TCP node".into(), subscription: "fixture".into(),
+        raw: serde_yaml::from_str(&format!("name: TCP node\ntype: socks5\nserver: 127.0.0.1\nport: {upstream_port}\nusername: fixture\npassword: password\n")).unwrap(),
+    }], ..Catalog::default() };
+    let mut strategy = default_strategy();
+    strategy.mixed_port = port();
+    strategy.global_selected = "TCP node".into();
+    activate(&strategy, &catalog).unwrap();
+    let runtime = active().unwrap();
+    let lane = runtime.lanes.get("TCP node").unwrap();
+    let (control, relay) = udp::associate(lane.address, &lane.username, &lane.password).unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    for qtype in [1u16, 28, 16] {
+        let mut query = vec![0x12, qtype as u8, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x07example\x03com\x00");
+        query.extend_from_slice(&qtype.to_be_bytes());
+        query.extend_from_slice(&[0, 1]);
+        socket.send_to(&udp::encode_target("resolver.invalid", 53, &query).unwrap(), relay).unwrap();
+        let mut response = [0; 2048];
+        let (size, _) = socket.recv_from(&mut response).unwrap();
+        let (_, response_port, offset) = udp::decode_target(&response[..size]).unwrap();
+        query[2] = 0x81;
+        query[3] = 0x80;
+        assert_eq!(response_port, 53);
+        assert_eq!(&response[offset..size], query);
+    }
+    drop(control);
+    worker.join().unwrap();
+}
