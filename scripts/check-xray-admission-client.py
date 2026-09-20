@@ -2,11 +2,10 @@
 """Exercise the compiled Xray admission client against a local mock broker."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import json
-import os
+import platform
 from pathlib import Path
 import socket
 import subprocess
@@ -19,7 +18,6 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / ".planning/xray-release/swift-extension-xray"
 ACTIVATION = "11111111-1111-4111-8111-111111111111"
 KEY = bytes(range(32))
-KEY_B64 = base64.b64encode(KEY).decode()
 LEASE = "lease-lowercase-opaque-7f3a"
 
 
@@ -64,11 +62,15 @@ def broker(scenario: str, listener: socket.socket, done: threading.Event) -> Non
     try:
         conn, _ = listener.accept()
         with conn:
+            conn.settimeout(2)
             header = recv_exact(conn, 4)
             size = int.from_bytes(header, "big")
             envelope = json.loads(recv_exact(conn, size))
             payload = envelope["payload"].encode()
+            assert hmac.compare_digest(envelope["mac"], hmac.new(KEY, payload, hashlib.sha256).hexdigest())
             request = json.loads(payload)
+            assert request["activation"] == ACTIVATION
+            assert request["source"]["userId"] == 501
             if scenario == "deadline":
                 time.sleep(1.35)
                 return
@@ -96,9 +98,11 @@ def broker(scenario: str, listener: socket.socket, done: threading.Event) -> Non
             response = json.dumps({"payload": reply_payload.decode(), "mac": mac}, separators=(",", ":")).encode()
             frame = len(response).to_bytes(4, "big") + response
             if scenario == "fragmented":
-                for byte in frame:
-                    conn.send(bytes([byte]))
-                    time.sleep(0.001)
+                start = 0
+                for end in (1, 3, 4, 17, 53, len(frame)):
+                    conn.sendall(frame[start:end])
+                    start = end
+                    time.sleep(0.002)
             else:
                 conn.sendall(frame)
     finally:
@@ -133,7 +137,7 @@ def main() -> None:
         driver_source.write_text(DRIVER)
         binary = temp_path / "driver"
         subprocess.run([
-            "swiftc", "-swift-version", "6", "-D", "MYPROXY_XRAY", "-target", "arm64-apple-macosx14.0",
+            "swiftc", "-swift-version", "6", "-D", "MYPROXY_XRAY", "-target", f"{platform.machine()}-apple-macosx14.0",
             "-I", str(BUILD), "-L", str(BUILD), "-lMyproxyNetworkShared",
             str(ROOT / "macos/NetworkExtension/AppAdmissionClient.swift"), str(driver_source),
             "-framework", "Network", "-framework", "NetworkExtension", "-o", str(binary),
