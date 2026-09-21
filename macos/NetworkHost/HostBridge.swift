@@ -443,8 +443,27 @@ private actor HostController {
                 $0.dnsMessage = error.localizedDescription
             }
             dnsConfigurationError = (intent, error.localizedDescription)
+            #if MYPROXY_XRAY
+            try await disableDNSProxyAllowingDenied(intent: intent)
+            try intent.check()
+            try await transparentProxy.stop(dropWedgedConfiguration: true)
+            try intent.check()
+            lastEndpoints = []
+            lastSocksPort = nil
+            lastUsername = nil
+            lastPassword = nil
+            HostRuntime.shared.update(operation: operation) {
+                $0.phase = "failed"
+                $0.captureEnabled = false
+                $0.failOpen = true
+                $0.appliedRevision = nil
+                $0.message = "DNS 启动失败，已关闭系统接管。本地 HTTP 和 SOCKS5 代理仍可使用。"
+            }
+            return
+            #else
             // A half-enabled NEDNSProxy with no backend blackholes getaddrinfo.
             try? await disableDNSProxyAllowingDenied(intent: intent)
+            #endif
         }
         HostRuntime.shared.update(operation: operation) { $0.phase = "running" }
         if let observation = HostRuntime.shared.observation(for: operation) {

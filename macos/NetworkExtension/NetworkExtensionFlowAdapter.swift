@@ -412,7 +412,7 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
     #if MYPROXY_XRAY
     func planDNSFlow(_ flow: NEAppProxyFlow, destination: SOCKS5Endpoint, transport: TransportProtocol, parentFlowIdentifier: UUID? = nil) -> (decision: FlowTrafficDecision, target: SOCKS5Endpoint?, proxy: ProviderSOCKSConfiguration?) {
         let endpoint = FlowRemoteEndpoint(host: destination.address.ipAddress?.presentation ?? destination.address.domain ?? "", port: destination.port)
-        let outcome = admissionOutcome(flow: flow, endpoint: endpoint, transport: transport, kind: "dns", parentFlowIdentifier: parentFlowIdentifier, useFlowHostname: false)
+        let outcome = admissionOutcome(flow: flow, endpoint: endpoint, transport: transport, kind: "dns", parentFlowIdentifier: parentFlowIdentifier, useFlowHostname: destination.address.ipAddress != nil)
         return (outcome.decision, outcome.target, outcome.proxy)
     }
     #endif

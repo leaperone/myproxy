@@ -1050,11 +1050,7 @@ fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
             println!("{warning}");
         }
     }
-    if selected_backend == BackendKind::Xray {
-        Ok(())
-    } else {
-        host_control::check_outcome(&snapshot)
-    }
+    host_control::check_outcome(&snapshot)
 }
 
 fn emit(json: bool, value: serde_json::Value, human: impl std::fmt::Display) {

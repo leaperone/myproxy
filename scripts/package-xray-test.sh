@@ -18,6 +18,7 @@ scripts/fetch-xray.sh
 scripts/fetch-sparkle.sh
 MYPROXY_XRAY_CHANNEL=1 scripts/build-network-extension.sh target/xray-network-extension
 python3 scripts/check-xray-admission-client.py target/xray-network-extension
+python3 scripts/test-xray-dns-tcp-framing.py
 cargo build --locked --release --bins --features 'sparkle,xray-channel'
 
 stage="$(mktemp -d "${TMPDIR:-/tmp}/myproxy-xray-package.XXXXXX")"

@@ -374,7 +374,13 @@ final class UDPFlowSession: @unchecked Sendable {
         _ record: ConversationRecord,
         note: String?
     ) {
+        #if MYPROXY_XRAY
+        let dnsOverTCP = record.plan.activity.captureOrigin == .dnsProxy && record.plan.directDestination?.port == 53
+        #else
+        let dnsOverTCP = false
+        #endif
         let conversation = DirectUDPConversation(
+            dnsOverTCP: dnsOverTCP,
             queue: queue,
             flow: flow,
             activityIdentifier: record.plan.activity.flowIdentifier,
@@ -610,6 +616,9 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
     let activityIdentifier: UUID
     let endpoint: SOCKS5Endpoint
 
+    private let dnsOverTCP: Bool
+    private var dnsFrames = DNSTCPFraming()
+    private var tcpEnded = false
     private let queue: DispatchQueue
     private let flow: NEAppProxyUDPFlow
     private let note: String?
@@ -629,6 +638,7 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
     private var lastPayloadAt: Date?
 
     init(
+        dnsOverTCP: Bool = false,
         queue: DispatchQueue,
         flow: NEAppProxyUDPFlow,
         activityIdentifier: UUID,
@@ -639,6 +649,7 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
         response: @escaping @Sendable (UUID, UDPFlowDatagram) -> Void,
         failure: @escaping @Sendable (UUID, Error, UDPConversationFailureStage) -> Void
     ) {
+        self.dnsOverTCP = dnsOverTCP
         self.queue = queue
         self.flow = flow
         self.activityIdentifier = activityIdentifier
@@ -659,7 +670,7 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
                 throw UDPFlowSessionError.unsupportedDestination
             }
             report(.connecting)
-            let parameters = NWParameters.udp
+            let parameters = dnsOverTCP ? NWParameters.tcp : NWParameters.udp
             parameters.preferNoProxies = true
             if #available(macOS 15.0, *) {
                 flow.setMetadata(on: parameters)
@@ -688,10 +699,13 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
             completion(UDPFlowSessionError.directConnectionFailed("The connection is not ready."))
             return
         }
+        let content: Data
+        do { content = dnsOverTCP ? try DNSTCPFraming.encode(payload) : payload }
+        catch { completion(error); fail(error, stage: .relaying); return }
         connection.send(
-            content: payload,
+            content: content,
             contentContext: .defaultMessage,
-            isComplete: true,
+            isComplete: !dnsOverTCP,
             completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if let error {
@@ -760,6 +774,7 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
 
     private func receiveNext() {
         guard !finished, ready, !receiveInFlight, let connection else { return }
+        if dnsOverTCP { receiveDNS(connection); return }
         receiveInFlight = true
         connection.receiveMessage { [weak self] data, _, isComplete, error in
             guard let self else { return }
@@ -785,6 +800,29 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
                 self.id,
                 UDPFlowDatagram(payload: data, endpoint: self.endpoint)
             )
+        }
+    }
+
+    private func receiveDNS(_ connection: NWConnection) {
+        do {
+            if let payload = try dnsFrames.next() {
+                byteLedger.recordUpstreamReceived(payload.count)
+                lastPayloadAt = Date()
+                responseCallback(id, UDPFlowDatagram(payload: payload, endpoint: endpoint))
+                return
+            }
+            if tcpEnded { throw UDPFlowSessionError.directConnectionFailed("DNS TCP connection closed") }
+        } catch { fail(error, stage: .relaying); return }
+        receiveInFlight = true
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, complete, error in
+            guard let self, !self.finished else { return }
+            self.receiveInFlight = false
+            if let error { self.fail(error, stage: .relaying); return }
+            do {
+                if let data { try self.dnsFrames.append(data) }
+                self.tcpEnded = complete
+                self.receiveNext()
+            } catch { self.fail(error, stage: .relaying) }
         }
     }
 

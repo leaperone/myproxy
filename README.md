@@ -106,6 +106,10 @@ not silently bypass the configured policy.
 Proxied DNS requests on UDP port 53 use TCP through that same selected node and
 keep the requested resolver. This supports nodes that relay TCP but reject UDP
 DNS. Other UDP traffic still requires UDP support from the selected node.
+Direct DNS also uses TCP in the extension. Before enabling capture, the app
+queries the configured system resolvers and chooses one that returns a DNS
+answer. If DNS activation fails, it disables both DNS and transparent capture;
+the local HTTP/SOCKS entrance remains available.
 
 New configurations start in global mode through 节点选择, with 美国优先,
 日本优先, 香港优先, and a direct choice. Groups expand to show their nodes;

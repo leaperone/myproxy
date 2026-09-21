@@ -404,8 +404,13 @@ fn serve_dynamic(
     for socket in [&client, &dialed.stream] { socket.set_read_timeout(Some(Duration::from_secs(1)))?; socket.set_write_timeout(Some(Duration::from_secs(15)))?; }
     let mut upload_client = client.try_clone()?; let mut upload_target = dialed.stream.try_clone()?;
     thread::scope(|scope| {
-        let upload = scope.spawn(|| pump(&mut upload_client, &mut upload_target, &request.initial, request.body_limit, entry, state, true));
+        let upload = scope.spawn(|| {
+            let result = pump(&mut upload_client, &mut upload_target, &request.initial, request.body_limit, entry, state, true);
+            if result.is_err() { entry.close(); }
+            result
+        });
         let download = pump(&mut dialed.stream, &mut client, &[], None, entry, state, false);
+        if download.is_err() { entry.close(); }
         let sent = upload.join().map_err(|_| anyhow::anyhow!("连接转发线程异常"))?;
         sent.and(download)
     })
@@ -1032,6 +1037,50 @@ mod tests {
         mixed.close_one(&snapshot.connections[0].id).unwrap();
         assert_eq!(client.read(&mut buf).unwrap(), 0);
         echo.join().unwrap();
+    }
+    #[test]
+    fn client_disconnect_releases_entry_when_upstream_closes_after_half_close() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target = upstream.local_addr().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mixed = MixedServer::start(
+            listener,
+            Arc::new(move |_, _| {
+                Ok(Dialed {
+                    stream: TcpStream::connect(target)?,
+                    chain: "NODE_A".into(),
+                    rule: "disconnect-fixture".into(),
+                })
+            }),
+        )
+        .unwrap();
+        let upstream_done = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut request = [0; 4];
+            socket.read_exact(&mut request).unwrap();
+            let mut eof = [0; 1];
+            assert_eq!(socket.read(&mut eof).unwrap(), 0);
+            // The upstream closes after observing the client's half-close;
+            // this is the safe condition in which both relay pumps can end.
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client.write_all(b"CONNECT host:443 HTTP/1.1\r\nHost: host:443\r\n\r\n").unwrap();
+        let mut head = vec![];
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        client.write_all(b"ping").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        upstream_done.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && mixed.snapshot().connection_count != 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(mixed.snapshot().connection_count, 0);
     }
     #[test]
     fn forward_proxy_never_relays_a_second_host_on_the_same_stream() {
