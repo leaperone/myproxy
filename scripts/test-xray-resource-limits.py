@@ -43,7 +43,7 @@ def main() -> None:
         temp = Path(temp); driver = temp / "driver.swift"; binary = temp / "driver"
         driver.write_text(DRIVER)
         arch = "arm64" if platform.machine() == "arm64" else "x86_64"
-        subprocess.run(["swiftc", "-swift-version", "6", "-target", f"{arch}-apple-macosx14.0", str(SOURCE), str(driver), "-framework", "OSLog", "-o", str(binary)], check=True, timeout=10)
+        subprocess.run(["swiftc", "-swift-version", "6", "-target", f"{arch}-apple-macosx14.0", str(SOURCE), str(driver), "-framework", "OSLog", "-o", str(binary)], check=True, timeout=60)
         for mode in ("raise", "low-hard"):
             result = subprocess.run([str(binary), mode], capture_output=True, text=True, timeout=5, check=True)
             print(result.stdout.strip())
