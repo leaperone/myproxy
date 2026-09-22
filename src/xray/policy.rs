@@ -900,4 +900,16 @@ mod tests {
         assert_eq!(decision.chain, ["节点选择", "香港优先", "香港", "香港 fast"]);
     }
 
+    #[test]
+    fn default_selector_can_use_a_node_outside_the_regional_presets() {
+        let strategy = crate::xray::default_strategy();
+        let catalog = Catalog {
+            nodes: vec![Node { name: "My server".into(), subscription: "manual".into(), raw: Value::Null }],
+            ..Catalog::default()
+        };
+        let decision = decide(&strategy, &catalog, &HashMap::new(), "example.com", 443, None);
+        assert_eq!(decision.route, Route::Node("My server".into()));
+        assert_eq!(decision.chain, ["节点选择", "My server"]);
+    }
+
 }

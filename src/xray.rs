@@ -125,7 +125,6 @@ pub fn default_strategy() -> Strategy {
     strategy.rule_sets.clear();
     let mut selector = Group::all_nodes("节点选择".into(), "select".into());
     selector.group_refs = vec!["美国优先".into(), "日本优先".into(), "香港优先".into()];
-    selector.selected = "美国优先".into();
     strategy.groups = vec![selector];
     for (name, order) in [
         ("美国优先", ["美国", "日本", "香港"]),
