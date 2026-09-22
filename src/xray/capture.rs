@@ -131,9 +131,7 @@ impl admission::Routing for ApplicationRouting {
             policy::decide_application(&strategy, &runtime.catalog, &runtime.health.read().expect("health"), &context)
         };
         let host = if request.kind == "dns" {
-            if request.host.parse::<std::net::IpAddr>().is_ok() { request.host.clone() }
-            else if decision.route == policy::Route::Direct { self.direct_dns_resolver.clone() }
-            else { crate::compile::DNS_NAMESERVERS[0].to_string() }
+            dns_target(&request.host, &decision.route, &self.direct_dns_resolver)
         } else {
             request.hostname.as_ref().filter(|name| !name.is_empty()).unwrap_or(&request.host).clone()
         };
@@ -165,8 +163,29 @@ impl admission::Routing for ApplicationRouting {
     }
 }
 
+fn dns_target(original: &str, route: &policy::Route, system_resolver: &str) -> String {
+    if *route != policy::Route::Direct {
+        // A system resolver reachable locally may not answer from the selected proxy exit.
+        crate::compile::DNS_NAMESERVERS[0].to_string()
+    } else if original.parse::<std::net::IpAddr>().is_ok() {
+        original.to_string()
+    } else {
+        system_resolver.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn captured_dns_uses_a_resolver_for_the_selected_route() {
+        use super::{dns_target, policy::Route};
+        let proxy = Route::Node("US".into());
+        assert_eq!(dns_target("223.5.5.5", &proxy, "223.5.5.5"), "1.1.1.1");
+        assert_eq!(dns_target("example.com", &proxy, "223.5.5.5"), "1.1.1.1");
+        assert_eq!(dns_target("192.168.1.1", &Route::Direct, "223.5.5.5"), "192.168.1.1");
+        assert_eq!(dns_target("example.com", &Route::Direct, "223.5.5.5"), "223.5.5.5");
+    }
+
     #[test]
     fn xray_dns_preflight_checks_a_real_framed_answer_and_transaction_id() {
         use std::io::{Read,Write};

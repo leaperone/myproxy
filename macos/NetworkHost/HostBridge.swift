@@ -423,10 +423,22 @@ private actor HostController {
             try intent.check()
             try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
             try intent.check()
+            #if MYPROXY_XRAY
+            try await waitForDNSProvider(
+                revision: request.revision,
+                activationIdentifier: activationIdentifier,
+                intent: intent
+            )
+            #endif
             // Preferences and the SOCKS backend can both look ready while
             // getaddrinfo is still hung on a name-endpoint flow.
             let probe = await dnsProxy.proveSystemResolver()
             AppLog.info("ne-host", "system resolver probe=\(probe)")
+            #if MYPROXY_XRAY
+            if let status = try? await transparentProxy.runtimeStatus().dnsRuntimeReport?.status {
+                AppLog.info("ne-host", "DNS delivery flows=\(status.totalFlows) failed=\(status.failedFlows) sent=\(status.uploadBytes) received=\(status.downloadBytes)")
+            }
+            #endif
             switch probe {
             case .intercepted, .clear:
                 break
@@ -604,6 +616,48 @@ private func isRecoverableDNSProxyDisableError(_ error: Error) -> Bool {
 }
 
 private extension HostController {
+    #if MYPROXY_XRAY
+    func waitForDNSProvider(
+        revision: UInt64,
+        activationIdentifier: UUID,
+        intent: HostSharedIntent
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            try intent.check()
+            let response = try await transparentProxy.runtimeStatus()
+            if let report = response.dnsRuntimeReport,
+               report.expectedRevision == revision,
+               report.expectedActivationIdentifier == activationIdentifier {
+                if let failure = report.startupFailure {
+                    throw NetworkExtensionControlFailure(
+                        operation: .configureDNSProxy,
+                        message: "DNS provider startup failed: \(failure.reason.rawValue)"
+                    )
+                }
+                if let status = report.status,
+                   (try? status.validate(expectedRevision: revision, activationIdentifier: activationIdentifier)) != nil {
+                    if status.isOperational {
+                        AppLog.info("ne-host", "DNS provider ready before system resolver probe")
+                        return
+                    }
+                    if status.phase == .failed {
+                        throw NetworkExtensionControlFailure(
+                            operation: .configureDNSProxy,
+                            message: "DNS provider failed: \(status.failureCategory?.rawValue ?? "unknown")"
+                        )
+                    }
+                }
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        throw NetworkExtensionControlFailure(
+            operation: .configureDNSProxy,
+            message: "DNS provider did not become ready before the system resolver probe"
+        )
+    }
+    #endif
+
     /// Only for enable/restart: a denied disable must not block writing a new
     /// DNS configuration. A full disable still throws so the core stays up.
     func disableDNSProxyAllowingDenied(intent: HostSharedIntent) async throws {

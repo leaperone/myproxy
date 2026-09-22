@@ -103,13 +103,16 @@ the original system path. For these cases, an application Direct decision uses
 the extension's direct transport, without sending payload through the app or
 Xray. Failure to contact the application rejects the captured request; it does
 not silently bypass the configured policy.
-Proxied DNS requests on UDP port 53 use TCP through that same selected node and
-keep the requested resolver. This supports nodes that relay TCP but reject UDP
-DNS. Other UDP traffic still requires UDP support from the selected node.
+Captured DNS requests routed through a proxy use TCP to the app's public DNS
+resolver through the selected node. The original system resolver can be local
+to the user's network and unreachable from that node. Explicit SOCKS UDP DNS
+requests retain their requested resolver. Other UDP traffic still requires UDP
+support from the selected node.
 Direct DNS also uses TCP in the extension. Before enabling capture, the app
 queries the configured system resolvers and chooses one that returns a DNS
-answer. If DNS activation fails, it disables both DNS and transparent capture;
-the local HTTP/SOCKS entrance remains available.
+answer. Startup waits for the current DNS provider to be ready before testing
+the system resolver. If DNS activation fails, it disables both DNS and
+transparent capture; the local HTTP/SOCKS entrance remains available.
 
 New configurations start in global mode through 节点选择, with 美国优先,
 日本优先, 香港优先, and a direct choice. Groups expand to show their nodes;
