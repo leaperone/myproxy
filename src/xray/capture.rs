@@ -14,8 +14,15 @@ impl CaptureService {
     pub fn prepare() -> Result<Self> {
         let resolvers = std::process::Command::new("/usr/sbin/scutil").arg("--dns").output()
             .context("无法读取当前系统 DNS 设置")?;
+        if !resolvers.status.success() { bail!("无法读取系统 DNS 设置：scutil 退出码 {:?}", resolvers.status.code()); }
         let resolvers = system_resolvers(&String::from_utf8_lossy(&resolvers.stdout));
-        let direct_dns_resolver = select_resolver(&resolvers, |ip| probe_dns(std::net::SocketAddr::new(ip,53)))
+        if resolvers.is_empty() { bail!("系统没有返回 DNS 服务器，系统接管未启用"); }
+        let direct_dns_resolver = select_resolver(&resolvers, |ip| {
+            match probe_dns_answer(std::net::SocketAddr::new(ip,53)) {
+                Ok(()) => true,
+                Err(error) => { crate::log::warn("xray-dns", format!("system resolver TCP probe {ip}: {error:#}")); false }
+            }
+        })
             .context("系统 DNS 服务器没有响应，系统接管未启用；本地代理继续可用")?;
         let admission = admission::AdmissionService::start(Arc::new(ApplicationRouting { direct_dns_resolver }))?;
         let (username, password) = admission.probe_credentials();
@@ -70,10 +77,9 @@ fn select_resolver(resolvers: &[std::net::IpAddr], probe: impl Fn(std::net::IpAd
     })
 }
 
-fn probe_dns(address: std::net::SocketAddr) -> bool {
+fn probe_dns_answer(address: std::net::SocketAddr) -> Result<()> {
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
-    let result = (|| -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(700))?;
         stream.set_write_timeout(Some(Duration::from_millis(500)))?;
@@ -98,14 +104,8 @@ fn probe_dns(address: std::net::SocketAddr) -> bool {
         let size = u16::from_be_bytes(length) as usize;
         if !(12..=4096).contains(&size) { bail!("Invalid DNS response size"); }
         let mut answer=vec![0;size];read(&mut answer)?;
-        // Some local resolvers rewrite the transaction id while forwarding a
-        // TCP probe. The probe only decides whether this resolver can answer,
-        // so validate the DNS response shape and at least one answer instead
-        // of rejecting a usable resolver for an id mismatch.
-        if answer[2]&128==0 || answer[3]&15!=0 || answer[6..8]==[0,0] { bail!("Invalid DNS response"); }
+        if answer[..2] != query[..2] || answer[2]&128==0 || answer[3]&15!=0 || answer[6..8]==[0,0] { bail!("Invalid DNS response"); }
         Ok(())
-    })();
-    result.is_ok()
 }
 
 struct ApplicationRouting { direct_dns_resolver: String }
@@ -184,7 +184,7 @@ mod tests {
                 stream.write_all(&(query.len() as u16).to_be_bytes()).unwrap();
                 stream.write_all(&query).unwrap();
             });
-            assert!(super::probe_dns(address));
+            assert_eq!(super::probe_dns_answer(address).is_ok(),correct_id);
             server.join().unwrap();
         }
     }
