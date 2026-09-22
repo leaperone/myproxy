@@ -1405,7 +1405,7 @@ impl AppView {
             });
         });
         let rule_query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选规则…"));
-        let global_query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选 GLOBAL…"));
+        let global_query = cx.new(|cx| InputState::new(window, cx).placeholder(if backend::is_xray() { "搜索出口或节点…" } else { "筛选 GLOBAL…" }));
         let member_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索所有组的节点…"));
         cx.observe(&rule_query, |_, _, cx| cx.notify()).detach();
@@ -1477,7 +1477,7 @@ impl AppView {
             live_revision: 0,
             member_query,
             member_limits: HashMap::new(),
-            global_limit: 36,
+            global_limit: if backend::is_xray() { 0 } else { 36 },
         };
         this
     }
@@ -3768,7 +3768,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "节点组",
-                if backend::is_xray() { "直接点击节点即可切换。自动组也可以固定节点，或恢复自动选择。全局出口控制全部代理流量。" } else { "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件。" },
+                if backend::is_xray() { "展开节点组，点击方案或节点即可切换。自动组可以固定选择，也可以恢复自动。" } else { "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件。" },
             ))
             .child(
                 h_flex().child({
@@ -3784,7 +3784,7 @@ impl AppView {
                         })
                 }),
             )
-            .child({
+            .when(!backend::is_xray() || self.strategy.uses_global(), |this| this.child({
                 let now = self.global_now();
                 let members = self.global_members(cx);
                 render_global_card(
@@ -3800,7 +3800,7 @@ impl AppView {
                     self.global_limit,
                     self.is_busy(),
                 )
-            })
+            }))
             .child(v_flex().gap_1().child(div().text_xs().child("搜索节点组成员")).child(Input::new(&self.member_query)))
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint_action(
@@ -5801,7 +5801,7 @@ fn render_global_card(
                 .text_xs()
                 .text_color(muted_fg)
                 .child(if inbound_global {
-                    format!("当前 {now_label}  ·  Mixed 或接管为全局时整段走这里")
+                    format!("当前 {now_label}  ·  全局模式的流量使用这个出口")
                 } else {
                     format!("当前 {now_label}  ·  未开全局时只作备用，规则仍按组走")
                 }),
@@ -5842,7 +5842,7 @@ fn render_global_card(
                     })),
             )
         })
-        .when(shown_empty, |this| {
+        .when(shown_empty && members.is_empty(), |this| {
             this.child(
                 div()
                     .text_xs()
@@ -5855,7 +5855,7 @@ fn render_global_card(
             this.child(
                 Button::new("more-GLOBAL")
                     .small()
-                    .label(format!("继续显示（{} / {}）", limit, members.len()))
+                    .label(if limit == 0 { format!("展开可选出口（{}）", members.len()) } else { format!("继续显示（{} / {}）", limit, members.len()) })
                     .on_click(move |_, _, app| {
                         entity.update(app, |this, cx| {
                             this.global_limit += 36;
