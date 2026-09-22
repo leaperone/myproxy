@@ -18,7 +18,7 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 | --- | --- | --- |
 | Prod | `https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml` | Push a `vMAJOR.MINOR.PATCH` tag, or run Release with channel `prod` and that existing tag. |
 | Nightly | `https://github.com/leaperone/myproxy/releases/download/nightly/appcast.xml` | Builds `main` daily at 18:00 UTC, or run Release with channel `nightly`. |
-| Xray | `https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml` | Publish a verified `v0.0.10-xray.DATE.RUN.ATTEMPT` tag through the Xray workflow. |
+| Xray | `https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml` | Build `xray` on push or run its workflow on that branch; publish only after validation. |
 
 Nightly builds are GitHub prereleases with immutable build tags. The `nightly` prerelease points to the latest Nightly feed. Both channels generate Sparkle deltas from recent same-channel archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow. While the core is connected, Check for Updates and archive/delta downloads use Mixed as an HTTP proxy.
 
@@ -147,10 +147,21 @@ matchers. Imported user-ID and destination-port conditions remain joint
 constraints on their original destination rules; they are not widened into
 standalone user or network rules.
 
+All three channels use the base version in `Cargo.toml`. Prod publishes
+`vMAJOR.MINOR.PATCH`; Nightly uses
+`vMAJOR.MINOR.PATCH-nightly.YYYYMMDD.RUN.ATTEMPT`; Xray uses
+`vMAJOR.MINOR.PATCH-xray.YYYYMMDD.RUN.ATTEMPT`. For example, with base version
+`0.0.10`, the Xray archive is `myproxy-0.0.10-xray.20260922.71.1.sparkle.zip`.
+Nightly and Xray are channel releases on GitHub and never replace the latest
+Prod release. Their separate feed pointers are `nightly` and `xray`.
+
 The Xray workflow tests feature-branch pushes. A commit marked `[xray-package]`
 also produces a signed, notarized candidate artifact for local acceptance, without
-publishing. An immutable `v0.0.10-xray.DATE.RUN.ATTEMPT` tag builds and publishes an Xray release
-and updates only the `xray` feed pointer. Distribution requires Developer ID
+publishing. A push to `xray`, or a manual run on that branch, creates a version
+Release and Tag only after testing, signing, and package validation pass. It then
+updates the `xray` feed pointer. Failed builds create no version tags. The app
+and extension use the numeric `RUN.ATTEMPT` build number for update ordering;
+this also upgrades the earlier incorrectly named `1.6.x` packages. Distribution requires Developer ID
 signing, the host and extension provisioning profiles, Apple notarization,
 stapling, Gatekeeper acceptance, and a signed Xray appcast. There is no ad-hoc
 fallback. Original Prod/Nightly release scripts and workflow remain unchanged.

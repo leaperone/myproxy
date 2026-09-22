@@ -4,14 +4,20 @@ cd "$(dirname "$0")/.."
 
 : "${MYPROXY_XRAY_VERSION:?MYPROXY_XRAY_VERSION is required}"
 : "${MYPROXY_XRAY_BUILD_NUMBER:?MYPROXY_XRAY_BUILD_NUMBER is required}"
+: "${MYPROXY_RELEASE_TAG:?MYPROXY_RELEASE_TAG is required}"
 version="$MYPROXY_XRAY_VERSION"
 build_number="$MYPROXY_XRAY_BUILD_NUMBER"
 target_dir="${CARGO_TARGET_DIR:-target/xray-build}"
 identity="${CODESIGN_IDENTITY:-}"
 host_profile="${MYPROXY_HOST_DEVID_PROFILE_PATH:-}"
 extension_profile="${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE_PATH:-}"
-[[ "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || { echo "invalid Xray version" >&2; exit 1; }
-[[ "$build_number" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { echo "invalid Xray build number" >&2; exit 1; }
+PYTHONPATH=scripts python3 - "$version" "$build_number" "$MYPROXY_RELEASE_TAG" <<'PY'
+import pathlib, sys, tomllib
+from xray_release_metadata import validate_release
+version, build, tag = sys.argv[1:]
+base = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"]
+validate_release(version, build, tag, f"myproxy-{version}.sparkle.zip", base)
+PY
 [[ -n "$identity" ]] || { echo "CODESIGN_IDENTITY is required for a distributable Xray build" >&2; exit 1; }
 [[ -s "$host_profile" && -s "$extension_profile" ]] || { echo "Developer ID provisioning profiles are required" >&2; exit 1; }
 

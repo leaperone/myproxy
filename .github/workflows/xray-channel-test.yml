@@ -2,17 +2,21 @@ name: Xray channel
 on:
   push:
     branches: [feat/xray-channel-1.6, xray]
-    tags: ["v*-xray.*"]
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
   group: myproxy-xray-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') || !contains(github.ref, '-xray.') }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/xray' }}
 jobs:
   test:
     runs-on: macos-15
     timeout-minutes: 30
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+      archive: ${{ steps.metadata.outputs.archive }}
     env:
       CARGO_TARGET_DIR: target/xray-build
       XRAY_BINARY: ${{ github.workspace }}/resources/xray/xray
@@ -41,6 +45,7 @@ jobs:
       - run: python3 scripts/test-install-xray-recovery.py
       - run: python3 scripts/test-xray-resource-limits.py
       - run: python3 scripts/test-xray-release-metadata.py
+      - run: python3 scripts/test-xray-release-artifacts.py
       - run: scripts/fetch-xray.sh
       - run: rustfmt --edition 2021 src/xray.rs src/backend.rs
       - uses: actions/upload-artifact@v4
@@ -55,25 +60,14 @@ jobs:
       - run: scripts/fetch-sparkle.sh
       - run: cargo build --locked --bins --features sparkle,xray-channel
       - name: Set Xray release metadata
-        if: (startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-xray.')) || contains(github.event.head_commit.message, '[xray-package]')
+        id: metadata
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
         run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/v*-xray.* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            release_tag="$GITHUB_REF_NAME"
-            build_number="$(sed -E 's/.*-xray\.[0-9]{8}\.([0-9]+\.[0-9]+)$/\1/' <<< "$version")"
-            [[ "$build_number" != "$version" ]] || { echo "invalid Xray tag $GITHUB_REF_NAME" >&2; exit 1; }
-          else
-            eval "$(python3 scripts/xray_release_metadata.py --date "$(date -u +%Y%m%d)" --run "$GITHUB_RUN_NUMBER" --attempt "$GITHUB_RUN_ATTEMPT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("MYPROXY_XRAY_VERSION="+d["version"]); print("MYPROXY_RELEASE_TAG="+d["tag"]); print("MYPROXY_XRAY_BUILD_NUMBER="+d["build_number"])')"
-            version="$MYPROXY_XRAY_VERSION"
-            release_tag="$MYPROXY_RELEASE_TAG"
-            build_number="$MYPROXY_XRAY_BUILD_NUMBER"
-          fi
-          echo "MYPROXY_XRAY_VERSION=${version}" >> "${GITHUB_ENV}"
-          echo "MYPROXY_RELEASE_TAG=${release_tag}" >> "${GITHUB_ENV}"
-          echo "MYPROXY_XRAY_BUILD_NUMBER=${build_number}" >> "${GITHUB_ENV}"
+          python3 scripts/xray_release_metadata.py \
+            --run "$GITHUB_RUN_NUMBER" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
       - name: Import Developer ID certificate
-        if: (startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-xray.')) || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
         run: |
           set -euo pipefail
           certificate_path="${RUNNER_TEMP}/myproxy-xray-developer-id.p12"
@@ -94,7 +88,7 @@ jobs:
           echo "MYPROXY_XRAY_KEYCHAIN_PATH=${keychain_path}" >> "${GITHUB_ENV}"
           echo "MYPROXY_XRAY_CERTIFICATE_PATH=${certificate_path}" >> "${GITHUB_ENV}"
       - name: Decode Developer ID profiles
-        if: (startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-xray.')) || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
         run: |
           set -euo pipefail
           [[ -n "${MYPROXY_HOST_DEVID_PROFILE}" && -n "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE}" ]] || { echo "Developer ID profiles are required" >&2; exit 1; }
@@ -104,15 +98,15 @@ jobs:
           echo "MYPROXY_HOST_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/host.provisionprofile" >> "${GITHUB_ENV}"
           echo "MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/network-extension.provisionprofile" >> "${GITHUB_ENV}"
       - run: scripts/package-xray-test.sh
-        if: (startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-xray.')) || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
       - uses: actions/upload-artifact@v4
-        if: (startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-xray.')) || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
         with:
-          name: myproxy-xray-${{ github.sha }}
+          name: myproxy-xray-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/xray-channel/*
           if-no-files-found: error
       - name: Preserve package diagnostics
-        if: failure() && ((startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-xray.')) || contains(github.event.head_commit.message, '[xray-package]'))
+        if: failure() && (github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]'))
         uses: actions/upload-artifact@v4
         with:
           name: xray-package-diagnostics-${{ github.sha }}
@@ -128,50 +122,22 @@ jobs:
 
   publish:
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-xray.')
+    if: github.ref == 'refs/heads/xray'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: myproxy-xray-${{ github.sha }}
+          name: myproxy-xray-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-assets
-      - name: Publish immutable Xray release and update Xray feed pointer
+      - name: Publish verified Xray build and update its feed
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
-          assets="release-assets"
-          archive="${assets}/myproxy-${version}.sparkle.zip"
-          checksum="${archive}.sha256"
-          appcast="${assets}/appcast.xml"
-          test -s "$archive" -a -s "$checksum" -a -s "$appcast"
-          body="$(mktemp)"
-          pointer_body="$(mktemp)"
-          remote="$(mktemp -d)"
-          trap 'rm -f "$body" "$pointer_body"; rm -rf "$remote"' EXIT
-          printf 'MyProxy Xray %s\n\nSource: %s\n' "$version" "$GITHUB_SHA" > "$body"
-          printf 'Xray channel feed pointer for immutable release %s.\n' "$tag" > "$pointer_body"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release download "$tag" --pattern "myproxy-${version}.sparkle.zip.sha256" --dir "$remote"
-            cmp -s "$checksum" "$remote/myproxy-${version}.sparkle.zip.sha256" || {
-              echo "immutable Xray release exists with a different digest" >&2
-              exit 1
-            }
-          else
-            gh release create "$tag" "$archive" "$appcast" "$checksum" \
-              --target "$GITHUB_SHA" --latest=false --title "myproxy Xray $version" --notes-file "$body"
-          fi
-          if gh release view xray >/dev/null 2>&1; then
-            gh release upload xray "$appcast" --clobber
-            gh release edit xray --latest=false --notes-file "$pointer_body"
-            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/xray" \
-              -f sha="$GITHUB_SHA" -F force=true >/dev/null
-          else
-            gh release create xray "$appcast" --target "$GITHUB_SHA" --latest=false \
-              --title "MyProxy Xray update channel" --notes-file "$pointer_body"
-          fi
+          XRAY_VERSION: ${{ needs.test.outputs.version }}
+          XRAY_TAG: ${{ needs.test.outputs.tag }}
+          XRAY_BUILD_NUMBER: ${{ needs.test.outputs.build_number }}
+          XRAY_ARCHIVE: ${{ needs.test.outputs.archive }}
+        run: python3 scripts/publish-xray-release.py release-assets

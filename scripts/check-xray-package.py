@@ -9,12 +9,16 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import datetime
 import fnmatch
-import re
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from xray_release_metadata import validate_release
 archive_path = Path(sys.argv[1])
 with zipfile.ZipFile(sys.argv[1]) as archive:
     names = archive.namelist()
     root = "MyProxy.app/Contents/"
     info = plistlib.loads(archive.read(root + "Info.plist"))
+    version = info["CFBundleShortVersionString"]
+    build_number = info["CFBundleVersion"]
+    validate_release(version, build_number, "v" + version, archive_path.name)
     assert info["CFBundleIdentifier"] == "local.harry.myproxy"
     assert info["CFBundleDisplayName"] == "MyProxy"
     assert info["CFBundleExecutable"] == "myproxy"
@@ -23,6 +27,9 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     assert all(root + "MacOS/" + name in names for name in ("myproxy", "myproxyctl", "xray"))
     assert root + "Frameworks/Sparkle.framework/" in "\n".join(names)
     extension = root + "Library/SystemExtensions/local.harry.myproxy.network-extension.systemextension/Contents/"
+    extension_info = plistlib.loads(archive.read(extension + "Info.plist"))
+    assert extension_info["CFBundleShortVersionString"] == version
+    assert extension_info["CFBundleVersion"] == build_number
     assert extension + "embedded.provisionprofile" in names
     assert extension + "MacOS/MyproxyNetworkExtension" in names
     assert root + "embedded.provisionprofile" in names
@@ -69,7 +76,6 @@ if len(sys.argv) == 3:
     assert any(element.tag.endswith("channel") and element.text == "xray" for element in item)
     enclosure = next(element for element in item if element.tag.endswith("enclosure"))
     short_version = info["CFBundleShortVersionString"]
-    assert re.fullmatch(r"\d+\.\d+\.\d+-xray\.\d{8}\.\d+\.\d+", short_version)
     assert "/releases/download/v" in enclosure.attrib["url"]
     assert archive_path.name == "myproxy-" + short_version + ".sparkle.zip"
     assert enclosure.attrib["url"] == "https://github.com/leaperone/myproxy/releases/download/v" + short_version + "/" + archive_path.name
