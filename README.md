@@ -143,6 +143,11 @@ signing, the host and extension provisioning profiles, Apple notarization,
 stapling, Gatekeeper acceptance, and a signed Xray appcast. There is no ad-hoc
 fallback. Original Prod/Nightly release scripts and workflow remain unchanged.
 
+For a local signed upgrade, run `python3 scripts/install-xray-channel.py ARCHIVE`.
+The installer verifies the package before stopping the app, backs up the current
+configuration and bundle, and restores an existing connection after replacement.
+It checks HTTP and SOCKS access on the original port before reporting success.
+
 ## Routing and runtime state
 
 `strategy.json` stores the saved configuration. Saving, applying, Mihomo readiness,

@@ -86,8 +86,9 @@ fn probe_dns_answer(address: std::net::SocketAddr) -> Result<()> {
         let id = uuid::Uuid::new_v4();
         let mut query = id.as_bytes()[..2].to_vec();
         query.extend_from_slice(b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01");
-        stream.write_all(&(query.len() as u16).to_be_bytes())?;
-        stream.write_all(&query)?;
+        let mut frame = (query.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(&query);
+        stream.write_all(&frame)?;
         let mut read = |bytes: &mut [u8]| -> Result<()> {
             let mut offset = 0;
             while offset < bytes.len() {
