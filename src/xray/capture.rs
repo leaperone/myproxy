@@ -136,7 +136,7 @@ impl admission::Routing for ApplicationRouting {
             policy::decide_application(&strategy, &runtime.catalog, &runtime.health.read().expect("health"), &context)
         };
         let host = if request.kind == "dns" {
-            self.direct_dns.target(&request.host, request.hostname.as_deref(), &decision.route)
+            self.direct_dns.target(&request.host, &decision.route)
         } else {
             request.hostname.as_ref().filter(|name| !name.is_empty()).unwrap_or(&request.host).clone()
         };
@@ -169,14 +169,13 @@ impl admission::Routing for ApplicationRouting {
 }
 
 impl DirectDns {
-    fn target(&self, original: &str, queried_name: Option<&str>, route: &policy::Route) -> String {
+    fn target(&self, original: &str, route: &policy::Route) -> String {
         if *route != policy::Route::Direct {
             return crate::compile::DNS_NAMESERVERS[0].to_string();
         }
         let address = original.parse::<std::net::IpAddr>().ok();
         // Browsers can query a system resolver without supplying hostname metadata.
-        if queried_name.is_some_and(|name| !name.is_empty()) || address.is_none()
-            || address.is_some_and(|ip| self.system_resolvers.contains(&ip)) {
+        if address.is_none() || address.is_some_and(|ip| self.system_resolvers.contains(&ip)) {
             self.selected.clone()
         } else {
             original.to_string()
@@ -194,12 +193,12 @@ mod tests {
             system_resolvers: vec!["119.29.29.29".parse().unwrap(), "223.5.5.5".parse().unwrap()],
         };
         let proxy = Route::Node("US".into());
-        assert_eq!(dns.target("223.5.5.5", Some("example.com"), &proxy), "1.1.1.1");
-        assert_eq!(dns.target("example.com", None, &proxy), "1.1.1.1");
-        assert_eq!(dns.target("119.29.29.29", Some("example.com"), &Route::Direct), "223.5.5.5");
-        assert_eq!(dns.target("119.29.29.29", None, &Route::Direct), "223.5.5.5");
-        assert_eq!(dns.target("192.168.1.1", None, &Route::Direct), "192.168.1.1");
-        assert_eq!(dns.target("example.com", None, &Route::Direct), "223.5.5.5");
+        assert_eq!(dns.target("223.5.5.5", &proxy), "1.1.1.1");
+        assert_eq!(dns.target("example.com", &proxy), "1.1.1.1");
+        assert_eq!(dns.target("119.29.29.29", &Route::Direct), "223.5.5.5");
+        assert_eq!(dns.target("192.168.1.1", &Route::Direct), "192.168.1.1");
+        assert_eq!(dns.target("8.8.8.8", &Route::Direct), "8.8.8.8");
+        assert_eq!(dns.target("example.com", &Route::Direct), "223.5.5.5");
     }
 
     #[test]
