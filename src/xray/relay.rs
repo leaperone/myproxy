@@ -1010,7 +1010,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn listener_survives_child_emfile_without_recreation() {
-        let control = std::env::temp_dir().join(format!("myproxy-emfile-{}", std::process::id()));
+        let control = std::env::var_os("MYPROXY_RELAY_EMFILE_CONTROL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("myproxy-emfile-{}", std::process::id())));
         let release = control.with_extension("release");
         let done = control.with_extension("done");
         if std::env::var_os("MYPROXY_RELAY_EMFILE_CHILD").is_some() {
@@ -1050,6 +1052,7 @@ mod tests {
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "xray::relay::tests::listener_survives_child_emfile_without_recreation", "--nocapture"])
             .env("MYPROXY_RELAY_EMFILE_CHILD", "1")
+            .env("MYPROXY_RELAY_EMFILE_CONTROL", &control)
             .spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while !control.exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
