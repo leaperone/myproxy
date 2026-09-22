@@ -14,6 +14,10 @@ const MAX_ACTIVE: usize = 128;
 const HEADER_LIMIT: usize = 32 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
+fn is_resource_exhaustion(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
 pub struct Dialed {
     pub stream: TcpStream,
     pub chain: String,
@@ -128,7 +132,18 @@ impl MixedServer {
         let shared = state.clone();
         let acceptor = thread::Builder::new().name("myproxy-admission-relay".into()).spawn(move || {
             while !shared.stop.load(Ordering::Acquire) {
-                let Ok((client, _)) = listener.accept() else { thread::sleep(Duration::from_millis(2)); continue; };
+                let (client, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if is_resource_exhaustion(&error) => {
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
                 if client.set_nonblocking(false).is_err() { continue; }
                 if shared.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_ACTIVE).then_some(n + 1)).is_err() {
                     let _ = client.shutdown(Shutdown::Both); continue;
@@ -255,6 +270,12 @@ impl MixedServer {
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) if is_resource_exhaustion(&error) => {
+                            // Keep the listener alive while transient process
+                            // descriptor pressure subsides. Existing flows
+                            // continue to drain and release their clones.
+                            thread::sleep(Duration::from_millis(100));
                         }
                         Err(_) => break,
                     }
@@ -402,14 +423,13 @@ fn serve_dynamic(
     entry.label.lock().expect("flow label").1 = if dialed.rule.is_empty() { dialed.chain.clone() } else { format!("{} → {}", dialed.rule, dialed.chain) };
     client.write_all(&request.handshake)?;
     for socket in [&client, &dialed.stream] { socket.set_read_timeout(Some(Duration::from_secs(1)))?; socket.set_write_timeout(Some(Duration::from_secs(15)))?; }
-    let mut upload_client = client.try_clone()?; let mut upload_target = dialed.stream.try_clone()?;
     thread::scope(|scope| {
         let upload = scope.spawn(|| {
-            let result = pump(&mut upload_client, &mut upload_target, &request.initial, request.body_limit, entry, state, true);
+            let result = pump(&client, &dialed.stream, &request.initial, request.body_limit, entry, state, true);
             if result.is_err() { entry.close(); }
             result
         });
-        let download = pump(&mut dialed.stream, &mut client, &[], None, entry, state, false);
+        let download = pump(&dialed.stream, &client, &[], None, entry, state, false);
         if download.is_err() { entry.close(); }
         let sent = upload.join().map_err(|_| anyhow::anyhow!("连接转发线程异常"))?;
         sent.and(download)
@@ -506,13 +526,11 @@ fn serve(
         socket.set_read_timeout(Some(Duration::from_secs(1)))?;
         socket.set_write_timeout(Some(Duration::from_secs(15)))?;
     }
-    let mut upload_client = client.try_clone()?;
-    let mut upload_target = dialed.stream.try_clone()?;
     thread::scope(|scope| {
         let upload = scope.spawn(|| {
             let result = pump(
-                &mut upload_client,
-                &mut upload_target,
+                &client,
+                &dialed.stream,
                 &request.initial,
                 request.body_limit,
                 entry,
@@ -525,8 +543,8 @@ fn serve(
             result
         });
         let download = pump(
-            &mut dialed.stream,
-            &mut client,
+            &dialed.stream,
+            &client,
             &[],
             None,
             entry,
@@ -543,8 +561,8 @@ fn serve(
     })
 }
 fn pump(
-    input: &mut TcpStream,
-    output: &mut TcpStream,
+    input: &TcpStream,
+    output: &TcpStream,
     initial: &[u8],
     limit: Option<u64>,
     entry: &Entry,
@@ -953,6 +971,103 @@ pub fn dial_socks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resource_exhaustion_keeps_accept_loop_retriable() {
+        assert!(is_resource_exhaustion(&io::Error::from_raw_os_error(libc::EMFILE)));
+        assert!(is_resource_exhaustion(&io::Error::from_raw_os_error(libc::ENFILE)));
+        assert!(!is_resource_exhaustion(&io::Error::from_raw_os_error(libc::ECONNABORTED)));
+    }
+
+    #[test]
+    fn flow_guard_releases_tracked_socket_clones() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let state = Arc::new(State {
+            stop: AtomicBool::new(false), active: AtomicUsize::new(1), serial: AtomicU64::new(1),
+            up: AtomicU64::new(0), down: AtomicU64::new(0), rows: Mutex::new(VecDeque::new()),
+        });
+        let entry = Arc::new(Entry {
+            id: "cleanup".into(), started: Instant::now(), source_port: 0, udp: AtomicBool::new(false),
+            visible: AtomicBool::new(true), label: Mutex::new((String::new(), String::new())),
+            process: Mutex::new(String::new()), app_matcher: Mutex::new(String::new()), sockets: Mutex::new(vec![]),
+            closed: AtomicBool::new(false), finished: AtomicBool::new(false), up: AtomicU64::new(0), down: AtomicU64::new(0), last_activity: AtomicU64::new(0),
+        });
+        entry.track(&client).unwrap();
+        entry.track(&server).unwrap();
+        assert_eq!(entry.sockets.lock().unwrap().len(), 2);
+        #[cfg(unix)]
+        let tracked_fd = std::os::unix::io::AsRawFd::as_raw_fd(&entry.sockets.lock().unwrap()[0]);
+        {
+            let _guard = FlowGuard { state, entry: entry.clone() };
+        }
+        assert!(entry.sockets.lock().unwrap().is_empty());
+        assert!(entry.finished.load(Ordering::Acquire));
+        #[cfg(unix)]
+        assert_eq!(unsafe { libc::fcntl(tracked_fd, libc::F_GETFD) }, -1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_survives_child_emfile_without_recreation() {
+        let control = std::env::temp_dir().join(format!("myproxy-emfile-{}", std::process::id()));
+        let release = control.with_extension("release");
+        let done = control.with_extension("done");
+        if std::env::var_os("MYPROXY_RELAY_EMFILE_CHILD").is_some() {
+            unsafe {
+                let limit = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+            }
+            let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let target_address = target.local_addr().unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let relay_address = listener.local_addr().unwrap();
+            let server = MixedServer::start(listener, Arc::new(move |_, _| {
+                Ok(Dialed { stream: TcpStream::connect(target_address)?, chain: "EMFILE".into(), rule: "fixture".into() })
+            })).unwrap();
+            std::fs::write(&control, format!("{}\n{}\n", relay_address.port(), target_address.port())).unwrap();
+            let target_worker = thread::spawn(move || {
+                let (mut stream, _) = target.accept().unwrap();
+                let mut request = [0; 4]; stream.read_exact(&mut request).unwrap();
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").unwrap();
+            });
+            let mut held = Vec::new();
+            while let Ok(file) = std::fs::File::open("/dev/null") { held.push(file); }
+            while !release.exists() { thread::sleep(Duration::from_millis(5)); }
+            drop(held);
+            target_worker.join().unwrap();
+            drop(server);
+            std::fs::write(done, "done").unwrap();
+            return;
+        }
+        let _ = std::fs::remove_file(&control);
+        let _ = std::fs::remove_file(&release);
+        let _ = std::fs::remove_file(&done);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "xray::relay::tests::listener_survives_child_emfile_without_recreation", "--nocapture"])
+            .env("MYPROXY_RELAY_EMFILE_CHILD", "1")
+            .spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !control.exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
+        assert!(control.exists(), "child did not publish relay metadata");
+        let ports: Vec<u16> = std::fs::read_to_string(&control).unwrap().lines().map(|line| line.parse().unwrap()).collect();
+        assert_eq!(ports.len(), 2);
+        let mut client = TcpStream::connect(("127.0.0.1", ports[0])).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"GET http://fixture.invalid/ HTTP/1.1\r\nHost: fixture.invalid\r\n\r\n").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        std::fs::write(&release, "release").unwrap();
+        let mut response = String::new(); client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("200 OK"), "listener failed to recover after EMFILE: {response:?}");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done.exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
+        assert!(done.exists(), "child did not complete");
+        let status = child.wait_with_output().unwrap();
+        assert!(status.status.success(), "child failed: {}", String::from_utf8_lossy(&status.stderr));
+        let _ = std::fs::remove_file(control);
+        let _ = std::fs::remove_file(release);
+        let _ = std::fs::remove_file(done);
+    }
     #[test]
     fn ipv6_authorities_and_invalid_ports() {
         assert_eq!(

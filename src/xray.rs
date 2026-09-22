@@ -35,6 +35,50 @@ static SERVICE: OnceLock<Mutex<Service>> = OnceLock::new();
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
+/// The Xray channel owns a loopback relay in addition to the core and may
+/// briefly hold several descriptors per active flow. macOS launchd commonly
+/// starts GUI processes with a soft limit of 256, which is too small for the
+/// bounded relay capacity. Raise only this process's soft limit and never
+/// change the hard limit or the default backend's process budget.
+pub fn raise_process_fd_limit() {
+    #[cfg(unix)]
+    {
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) };
+        if result != 0 {
+            crate::log::warn(
+                "xray-resource",
+                format!("读取文件描述符上限失败 errno={}", std::io::Error::last_os_error()),
+            );
+            return;
+        }
+        let target = (16_384 as libc::rlim_t).min(limits.rlim_max);
+        if target <= limits.rlim_cur {
+            crate::log::info(
+                "xray-resource",
+                format!("文件描述符预算保持 soft={} hard={}", limits.rlim_cur, limits.rlim_max),
+            );
+            return;
+        }
+        let before = limits.rlim_cur;
+        limits.rlim_cur = target;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+            crate::log::warn(
+                "xray-resource",
+                format!("提高文件描述符预算失败 before={} target={} errno={}", before, target, std::io::Error::last_os_error()),
+            );
+            return;
+        }
+        crate::log::info(
+            "xray-resource",
+            format!("文件描述符预算提高 soft={} -> {} hard={}", before, target, limits.rlim_max),
+        );
+    }
+}
+
 #[derive(Default)]
 struct Service {
     runtime: Option<Arc<Runtime>>,

@@ -39,6 +39,7 @@ jobs:
           cache-on-failure: true
       - run: python3 scripts/check-xray-boundary.py
       - run: python3 scripts/test-install-xray-recovery.py
+      - run: python3 scripts/test-xray-resource-limits.py
       - run: scripts/fetch-xray.sh
       - run: rustfmt --edition 2021 src/xray.rs src/backend.rs
       - uses: actions/upload-artifact@v4

@@ -20,6 +20,9 @@ gpui_kit::actions!(app, [About, CheckForUpdates, Quit]);
 fn main() {
     let host_control_launch = std::env::args().any(|arg| arg == "--host-control");
     myproxy::log::init();
+    if myproxy::backend::is_xray() {
+        myproxy::xray::raise_process_fd_limit();
+    }
     let _instance_guard = match myproxy::instance::InstanceGuard::acquire() {
         Ok(Some(guard)) => guard,
         Ok(None) => {
