@@ -561,8 +561,8 @@ fn serve(
     })
 }
 fn pump(
-    input: &TcpStream,
-    output: &TcpStream,
+    mut input: &TcpStream,
+    mut output: &TcpStream,
     initial: &[u8],
     limit: Option<u64>,
     entry: &Entry,
