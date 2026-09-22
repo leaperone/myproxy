@@ -98,7 +98,11 @@ fn probe_dns(address: std::net::SocketAddr) -> bool {
         let size = u16::from_be_bytes(length) as usize;
         if !(12..=4096).contains(&size) { bail!("Invalid DNS response size"); }
         let mut answer=vec![0;size];read(&mut answer)?;
-        if answer[..2] != query[..2] || answer[2]&128==0 || answer[3]&15!=0 || answer[6..8]==[0,0] { bail!("Invalid DNS response"); }
+        // Some local resolvers rewrite the transaction id while forwarding a
+        // TCP probe. The probe only decides whether this resolver can answer,
+        // so validate the DNS response shape and at least one answer instead
+        // of rejecting a usable resolver for an id mismatch.
+        if answer[2]&128==0 || answer[3]&15!=0 || answer[6..8]==[0,0] { bail!("Invalid DNS response"); }
         Ok(())
     })();
     result.is_ok()
