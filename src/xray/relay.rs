@@ -1014,23 +1014,27 @@ mod tests {
         let release = control.with_extension("release");
         let done = control.with_extension("done");
         if std::env::var_os("MYPROXY_RELAY_EMFILE_CHILD").is_some() {
-            unsafe {
-                let limit = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
-                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
-            }
             let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let target_address = target.local_addr().unwrap();
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let relay_address = listener.local_addr().unwrap();
+            // Publish and start the target before lowering the child budget.
+            // The test harness itself already owns descriptors, so creating
+            // listeners after the artificial limit would test setup failure,
+            // not recovery from EMFILE in the accept loop.
+            std::fs::write(&control, format!("{}\n{}\n", relay_address.port(), target_address.port())).unwrap();
             let server = MixedServer::start(listener, Arc::new(move |_, _| {
                 Ok(Dialed { stream: TcpStream::connect(target_address)?, chain: "EMFILE".into(), rule: "fixture".into() })
             })).unwrap();
-            std::fs::write(&control, format!("{}\n{}\n", relay_address.port(), target_address.port())).unwrap();
             let target_worker = thread::spawn(move || {
                 let (mut stream, _) = target.accept().unwrap();
                 let mut request = [0; 4]; stream.read_exact(&mut request).unwrap();
                 stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").unwrap();
             });
+            unsafe {
+                let limit = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+            }
             let mut held = Vec::new();
             while let Ok(file) = std::fs::File::open("/dev/null") { held.push(file); }
             while !release.exists() { thread::sleep(Duration::from_millis(5)); }
