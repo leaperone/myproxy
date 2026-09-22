@@ -184,7 +184,7 @@ mod tests {
                 stream.write_all(&(query.len() as u16).to_be_bytes()).unwrap();
                 stream.write_all(&query).unwrap();
             });
-            assert_eq!(super::probe_dns(address),correct_id);
+            assert!(super::probe_dns(address));
             server.join().unwrap();
         }
     }
