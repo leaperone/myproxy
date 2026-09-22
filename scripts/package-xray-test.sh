@@ -2,8 +2,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-version="${MYPROXY_XRAY_VERSION:-1.6.1}"
-build_number="${MYPROXY_XRAY_BUILD_NUMBER:-1.6.0.1}"
+: "${MYPROXY_XRAY_VERSION:?MYPROXY_XRAY_VERSION is required}"
+: "${MYPROXY_XRAY_BUILD_NUMBER:?MYPROXY_XRAY_BUILD_NUMBER is required}"
+version="$MYPROXY_XRAY_VERSION"
+build_number="$MYPROXY_XRAY_BUILD_NUMBER"
 target_dir="${CARGO_TARGET_DIR:-target/xray-build}"
 identity="${CODESIGN_IDENTITY:-}"
 host_profile="${MYPROXY_HOST_DEVID_PROFILE_PATH:-}"
@@ -91,7 +93,7 @@ done
 scripts/notarize-macos-app.sh "$app" "$dist/notarization.json"
 xcrun stapler validate "$app"
 spctl --assess --type execute --verbose=2 "$app"
-archive="$dist/myproxy-xray-${version}.sparkle.zip"
+archive="$dist/myproxy-${version}.sparkle.zip"
 ditto -c -k --keepParent "$app" "$archive"
 cp "$archive" "$dist/sparkle-archives/"
 printf '%s\n' "$SPARKLE_ED_PRIVATE_KEY" | resources/sparkle/bin/generate_appcast --ed-key-file - \

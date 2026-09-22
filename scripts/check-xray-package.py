@@ -9,6 +9,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import datetime
 import fnmatch
+import re
 archive_path = Path(sys.argv[1])
 with zipfile.ZipFile(sys.argv[1]) as archive:
     names = archive.namelist()
@@ -67,8 +68,11 @@ if len(sys.argv) == 3:
     assert item is not None
     assert any(element.tag.endswith("channel") and element.text == "xray" for element in item)
     enclosure = next(element for element in item if element.tag.endswith("enclosure"))
-    assert "/releases/download/xray-v" in enclosure.attrib["url"]
-    assert enclosure.attrib["url"] == "https://github.com/leaperone/myproxy/releases/download/xray-v" + info["CFBundleShortVersionString"] + "/" + archive_path.name
+    short_version = info["CFBundleShortVersionString"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+-xray\.\d{8}\.\d+\.\d+", short_version)
+    assert "/releases/download/v" in enclosure.attrib["url"]
+    assert archive_path.name == "myproxy-" + short_version + ".sparkle.zip"
+    assert enclosure.attrib["url"] == "https://github.com/leaperone/myproxy/releases/download/v" + short_version + "/" + archive_path.name
     assert int(enclosure.attrib["length"]) == archive_path.stat().st_size
     assert any(key.endswith("edSignature") and value for key, value in enclosure.attrib.items())
     sparkle_version = item.findtext("{http://www.andymatuschak.org/xml-namespaces/sparkle}version") or enclosure.get("{http://www.andymatuschak.org/xml-namespaces/sparkle}version")

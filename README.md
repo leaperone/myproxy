@@ -18,7 +18,7 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 | --- | --- | --- |
 | Prod | `https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml` | Push a `vMAJOR.MINOR.PATCH` tag, or run Release with channel `prod` and that existing tag. |
 | Nightly | `https://github.com/leaperone/myproxy/releases/download/nightly/appcast.xml` | Builds `main` daily at 18:00 UTC, or run Release with channel `nightly`. |
-| Xray | `https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml` | Publish a verified `xray-vVERSION` tag through the Xray workflow. |
+| Xray | `https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml` | Publish a verified `v0.0.10-xray.DATE.RUN.ATTEMPT` tag through the Xray workflow. |
 
 Nightly builds are GitHub prereleases with immutable build tags. The `nightly` prerelease points to the latest Nightly feed. Both channels generate Sparkle deltas from recent same-channel archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow. While the core is connected, Check for Updates and archive/delta downloads use Mixed as an HTTP proxy.
 
@@ -149,7 +149,7 @@ standalone user or network rules.
 
 The Xray workflow tests feature-branch pushes. A commit marked `[xray-package]`
 also produces a signed, notarized candidate artifact for local acceptance, without
-publishing. An immutable `xray-vVERSION` tag builds and publishes an Xray release
+publishing. An immutable `v0.0.10-xray.DATE.RUN.ATTEMPT` tag builds and publishes an Xray release
 and updates only the `xray` feed pointer. Distribution requires Developer ID
 signing, the host and extension provisioning profiles, Apple notarization,
 stapling, Gatekeeper acceptance, and a signed Xray appcast. There is no ad-hoc
