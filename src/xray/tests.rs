@@ -410,7 +410,8 @@ fn nested_region_fallback_changes_real_xray_egress_without_core_restart() {
     assert!(request(strategy.mixed_port, "http").ends_with("REGION_US"));
     runtime.health.write().unwrap().get_mut("A").unwrap().failures = 2;
     assert!(request(strategy.mixed_port, "socks").ends_with("REGION_JP"));
-    assert!(traffic().unwrap().connections.iter().any(|row| row.chain == "Priority → JP → B"));
+    let chains = traffic().unwrap().connections.into_iter().map(|row| row.chain).collect::<Vec<_>>();
+    assert!(chains.iter().any(|chain| chain == "全局出口 → Priority → JP → B"), "{chains:?}");
     runtime.health.write().unwrap().get_mut("A").unwrap().failures = 0;
     assert!(request(strategy.mixed_port, "connect").ends_with("REGION_US"));
     assert_eq!(runtime.child.lock().unwrap().id(), pid);
