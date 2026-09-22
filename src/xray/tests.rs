@@ -379,3 +379,56 @@ fn xray_udp_dns_preserves_queries_and_resolver_through_selected_tcp_node() {
     drop(control);
     worker.join().unwrap();
 }
+
+#[test]
+fn nested_region_fallback_changes_real_xray_egress_without_core_restart() {
+    if std::env::var_os("XRAY_BINARY").is_none() { return; }
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = isolated();
+    let (a, stop_a) = proxy("REGION_US");
+    let (b, stop_b) = proxy("REGION_JP");
+    let mut strategy = default_strategy();
+    strategy.mixed_port = port();
+    strategy.global_selected = "Priority".into();
+    let mut us = Group::matching("US".into(), "url-test".into(), vec![], vec![]);
+    us.include = vec!["A".into()];
+    let mut jp = Group::matching("JP".into(), "url-test".into(), vec![], vec![]);
+    jp.include = vec!["B".into()];
+    let mut priority = Group::matching("Priority".into(), "fallback".into(), vec![], vec![]);
+    priority.group_refs = vec!["US".into(), "JP".into()];
+    strategy.groups = vec![priority, us, jp];
+    strategy.unmatched_via = "Priority".into();
+    strategy.save().unwrap();
+    activate(&strategy, &catalog(a, b)).unwrap();
+    let runtime = active().unwrap();
+    let _probe = runtime.probe_lock.lock().unwrap();
+    *runtime.health.write().unwrap() = HashMap::from([
+        ("A".into(), policy::NodeHealth { delay_ms: Some(80), failures: 0 }),
+        ("B".into(), policy::NodeHealth { delay_ms: Some(5), failures: 0 }),
+    ]);
+    let pid = runtime.child.lock().unwrap().id();
+    assert!(request(strategy.mixed_port, "http").ends_with("REGION_US"));
+    runtime.health.write().unwrap().get_mut("A").unwrap().failures = 2;
+    assert!(request(strategy.mixed_port, "socks").ends_with("REGION_JP"));
+    assert!(traffic().unwrap().connections.iter().any(|row| row.chain == "Priority → JP → B"));
+    runtime.health.write().unwrap().get_mut("A").unwrap().failures = 0;
+    assert!(request(strategy.mixed_port, "connect").ends_with("REGION_US"));
+    assert_eq!(runtime.child.lock().unwrap().id(), pid);
+    stop_a.store(true, Ordering::Release);
+    stop_b.store(true, Ordering::Release);
+}
+
+#[test]
+fn regional_references_compile_without_flattening_for_the_original_backend() {
+    let strategy = default_strategy();
+    let yaml = crate::compile::compile(&strategy, &Catalog::default()).unwrap();
+    let root: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let groups = root.get("proxy-groups").unwrap().as_sequence().unwrap();
+    let find = |name: &str| groups.iter().find(|value| value.get("name").and_then(serde_yaml::Value::as_str) == Some(name)).unwrap();
+    let choices = |name| find(name).get("proxies").unwrap().as_sequence().unwrap().iter().map(|item| item.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(choices("美国优先"), ["美国", "日本", "香港"]);
+    assert_eq!(choices("日本优先"), ["日本", "香港", "美国"]);
+    assert_eq!(choices("香港优先"), ["香港", "美国", "日本"]);
+    assert_eq!(find("美国优先").get("type").unwrap().as_str(), Some("fallback"));
+    assert_eq!(choices("美国"), ["REJECT"]);
+}

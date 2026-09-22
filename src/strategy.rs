@@ -252,6 +252,10 @@ pub struct Group {
     pub name_excludes: Vec<String>,
     #[serde(default)]
     pub include: Vec<String>,
+    /// Ordered references to other groups. References are resolved before
+    /// direct node pins and filters and are kept in this order.
+    #[serde(default)]
+    pub group_refs: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Last user-picked member for select groups. Restored after connect/reload.
@@ -268,6 +272,67 @@ fn default_mixed_port() -> u16 {
 
 fn default_select() -> String {
     "select".into()
+}
+
+fn validate_group_references(groups: &[Group]) -> Result<()> {
+    const MAX_GROUP_REFERENCE_DEPTH: usize = 64;
+    let indexes: std::collections::HashMap<String, usize> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.name.to_ascii_lowercase(), index))
+        .collect();
+    let mut state = vec![0u8; groups.len()];
+    let mut height = vec![0usize; groups.len()];
+    fn visit(
+        index: usize,
+        groups: &[Group],
+        indexes: &std::collections::HashMap<String, usize>,
+        state: &mut [u8],
+        height: &mut [usize],
+        depth: usize,
+    ) -> Result<usize> {
+        if depth >= MAX_GROUP_REFERENCE_DEPTH {
+            anyhow::bail!("节点组引用层级超过 {MAX_GROUP_REFERENCE_DEPTH} 层");
+        }
+        match state[index] {
+            1 => anyhow::bail!("节点组引用形成循环：{}", groups[index].name),
+            2 => {
+                if depth + height[index] >= MAX_GROUP_REFERENCE_DEPTH {
+                    anyhow::bail!("节点组引用层级超过 {MAX_GROUP_REFERENCE_DEPTH} 层");
+                }
+                return Ok(height[index]);
+            }
+            _ => state[index] = 1,
+        }
+        let mut longest = 0;
+        let mut seen = HashSet::new();
+        for reference in &groups[index].group_refs {
+            let key = reference.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                anyhow::bail!("节点组 {} 包含空引用", groups[index].name);
+            }
+            if !seen.insert(key.clone()) {
+                anyhow::bail!("节点组 {} 重复引用 {}", groups[index].name, reference);
+            }
+            let Some(&target) = indexes.get(&key) else {
+                anyhow::bail!("节点组 {} 引用了不存在的节点组 {}", groups[index].name, reference);
+            };
+            if target == index {
+                anyhow::bail!("节点组 {} 不能引用自身", groups[index].name);
+            }
+            if reference.trim() != groups[target].name {
+                anyhow::bail!("节点组名称大小写不一致，请使用 {}", groups[target].name);
+            }
+            longest = longest.max(visit(target, groups, indexes, state, height, depth + 1)? + 1);
+        }
+        state[index] = 2;
+        height[index] = longest;
+        Ok(longest)
+    }
+    for index in 0..groups.len() {
+        visit(index, groups, &indexes, &mut state, &mut height, 0)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -420,6 +485,7 @@ impl Strategy {
             }
             Group::parse_kind(&group.kind).with_context(|| format!("group {}", group.name))?;
         }
+        validate_group_references(&self.groups)?;
         names.clear();
         ids.clear();
         for subscription in &self.subscriptions {
@@ -750,6 +816,18 @@ impl Strategy {
         if self.references_group(&self.global_selected, &group.id) {
             refs.push("GLOBAL".into());
         }
+        for child in &self.groups {
+            if child.group_refs.iter().any(|reference| {
+                let reference = reference.trim();
+                reference == group.name || reference == group.id
+                    || reference.eq_ignore_ascii_case(&group.name)
+            }) || child.selected.trim() == group.name
+                || child.selected.trim() == group.id
+                || child.selected.trim().eq_ignore_ascii_case(&group.name)
+            {
+                refs.push(format!("group {}", child.name));
+            }
+        }
         if group.name == self.default_group_name()
             && (self.mixed_mode == InboundMode::Proxy
                 || (self.system_extension && self.extension_mode == InboundMode::Proxy)
@@ -777,6 +855,7 @@ impl Strategy {
             .context("节点组已不存在")?;
         let renamed = self.groups[index].name != next.name;
         if renamed {
+            let old_name = self.groups[index].name.clone();
             let mut candidate = self.clone();
             candidate.groups[index].name = next.name.clone();
             let previous_default = self
@@ -813,10 +892,30 @@ impl Strategy {
             if global {
                 rename_target(&mut self.global_selected, &next.name);
             }
+            for child in &mut self.groups {
+                if child.selected == old_name || child.selected.eq_ignore_ascii_case(&old_name) || child.selected == id {
+                    child.selected = next.name.clone();
+                }
+                for reference in &mut child.group_refs {
+                    let reference_name = reference.trim();
+                    if reference_name == old_name
+                        || reference_name.eq_ignore_ascii_case(&old_name)
+                        || reference_name == id
+                    {
+                        *reference = next.name.clone();
+                    }
+                }
+            }
         }
         next.id = self.groups[index].id.clone();
-        if next.selected.trim().is_empty() {
-            next.selected = self.groups[index].selected.clone();
+        let previous = &self.groups[index];
+        let removed_selection = previous.group_refs.iter().any(|name| name.trim().eq_ignore_ascii_case(previous.selected.trim()))
+            && !next.group_refs.iter().any(|name| name.trim().eq_ignore_ascii_case(previous.selected.trim()));
+        if removed_selection && next.selected.trim().eq_ignore_ascii_case(previous.selected.trim()) {
+            next.selected.clear();
+        }
+        if next.selected.trim().is_empty() && !removed_selection {
+            next.selected = previous.selected.clone();
         }
         self.groups[index] = next;
         Ok(())
@@ -908,6 +1007,7 @@ impl Group {
             name_contains: Vec::new(),
             name_excludes: Vec::new(),
             include: Vec::new(),
+            group_refs: Vec::new(),
             exclude: Vec::new(),
             selected: String::new(),
             filter: String::new(),
@@ -929,6 +1029,7 @@ impl Group {
             name_contains,
             name_excludes: Vec::new(),
             include: Vec::new(),
+            group_refs: Vec::new(),
             exclude: Vec::new(),
             selected: String::new(),
             filter: String::new(),
@@ -970,12 +1071,15 @@ impl Group {
             if !self.sources.is_empty() {
                 parts.push(format!("来源 {}", self.sources.join(" / ")));
             }
-            if !self.name_contains.is_empty() {
+        if !self.name_contains.is_empty() {
                 parts.push(format!("名称含 {}", self.name_contains.join(" / ")));
             }
-            if self.name_contains.is_empty() {
+            if self.name_contains.is_empty() && self.group_refs.is_empty() {
                 parts.push("无自动匹配（仅钉住；来源只限定范围）".into());
             }
+        }
+        if !self.group_refs.is_empty() {
+            parts.push(format!("{} {}", if self.kind == "fallback" { "优先顺序" } else { "可选组" }, self.group_refs.join(" → ")));
         }
         if !self.name_excludes.is_empty() {
             parts.push(format!("名称不含 {}", self.name_excludes.join(" / ")));
@@ -1643,4 +1747,74 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn group_references_validate_missing_duplicate_self_and_cycle() {
+        let mut strategy = Strategy::default();
+        strategy.groups = vec![Group::all_nodes("A".into(), "fallback".into()), Group::all_nodes("B".into(), "fallback".into())];
+        strategy.groups[0].group_refs = vec!["missing".into()];
+        assert!(strategy.validate().unwrap_err().to_string().contains("不存在"));
+        strategy.groups[0].group_refs = vec!["A".into()];
+        assert!(strategy.validate().unwrap_err().to_string().contains("自身"));
+        strategy.groups[0].group_refs = vec!["B".into(), "b".into()];
+        assert!(strategy.validate().unwrap_err().to_string().contains("重复"));
+        strategy.groups[0].group_refs = vec!["B".into()];
+        strategy.groups[1].group_refs = vec!["A".into()];
+        assert!(strategy.validate().unwrap_err().to_string().contains("循环"));
+    }
+
+    #[test]
+    fn renaming_group_updates_children_and_removal_blocks_references() {
+        let mut strategy = Strategy::default();
+        let base = Group::all_nodes("Base".into(), "fallback".into());
+        let mut child = Group::all_nodes("Child".into(), "fallback".into());
+        child.group_refs = vec!["Base".into()];
+        strategy.groups = vec![base, child];
+        let mut renamed = strategy.groups[0].clone();
+        renamed.name = "Renamed".into();
+        let id = renamed.id.clone();
+        strategy.update_group(&id, renamed).unwrap();
+        assert_eq!(strategy.groups[1].group_refs, vec!["Renamed"]);
+        assert!(strategy.remove_group_checked("Renamed").is_err());
+    }
+
+    #[test]
+    fn old_group_json_decodes_without_references() {
+        let group: Group = serde_json::from_str(r#"{"id":"g","name":"A","kind":"select"}"#).unwrap();
+        assert!(group.group_refs.is_empty());
+        let nested: Group = serde_json::from_str(r#"{"id":"g","name":"A","group_refs":["B"]}"#).unwrap();
+        assert_eq!(nested.group_refs, ["B"]);
+    }
+
+    #[test]
+    fn selected_group_reference_blocks_removal() {
+        let mut strategy = Strategy::default();
+        strategy.groups = vec![Group::all_nodes("A".into(), "fallback".into()), Group::all_nodes("B".into(), "select".into())];
+        strategy.groups[1].selected = "A".into();
+        assert!(strategy.remove_group_checked("A").is_err());
+    }
+
+    #[test]
+    fn group_reference_depth_allows_64_groups_and_rejects_65() {
+        let mut groups = (0..64).map(|index| Group::all_nodes(format!("G{index}"), "fallback".into())).collect::<Vec<_>>();
+        for index in 0..63 { groups[index].group_refs = vec![format!("G{}", index + 1)]; }
+        assert!(validate_group_references(&groups).is_ok());
+        groups.push(Group::all_nodes("G64".into(), "fallback".into()));
+        groups[63].group_refs = vec!["G64".into()];
+        assert!(validate_group_references(&groups).is_err());
+    }
+    #[test]
+    fn removing_the_manually_selected_child_restores_automatic_choice() {
+        let mut strategy = Strategy::default();
+        let mut parent = Group::matching("Parent".into(), "fallback".into(), vec![], vec![]);
+        parent.group_refs = vec!["A".into(), "B".into()];
+        parent.selected = "A".into();
+        strategy.groups = vec![parent, Group::all_nodes("A".into(), "select".into()), Group::all_nodes("B".into(), "select".into())];
+        let mut next = strategy.groups[0].clone();
+        next.group_refs = vec!["B".into()];
+        strategy.update_group(&next.id.clone(), next).unwrap();
+        assert_eq!(strategy.groups[0].group_refs, ["B"]);
+        assert!(strategy.groups[0].selected.is_empty());
+    }
+
 }

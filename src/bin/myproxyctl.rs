@@ -48,7 +48,7 @@ enum Commands {
     ExtensionMode {
         mode: Option<String>,
     },
-    /// Mihomo GLOBAL selector: omit to read, pass a member to switch.
+    /// Global exit: omit to read, or pass a group or node to switch.
     Global {
         name: Option<String>,
     },
@@ -120,6 +120,8 @@ enum GroupCmd {
         contains: Vec<String>,
         #[arg(long = "not-contains")]
         not_contains: Vec<String>,
+        #[arg(long = "group-ref")]
+        group_ref: Vec<String>,
     },
     Set {
         name: String,
@@ -136,6 +138,10 @@ enum GroupCmd {
         contains: Vec<String>,
         #[arg(long = "not-contains")]
         not_contains: Vec<String>,
+        #[arg(long = "group-ref")]
+        group_ref: Vec<String>,
+        #[arg(long)]
+        clear_group_refs: bool,
     },
     Remove {
         name: String,
@@ -705,20 +711,22 @@ fn run(cli: Cli) -> Result<()> {
                         .iter()
                         .map(|group| {
                             let mut value = serde_json::to_value(group)?;
-                            value["members"] =
-                                serde_json::json!(catalog::resolve_group_members(group, &catalog));
+                            value["choices"] = serde_json::json!(catalog::resolve_group_members(group, &catalog));
+                            value["members"] = serde_json::json!(catalog::resolve_group_members_with_strategy(&strategy, &group.name, &catalog)?);
                             Ok(value)
                         })
                         .collect::<Result<Vec<_>>>()?;
                     println!("{}", serde_json::json!({"groups": groups}));
                 } else {
                     for group in &strategy.groups {
-                        let members = catalog::resolve_group_members(group, &catalog);
+                        let choices = catalog::resolve_group_members(group, &catalog);
+                        let members = catalog::resolve_group_members_with_strategy(&strategy, &group.name, &catalog)?;
                         println!(
-                            "{}\t{}\t{}\tmembers={}",
+                            "{}\t{}\t{}\tchoices={}\tmembers={}",
                             group.name,
                             group.kind,
                             group.policy_label(),
+                            choices.len(),
                             members.len()
                         );
                     }
@@ -731,6 +739,7 @@ fn run(cli: Cli) -> Result<()> {
                 source,
                 contains,
                 not_contains,
+                group_ref,
             } => {
                 let kind = strategy::Group::parse_kind(&kind)?;
                 let mut strategy = Strategy::load()?;
@@ -742,6 +751,7 @@ fn run(cli: Cli) -> Result<()> {
                     strategy::Group::matching(name.clone(), kind, source, contains)
                 };
                 group.name_excludes = not_contains;
+                group.group_refs = group_ref;
                 strategy.add_group(group);
                 strategy.save()?;
                 emit(
@@ -758,6 +768,8 @@ fn run(cli: Cli) -> Result<()> {
                 source,
                 contains,
                 not_contains,
+                group_ref,
+                clear_group_refs,
             } => {
                 let kind = kind
                     .as_deref()
@@ -789,6 +801,12 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 if !not_contains.is_empty() {
                     group.name_excludes = not_contains;
+                }
+                if clear_group_refs {
+                    group.group_refs.clear();
+                }
+                if !group_ref.is_empty() {
+                    group.group_refs = group_ref;
                 }
                 let name = group.name.clone();
                 strategy.update_group(&id, group)?;

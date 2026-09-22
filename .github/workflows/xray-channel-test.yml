@@ -60,7 +60,7 @@ jobs:
             version="${GITHUB_REF_NAME#xray-v}"
             release_tag="$GITHUB_REF_NAME"
           else
-            version="1.6.0-xray.1"
+            version="1.6.0-xray.2"
             release_tag="xray-v${version}"
           fi
           echo "MYPROXY_XRAY_VERSION=${version}" >> "${GITHUB_ENV}"

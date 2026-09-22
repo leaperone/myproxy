@@ -117,6 +117,15 @@ transparent capture; the local HTTP/SOCKS entrance remains available.
 New configurations start in global mode through 节点选择, with 美国优先,
 日本优先, 香港优先, and a direct choice. Groups expand to show their nodes;
 automatic groups support a manual pin and a return to automatic selection.
+Region groups aggregate matching nodes from every subscription and select the
+lowest-latency available node. Priority groups reference those region groups in
+order: 美国优先 uses 美国 → 日本 → 香港, 日本优先 uses 日本 → 香港 → 美国,
+and 香港优先 uses 香港 → 美国 → 日本. A priority group tries the next region
+when the current region has no available node; it never falls back to Direct.
+These references stay current when subscriptions refresh. The group editor
+supports adding, removing, and reordering child groups; the CLI accepts repeated
+`--group-ref` arguments. Renaming a group updates its references, and a referenced
+group cannot be deleted until those references are removed.
 Routing changes close old flows without restarting Xray. Disconnect confirms
 both capture and DNS are disabled before stopping their relay or core.
 

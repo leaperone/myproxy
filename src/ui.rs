@@ -135,6 +135,7 @@ struct GroupEditor {
     contains: Entity<InputState>,
     excludes: Entity<InputState>,
     include: Vec<String>,
+    group_refs: Vec<String>,
     blocked: Vec<String>,
     selected: String,
     member_query: Entity<InputState>,
@@ -166,6 +167,10 @@ impl GroupEditor {
         let blocked = existing
             .as_ref()
             .map(|g| g.exclude.clone())
+            .unwrap_or_default();
+        let group_refs = existing
+            .as_ref()
+            .map(|g| g.group_refs.clone())
             .unwrap_or_default();
         let name = existing
             .as_ref()
@@ -229,6 +234,7 @@ impl GroupEditor {
             contains,
             excludes,
             include,
+            group_refs,
             blocked,
             selected,
         }
@@ -256,6 +262,7 @@ impl GroupEditor {
             name_contains: parse_list(&self.contains.read(cx).value()),
             name_excludes: parse_list(&self.excludes.read(cx).value()),
             include: self.include.clone(),
+            group_refs: self.group_refs.clone(),
             exclude: self.blocked.clone(),
             selected: self.selected.clone(),
             filter: String::new(),
@@ -377,6 +384,27 @@ impl GroupEditor {
         self.blocked.retain(|n| n != name);
         self.notice = format!("取消排除 {name}。");
     }
+
+    fn add_group_ref(&mut self, name: &str) {
+        if !self.group_refs.iter().any(|item| item == name) {
+            self.group_refs.push(name.to_string());
+            self.notice = format!("已加入子组 {name}。保存后按此顺序选择。" );
+        }
+    }
+
+    fn remove_group_ref(&mut self, name: &str) {
+        self.group_refs.retain(|item| item != name);
+        self.notice = format!("已移除子组 {name}。" );
+    }
+
+    fn move_group_ref(&mut self, name: &str, delta: i32) {
+        let Some(index) = self.group_refs.iter().position(|item| item == name) else { return; };
+        let target = index as i32 + delta;
+        if target < 0 || target >= self.group_refs.len() as i32 { return; }
+        let item = self.group_refs.remove(index);
+        self.group_refs.insert(target as usize, item);
+        self.notice = "已调整子组优先顺序。保存后生效。".into();
+    }
 }
 
 impl Render for GroupEditor {
@@ -386,7 +414,18 @@ impl Render for GroupEditor {
         let theme = cx.theme().clone();
         let draft = self.draft(cx);
         let started = Instant::now();
-        let members = catalog::resolve_group_members(&draft, &parent.catalog);
+        let members = if draft.name.trim().is_empty() {
+            catalog::resolve_group_members(&draft, &parent.catalog)
+        } else {
+            let mut preview_strategy = parent.strategy.clone();
+            if let Some(group) = preview_strategy.groups.iter_mut().find(|group| group.id == draft.id) {
+                *group = draft.clone();
+            } else {
+                preview_strategy.groups.push(draft.clone());
+            }
+            catalog::resolve_group_members_with_strategy(&preview_strategy, &draft.name, &parent.catalog)
+                .unwrap_or_else(|_| catalog::resolve_group_members(&draft, &parent.catalog))
+        };
         let resolve_ms = started.elapsed().as_millis();
         if resolve_ms >= 8 {
             log::debug(
@@ -405,6 +444,10 @@ impl Render for GroupEditor {
         let radius = theme.radius;
         let group_box = theme.group_box;
         let subscriptions = parent.strategy.subscriptions.clone();
+        let available_groups: Vec<String> = parent.strategy.groups.iter()
+            .filter(|group| self.edit_id.as_deref() != Some(group.id.as_str()) && group.name != draft.name)
+            .map(|group| group.name.clone())
+            .collect();
         let query = self.member_query.read(cx).value().trim().to_lowercase();
         let preview: Vec<_> = members
             .iter()
@@ -466,6 +509,55 @@ impl Render for GroupEditor {
                             });
                         })
                     }),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_xs().child("子节点组顺序"))
+                    .child(div().text_xs().text_color(muted_fg).child(if self.kind == "fallback" {
+                        "自动切换会按顺序尝试子组，第一个可用的出口优先；下面仍可保留直接节点。"
+                    } else if self.kind == "url-test" {
+                        "延迟最低会在子组和直接节点中选择可用出口。"
+                    } else {
+                        "手动选择会按顺序显示子组和直接节点，点击即可切换。"
+                    }))
+                    .when(self.group_refs.is_empty(), |this| {
+                        this.child(div().text_xs().text_color(muted_fg).child("尚未选择子组。"))
+                    })
+                    .children(self.group_refs.iter().enumerate().map(|(index, name)| {
+                        let up_entity = entity.clone();
+                        let down_entity = entity.clone();
+                        let remove_entity = entity.clone();
+                        let name_for_up = name.clone();
+                        let name_for_down = name.clone();
+                        let name_for_remove = name.clone();
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(div().text_xs().child(format!("{}. {name}", index + 1)))
+                            .child(Button::new(SharedString::from(format!("group-ref-up-{index}"))).small().label("上移").disabled(index == 0).on_click(move |_, _, app| {
+                                up_entity.update(app, |this, cx| { this.move_group_ref(&name_for_up, -1); cx.notify(); });
+                            }))
+                            .child({
+                                Button::new(SharedString::from(format!("group-ref-down-{index}"))).small().label("下移").disabled(index + 1 >= self.group_refs.len()).on_click(move |_, _, app| {
+                                    down_entity.update(app, |this, cx| { this.move_group_ref(&name_for_down, 1); cx.notify(); });
+                                })
+                            })
+                            .child({
+                                Button::new(SharedString::from(format!("group-ref-remove-{index}"))).small().danger().label("移除").on_click(move |_, _, app| {
+                                    remove_entity.update(app, |this, cx| { this.remove_group_ref(&name_for_remove); cx.notify(); });
+                                })
+                            })
+                    }))
+                    .child(
+                        h_flex().gap_1().flex_wrap().children(available_groups.into_iter().filter(|name| !self.group_refs.iter().any(|selected| selected == name)).map(|name| {
+                            let entity = entity.clone();
+                            let pick = name.clone();
+                            Button::new(SharedString::from(format!("group-ref-add-{name}"))).small().label(format!("加入 {name}")).on_click(move |_, _, app| {
+                                entity.update(app, |this, cx| { this.add_group_ref(&pick); cx.notify(); });
+                            })
+                        }))
+                    ),
             )
             .child(
                 h_flex()
@@ -589,7 +681,7 @@ impl Render for GroupEditor {
                 draft.kind_setting_label(),
                 draft.policy_label()
             )))
-            .when(!draft.all_nodes && draft.name_contains.is_empty(), |this| {
+            .when(!draft.all_nodes && draft.name_contains.is_empty() && draft.group_refs.is_empty() && draft.include.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("仅选择来源不会自动加入节点；请添加名称条件或钉住节点。空组保持不可用，不会直连。"))
             })
             .child(v_flex().gap_1().child(div().text_xs().child("搜索预览成员（含排除项）")).child(Input::new(&self.member_query)))
@@ -2465,20 +2557,34 @@ impl AppView {
             .find(|live| live.name == group.name)
     }
 
-    fn group_now<'a>(&'a self, group: &'a Group) -> &'a str {
+    fn group_now_label(&self, group: &Group) -> String {
         if self.connected {
-            return match self.live_group(group) {
-                Some(live) if live.members.is_empty() => "不可用",
-                Some(live) if !live.now.is_empty() => &live.now,
-                _ => "等待核心状态",
-            };
+            let mut current = group.name.clone();
+            let mut visited = std::collections::HashSet::new();
+            for _ in 0..64 {
+                if !visited.insert(current.to_ascii_lowercase()) { return "不可用".into(); }
+                let Some(live) = self.proxy_groups.iter().find(|item| item.name == current) else {
+                    return "等待核心状态".into();
+                };
+                if live.members.is_empty() { return "不可用".into(); }
+                if live.now.is_empty() { return "等待核心状态".into(); }
+                if live.now == "REJECT" { return "暂无可用节点".into(); }
+                if live.now == "DIRECT" { return "直连".into(); }
+                let Some(child) = self.strategy.groups.iter().find(|item| item.name == live.now || item.id == live.now || item.name.eq_ignore_ascii_case(&live.now)) else {
+                    return live.now.clone();
+                };
+                current = child.name.clone();
+            }
+            return "不可用".into();
         }
-        if catalog::resolve_group_members(group, &self.catalog).is_empty() {
-            "不可用"
+        let resolved = catalog::resolve_group_members_with_strategy(&self.strategy, &group.name, &self.catalog)
+            .unwrap_or_else(|_| catalog::resolve_group_members(group, &self.catalog));
+        if resolved.is_empty() {
+            "不可用".into()
         } else if group.selected.is_empty() {
-            "—"
+            "—".into()
         } else {
-            &group.selected
+            group.selected.clone()
         }
     }
 
@@ -3730,7 +3836,8 @@ impl AppView {
                     Some(member_names.len())
                 };
                 let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
-                let now = self.group_now(group).to_string();
+                let now = self.group_now_label(group);
+                let active_choice = self.live_group(group).map(|live| live.now.as_str()).unwrap_or(&group.selected);
                 let members: Vec<(String, Option<u32>)> = member_names
                     .into_iter()
                     .filter(|name| name.to_lowercase().contains(&query))
@@ -3747,6 +3854,7 @@ impl AppView {
                     selected,
                     accent,
                     &now,
+                    active_choice,
                     &members,
                     group.kind == "select" || backend::is_xray(),
                     self.delaying.contains(&group.name),
@@ -5410,6 +5518,7 @@ fn render_group_card(
     selected: bool,
     accent: Hsla,
     now: &str,
+    active_choice: &str,
     members: &[(String, Option<u32>)],
     can_select: bool,
     delaying: bool,
@@ -5461,7 +5570,7 @@ fn render_group_card(
                         group.name,
                         group.kind_label(),
                         count
-                            .map(|count| format!("{count} 个节点"))
+                            .map(|count| if group.group_refs.is_empty() { format!("{count} 个节点") } else { format!("{count} 个选项") })
                             .unwrap_or_else(|| "等待核心状态".into())
                     )))
                 .child(
@@ -5543,7 +5652,7 @@ fn render_group_card(
         .child(div().text_xs().text_color(muted_fg).child(format!(
             "{} {}  ·  {}",
             if connected {
-                "核心当前"
+                "当前节点"
             } else {
                 "已保存选择"
             },
@@ -5569,7 +5678,7 @@ fn render_group_card(
                         } else {
                             format!("{name}  {delay_text}")
                         };
-                        let is_now = name == now;
+                        let is_now = name == active_choice;
                         let entity = entity.clone();
                         let group_id = id.clone();
                         if can_select {

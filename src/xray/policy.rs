@@ -67,7 +67,7 @@ fn group<'a>(strategy: &'a Strategy, name: &str) -> Option<&'a Group> {
     strategy
         .groups
         .iter()
-        .find(|item| item.name == name || item.id == name)
+        .find(|item| item.name.eq_ignore_ascii_case(name.trim()) || item.id == name.trim())
 }
 
 fn healthy(name: &str, health: &HashMap<String, NodeHealth>) -> bool {
@@ -82,8 +82,10 @@ fn append_route(chain: &mut Vec<String>, route: &Route) {
     });
 }
 
-fn members(group: &Group, catalog: &Catalog) -> Vec<String> {
-    catalog::resolve_group_members(group, catalog)
+fn members(strategy: &Strategy, item: &Group, catalog: &Catalog) -> Vec<String> {
+    catalog::resolve_group_members(item, catalog).into_iter().map(|name| {
+        group(strategy, &name).map_or(name.clone(), |child| child.name.clone())
+    }).collect()
 }
 
 fn choose_group(
@@ -93,44 +95,59 @@ fn choose_group(
     name: &str,
     visited: &mut HashSet<String>,
     chain: &mut Vec<String>,
+    cache: &mut HashMap<String, (Route, Vec<String>)>,
 ) -> Route {
-    if !visited.insert(name.to_string()) {
-        return Route::Reject;
+    let Some(item) = group(strategy, name) else { return Route::Reject; };
+    if visited.len() >= 64 || visited.contains(&item.id) { return Route::Reject; }
+    if let Some((route, path)) = cache.get(&item.id) {
+        if visited.len() + path.len() > 64 { return Route::Reject; }
+        chain.extend(path.iter().cloned());
+        return route.clone();
     }
-    let Some(item) = group(strategy, name) else {
-        return Route::Reject;
-    };
+    visited.insert(item.id.clone());
+    let chain_start = chain.len();
     chain.push(item.name.clone());
-    let names = members(item, catalog);
-    let mut candidates: Vec<String> = names
-        .into_iter()
-        .filter(|node| catalog.nodes.iter().any(|item| item.name == *node))
-        .collect();
-    if !item.selected.trim().is_empty() {
-        let selected = item.selected.trim();
-        if candidates.iter().any(|node| node == selected) {
-            // A manual choice is authoritative, even while its probe is failing.
-            return Route::Node(selected.to_string());
+    let choices = members(strategy, item, catalog);
+    let selected = item.selected.trim();
+    let route = if !selected.is_empty() {
+        if choices.iter().any(|value| value == selected)
+            && catalog.nodes.iter().any(|node| node.name == selected) {
+            Route::Node(selected.to_string())
+        } else if group(strategy, selected).is_some()
+            && (item.group_refs.is_empty() || item.group_refs.iter().any(|name| name.trim().eq_ignore_ascii_case(selected))) {
+            choose_group(strategy, catalog, health, selected, visited, chain, cache)
+        } else {
+            Route::Reject
         }
-        if group(strategy, selected).is_some() {
-            return choose_group(strategy, catalog, health, selected, visited, chain);
+    } else {
+        let mut best: Option<(Route, Vec<String>, u32)> = None;
+        for choice in choices {
+            let mut child_chain = Vec::new();
+            let candidate = if group(strategy, &choice).is_some() {
+                choose_group(strategy, catalog, health, &choice, visited, &mut child_chain, cache)
+            } else if catalog.nodes.iter().any(|node| node.name == choice) {
+                Route::Node(choice)
+            } else {
+                Route::Reject
+            };
+            let Route::Node(node) = &candidate else { continue; };
+            if !healthy(node, health) { continue; }
+            let delay = health.get(node).and_then(|value| value.delay_ms).unwrap_or(u32::MAX);
+            if best.as_ref().is_none_or(|(_, _, previous)| delay < *previous) {
+                best = Some((candidate, child_chain, delay));
+            }
+            if item.kind != "url-test" { break; }
         }
-        return Route::Reject;
-    }
-    candidates.retain(|node| healthy(node, health));
-    if item.kind == "url-test" {
-        candidates.sort_by_key(|node| {
-            health
-                .get(node)
-                .and_then(|value| value.delay_ms)
-                .unwrap_or(u32::MAX)
-        });
-    }
-    candidates
-        .into_iter()
-        .next()
-        .map(Route::Node)
-        .unwrap_or(Route::Reject)
+        if let Some((route, child_chain, _)) = best {
+            chain.extend(child_chain);
+            route
+        } else {
+            Route::Reject
+        }
+    };
+    visited.remove(&item.id);
+    cache.insert(item.id.clone(), (route.clone(), chain[chain_start..].to_vec()));
+    route
 }
 
 fn target(
@@ -172,6 +189,7 @@ fn target(
         group_value,
         &mut HashSet::new(),
         chain,
+        &mut HashMap::new(),
     )
 }
 
@@ -501,17 +519,20 @@ pub fn groups(
             ])
             .collect(),
     }];
+    let mut cache = HashMap::new();
     result.extend(strategy.groups.iter().map(|group| {
-        let names = members(group, catalog);
+        let names = members(strategy, group, catalog);
+        let mut chain = Vec::new();
         let now = match choose_group(
             strategy,
             catalog,
             health,
             &group.name,
             &mut HashSet::new(),
-            &mut Vec::new(),
+            &mut chain,
+            &mut cache,
         ) {
-            Route::Node(name) => name,
+            Route::Node(name) => chain.get(1).cloned().unwrap_or(name),
             Route::Direct => "DIRECT".into(),
             Route::Reject => "REJECT".into(),
         };
@@ -522,7 +543,10 @@ pub fn groups(
             members: names
                 .into_iter()
                 .map(|name| LiveMember {
-                    delay: health.get(&name).and_then(|item| item.delay_ms),
+                    delay: if strategy.groups.iter().any(|item| item.name == name) {
+                        let route = choose_group(strategy, catalog, health, &name, &mut HashSet::new(), &mut Vec::new(), &mut cache);
+                        if let Route::Node(node) = route { health.get(&node).and_then(|item| item.delay_ms) } else { None }
+                    } else { health.get(&name).and_then(|item| item.delay_ms) },
                     name,
                 })
                 .collect(),
@@ -810,4 +834,70 @@ mod tests {
             Route::Node("B".into())
         );
     }
+    fn regional_fixture() -> (Strategy, Catalog, HashMap<String, NodeHealth>) {
+        let strategy = crate::xray::default_strategy();
+        let values = [("美国 slow", 90), ("美国 fast", 40), ("日本 fast", 10), ("香港 fast", 1)];
+        let catalog = Catalog {
+            nodes: values.iter().map(|(name, _)| crate::catalog::Node {
+                name: (*name).into(), subscription: "fixture".into(), raw: serde_yaml::Value::Null,
+            }).collect(),
+            ..Catalog::default()
+        };
+        let health = values.into_iter().map(|(name, delay)| (name.into(), NodeHealth {
+            delay_ms: Some(delay), failures: 0,
+        })).collect();
+        (strategy, catalog, health)
+    }
+
+    #[test]
+    fn region_priority_beats_other_region_latency_and_fails_over_then_recovers() {
+        let (strategy, catalog, mut health) = regional_fixture();
+        let pick = |health: &HashMap<String, NodeHealth>| decide(&strategy, &catalog, health, "example.com", 443, None);
+        let decision = pick(&health);
+        assert_eq!(decision.route, Route::Node("美国 fast".into()));
+        assert_eq!(decision.chain, ["节点选择", "美国优先", "美国", "美国 fast"]);
+        health.get_mut("美国 slow").unwrap().failures = 2;
+        health.get_mut("美国 fast").unwrap().failures = 2;
+        let decision = pick(&health);
+        assert_eq!(decision.route, Route::Node("日本 fast".into()));
+        assert_eq!(decision.chain, ["节点选择", "美国优先", "日本", "日本 fast"]);
+        health.get_mut("日本 fast").unwrap().failures = 2;
+        assert_eq!(pick(&health).route, Route::Node("香港 fast".into()));
+        health.get_mut("香港 fast").unwrap().failures = 2;
+        assert_eq!(pick(&health).route, Route::Reject);
+        health.get_mut("美国 slow").unwrap().failures = 0;
+        assert_eq!(pick(&health).route, Route::Node("美国 slow".into()));
+    }
+
+    #[test]
+    fn regional_profiles_keep_their_own_order_and_live_child_selection() {
+        let (mut strategy, catalog, health) = regional_fixture();
+        strategy.global_selected = "日本优先".into();
+        assert_eq!(decide(&strategy, &catalog, &health, "example.com", 443, None).route, Route::Node("日本 fast".into()));
+        strategy.global_selected = "香港优先".into();
+        assert_eq!(decide(&strategy, &catalog, &health, "example.com", 443, None).route, Route::Node("香港 fast".into()));
+        let live = groups(&strategy, &catalog, &health);
+        let profile = live.iter().find(|group| group.name == "美国优先").unwrap();
+        assert_eq!(profile.now, "美国");
+        assert_eq!(profile.members.iter().map(|member| member.name.as_str()).collect::<Vec<_>>(), ["美国", "日本", "香港"]);
+        assert_eq!(live.iter().find(|group| group.name == "美国").unwrap().now, "美国 fast");
+        assert_eq!(live.iter().find(|group| group.name == "节点选择").unwrap().now, "美国优先");
+    }
+
+    #[test]
+    fn nested_manual_selection_and_shared_latency_groups_use_actual_routes() {
+        let (mut strategy, catalog, mut health) = regional_fixture();
+        strategy.groups[0].selected = "日本优先".into();
+        assert_eq!(decide(&strategy, &catalog, &health, "example.com", 443, None).route, Route::Node("日本 fast".into()));
+        strategy.groups[0].selected = "美国 slow".into();
+        health.get_mut("美国 slow").unwrap().failures = 99;
+        assert_eq!(decide(&strategy, &catalog, &health, "example.com", 443, None).route, Route::Node("美国 slow".into()));
+        strategy.groups[0].selected.clear();
+        strategy.groups[0].all_nodes = false;
+        strategy.groups[0].kind = "url-test".into();
+        let decision = decide(&strategy, &catalog, &health, "example.com", 443, None);
+        assert_eq!(decision.route, Route::Node("香港 fast".into()));
+        assert_eq!(decision.chain, ["节点选择", "香港优先", "香港", "香港 fast"]);
+    }
+
 }
