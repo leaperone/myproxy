@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-version="${MYPROXY_XRAY_VERSION:-1.6.0-xray.7}"
+version="${MYPROXY_XRAY_VERSION:-1.6.0-xray.8}"
 build_number="${MYPROXY_XRAY_BUILD_NUMBER:-1.6.0.1}"
 target_dir="${CARGO_TARGET_DIR:-target/xray-build}"
 identity="${CODESIGN_IDENTITY:-}"
