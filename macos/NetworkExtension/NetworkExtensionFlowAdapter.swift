@@ -99,6 +99,10 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         var availableMihomoRoutes: Set<MihomoRoute> = []
         var rulesByIdentifier: [String: CaptureRule] = [:]
         var dnsRulesByIdentifier: [String: CaptureRule] = [:]
+        #if MYPROXY_XRAY
+        var admission: AppAdmissionClient?
+        var admissionActivation: String = ""
+        #endif
     }
 
     private let lock = NSLock()
@@ -110,6 +114,16 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
     private var state = State()
 
     func load(configuration: [String: Any]?) {
+        #if MYPROXY_XRAY
+        let admissionData = configuration?[ProviderConfigurationKey.appAdmission] as? Data
+        lock.lock()
+        state.admission = AppAdmissionClient(data: admissionData)
+        state.captureEnabled = state.admission != nil
+        state.admissionActivation = state.admission?.activation ?? ""
+        state.revision = Self.uint64(configuration?[ProviderConfigurationKey.revision]) ?? 0
+        lock.unlock()
+        return
+        #endif
         let captureEnabled = Self.bool(
             configuration?[ProviderConfigurationKey.captureEnabled]
         ) ?? false
@@ -165,6 +179,9 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
     }
 
     func validates(configuration: [String: Any]) -> Bool {
+        #if MYPROXY_XRAY
+        return AppAdmissionClient(data: configuration[ProviderConfigurationKey.appAdmission] as? Data) != nil
+        #endif
         let captureEnabled = Self.bool(
             configuration[ProviderConfigurationKey.captureEnabled]
         ) ?? false
@@ -179,6 +196,9 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
     }
 
     func planTCPFlow(_ flow: NEAppProxyTCPFlow) -> TCPFlowInterceptionPlan {
+        #if MYPROXY_XRAY
+        return planAdmissionTCPFlow(flow)
+        #else
         let endpoint: FlowRemoteEndpoint
         if #available(macOS 15.0, *) {
             guard let converted = Self.endpoint(flow.remoteFlowEndpoint) else {
@@ -244,7 +264,100 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
             ),
             activity: outcome.activity
         )
+        #endif
     }
+
+    #if MYPROXY_XRAY
+    private func planAdmissionTCPFlow(_ flow: NEAppProxyTCPFlow) -> TCPFlowInterceptionPlan {
+        guard let endpoint = Self.endpointTCP(flow) else {
+            let decision = FlowTrafficDecision(disposition: .reject, reason: .contextUnavailable(.unsupportedRemoteEndpoint))
+            return TCPFlowInterceptionPlan(decision: decision, destination: nil, mihomoDestination: nil, proxy: nil, unavailableFallback: .reject, activity: fallbackActivity(flow: flow, endpoint: nil, transportProtocol: .tcp, failure: .unsupportedRemoteEndpoint))
+        }
+        let result = admissionOutcome(flow: flow, endpoint: endpoint, transport: .tcp, kind: "traffic")
+        let target = result.target
+        return TCPFlowInterceptionPlan(decision: result.decision, destination: result.decision.disposition == FlowTrafficDisposition.direct ? target : endpointAsSocks(endpoint), mihomoDestination: target, proxy: result.proxy, unavailableFallback: .reject, activity: result.activity)
+    }
+
+    private func planAdmissionUDP(_ flow: NEAppProxyUDPFlow, endpoint: FlowRemoteEndpoint, parentFlowIdentifier: UUID, useFlowHostname: Bool = true) -> UDPFlowInterceptionPlan {
+        let result = admissionOutcome(flow: flow, endpoint: endpoint, transport: .udp, kind: "traffic", parentFlowIdentifier: parentFlowIdentifier, useFlowHostname: useFlowHostname)
+        let target = result.target
+        return UDPFlowInterceptionPlan(decision: result.decision, initialDestination: endpointAsSocks(endpoint), mihomoDestination: target, directDestination: target, proxy: result.proxy, unavailableFallback: .reject, activity: result.activity, parentFlowIdentifier: parentFlowIdentifier)
+    }
+
+    private struct AdmissionOutcome {
+        let decision: FlowTrafficDecision
+        let target: SOCKS5Endpoint?
+        let proxy: ProviderSOCKSConfiguration?
+        let activity: AppRoutingActivity
+    }
+
+    private func admissionOutcome(flow: NEAppProxyFlow, endpoint: FlowRemoteEndpoint, transport: TransportProtocol, kind: String, parentFlowIdentifier: UUID? = nil, useFlowHostname: Bool = true) -> AdmissionOutcome {
+        let flowID = UUID()
+        let currentState = snapshotState()
+        guard currentState.captureEnabled else {
+            let decision = FlowTrafficDecision(disposition: .direct, reason: .rule(.defaultDirect))
+            let original = endpointAsSocks(endpoint)
+            let target = kind == "dns" ? original.map { DNSProxyUpstreamResolver.relayDestination(for: $0) } : original
+            return AdmissionOutcome(decision: decision, target: target, proxy: nil, activity: fallbackActivity(flow: flow, endpoint: endpoint, transportProtocol: transport, failure: .unsupportedRemoteEndpoint))
+        }
+        let identityResolution = resolveIdentity(flow)
+        let contextResolution = contextBuilder.resolve(endpoint: endpoint, remoteHostname: useFlowHostname ? flow.remoteHostname : nil, metadata: FlowApplicationMetadata(sourceAppAuditToken: flow.metaData.sourceAppAuditToken, sourceAppUniqueIdentifier: flow.metaData.sourceAppUniqueIdentifier, sourceAppSigningIdentifier: flow.metaData.sourceAppSigningIdentifier), identityResolution: identityResolution, transportProtocol: transport, isTrustedMyproxyComponent: trustedComponentPolicy.contains(identityResolution))
+        guard let request = makeAdmissionRequest(flow: flow, endpoint: endpoint, transport: transport, kind: kind, flowID: flowID, context: contextResolution, activation: currentState.admissionActivation),
+              let client = currentState.admission else {
+            let decision = FlowTrafficDecision(disposition: .reject, reason: .configurationUnavailable(.missingEncodedSnapshot))
+            return AdmissionOutcome(decision: decision, target: nil, proxy: nil, activity: fallbackActivity(flow: flow, endpoint: endpoint, transportProtocol: transport, failure: .unsupportedRemoteEndpoint))
+        }
+        let reply: AppAdmissionReply
+        switch client.request(request) {
+        case let .success(value): reply = value
+        case .failure:
+            let decision = FlowTrafficDecision(disposition: .reject, reason: .configurationUnavailable(.missingEncodedSnapshot))
+            return AdmissionOutcome(decision: decision, target: nil, proxy: nil, activity: fallbackActivity(flow: flow, endpoint: endpoint, transportProtocol: transport, failure: .unsupportedRemoteEndpoint))
+        }
+        let target = admissionEndpoint(host: reply.host, port: reply.port)
+        let decision: FlowTrafficDecision
+        let proxy: ProviderSOCKSConfiguration?
+        switch reply.action {
+        case "direct":
+            decision = FlowTrafficDecision(disposition: .direct, reason: .rule(.defaultDirect)); proxy = nil
+        case "proxy":
+            guard let port = reply.relayPort, let lease = reply.lease, let password = reply.password,
+                  (try? SOCKS5UsernamePasswordCredentials(username: lease, password: password)) != nil else {
+                let reject = FlowTrafficDecision(disposition: .reject, reason: .configurationUnavailable(.missingEncodedSnapshot))
+                return AdmissionOutcome(decision: reject, target: nil, proxy: nil, activity: fallbackActivity(flow: flow, endpoint: endpoint, transportProtocol: transport, failure: .unsupportedRemoteEndpoint))
+            }
+            decision = FlowTrafficDecision(disposition: .mihomo(.profileRules), reason: .rule(.defaultDirect))
+            proxy = try? ProviderSOCKSConfiguration(routeEndpoint: MihomoRouteProxyEndpoint(route: .profileRules, host: "127.0.0.1", port: port, username: lease, password: password))
+        default:
+            decision = FlowTrafficDecision(disposition: .reject, reason: .rule(.defaultDirect)); proxy = nil
+        }
+        let activity = makeActivity(flow: flow, endpoint: endpoint, transportProtocol: transport, context: contextResolution, identityResolution: identityResolution, decision: decision, state: snapshotState(), flowIdentifier: flowID, parentFlowIdentifier: parentFlowIdentifier)
+        return AdmissionOutcome(decision: decision, target: target, proxy: proxy, activity: activity)
+    }
+
+    private func makeAdmissionRequest(flow: NEAppProxyFlow, endpoint: FlowRemoteEndpoint, transport: TransportProtocol, kind: String, flowID: UUID, context: FlowContextResolution, activation: String) -> AppAdmissionRequest? {
+        guard let resolved = context.context else { return nil }
+        let metadata = flow.metaData
+        let identity = context.processIdentity
+        let start = identity?.processStartTime.map { "\($0.seconds):\($0.microseconds)" }
+        let signing: SignedCodeIdentity? = identity.flatMap {
+            if case let .signed(value) = $0.codeSigning { return value }
+            return nil
+        }
+        let source = AppAdmissionSource(processId: identity?.processIdentifier, userId: identity?.effectiveUserID, processStart: start, executablePath: identity?.executablePath, bundleId: signing?.securedBundleIdentifier, signingId: signing?.signingIdentifier ?? (metadata.sourceAppSigningIdentifier.isEmpty ? nil : metadata.sourceAppSigningIdentifier), teamId: signing?.teamIdentifier)
+        return AppAdmissionRequest(version: AppAdmissionBootstrap.version, activation: activation, nonce: UUID().uuidString, flowId: flowID.uuidString, kind: kind, network: transport.rawValue, host: resolved.destination.ipAddress?.presentation ?? endpoint.host, hostname: resolved.destination.hostname, port: resolved.destination.port, source: source)
+    }
+
+    private func resolveIdentity(_ flow: NEAppProxyFlow) -> ProcessIdentityResolution {
+        guard let token = flow.metaData.sourceAppAuditToken else { return .unavailable(.invalidAuditTokenLength(expected: 32, actual: 0)) }
+        return identityCache.resolve(sourceAppAuditToken: token, using: identityResolver)
+    }
+    private func admissionEndpoint(host: String, port: UInt16) -> SOCKS5Endpoint? {
+        if let ip = try? IPAddress(host) { return SOCKS5Endpoint(address: SOCKS5Address(ipAddress: ip), port: port) }
+        return try? SOCKS5Endpoint(address: SOCKS5Address(domain: host), port: port)
+    }
+    private func endpointAsSocks(_ endpoint: FlowRemoteEndpoint) -> SOCKS5Endpoint? { admissionEndpoint(host: endpoint.host, port: UInt16(endpoint.port) ?? 0) }
+    #endif
 
     func decideTCPFlow(_ flow: NEAppProxyTCPFlow) -> FlowTrafficDecision {
         planTCPFlow(flow).decision
@@ -274,6 +387,9 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         destination: SOCKS5Endpoint,
         transportProtocol: TransportProtocol
     ) -> FlowTrafficDecision {
+        #if MYPROXY_XRAY
+        return planDNSFlow(flow, destination: destination, transport: transportProtocol).decision
+        #else
         let host = destination.address.ipAddress?.presentation
             ?? destination.address.domain
             ?? ""
@@ -290,7 +406,16 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
             state: dnsState,
             remoteHostname: destination.address.domain
         ).decision
+        #endif
     }
+
+    #if MYPROXY_XRAY
+    func planDNSFlow(_ flow: NEAppProxyFlow, destination: SOCKS5Endpoint, transport: TransportProtocol, parentFlowIdentifier: UUID? = nil) -> (decision: FlowTrafficDecision, target: SOCKS5Endpoint?, proxy: ProviderSOCKSConfiguration?) {
+        let endpoint = FlowRemoteEndpoint(host: destination.address.ipAddress?.presentation ?? destination.address.domain ?? "", port: destination.port)
+        let outcome = admissionOutcome(flow: flow, endpoint: endpoint, transport: transport, kind: "dns", parentFlowIdentifier: parentFlowIdentifier, useFlowHostname: destination.address.ipAddress != nil)
+        return (outcome.decision, outcome.target, outcome.proxy)
+    }
+    #endif
 
     @available(macOS 15.0, *)
     func planUDPFlow(
@@ -298,6 +423,12 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         initialRemoteEndpoint: Network.NWEndpoint,
         parentFlowIdentifier: UUID? = nil
     ) -> UDPFlowInterceptionPlan {
+        #if MYPROXY_XRAY
+        guard let endpoint = Self.endpoint(initialRemoteEndpoint) else {
+            return UDPFlowInterceptionPlan(decision: FlowTrafficDecision(disposition: .reject, reason: .contextUnavailable(.unsupportedRemoteEndpoint)), initialDestination: nil, mihomoDestination: nil, proxy: nil, unavailableFallback: .reject, activity: fallbackActivity(flow: flow, endpoint: nil, transportProtocol: .udp, failure: .unsupportedRemoteEndpoint), parentFlowIdentifier: parentFlowIdentifier)
+        }
+        return planAdmissionUDP(flow, endpoint: endpoint, parentFlowIdentifier: parentFlowIdentifier ?? UUID())
+        #else
         guard let endpoint = Self.endpoint(initialRemoteEndpoint) else {
             return UDPFlowInterceptionPlan(
                 decision: failOpen(.unsupportedRemoteEndpoint),
@@ -320,6 +451,7 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
             state: snapshotState(),
             parentFlowIdentifier: parentFlowIdentifier
         )
+        #endif
     }
 
     @available(macOS 15.0, *)
@@ -336,6 +468,12 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         initialRemoteEndpoint: NetworkExtension.__NWEndpoint,
         parentFlowIdentifier: UUID? = nil
     ) -> UDPFlowInterceptionPlan {
+        #if MYPROXY_XRAY
+        guard let endpoint = Self.legacyEndpoint(initialRemoteEndpoint) else {
+            return UDPFlowInterceptionPlan(decision: FlowTrafficDecision(disposition: .reject, reason: .contextUnavailable(.unsupportedRemoteEndpoint)), initialDestination: nil, mihomoDestination: nil, proxy: nil, unavailableFallback: .reject, activity: fallbackActivity(flow: flow, endpoint: nil, transportProtocol: .udp, failure: .unsupportedRemoteEndpoint), parentFlowIdentifier: parentFlowIdentifier)
+        }
+        return planAdmissionUDP(flow, endpoint: endpoint, parentFlowIdentifier: parentFlowIdentifier ?? UUID())
+        #else
         guard let endpoint = Self.legacyEndpoint(initialRemoteEndpoint) else {
             return UDPFlowInterceptionPlan(
                 decision: failOpen(.unsupportedRemoteEndpoint),
@@ -358,6 +496,7 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
             state: snapshotState(),
             parentFlowIdentifier: parentFlowIdentifier
         )
+        #endif
     }
 
     /// Re-evaluates one destination of an already-owned UDP flow. A UDP socket
@@ -368,6 +507,9 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         destination: SOCKS5Endpoint,
         parentFlowIdentifier: UUID
     ) -> UDPFlowInterceptionPlan {
+        #if MYPROXY_XRAY
+        return planAdmissionUDP(flow, endpoint: FlowRemoteEndpoint(host: destination.address.ipAddress?.presentation ?? destination.address.domain ?? "", port: destination.port), parentFlowIdentifier: parentFlowIdentifier, useFlowHostname: false)
+        #else
         let endpoint = FlowRemoteEndpoint(
             host: destination.address.ipAddress?.presentation
                 ?? destination.address.domain
@@ -383,6 +525,7 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
             // must not leak into later per-datagram destination decisions.
             remoteHostname: ""
         )
+        #endif
     }
 
     func currentRevision() -> UInt64 {
@@ -398,6 +541,9 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
     }
 
     func failOpen(_ failure: FlowContextConversionFailure) -> FlowTrafficDecision {
+        #if MYPROXY_XRAY
+        return FlowTrafficDecision(disposition: .reject, reason: .contextUnavailable(failure))
+        #else
         let currentState = snapshotState()
         return decisionAdapter.decide(
             preparedConfiguration: currentState.preparedConfiguration,
@@ -405,6 +551,7 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
             captureEnabled: currentState.captureEnabled,
             mihomoAvailable: false
         )
+        #endif
     }
 
     private func decide(
@@ -672,6 +819,13 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         guard case let .hostPort(host, port) = endpoint else { return nil }
         return FlowRemoteEndpoint(host: host.debugDescription, port: port.rawValue)
     }
+
+    #if MYPROXY_XRAY
+    private static func endpointTCP(_ flow: NEAppProxyTCPFlow) -> FlowRemoteEndpoint? {
+        if #available(macOS 15.0, *) { return endpoint(flow.remoteFlowEndpoint) }
+        return legacyEndpoint(flow.__remoteEndpoint)
+    }
+    #endif
 
     @available(macOS, introduced: 14.0, obsoleted: 15.0)
     private static func legacyEndpoint(

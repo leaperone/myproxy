@@ -1,5 +1,10 @@
 import Dispatch
 import NetworkExtension
+import MyproxyNetworkShared
+
+#if MYPROXY_XRAY
+_ = ProcessResourceLimits.raiseXraySoftLimit()
+#endif
 
 // Network Extension system extensions do not use NSApplicationMain. Apple asks
 // providers to enter system-extension mode as early as possible, then keep the

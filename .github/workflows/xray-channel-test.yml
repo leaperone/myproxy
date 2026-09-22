@@ -1,0 +1,143 @@
+name: Xray channel
+on:
+  push:
+    branches: [feat/xray-channel-1.6, xray]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: myproxy-xray-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/xray' }}
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+      archive: ${{ steps.metadata.outputs.archive }}
+    env:
+      CARGO_TARGET_DIR: target/xray-build
+      XRAY_BINARY: ${{ github.workspace }}/resources/xray/xray
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+      MYPROXY_HOST_DEVID_PROFILE: ${{ secrets.MYPROXY_HOST_DEVID_PROFILE }}
+      MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE: ${{ secrets.MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE }}
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/xray-build"
+          key: xray-test
+          cache-on-failure: true
+      - run: python3 scripts/check-xray-boundary.py
+      - run: python3 scripts/test-install-xray-recovery.py
+      - run: python3 scripts/test-xray-resource-limits.py
+      - run: python3 scripts/test-xray-release-metadata.py
+      - run: python3 scripts/test-xray-release-artifacts.py
+      - run: scripts/fetch-xray.sh
+      - run: rustfmt --edition 2021 src/xray.rs src/backend.rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-formatted-${{ github.sha }}
+          path: |
+            src/xray.rs
+            src/backend.rs
+            src/xray/
+      - run: cargo test --locked --lib -- --test-threads=1
+      - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
+      - run: scripts/fetch-sparkle.sh
+      - run: cargo build --locked --bins --features sparkle,xray-channel
+      - name: Set Xray release metadata
+        id: metadata
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        run: |
+          python3 scripts/xray_release_metadata.py \
+            --run "$GITHUB_RUN_NUMBER" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
+      - name: Import Developer ID certificate
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        run: |
+          set -euo pipefail
+          certificate_path="${RUNNER_TEMP}/myproxy-xray-developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/myproxy-xray-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_data="${CSC_LINK}"
+          if [[ "${certificate_data}" == data:*base64,* ]]; then certificate_data="${certificate_data#*,}"; fi
+          printf '%s' "${certificate_data}" | base64 --decode > "${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" -k "${keychain_path}" -P "${CSC_KEY_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain_path}" >/dev/null
+          security list-keychains -d user -s "${keychain_path}"
+          identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+          [[ -n "${identity}" ]] || { echo "No Developer ID Application identity" >&2; exit 1; }
+          echo "CODESIGN_IDENTITY=${identity}" >> "${GITHUB_ENV}"
+          echo "MYPROXY_XRAY_KEYCHAIN_PATH=${keychain_path}" >> "${GITHUB_ENV}"
+          echo "MYPROXY_XRAY_CERTIFICATE_PATH=${certificate_path}" >> "${GITHUB_ENV}"
+      - name: Decode Developer ID profiles
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        run: |
+          set -euo pipefail
+          [[ -n "${MYPROXY_HOST_DEVID_PROFILE}" && -n "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE}" ]] || { echo "Developer ID profiles are required" >&2; exit 1; }
+          mkdir -p "${RUNNER_TEMP}/myproxy-xray-profiles"
+          printf '%s' "${MYPROXY_HOST_DEVID_PROFILE}" | base64 --decode > "${RUNNER_TEMP}/myproxy-xray-profiles/host.provisionprofile"
+          printf '%s' "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE}" | base64 --decode > "${RUNNER_TEMP}/myproxy-xray-profiles/network-extension.provisionprofile"
+          echo "MYPROXY_HOST_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/host.provisionprofile" >> "${GITHUB_ENV}"
+          echo "MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/network-extension.provisionprofile" >> "${GITHUB_ENV}"
+      - run: scripts/package-xray-test.sh
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        with:
+          name: myproxy-xray-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/xray-channel/*
+          if-no-files-found: error
+      - name: Preserve package diagnostics
+        if: failure() && (github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-package-diagnostics-${{ github.sha }}
+          path: dist/xray-channel/*
+          if-no-files-found: ignore
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          set +e
+          [[ -f "${MYPROXY_XRAY_KEYCHAIN_PATH:-}" ]] && security delete-keychain "${MYPROXY_XRAY_KEYCHAIN_PATH}"
+          [[ -f "${MYPROXY_XRAY_CERTIFICATE_PATH:-}" ]] && rm -f "${MYPROXY_XRAY_CERTIFICATE_PATH}"
+          exit 0
+
+  publish:
+    needs: test
+    if: github.ref == 'refs/heads/xray'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: myproxy-xray-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets
+      - name: Publish verified Xray build and update its feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          XRAY_VERSION: ${{ needs.test.outputs.version }}
+          XRAY_TAG: ${{ needs.test.outputs.tag }}
+          XRAY_BUILD_NUMBER: ${{ needs.test.outputs.build_number }}
+          XRAY_ARCHIVE: ${{ needs.test.outputs.archive }}
+        run: python3 scripts/publish-xray-release.py release-assets

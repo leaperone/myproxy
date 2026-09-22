@@ -1138,6 +1138,7 @@ mod tests {
     fn dest_gfw_emits_and_rule_set_and_provider() {
         let mut strategy = Strategy::default();
         strategy.rule_sets.push(crate::strategy::RuleSet {
+            unavailable_fallback: Default::default(),
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
@@ -1223,6 +1224,7 @@ mod tests {
         strategy.system_extension = true;
         strategy.extension_mode = InboundMode::Rule;
         strategy.rule_sets = vec![crate::strategy::RuleSet {
+            unavailable_fallback: Default::default(),
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),

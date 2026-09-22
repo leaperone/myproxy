@@ -259,6 +259,9 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
 }
 
 fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
+    if crate::backend::is_xray() && ["vless://","vmess://","trojan://","ss://"].iter().any(|scheme|url.trim().starts_with(scheme)) {
+        return crate::xray::import::parse_links(url);
+    }
     let body = if let Some(path) = url.strip_prefix("file://") {
         fs::read_to_string(path).with_context(|| format!("read {name}"))?
     } else if url.starts_with("http://") || url.starts_with("https://") {
@@ -319,6 +322,7 @@ fn parse_subscription(body: &str) -> Result<Vec<serde_yaml::Value>> {
             }
         }
     }
+    if crate::backend::is_xray() { return crate::xray::import::parse_links(trimmed); }
     bail!("subscription is not Clash YAML or base64 YAML");
 }
 
@@ -340,7 +344,7 @@ fn proxies_from_yaml(text: &str) -> Result<Vec<serde_yaml::Value>> {
     }
 }
 
-pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) -> Vec<String> {
+fn resolve_node_members(group: &crate::strategy::Group, catalog: &Catalog) -> Vec<String> {
     // Pin order is fallback/select priority. Do not alpha-sort: flag-prefixed
     // names would otherwise become the implicit first member.
     let mut names: Vec<String> = Vec::new();
@@ -369,6 +373,86 @@ pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) 
 
 pub fn count_group_members(group: &crate::strategy::Group, catalog: &Catalog) -> usize {
     resolve_group_members(group, catalog).len()
+}
+
+/// Resolves an ordered group graph against the current catalog. Direct node
+/// pins and filters retain their existing semantics; referenced groups are
+/// expanded first in declaration order and duplicate nodes are removed.
+/// Missing references and cycles fail closed for callers that can surface an
+/// unavailable group instead of accidentally selecting a different node.
+pub fn resolve_group_members_with_strategy(
+    strategy: &crate::strategy::Strategy,
+    group_name: &str,
+    catalog: &Catalog,
+) -> anyhow::Result<Vec<String>> {
+    fn find_group<'a>(strategy: &'a crate::strategy::Strategy, name: &str) -> Option<&'a crate::strategy::Group> {
+        let name = name.trim();
+        strategy.groups.iter().find(|group| {
+            group.name == name || group.id == name || group.name.eq_ignore_ascii_case(name)
+        })
+    }
+    let mut visiting = std::collections::HashSet::new();
+    let mut completed = std::collections::HashSet::new();
+    let mut resolved = Vec::new();
+    fn append_unique(names: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
+        for value in values {
+            if !names.iter().any(|existing| existing == &value) {
+                names.push(value);
+            }
+        }
+    }
+    fn visit(
+        group: &crate::strategy::Group,
+        strategy: &crate::strategy::Strategy,
+        catalog: &Catalog,
+        visiting: &mut std::collections::HashSet<String>,
+        completed: &mut std::collections::HashSet<String>,
+        resolved: &mut Vec<String>,
+        depth: usize,
+    ) -> anyhow::Result<()> {
+        if depth >= 64 {
+            anyhow::bail!("节点组引用层级超过 64 层");
+        }
+        let key = group.id.to_ascii_lowercase();
+        if completed.contains(&key) { return Ok(()); }
+        if !visiting.insert(key.clone()) {
+            anyhow::bail!("节点组引用形成循环：{}", group.name);
+        }
+        for reference in &group.group_refs {
+            let Some(target) = find_group(strategy, reference) else {
+                anyhow::bail!("节点组 {} 引用了不存在的节点组 {}", group.name, reference);
+            };
+            visit(target, strategy, catalog, visiting, completed, resolved, depth + 1)?;
+        }
+        append_unique(resolved, resolve_node_members(group, catalog));
+        visiting.remove(&key);
+        completed.insert(key);
+        Ok(())
+    }
+    let group = find_group(strategy, group_name).with_context(|| format!("group not found: {group_name}"))?;
+    visit(group, strategy, catalog, &mut visiting, &mut completed, &mut resolved, 0)?;
+    Ok(resolved)
+}
+
+/// Returns the unflattened ordered choices for a group: referenced group names
+/// first, followed by its ordinary node choices. This is suitable for live
+/// group/UI views where nested group identity must remain visible.
+pub fn resolve_group_members(
+    group: &crate::strategy::Group,
+    catalog: &Catalog,
+) -> Vec<String> {
+    let mut choices = group
+        .group_refs
+        .iter()
+        .map(|reference| reference.trim().to_string())
+        .filter(|reference| !reference.is_empty())
+        .collect::<Vec<_>>();
+    for node in resolve_node_members(group, catalog) {
+        if !choices.iter().any(|choice| choice == &node) {
+            choices.push(node);
+        }
+    }
+    choices
 }
 
 fn group_accepts(group: &crate::strategy::Group, node: &Node) -> bool {
@@ -416,7 +500,7 @@ fn name_matches_pattern(text: &str, pattern: &str) -> bool {
     )
 }
 
-fn wildcard_match(pattern: &[char], value: &[char]) -> bool {
+pub(crate) fn wildcard_match(pattern: &[char], value: &[char]) -> bool {
     let (mut p, mut v) = (0usize, 0usize);
     let (mut star, mut star_v) = (None, 0usize);
     while v < value.len() {
@@ -484,5 +568,33 @@ mod tests {
         assert_eq!(catalog.filter_excluded_count(), 1);
         assert!(catalog.subscription_warning("A").is_some());
         assert!(catalog.subscription_warning("B").is_none());
+    }
+
+    #[test]
+    fn ordered_group_references_expand_and_deduplicate_current_nodes() {
+        let mut strategy = crate::strategy::Strategy::default();
+        let mut region_a = crate::strategy::Group::matching("A".into(), "fallback".into(), vec![], vec!["A".into()]);
+        region_a.include = vec!["one".into()];
+        let mut region_b = crate::strategy::Group::matching("B".into(), "fallback".into(), vec![], vec!["B".into()]);
+        region_b.include = vec!["two".into()];
+        let mut profile = crate::strategy::Group::matching("Profile".into(), "fallback".into(), vec![], vec![]);
+        profile.group_refs = vec!["B".into(), "A".into()];
+        strategy.groups = vec![region_a, region_b, profile];
+        let catalog = Catalog {
+            nodes: ["A-one", "B-two"].into_iter().map(|name| Node {
+                name: name.into(), subscription: "fixture".into(), raw: serde_yaml::from_str(&format!("name: {name}")).unwrap(),
+            }).collect(),
+            ..Catalog::default()
+        };
+        assert_eq!(resolve_group_members_with_strategy(&strategy, "Profile", &catalog).unwrap(), ["B-two", "A-one"]);
+        let refreshed = Catalog { nodes: ["A-one", "B-two", "A-new"].into_iter().map(|name| Node {
+            name: name.into(), subscription: "fixture".into(), raw: serde_yaml::from_str(&format!("name: {name}")).unwrap(),
+        }).collect(), ..catalog };
+        assert_eq!(resolve_group_members_with_strategy(&strategy, "Profile", &refreshed).unwrap(), ["B-two", "A-one", "A-new"]);
+        strategy.groups[2].group_refs = vec!["Missing".into()];
+        assert!(resolve_group_members_with_strategy(&strategy, "Profile", &refreshed).is_err());
+        strategy.groups[2].group_refs = vec!["A".into()];
+        strategy.groups[0].group_refs = vec!["Profile".into()];
+        assert!(resolve_group_members_with_strategy(&strategy, "Profile", &refreshed).is_err());
     }
 }

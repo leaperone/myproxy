@@ -1,0 +1,236 @@
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+use crate::controller::TrafficSnapshot;
+use crate::network_extension::{self, EnableRequest};
+use super::{admission, policy, relay, udp};
+
+pub struct CaptureService {
+    pub request: EnableRequest,
+    admission: admission::AdmissionService,
+}
+
+impl CaptureService {
+    pub fn prepare() -> Result<Self> {
+        let resolvers = std::process::Command::new("/usr/sbin/scutil").arg("--dns").output()
+            .context("无法读取当前系统 DNS 设置")?;
+        if !resolvers.status.success() { bail!("无法读取系统 DNS 设置：scutil 退出码 {:?}", resolvers.status.code()); }
+        let resolvers = system_resolvers(&String::from_utf8_lossy(&resolvers.stdout));
+        if resolvers.is_empty() { bail!("系统没有返回 DNS 服务器，系统接管未启用"); }
+        let direct_dns_resolver = select_resolver(&resolvers, |ip| {
+            match probe_dns_answer(std::net::SocketAddr::new(ip,53)) {
+                Ok(()) => true,
+                Err(error) => { crate::log::warn("xray-dns", format!("system resolver TCP probe {ip}: {error:#}")); false }
+            }
+        })
+            .context("系统 DNS 服务器没有响应，系统接管未启用；本地代理继续可用")?;
+        let admission = admission::AdmissionService::start(Arc::new(ApplicationRouting { direct_dns: DirectDns { selected: direct_dns_resolver, system_resolvers: resolvers } }))?;
+        let (username, password) = admission.probe_credentials();
+        let request = EnableRequest {
+            revision: super::next_generation(), operation_revision: 0,
+            socks_port: admission.relay_port(), username: username.into(), password: password.into(),
+            app_admission: Some(admission.bootstrap().clone()),
+            process_rules: vec![], dest_rules: vec![], qualified_rules: vec![],
+            gfw_domains: vec![], group_ports: vec![], gfw_ports: vec![],
+            dns_resolvers: crate::compile::DNS_NAMESERVERS.iter().map(|value| (*value).to_string()).collect(),
+            capture_private_networks: true,
+        };
+        network_extension::prepare_request(&request)?;
+        Ok(Self { request, admission })
+    }
+
+    pub fn snapshot(&self) -> TrafficSnapshot {
+        let mut snapshot = self.admission.snapshot();
+        for connection in &mut snapshot.connections {
+            connection.id = format!("capture:{}", connection.id);
+        }
+        snapshot
+    }
+
+    pub fn close_one(&self, id: &str) -> Result<()> {
+        self.admission.close_one(id.strip_prefix("capture:").context("无效的系统接管连接标识")?)
+    }
+
+    pub fn close_all(&self) -> Result<()> { self.admission.close_all() }
+}
+
+fn system_resolvers(output: &str) -> Vec<std::net::IpAddr> {
+    let mut resolvers = Vec::new();
+    for address in output.lines().filter_map(|line| {
+        let (key, value) = line.trim().split_once(" : ")?;
+        if !key.starts_with("nameserver[") { return None; }
+        value.trim().parse::<std::net::IpAddr>().ok()
+    }) {
+        if !resolvers.contains(&address) { resolvers.push(address); }
+        if resolvers.len() == 4 { break; }
+    }
+    resolvers
+}
+
+fn select_resolver(resolvers: &[std::net::IpAddr], probe: impl Fn(std::net::IpAddr)->bool + Sync) -> Option<String> {
+    std::thread::scope(|scope| {
+        let handles = resolvers.iter().map(|&address| {
+            let probe = &probe;
+            (address, scope.spawn(move || probe(address)))
+        }).collect::<Vec<_>>();
+        handles.into_iter().filter_map(|(address, result)| result.join().ok().filter(|&ok| ok).map(|_| address.to_string())).next()
+    })
+}
+
+fn probe_dns_answer(address: std::net::SocketAddr) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(700))?;
+        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+        let id = uuid::Uuid::new_v4();
+        let mut query = id.as_bytes()[..2].to_vec();
+        query.extend_from_slice(b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01");
+        let mut frame = (query.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(&query);
+        stream.write_all(&frame)?;
+        let mut read = |bytes: &mut [u8]| -> Result<()> {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() { bail!("DNS probe timed out"); }
+                stream.set_read_timeout(Some(remaining))?;
+                let size = stream.read(&mut bytes[offset..])?;
+                if size == 0 { bail!("DNS probe closed"); }
+                offset += size;
+            }
+            Ok(())
+        };
+        let mut length=[0;2];read(&mut length)?;
+        let size = u16::from_be_bytes(length) as usize;
+        if !(12..=4096).contains(&size) { bail!("Invalid DNS response size"); }
+        let mut answer=vec![0;size];read(&mut answer)?;
+        if answer[..2] != query[..2] || answer[2]&128==0 || answer[3]&15!=0 || answer[6..8]==[0,0] { bail!("Invalid DNS response"); }
+        Ok(())
+}
+
+struct DirectDns {
+    selected: String,
+    system_resolvers: Vec<std::net::IpAddr>,
+}
+
+struct ApplicationRouting { direct_dns: DirectDns }
+impl admission::Routing for ApplicationRouting {
+    fn decide(&self, request: &admission::FlowRequest) -> Result<admission::AdmittedRoute> {
+        let runtime = super::active()?;
+        if !runtime.core_alive() { bail!("代理内核未运行"); }
+        let strategy = runtime.strategy.read().expect("strategy");
+        let generation = runtime.generation.load(std::sync::atomic::Ordering::Acquire);
+        let applications = policy::application_identifiers(request.source.executable_path.as_deref(), request.source.bundle_id.as_deref(), request.source.signing_id.as_deref());
+        let context = policy::FlowContext {
+            host: &request.host, hostname: request.hostname.as_deref(), port: request.port,
+            network: &request.network, user_id: request.source.user_id, applications: &applications,
+        };
+        let trusted_dns = request.kind == "dns"
+            && matches!(request.source.signing_id.as_deref(), Some("local.harry.myproxy" | "local.harry.myproxy.xray"))
+            && (request.source.team_id.as_deref() == Some("5UAHRS482C")
+                || (request.source.process_id.is_none() && request.source.team_id.is_none()));
+        let decision = if trusted_dns {
+            policy::Decision { allow_direct_fallback: false, route: policy::Route::Direct, chain: vec!["DIRECT".into()], rule: "代理自身的域名解析".into() }
+        } else {
+            policy::decide_application(&strategy, &runtime.catalog, &runtime.health.read().expect("health"), &context)
+        };
+        let host = if request.kind == "dns" {
+            self.direct_dns.target(&request.host, &decision.route)
+        } else {
+            request.hostname.as_ref().filter(|name| !name.is_empty()).unwrap_or(&request.host).clone()
+        };
+        Ok(admission::AdmittedRoute { generation, decision, host, port: request.port })
+    }
+
+    fn generation(&self) -> Result<u64> {
+        Ok(super::active()?.generation.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn dial(&self, route: &admission::AdmittedRoute) -> Result<relay::Dialed> {
+        let runtime = super::active()?;
+        runtime.check_admission_generation(route.generation)?;
+        let policy::Route::Node(name) = &route.decision.route else { bail!("此连接未获准进入代理转发"); };
+        let lane = runtime.lanes.get(name).context("所选节点已不可用")?;
+        let stream = relay::dial_socks(lane.address, &lane.username, &lane.password, &route.host, route.port)?;
+        runtime.check_admission_generation(route.generation)?;
+        Ok(relay::Dialed { stream, chain: route.decision.chain.join(" → "), rule: route.decision.rule.clone() })
+    }
+
+    fn datagram_route(&self, route: &admission::AdmittedRoute) -> Result<udp::DatagramRoute> {
+        let runtime = super::active()?;
+        runtime.check_admission_generation(route.generation)?;
+        let policy::Route::Node(name) = &route.decision.route else { bail!("此数据报未获准进入代理转发"); };
+        let lane = runtime.lanes.get(name).context("所选节点已不可用")?;
+        let target = udp::DatagramRoute::Socks { address: lane.address, username: lane.username.clone(), password: lane.password.clone(), label: route.decision.chain.join(" → "), fallback_direct: false };
+        runtime.check_admission_generation(route.generation)?;
+        Ok(target)
+    }
+}
+
+impl DirectDns {
+    fn target(&self, original: &str, route: &policy::Route) -> String {
+        if *route != policy::Route::Direct {
+            return crate::compile::DNS_NAMESERVERS[0].to_string();
+        }
+        let address = original.parse::<std::net::IpAddr>().ok();
+        // Browsers can query a system resolver without supplying hostname metadata.
+        if address.is_none() || address.is_some_and(|ip| self.system_resolvers.contains(&ip)) {
+            self.selected.clone()
+        } else {
+            original.to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn captured_dns_uses_a_resolver_for_the_selected_route() {
+        use super::{DirectDns, policy::Route};
+        let dns = DirectDns {
+            selected: "223.5.5.5".into(),
+            system_resolvers: vec!["119.29.29.29".parse().unwrap(), "223.5.5.5".parse().unwrap()],
+        };
+        let proxy = Route::Node("US".into());
+        assert_eq!(dns.target("223.5.5.5", &proxy), "1.1.1.1");
+        assert_eq!(dns.target("example.com", &proxy), "1.1.1.1");
+        assert_eq!(dns.target("119.29.29.29", &Route::Direct), "223.5.5.5");
+        assert_eq!(dns.target("192.168.1.1", &Route::Direct), "192.168.1.1");
+        assert_eq!(dns.target("8.8.8.8", &Route::Direct), "8.8.8.8");
+        assert_eq!(dns.target("example.com", &Route::Direct), "223.5.5.5");
+    }
+
+    #[test]
+    fn xray_dns_preflight_checks_a_real_framed_answer_and_transaction_id() {
+        use std::io::{Read,Write};
+        for correct_id in [true,false] {
+            let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address=listener.local_addr().unwrap();
+            let server=std::thread::spawn(move || {
+                let (mut stream,_)=listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+                let mut length=[0;2];stream.read_exact(&mut length).unwrap();
+                let mut query=vec![0;u16::from_be_bytes(length) as usize];stream.read_exact(&mut query).unwrap();
+                assert_eq!(&query[12..],b"\x07example\x03com\x00\x00\x01\x00\x01");
+                if !correct_id {query[0]^=1;}
+                query[2]=0x81;query[3]=0x80;query[7]=1;
+                query.extend_from_slice(&[0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,192,0,2,1]);
+                stream.write_all(&(query.len() as u16).to_be_bytes()).unwrap();
+                stream.write_all(&query).unwrap();
+            });
+            assert_eq!(super::probe_dns_answer(address).is_ok(),correct_id);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn xray_direct_dns_preserves_the_current_system_resolver() {
+        let resolvers = super::system_resolvers("DNS configuration\nresolver #1\n  nameserver[0] : 119.29.29.29\n  nameserver[1] : 223.5.5.5\n  nameserver[0] : 119.29.29.29\n");
+        assert_eq!(resolvers.iter().map(ToString::to_string).collect::<Vec<_>>(), vec!["119.29.29.29","223.5.5.5"]);
+        assert_eq!(super::select_resolver(&resolvers, |ip| ip.to_string()=="223.5.5.5"), Some("223.5.5.5".into()));
+        assert_eq!(super::select_resolver(&resolvers, |_| false), None);
+        assert_eq!(super::system_resolvers("nameserver[0] : 2606:4700:4700::1111").len(), 1);
+        assert!(super::system_resolvers("No DNS configuration available").is_empty());
+    }
+}

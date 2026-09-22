@@ -4,13 +4,27 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+pub const fn data_dir_env() -> &'static str {
+    if crate::backend::is_xray() {
+        "MYPROXY_XRAY_DATA_DIR"
+    } else {
+        "MYPROXY_DATA_DIR"
+    }
+}
+
 pub fn data_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("MYPROXY_DATA_DIR") {
+    let dir = match std::env::var_os(data_dir_env()) {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         _ => dirs::data_dir()
             .context("no application support directory")?
-            .join("myproxy"),
+            .join(if crate::backend::is_xray() { "myproxy-xray" } else { "myproxy" }),
     };
+    if crate::backend::is_xray() {
+        let legacy = dirs::data_dir().context("no application support directory")?.join("myproxy");
+        if dir == legacy || (dir.exists() && legacy.exists() && fs::canonicalize(&dir)? == fs::canonicalize(&legacy)?) {
+            anyhow::bail!("Xray 通道使用独立配置目录，不能直接覆盖原内核的配置");
+        }
+    }
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
 }
@@ -29,6 +43,10 @@ pub fn runtime_yaml_path() -> Result<PathBuf> {
 
 pub fn runtime_state_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("runtime-state.json"))
+}
+
+pub fn xray_runtime_state_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("xray-runtime-state.json"))
 }
 
 pub fn candidate_yaml_path() -> Result<PathBuf> {
@@ -99,4 +117,14 @@ pub fn bundled_mihomo() -> PathBuf {
         return next_to_exe;
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/mihomo/mihomo")
+}
+
+pub fn bundled_xray() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    let next_to_exe = exe.parent().map(|p| p.join("xray")).unwrap_or_default();
+    if next_to_exe.is_file() {
+        return next_to_exe;
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/xray/xray")
 }

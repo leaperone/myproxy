@@ -316,6 +316,7 @@ struct RawHistory {
 }
 
 pub fn fetch(mixed_port: u16, system_extension: bool) -> Result<TrafficSnapshot> {
+    if crate::backend::is_xray() { return crate::xray::traffic(); }
     let url = format!(
         "http://127.0.0.1:{}/connections",
         controller_port(mixed_port)
@@ -358,6 +359,7 @@ pub fn fetch(mixed_port: u16, system_extension: bool) -> Result<TrafficSnapshot>
 }
 
 pub fn fetch_totals(mixed_port: u16) -> Result<TrafficTotals> {
+    if crate::backend::is_xray() { let snap = crate::xray::traffic()?; return Ok(TrafficTotals { upload_total:snap.upload_total, download_total:snap.download_total, connection_count:snap.connection_count }); }
     let url = format!(
         "http://127.0.0.1:{}/connections",
         controller_port(mixed_port)
@@ -426,6 +428,7 @@ pub fn probe(mixed_port: u16, group_name: &str) -> Result<String> {
 }
 
 pub fn ready(mixed_port: u16) -> Result<()> {
+    if crate::backend::is_xray() { if !crate::xray::status()?.ready { bail!("Xray 入口未就绪"); } return Ok(()); }
     let url = format!("http://127.0.0.1:{}/version", controller_port(mixed_port));
     let body = authorized_get(&url, FETCH_TIMEOUT).context("Mihomo controller unavailable")?;
     let version: Value =
@@ -437,6 +440,7 @@ pub fn ready(mixed_port: u16) -> Result<()> {
 }
 
 pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
+    if crate::backend::is_xray() { return crate::xray::groups(); }
     let url = format!("http://127.0.0.1:{}/proxies", controller_port(mixed_port));
     let body = authorized_get(&url, FETCH_TIMEOUT)
         .with_context(|| format!("GET proxies :{}", controller_port(mixed_port)))?;
@@ -520,6 +524,7 @@ pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {
 }
 
 pub fn test_group_delay(mixed_port: u16, group: &str) -> Result<HashMap<String, u32>> {
+    if crate::backend::is_xray() { return crate::xray::test_group_delay(group); }
     let port = controller_port(mixed_port);
     let encoded = encode_path_segment(group);
     let probe = encode_path_segment("https://www.gstatic.com/generate_204");

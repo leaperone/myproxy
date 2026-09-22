@@ -4,6 +4,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=MYPROXY_BUILD_CHANNEL");
     println!("cargo:rerun-if-env-changed=MYPROXY_VERSION");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_XRAY_CHANNEL");
     let channel = std::env::var("MYPROXY_BUILD_CHANNEL").unwrap_or_else(|_| {
         if std::env::var("PROFILE").ok().as_deref() == Some("release") {
             "prod"
@@ -13,7 +14,7 @@ fn main() {
         .into()
     });
     assert!(
-        matches!(channel.as_str(), "prod" | "nightly" | "dev"),
+        matches!(channel.as_str(), "prod" | "nightly" | "xray" | "dev"),
         "invalid build channel"
     );
     let version = std::env::var("MYPROXY_VERSION")
@@ -67,6 +68,7 @@ fn compile_network_host(manifest: &PathBuf) {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("network-host");
     let status = Command::new(manifest.join("scripts/build-network-host.sh"))
         .arg(&out)
+        .env("MYPROXY_XRAY_CHANNEL", if std::env::var_os("CARGO_FEATURE_XRAY_CHANNEL").is_some() { "1" } else { "0" })
         .status()
         .expect("run scripts/build-network-host.sh");
     if !status.success() {

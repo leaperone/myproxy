@@ -21,8 +21,12 @@ pub struct EnableRequest {
     pub socks_port: u16,
     pub username: String,
     pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_admission: Option<crate::xray::admission::Bootstrap>,
     pub process_rules: Vec<ProcessRule>,
     pub dest_rules: Vec<DestRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qualified_rules: Vec<QualifiedRule>,
     pub gfw_domains: Vec<String>,
     pub group_ports: Vec<GroupPort>,
     #[serde(default)]
@@ -39,6 +43,8 @@ pub struct ProcessRule {
     pub order: u64,
     pub pattern: String,
     pub via: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +54,8 @@ pub struct DestRule {
     pub kind: String,
     pub value: String,
     pub via: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,11 +64,23 @@ pub struct GroupPort {
     pub port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualifiedRule {
+    pub order: u64,
+    pub via: String,
+    pub user_ids: Vec<u32>,
+    pub ports: Vec<u16>,
+    pub destinations: Vec<DestRule>,
+    pub protocols: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureFace {
     socks_port: u16,
     process_rules: Vec<ProcessRule>,
     dest_rules: Vec<DestRule>,
+    qualified_rules: Vec<QualifiedRule>,
     gfw_domains: Vec<String>,
     group_ports: Vec<GroupPort>,
     gfw_ports: Vec<GroupPort>,
@@ -391,6 +411,23 @@ pub fn prepare_request(request: &EnableRequest) -> Result<()> {
 }
 
 fn validate_request(request: &EnableRequest) -> Result<()> {
+    if crate::backend::is_xray() {
+        if request.app_admission.is_none()
+            || !request.process_rules.is_empty() || !request.dest_rules.is_empty()
+            || !request.qualified_rules.is_empty() || !request.group_ports.is_empty()
+            || !request.gfw_ports.is_empty() || !request.gfw_domains.is_empty()
+        {
+            bail!("Xray 系统接管只接受应用决策服务，不下发路由规则");
+        }
+        if let Some(admission) = &request.app_admission {
+            use base64::Engine;
+            if admission.version != 1 || admission.port == 0 || Uuid::parse_str(&admission.activation).is_err()
+                || !base64::engine::general_purpose::STANDARD.decode(&admission.key).is_ok_and(|key| key.len() == 32)
+            {
+                bail!("应用决策服务的连接信息无效");
+            }
+        }
+    }
     if !request.gfw_domains.is_empty() {
         bail!("系统接管不再嵌入 GFWList 域名");
     }
@@ -409,6 +446,9 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
 }
 
 pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
+    if crate::backend::is_xray() {
+        bail!("Xray 系统接管由应用决策服务创建，不编译网络扩展规则");
+    }
     let socks_port = compile::network_extension_socks_port(strategy.mixed_port);
     let controller = compile::controller_port(strategy.mixed_port);
     let mut session = SESSION.lock().expect("ne session");
@@ -429,11 +469,13 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
 
     let mut process_rules = Vec::new();
     let mut dest_rules = Vec::new();
+    let mut qualified_rules = Vec::new();
     let mut order = 0u64;
     let mut needed = Vec::new();
     let mut gfw_needed = Vec::new();
     if strategy.extension_mode == InboundMode::Rule {
         for set in &strategy.rule_sets {
+            let protocols: Vec<String> = Vec::new();
             let via = set.via.trim();
             if via.is_empty() {
                 continue;
@@ -452,9 +494,9 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
                 match matcher.kind.as_str() {
                     "app" => {
                         pins_inlet = true;
-                        push_app_patterns(&mut process_rules, order, value, &capture_via);
+                        push_app_patterns(&mut process_rules, order, value, &capture_via, &protocols);
                     }
-                    "domain" | "suffix" | "keyword" | "cidr" => {
+                    "domain" | "suffix" | "keyword" | "cidr" | "wildcard" => {
                         if matcher.kind == "cidr" && gfw::gfw_group(&capture_via).is_some() {
                             bail!("GFWList 无法与网段规则求交，请改用节点组或域名条件");
                         }
@@ -464,6 +506,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
                             kind: matcher.kind.clone(),
                             value: value.to_string(),
                             via: capture_via.clone(),
+                            protocols: protocols.clone(),
                         });
                     }
                     _ => {}
@@ -504,6 +547,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         socks_port,
         process_rules: process_rules.clone(),
         dest_rules: dest_rules.clone(),
+        qualified_rules: qualified_rules.clone(),
         gfw_domains: Vec::new(),
         group_ports: group_ports.clone(),
         gfw_ports: gfw_ports.clone(),
@@ -519,8 +563,10 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         socks_port,
         username: session.username.clone(),
         password: session.password.clone(),
+        app_admission: None,
         process_rules,
         dest_rules,
+        qualified_rules,
         gfw_domains: Vec::new(),
         group_ports,
         gfw_ports,
@@ -563,19 +609,20 @@ fn allocate_named_ports(
     Ok(ports)
 }
 
-fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &str, via: &str) {
+fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &str, via: &str, protocols: &[String]) {
     let pattern = value.trim();
     if pattern.is_empty() {
         return;
     }
     if !process_rules
         .iter()
-        .any(|rule| rule.pattern == pattern && rule.via == via)
+        .any(|rule| rule.pattern == pattern && rule.via == via && rule.protocols == protocols)
     {
         process_rules.push(ProcessRule {
             order,
             pattern: pattern.to_string(),
             via: via.to_string(),
+            protocols: protocols.to_vec(),
         });
     }
     if pattern.contains('*') || pattern.contains('?') {
@@ -584,12 +631,13 @@ fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &s
     let wildcard = format!("{pattern}*");
     if !process_rules
         .iter()
-        .any(|rule| rule.pattern == wildcard && rule.via == via)
+        .any(|rule| rule.pattern == wildcard && rule.via == via && rule.protocols == protocols)
     {
         process_rules.push(ProcessRule {
             order,
             pattern: wildcard,
             via: via.to_string(),
+            protocols: protocols.to_vec(),
         });
     }
 }
@@ -743,8 +791,30 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::strategy::{InboundMode, RoutingProfile, Strategy};
+
+    #[test]
+    #[cfg(feature = "xray-channel")]
+    fn xray_capture_requires_application_admission_and_rejects_rule_tables() {
+        let mut request = EnableRequest {
+            revision: 1, operation_revision: 0, socks_port: 49152,
+            username: "probe".into(), password: "probe-password".into(),
+            app_admission: Some(crate::xray::admission::Bootstrap {
+                version: 1, activation: Uuid::new_v4().to_string(), port: 49153, key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            }),
+            process_rules: vec![], dest_rules: vec![], qualified_rules: vec![], group_ports: vec![],
+            gfw_ports: vec![], gfw_domains: vec![], dns_resolvers: vec!["1.1.1.1".into()], capture_private_networks: true,
+        };
+        assert!(validate_request(&request).is_ok());
+        assert!(serde_json::to_vec(&request).unwrap().len() < 2048);
+        request.dest_rules.push(DestRule { order: 0, kind: "suffix".into(), value: "example.com".into(), via: "DIRECT".into(), protocols: vec![] });
+        assert!(validate_request(&request).is_err());
+        request.dest_rules.clear(); request.app_admission = None;
+        assert!(validate_request(&request).is_err());
+        assert!(try_inbound_plan(&Strategy::default()).is_err());
+    }
 
     #[test]
     fn rule_mode_pins_app_matchers() {
@@ -801,6 +871,7 @@ mod tests {
         strategy.system_extension = true;
         strategy.extension_mode = InboundMode::Rule;
         strategy.rule_sets = vec![crate::strategy::RuleSet {
+            unavailable_fallback: Default::default(),
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
@@ -842,6 +913,7 @@ mod tests {
             }];
         }
         strategy.rule_sets.push(crate::strategy::RuleSet {
+            unavailable_fallback: Default::default(),
             id: "cpa".into(),
             name: "CPA".into(),
             via: "AI Proxy".into(),
@@ -942,8 +1014,10 @@ mod tests {
             socks_port: 1080,
             username: "u".into(),
             password: "p".into(),
+            app_admission: None,
             process_rules: vec![],
             dest_rules: vec![],
+            qualified_rules: vec![],
             gfw_domains: vec![],
             group_ports: vec![],
             gfw_ports: vec![],

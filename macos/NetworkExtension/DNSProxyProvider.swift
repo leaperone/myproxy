@@ -360,20 +360,31 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             reject(flow, category: .flowConversionFailed)
             return true
         }
-        let relayTarget = relayDestination(
-            for: destination,
-            resolvers: runtimeState.upstreamResolvers
-        )
         let identifier = UUID()
         runtimeState.reporter?.beginFlow(identifier, transportProtocol: .tcp)
         let reporter = runtimeState.reporter
         let observer: @Sendable (AppRoutingRelaySnapshot) -> Void = { snapshot in
-            reporter?.observe(
-                snapshot,
-                flowIdentifier: identifier,
-                transportProtocol: .tcp
-            )
+            reporter?.observe(snapshot, flowIdentifier: identifier, transportProtocol: .tcp)
         }
+        #if MYPROXY_XRAY
+        let admission = flowDecisionCoordinator.planDNSFlow(tcpFlow, destination: destination, transport: .tcp)
+        switch admission.decision.disposition {
+        case .direct:
+            tcpRelays.startDirect(flow: tcpFlow, destination: admission.target ?? relayDestination(for: destination, resolvers: runtimeState.upstreamResolvers), relayNote: "Application selected Direct DNS transport.", activityObserver: observer)
+        case .reject:
+            reject(tcpFlow, category: .backendUnavailable)
+        case .mihomo:
+            guard let proxy = admission.proxy, let target = admission.target else { reject(tcpFlow, category: .backendUnavailable); return true }
+            tcpRelays.startMihomo(flow: tcpFlow, proxy: proxy, destination: target, directFallbackDestination: nil, unavailableFallback: .reject, activityObserver: observer)
+        case .failOpen:
+            reject(tcpFlow, category: .backendUnavailable)
+        }
+        return true
+        #endif
+        let relayTarget = relayDestination(
+            for: destination,
+            resolvers: runtimeState.upstreamResolvers
+        )
         let sourceIsTrusted = flowDecisionCoordinator.isTrustedMyproxyComponent(tcpFlow)
         let baseRoute = DNSRelayRoutingPolicy.route(
             destination: destination,
@@ -619,6 +630,22 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             return true
         }
         let parentIdentifier = UUID()
+        #if MYPROXY_XRAY
+        let initialPlan = admissionUDPPlan(flow: flow, destination: initialDestination, parentIdentifier: parentIdentifier)
+        let reporter = runtimeState.reporter
+        let started = udpSessions.start(
+            id: parentIdentifier, flow: flow, initialPlan: initialPlan,
+            planner: { [weak self] destination in
+                self?.admissionUDPPlan(flow: flow, destination: destination, parentIdentifier: parentIdentifier) ?? initialPlan
+            },
+            revisionProvider: { initialPlan.activity.configurationRevision },
+            activitySink: { activity in reporter?.beginFlow(activity.flowIdentifier, transportProtocol: .udp) },
+            observerFactory: { identifier in { snapshot in reporter?.observe(snapshot, flowIdentifier: identifier, transportProtocol: .udp) } }
+        )
+        if !started { reject(flow, category: .udpRelayFailed) }
+        return true
+        #endif
+        #if !MYPROXY_XRAY
         let sourceIsTrusted = flowDecisionCoordinator.isTrustedMyproxyComponent(flow)
         let initialRoute = resolvedMihomoRoute(
             DNSRelayRoutingPolicy.route(
@@ -691,6 +718,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             reject(flow, category: .udpRelayFailed)
         }
         return true
+        #endif
     }
 
     private func dnsPlan(
@@ -755,6 +783,19 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             parentFlowIdentifier: parentIdentifier
         )
     }
+
+    #if MYPROXY_XRAY
+    private func admissionUDPPlan(flow: NEAppProxyUDPFlow, destination: SOCKS5Endpoint, parentIdentifier: UUID) -> UDPFlowInterceptionPlan {
+        let admission = flowDecisionCoordinator.planDNSFlow(flow, destination: destination, transport: .udp, parentFlowIdentifier: parentIdentifier)
+        let route: DNSRelayRoute = switch admission.decision.disposition {
+        case .mihomo: .mihomo(.profileRules)
+        case .direct: .directLocalResolver
+        default: .mihomo(.profileRules)
+        }
+        let base = dnsPlan(destination: destination, proxy: admission.proxy, route: route, parentIdentifier: parentIdentifier, resolvers: runtimeDataPlaneSnapshot().upstreamResolvers)
+        return UDPFlowInterceptionPlan(decision: admission.decision, initialDestination: destination, mihomoDestination: admission.target, directDestination: admission.target, proxy: admission.proxy, unavailableFallback: .reject, activity: base.activity, parentFlowIdentifier: parentIdentifier)
+    }
+    #endif
 
     /// macOS reports the *queried name* as the endpoint of system-resolver DNS
     /// flows, so the endpoint the provider sees is not the resolver it must
@@ -952,6 +993,12 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             ProviderConfigurationKey.captureEnabled: NSNumber(value: true),
             ProviderConfigurationKey.mihomoRouteProxyCatalog: catalogData,
         ]
+        #if MYPROXY_XRAY
+        if let admission = bootstrap.appAdmission,
+           let admissionData = try? JSONEncoder().encode(admission) {
+            routingConfiguration[ProviderConfigurationKey.appAdmission] = admissionData
+        }
+        #endif
         if let snapshot = bootstrap.encodedCaptureSnapshot {
             routingConfiguration[ProviderConfigurationKey.captureConfigurationSnapshot] =
                 snapshot

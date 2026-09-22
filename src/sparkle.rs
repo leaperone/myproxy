@@ -17,8 +17,16 @@ extern "C" {
     fn myproxy_sparkle_set_channel(feed_url: *const std::os::raw::c_char, nightly: i32);
 }
 
+#[cfg(all(target_os = "macos", feature = "sparkle"))]
+#[no_mangle]
+pub extern "C" fn myproxy_sparkle_mark_update_resume() {
+    if let Err(error) = myproxy::xray::update_resume::mark_if_wanted() {
+        myproxy::log::warn("sparkle", format!("write Xray update resume marker failed: {error:#}"));
+    }
+}
+
 static FEED_PORT: AtomicU16 = AtomicU16::new(0);
-static REMOTE_FEED: Mutex<Option<(String, bool)>> = Mutex::new(None);
+static REMOTE_FEED: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn available() -> bool {
     cfg!(all(target_os = "macos", feature = "sparkle"))
@@ -36,17 +44,21 @@ pub fn init() {
 
 pub fn set_channel(channel: UpdateChannel) {
     let remote = channel.feed_url().to_string();
-    let nightly = channel == UpdateChannel::Nightly;
-    *REMOTE_FEED.lock().expect("sparkle feed") = Some((remote, nightly));
+    let channel_id = match channel {
+        UpdateChannel::Prod => 0,
+        UpdateChannel::Nightly => 1,
+        UpdateChannel::Xray => 2,
+    };
+    *REMOTE_FEED.lock().expect("sparkle feed") = Some(remote);
     let port = start_local_feed();
     let local = format!("http://127.0.0.1:{port}/appcast.xml");
     #[cfg(all(target_os = "macos", feature = "sparkle"))]
     unsafe {
         let url = std::ffi::CString::new(local).expect("update feed URL");
-        myproxy_sparkle_set_channel(url.as_ptr(), i32::from(nightly));
+        myproxy_sparkle_set_channel(url.as_ptr(), channel_id);
     }
     #[cfg(not(all(target_os = "macos", feature = "sparkle")))]
-    let _ = (local, nightly);
+    let _ = (local, channel_id);
 }
 
 pub fn check() {
@@ -116,7 +128,7 @@ fn handle_feed_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
         let remote = REMOTE_FEED
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|(url, _)| url.clone()));
+            .and_then(|guard| guard.clone());
         let Some(remote) = remote else {
             return write_http(&mut stream, 503, "text/plain", b"no feed");
         };

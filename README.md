@@ -18,6 +18,7 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 | --- | --- | --- |
 | Prod | `https://github.com/leaperone/myproxy/releases/latest/download/appcast.xml` | Push a `vMAJOR.MINOR.PATCH` tag, or run Release with channel `prod` and that existing tag. |
 | Nightly | `https://github.com/leaperone/myproxy/releases/download/nightly/appcast.xml` | Builds `main` daily at 18:00 UTC, or run Release with channel `nightly`. |
+| Xray | `https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml` | Build `xray` on push or run its workflow on that branch; publish only after validation. |
 
 Nightly builds are GitHub prereleases with immutable build tags. The `nightly` prerelease points to the latest Nightly feed. Both channels generate Sparkle deltas from recent same-channel archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow. While the core is connected, Check for Updates and archive/delta downloads use Mixed as an HTTP proxy.
 
@@ -25,7 +26,7 @@ Nightly builds are GitHub prereleases with immutable build tags. The `nightly` p
 
 Both channels use the Release workflow's run number and attempt as `CFBundleVersion`, so Sparkle can compare builds across channels. The display version, build number, feed, and channel are validated against the packaged app before publication. A manually dispatched Prod release checks out the requested tag; its version must match `Cargo.toml` at that commit.
 
-The title shows **Dev** for development builds and **Nightly** for Nightly builds; Prod has no badge. This identifies the installed build, independently of the selected update channel or developer logging. Local debug builds default to Dev and release builds to Prod; `MYPROXY_BUILD_CHANNEL=dev|prod|nightly` overrides this at build time.
+The title shows **Dev** for development builds and **Nightly** for Nightly builds; Prod has no badge. This identifies the installed build, independently of the selected update channel or developer logging. Local debug builds default to Dev and release builds to Prod; `MYPROXY_BUILD_CHANNEL=dev|prod|nightly|xray` overrides this at build time.
 
 The repository's [release skill](.agents/skills/release/SKILL.md) handles `/release patch`, `/release minor`, `/release major`, and `/release nightly` (`$release` in Codex). Stable increments start from the latest published Prod version, so an already-advanced development version is not incremented twice. Creating or reviewing the skill does not publish a release.
 
@@ -73,6 +74,102 @@ cargo run --bin myproxyctl -- connect
 ```
 
 Default Mixed port is **7890**.
+
+## Xray channel
+
+Xray is a separate release channel alongside Prod and Nightly. It uses the same
+MyProxy application identity and the existing signed Network Extension. The title
+shows an Xray badge. Its Sparkle feed is
+`https://github.com/leaperone/myproxy/releases/download/xray/appcast.xml`; Xray
+releases never update the Prod or Nightly feeds or GitHub's latest stable release.
+The application stores Xray settings under
+`~/Library/Application Support/myproxy-xray/`. Existing configurations imported
+into earlier Xray builds remain there. `MYPROXY_XRAY_DATA_DIR` overrides this
+location for isolated checks; the original backend still uses `MYPROXY_DATA_DIR`.
+
+The app owns routing, manual node selection, ordered fallback, latency selection,
+and connection accounting. HTTP and SOCKS share one public loopback entrance,
+default **40808**. The System Extension sends connection metadata to the
+application before accepting a connection. The application evaluates every
+rule and returns Direct, Proxy, or Reject. The extension receives no routing
+rules, domain lists, groups, or node configuration. Direct TCP and initial UDP
+decisions return the original connection to macOS. Proxy decisions use a
+short-lived authenticated relay credential bound to the selected route; the
+application forwards those bytes to Xray's private per-node entrances. A signed
+Xray host and core bypass their own capture path to avoid proxy and DNS recursion.
+
+macOS cannot return an already-owned UDP destination or a DNS proxy flow to
+the original system path. For these cases, an application Direct decision uses
+the extension's direct transport, without sending payload through the app or
+Xray. Failure to contact the application rejects the captured request; it does
+not silently bypass the configured policy.
+Captured DNS requests routed through a proxy use TCP to the app's public DNS
+resolver through the selected node. The original system resolver can be local
+to the user's network and unreachable from that node. Explicit SOCKS UDP DNS
+requests retain their requested resolver. Other UDP traffic still requires UDP
+support from the selected node.
+Direct DNS also uses TCP in the extension. Before enabling capture, the app
+queries the configured system resolvers and chooses one that returns a DNS
+answer. Startup waits for the current DNS provider to be ready before testing
+the system resolver. If DNS activation fails, it disables both DNS and
+transparent capture; the local HTTP/SOCKS entrance remains available.
+
+New configurations start in global mode through 节点选择, with 美国优先,
+日本优先, 香港优先, and a direct choice. Groups expand to show their nodes;
+automatic groups support a manual pin and a return to automatic selection.
+Region groups aggregate matching nodes from every subscription and select the
+lowest-latency available node. Priority groups reference those region groups in
+order: 美国优先 uses 美国 → 日本 → 香港, 日本优先 uses 日本 → 香港 → 美国,
+and 香港优先 uses 香港 → 美国 → 日本. A priority group tries the next region
+when the current region has no available node; it never falls back to Direct.
+These references stay current when subscriptions refresh. The group editor
+supports adding, removing, and reordering child groups; the CLI accepts repeated
+`--group-ref` arguments. Renaming a group updates its references, and a referenced
+group cannot be deleted until those references are removed.
+Routing changes close old flows without restarting Xray. Disconnect confirms
+both capture and DNS are disabled before stopping their relay or core.
+
+Rule mode supports application rules for captured traffic, exact/suffix/keyword/
+wildcard domains, CIDRs, optional TCP/UDP qualifiers, and imported geographic or
+domain categories. Domain and IP data are evaluated in the app. The local
+`rulesets/mclash-geodata.json` snapshot preserves the imported categories;
+missing or invalid data rejects activation. Explicit proxy requests do not carry
+a trustworthy process identity, so application rules require system capture.
+TUN is not used in this channel. Plain HTTP chunked uploads remain unsupported;
+HTTPS uses CONNECT.
+
+`scripts/export-mclash-geodata.py` copies the selected installed routing databases
+into the private Xray configuration directory.
+`scripts/import-mclash-rules.py` prepares a private migration candidate and receipt,
+preserving current ports, modes, subscriptions, node selections and unrelated rules.
+`--apply` imports through the bundled CLI after the channel supports the required
+matchers. Imported user-ID and destination-port conditions remain joint
+constraints on their original destination rules; they are not widened into
+standalone user or network rules.
+
+All three channels use the base version in `Cargo.toml`. Prod publishes
+`vMAJOR.MINOR.PATCH`; Nightly uses
+`vMAJOR.MINOR.PATCH-nightly.YYYYMMDD.RUN.ATTEMPT`; Xray uses
+`vMAJOR.MINOR.PATCH-xray.YYYYMMDD.RUN.ATTEMPT`. For example, with base version
+`0.0.10`, the Xray archive is `myproxy-0.0.10-xray.20260922.71.1.sparkle.zip`.
+Nightly and Xray are channel releases on GitHub and never replace the latest
+Prod release. Their separate feed pointers are `nightly` and `xray`.
+
+The Xray workflow tests feature-branch pushes. A commit marked `[xray-package]`
+also produces a signed, notarized candidate artifact for local acceptance, without
+publishing. A push to `xray`, or a manual run on that branch, creates a version
+Release and Tag only after testing, signing, and package validation pass. It then
+updates the `xray` feed pointer. Failed builds create no version tags. The app
+and extension use the numeric `RUN.ATTEMPT` build number for update ordering;
+this also upgrades the earlier incorrectly named `1.6.x` packages. Distribution requires Developer ID
+signing, the host and extension provisioning profiles, Apple notarization,
+stapling, Gatekeeper acceptance, and a signed Xray appcast. There is no ad-hoc
+fallback. Original Prod/Nightly release scripts and workflow remain unchanged.
+
+For a local signed upgrade, run `python3 scripts/install-xray-channel.py ARCHIVE`.
+The installer verifies the package before stopping the app, backs up the current
+configuration and bundle, and restores an existing connection after replacement.
+It checks HTTP and SOCKS access on the original port before reporting success.
 
 ## Routing and runtime state
 

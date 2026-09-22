@@ -65,6 +65,9 @@ enum ProviderConfigurationKey {
     static let mihomoSOCKSPort = "mihomoSOCKSPort"
     static let mihomoSOCKSUsername = "mihomoSOCKSUsername"
     static let mihomoSOCKSPassword = "mihomoSOCKSPassword"
+    #if MYPROXY_XRAY
+    static let appAdmission = "appAdmission"
+    #endif
 }
 
 enum ProviderControlCodec {

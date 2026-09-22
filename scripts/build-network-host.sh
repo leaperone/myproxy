@@ -7,6 +7,10 @@ out="${1:-target/network-host}"
 arch="$(uname -m)"
 target="${arch}-apple-macosx14.0"
 mkdir -p "$out"
+swift_flags=(-swift-version 6)
+if [[ "${MYPROXY_XRAY_CHANNEL:-0}" == "1" ]]; then
+  swift_flags+=(-D MYPROXY_XRAY)
+fi
 
 shared_sources=(macos/NetworkShared/*.swift)
 host_sources=(macos/NetworkHost/*.swift)
@@ -16,8 +20,8 @@ if (( ${#shared_sources[@]} == 0 )) || (( ${#host_sources[@]} == 0 )); then
 fi
 
 swiftc \
+  "${swift_flags[@]}" \
   -parse-as-library \
-  -swift-version 6 \
   -O \
   -whole-module-optimization \
   -target "$target" \
@@ -30,8 +34,8 @@ swiftc \
   -o "$out/libMyproxyNetworkShared.a"
 
 swiftc \
+  "${swift_flags[@]}" \
   -parse-as-library \
-  -swift-version 6 \
   -O \
   -whole-module-optimization \
   -target "$target" \

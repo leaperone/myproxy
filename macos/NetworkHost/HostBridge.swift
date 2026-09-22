@@ -7,6 +7,7 @@ private struct HostEnableRequest: Decodable, Sendable {
         let order: UInt64
         let pattern: String
         let via: String
+        let protocols: [TransportProtocol]?
     }
 
     struct GroupPort: Decodable, Sendable {
@@ -19,6 +20,16 @@ private struct HostEnableRequest: Decodable, Sendable {
         let kind: String
         let value: String
         let via: String
+        let protocols: [TransportProtocol]?
+    }
+
+    struct QualifiedRule: Decodable, Sendable {
+        let order: UInt64
+        let via: String
+        let userIds: [UInt32]
+        let ports: [UInt16]
+        let destinations: [DestRule]
+        let protocols: [TransportProtocol]
     }
 
     let revision: UInt64
@@ -26,8 +37,10 @@ private struct HostEnableRequest: Decodable, Sendable {
     let socksPort: UInt16
     let username: String
     let password: String
+    let appAdmission: AppAdmissionBootstrap?
     let processRules: [ProcessRule]
     let destRules: [DestRule]
+    let qualifiedRules: [QualifiedRule]?
     let gfwDomains: [String]
     let groupPorts: [GroupPort]
     let gfwPorts: [GroupPort]
@@ -62,7 +75,14 @@ private struct HostSharedIntent: Sendable {
     }
 
     static func stateURL(_ name: String) throws -> URL {
-        if let override = ProcessInfo.processInfo.environment["MYPROXY_DATA_DIR"], !override.isEmpty {
+        #if MYPROXY_XRAY
+        let environmentKey = "MYPROXY_XRAY_DATA_DIR"
+        let directoryName = "myproxy-xray"
+        #else
+        let environmentKey = "MYPROXY_DATA_DIR"
+        let directoryName = "myproxy"
+        #endif
+        if let override = ProcessInfo.processInfo.environment[environmentKey], !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true).appendingPathComponent(name)
         }
         guard let root = FileManager.default.urls(
@@ -73,7 +93,7 @@ private struct HostSharedIntent: Sendable {
                 message: "无法定位系统接管共享状态目录"
             )
         }
-        return root.appendingPathComponent("myproxy", isDirectory: true)
+        return root.appendingPathComponent(directoryName, isDirectory: true)
             .appendingPathComponent(name)
     }
 }
@@ -352,6 +372,8 @@ private actor HostController {
         defer { withExtendedLifetime(sideEffects) {} }
         try intent.check()
         HostRuntime.shared.update(operation: operation) { $0.phase = "requesting" }
+        var applied = false
+        #if !MYPROXY_XRAY
         let connected = await transparentProxy.isConnected()
         try intent.check()
         let canLiveUpdate = connected
@@ -359,7 +381,6 @@ private actor HostController {
             && lastUsername == request.username
             && lastPassword == request.password
             && preservesRouteEndpoints(lastEndpoints, endpoints)
-        var applied = false
         if canLiveUpdate {
             do {
                 try await transparentProxy.configureAndApplyRunning(
@@ -373,6 +394,7 @@ private actor HostController {
                 AppLog.warn("ne-host", "live capture update failed; restarting provider")
             }
         }
+        #endif
         if !applied {
             try await disableDNSProxyAllowingDenied(intent: intent)
             try intent.check()
@@ -401,10 +423,22 @@ private actor HostController {
             try intent.check()
             try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
             try intent.check()
+            #if MYPROXY_XRAY
+            try await waitForDNSProvider(
+                revision: request.revision,
+                activationIdentifier: activationIdentifier,
+                intent: intent
+            )
+            #endif
             // Preferences and the SOCKS backend can both look ready while
             // getaddrinfo is still hung on a name-endpoint flow.
             let probe = await dnsProxy.proveSystemResolver()
             AppLog.info("ne-host", "system resolver probe=\(probe)")
+            #if MYPROXY_XRAY
+            if let status = try? await transparentProxy.runtimeStatus().dnsRuntimeReport?.status {
+                AppLog.info("ne-host", "DNS delivery flows=\(status.totalFlows) failed=\(status.failedFlows) sent=\(status.uploadBytes) received=\(status.downloadBytes)")
+            }
+            #endif
             switch probe {
             case .intercepted, .clear:
                 break
@@ -421,8 +455,27 @@ private actor HostController {
                 $0.dnsMessage = error.localizedDescription
             }
             dnsConfigurationError = (intent, error.localizedDescription)
+            #if MYPROXY_XRAY
+            try await disableDNSProxyAllowingDenied(intent: intent)
+            try intent.check()
+            try await transparentProxy.stop(dropWedgedConfiguration: true)
+            try intent.check()
+            lastEndpoints = []
+            lastSocksPort = nil
+            lastUsername = nil
+            lastPassword = nil
+            HostRuntime.shared.update(operation: operation) {
+                $0.phase = "failed"
+                $0.captureEnabled = false
+                $0.failOpen = true
+                $0.appliedRevision = nil
+                $0.message = "DNS 启动失败，已关闭系统接管。本地 HTTP 和 SOCKS5 代理仍可使用。"
+            }
+            return
+            #else
             // A half-enabled NEDNSProxy with no backend blackholes getaddrinfo.
             try? await disableDNSProxyAllowingDenied(intent: intent)
+            #endif
         }
         HostRuntime.shared.update(operation: operation) { $0.phase = "running" }
         if let observation = HostRuntime.shared.observation(for: operation) {
@@ -451,6 +504,8 @@ private actor HostController {
             $0.phase = "disabled"
             $0.dnsPhase = "disabled"
             $0.appliedRevision = nil
+            $0.captureEnabled = false
+            $0.failOpen = true
         }
     }
 
@@ -561,6 +616,48 @@ private func isRecoverableDNSProxyDisableError(_ error: Error) -> Bool {
 }
 
 private extension HostController {
+    #if MYPROXY_XRAY
+    func waitForDNSProvider(
+        revision: UInt64,
+        activationIdentifier: UUID,
+        intent: HostSharedIntent
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            try intent.check()
+            let response = try await transparentProxy.runtimeStatus()
+            if let report = response.dnsRuntimeReport,
+               report.expectedRevision == revision,
+               report.expectedActivationIdentifier == activationIdentifier {
+                if let failure = report.startupFailure {
+                    throw NetworkExtensionControlFailure(
+                        operation: .configureDNSProxy,
+                        message: "DNS provider startup failed: \(failure.reason.rawValue)"
+                    )
+                }
+                if let status = report.status,
+                   (try? status.validate(expectedRevision: revision, activationIdentifier: activationIdentifier)) != nil {
+                    if status.isOperational {
+                        AppLog.info("ne-host", "DNS provider ready before system resolver probe")
+                        return
+                    }
+                    if status.phase == .failed {
+                        throw NetworkExtensionControlFailure(
+                            operation: .configureDNSProxy,
+                            message: "DNS provider failed: \(status.failureCategory?.rawValue ?? "unknown")"
+                        )
+                    }
+                }
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        throw NetworkExtensionControlFailure(
+            operation: .configureDNSProxy,
+            message: "DNS provider did not become ready before the system resolver probe"
+        )
+    }
+    #endif
+
     /// Only for enable/restart: a denied disable must not block writing a new
     /// DNS configuration. A full disable still throws so the core stays up.
     func disableDNSProxyAllowingDenied(intent: HostSharedIntent) async throws {
@@ -615,6 +712,29 @@ private func providerConfigurations(
     endpoints: [MihomoRouteProxyEndpoint],
     activationIdentifier: UUID
 ) throws -> HostProviderConfigurations {
+    #if MYPROXY_XRAY
+    let admission = try applicationAdmission(from: request)
+    let bootstrap = try DNSProxyBootstrapConfiguration(
+        revision: request.revision,
+        activationIdentifier: activationIdentifier,
+        profileRulesProxy: endpoints[0],
+        upstreamResolvers: usableResolvers(from: request.dnsResolvers),
+        appAdmission: admission
+    ).encoded()
+    let transparent: [String: NSObject] = [
+        "revision": NSNumber(value: request.revision),
+        "activationIdentifier": activationIdentifier.uuidString as NSString,
+        "dnsProxyBootstrap": bootstrap as NSData,
+        "captureEnabled": NSNumber(value: true),
+        "failOpen": NSNumber(value: false),
+        "appAdmission": try JSONEncoder().encode(admission) as NSData,
+        "mihomoSOCKSHost": "127.0.0.1" as NSString,
+        "mihomoSOCKSPort": NSNumber(value: request.socksPort),
+        "mihomoSOCKSUsername": request.username as NSString,
+        "mihomoSOCKSPassword": request.password as NSString,
+    ]
+    return HostProviderConfigurations(transparent: transparent, dnsBootstrap: bootstrap)
+    #else
     let snapshot = try captureSnapshot(from: request)
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
@@ -633,7 +753,7 @@ private func providerConfigurations(
         "activationIdentifier": activationIdentifier.uuidString as NSString,
         "dnsProxyBootstrap": bootstrap as NSData,
         "captureEnabled": NSNumber(value: true),
-        "failOpen": NSNumber(value: true),
+        "failOpen": NSNumber(value: captureFailureOpensDirectly),
         "captureConfigurationSnapshot": encodedSnapshot as NSData,
         "mihomoRouteProxyCatalog": catalog as NSData,
         "mihomoSOCKSHost": "127.0.0.1" as NSString,
@@ -642,6 +762,30 @@ private func providerConfigurations(
         "mihomoSOCKSPassword": request.password as NSString,
     ]
     return HostProviderConfigurations(transparent: transparent, dnsBootstrap: bootstrap)
+    #endif
+}
+
+private func applicationAdmission(from request: HostEnableRequest) throws -> AppAdmissionBootstrap {
+    guard let admission = request.appAdmission,
+          admission.version == 1, admission.port > 0,
+          UUID(uuidString: admission.activation) != nil,
+          Data(base64Encoded: admission.key)?.count == 32,
+          request.processRules.isEmpty, request.destRules.isEmpty,
+          (request.qualifiedRules ?? []).isEmpty, request.groupPorts.isEmpty,
+          request.gfwPorts.isEmpty, request.gfwDomains.isEmpty else {
+        throw NetworkExtensionControlFailure(operation: .configureTransparentProxy,
+            message: "系统接管需要应用决策服务，不能包含路由规则")
+    }
+    return admission
+}
+
+private func validateHostRequest(_ request: HostEnableRequest) throws {
+    #if MYPROXY_XRAY
+    _ = try applicationAdmission(from: request)
+    #else
+    _ = try captureSnapshot(from: request)
+    #endif
+    _ = try routeEndpoints(from: request)
 }
 
 private func captureSnapshot(
@@ -660,6 +804,8 @@ private func captureSnapshot(
         _ id: String,
         sources: [SourceMatcher] = [],
         destinations: [DestinationMatcher] = [],
+        protocols: [TransportProtocol] = [],
+        portRanges: [PortRange] = [],
         via: String
     ) throws {
         rules.append(try CaptureRule(
@@ -667,6 +813,8 @@ private func captureSnapshot(
             priority: rules.count,
             sources: sources,
             destinations: destinations,
+            protocols: Set(protocols),
+            portRanges: portRanges,
             action: captureAction(via: via),
             unavailableFallback: captureFallback(via: via)
         ))
@@ -675,21 +823,31 @@ private func captureSnapshot(
     enum OrderedInput {
         case process(Int, HostEnableRequest.ProcessRule)
         case destination(Int, HostEnableRequest.DestRule)
+        case qualified(Int, HostEnableRequest.QualifiedRule)
         var order: UInt64 {
             switch self {
             case .process(_, let rule): rule.order
             case .destination(_, let rule): rule.order
+            case .qualified(_, let rule): rule.order
             }
         }
     }
     let inputs = request.processRules.enumerated().map { OrderedInput.process($0.offset, $0.element) }
         + request.destRules.enumerated().map { OrderedInput.destination($0.offset, $0.element) }
+        + (request.qualifiedRules ?? []).enumerated().map { OrderedInput.qualified($0.offset, $0.element) }
     let ordered = inputs.enumerated().sorted {
         if $0.element.order == $1.element.order { return $0.offset < $1.offset }
         return $0.element.order < $1.element.order
     }
     for input in ordered.map(\.element) {
         switch input {
+        case .qualified(let index, let rule):
+            let destinations = rule.destinations.flatMap { destinationMatchers(kind: $0.kind, value: $0.value) }
+            guard rule.destinations.isEmpty || !destinations.isEmpty else {
+                throw NetworkExtensionControlFailure(operation: .configureTransparentProxy, message: "无效的组合目标条件")
+            }
+            try append("qualified-\(index)", sources: rule.userIds.map { .userID($0) }, destinations: destinations,
+                protocols: rule.protocols, portRanges: try rule.ports.map { try PortRange($0) }, via: rule.via)
         case .process(let index, let rule):
             let sources = sourceMatchers(from: rule.pattern)
             guard !sources.isEmpty else {
@@ -697,7 +855,7 @@ private func captureSnapshot(
                     operation: .configureTransparentProxy, message: "无效的应用匹配条件"
                 )
             }
-            try append("process-\(index)", sources: sources, via: rule.via)
+            try append("process-\(index)", sources: sources, protocols: rule.protocols ?? [], via: rule.via)
         case .destination(let index, let rule):
             if rule.kind == "cidr" && gfwGroup(via: rule.via) != nil {
                 throw NetworkExtensionControlFailure(
@@ -711,14 +869,14 @@ private func captureSnapshot(
                     operation: .configureTransparentProxy, message: "无效的目标匹配条件"
                 )
             }
-            try append("dest-\(index)", destinations: destinations, via: rule.via)
+            try append("dest-\(index)", destinations: destinations, protocols: rule.protocols ?? [], via: rule.via)
         }
     }
     rules.append(try CaptureRule(
         id: "default-profile-rules",
         priority: rules.count,
         action: .mihomo(.profileRules),
-        unavailableFallback: .direct
+        unavailableFallback: captureFailureOpensDirectly ? .direct : .reject
     ))
     return try CaptureConfigurationSnapshot(
         revision: request.revision,
@@ -753,6 +911,9 @@ private func destinationMatchers(kind: String, value: String) -> [DestinationMat
         return (try? DestinationMatcher.host(HostMatcher(kind: .exact, value: trimmed))).map { [$0] } ?? []
     case "keyword":
         return (try? DestinationMatcher.hostPattern(HostPatternMatcher(pattern: "*\(trimmed)*")))
+            .map { [$0] } ?? []
+    case "wildcard":
+        return (try? DestinationMatcher.hostPattern(HostPatternMatcher(pattern: trimmed)))
             .map { [$0] } ?? []
     case "cidr":
         return (try? DestinationMatcher.network(IPNetwork(trimmed))).map { [$0] } ?? []
@@ -839,7 +1000,18 @@ private func captureAction(via: String) -> CaptureAction {
     }
 }
 
+private var captureFailureOpensDirectly: Bool {
+    #if MYPROXY_XRAY
+    return false
+    #else
+    return true
+    #endif
+}
+
 private func captureFallback(via: String) -> UnavailableFallback {
+    #if MYPROXY_XRAY
+    return via.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "direct" ? .direct : .reject
+    #else
     switch via.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "direct":
         return .direct
@@ -848,6 +1020,7 @@ private func captureFallback(via: String) -> UnavailableFallback {
     default:
         return .profileRules
     }
+    #endif
 }
 
 private func routeEndpoints(
@@ -905,8 +1078,7 @@ public func myproxy_ne_validate(
         let request = try JSONDecoder().decode(
             HostEnableRequest.self, from: Data(String(cString: json).utf8)
         )
-        _ = try captureSnapshot(from: request)
-        _ = try routeEndpoints(from: request)
+        try validateHostRequest(request)
         return 0
     } catch {
         errorOut?.pointee = duplicateString(error.localizedDescription)
@@ -929,8 +1101,7 @@ public func myproxy_ne_enable(
             HostEnableRequest.self, from: Data(String(cString: json).utf8)
         )
         // Validate before scheduling side effects or cancelling a working plan.
-        _ = try captureSnapshot(from: request)
-        _ = try routeEndpoints(from: request)
+        try validateHostRequest(request)
         let submitted = try HostOperations.shared.submit(
             revision: request.operationRevision,
             desired: request.revision,

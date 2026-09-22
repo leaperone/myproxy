@@ -64,7 +64,12 @@ public enum AppLog {
         ).first else {
             return
         }
+        #if MYPROXY_XRAY
+        let dir = ProcessInfo.processInfo.environment["MYPROXY_XRAY_DATA_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? root.appendingPathComponent("myproxy-xray", isDirectory: true)
+        #else
         let dir = root.appendingPathComponent("myproxy", isDirectory: true)
+        #endif
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("myproxy.log").path
         let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
