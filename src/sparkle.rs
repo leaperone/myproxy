@@ -17,6 +17,14 @@ extern "C" {
     fn myproxy_sparkle_set_channel(feed_url: *const std::os::raw::c_char, nightly: i32);
 }
 
+#[cfg(all(target_os = "macos", feature = "sparkle"))]
+#[no_mangle]
+pub extern "C" fn myproxy_sparkle_mark_update_resume() {
+    if let Err(error) = myproxy::xray::update_resume::mark_if_wanted() {
+        myproxy::log::warn("sparkle", format!("write Xray update resume marker failed: {error:#}"));
+    }
+}
+
 static FEED_PORT: AtomicU16 = AtomicU16::new(0);
 static REMOTE_FEED: Mutex<Option<String>> = Mutex::new(None);
 

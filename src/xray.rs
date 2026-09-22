@@ -1,5 +1,6 @@
 pub mod import;
 pub mod admission;
+pub mod update_resume;
 pub mod geo;
 mod capture;
 pub mod nodes;
@@ -706,6 +707,7 @@ pub fn select_proxy(identity: &RuntimeIdentity, group: &str, name: &str) -> Resu
 
 pub fn disconnect() -> Result<()> {
     let _operation = OPERATION.lock().expect("Xray operation");
+    if !SHUTTING_DOWN.load(Ordering::Acquire) { update_resume::cancel()?; }
     release_capture()?;
     crate::system_proxy::restore()?;
     stop_service()

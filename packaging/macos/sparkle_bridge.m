@@ -4,6 +4,7 @@
 static SPUStandardUpdaterController *gController;
 static NSString *gFeedURL;
 static NSInteger gChannel;
+extern void myproxy_sparkle_mark_update_resume(void);
 
 @interface MyproxyUpdaterDelegate : NSObject <SPUUpdaterDelegate>
 @end
@@ -18,6 +19,10 @@ static NSInteger gChannel;
     if (gChannel == 1) return [NSSet setWithObject:@"nightly"];
     if (gChannel == 2) return [NSSet setWithObject:@"xray"];
     return [NSSet set];
+}
+- (void)updaterWillRelaunchApplication:(SPUUpdater *)updater {
+    (void)updater;
+    myproxy_sparkle_mark_update_resume();
 }
 @end
 

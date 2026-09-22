@@ -76,22 +76,42 @@ fn main() {
         if let Err(err) = myproxy::host_control::start() {
             myproxy::log::error("host-control", format!("start failed: {err:#}"));
         }
-        if myproxy::backend::is_xray() {
+        if myproxy::backend::is_xray() && !host_control_launch {
+            let strategy = strategy.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let resume_update = match myproxy::xray::update_resume::consume_if_fresh() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            myproxy::log::warn("xray", format!("consume update resume marker failed: {error:#}"));
+                            false
+                        }
+                    };
+                    if let Err(error) = myproxy::xray::recover_after_launch() {
+                        myproxy::log::error("xray", format!("recover previous network session: {error:#}"));
+                    }
+                    if resume_update || strategy.connect_on_launch {
+                        if let Err(err) = Supervisor::shared().connect(&strategy) {
+                            myproxy::log::error("main", format!("connect on launch failed: {err:#}"));
+                        }
+                    }
+                })
+                .detach();
+        } else if myproxy::backend::is_xray() {
+            // The command client owns the requested operation; starting its
+            // host must not consume the updater's separate reconnect intent.
             cx.background_executor().spawn(async {
                 if let Err(error) = myproxy::xray::recover_after_launch() {
                     myproxy::log::error("xray", format!("recover previous network session: {error:#}"));
                 }
             }).detach();
-        }
-        if strategy.connect_on_launch && !host_control_launch {
+        } else if strategy.connect_on_launch && !host_control_launch {
             let strategy = strategy.clone();
-            cx.background_executor()
-                .spawn(async move {
-                    if let Err(err) = Supervisor::shared().connect(&strategy) {
-                        myproxy::log::error("main", format!("connect on launch failed: {err:#}"));
-                    }
-                })
-                .detach();
+            cx.background_executor().spawn(async move {
+                if let Err(err) = Supervisor::shared().connect(&strategy) {
+                    myproxy::log::error("main", format!("connect on launch failed: {err:#}"));
+                }
+            }).detach();
         }
         if show_window {
             cx.spawn(async move |cx| {

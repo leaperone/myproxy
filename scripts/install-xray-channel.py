@@ -60,7 +60,16 @@ subprocess.run(['/usr/bin/open',str(destination),'--args','--host-control'],chec
 cli=destination/'Contents/MacOS/myproxyctl'
 if was_connected:
     print('Restoring the connection that was active before upgrade.',flush=True)
-    run('connect')
+    try:
+        run('connect')
+    except subprocess.CalledProcessError:
+        if before.get('extension_runtime', {}).get('captureEnabled', False):
+            raise
+        # An un-applied capture preference must not prevent restoring the
+        # local proxy that was already working before the upgrade.
+        run('extension','off')
+        run('connect')
+        receipt['capture_preference_disabled_to_restore_previous_runtime']=True
     restored=run('status')
     assert restored['xray']['running'] and restored['xray']['ready'], 'Proxy did not become ready after upgrade'
     assert restored['mixed_port']==before['mixed_port'], 'Proxy port changed during upgrade'
