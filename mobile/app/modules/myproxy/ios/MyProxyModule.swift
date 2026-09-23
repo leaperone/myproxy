@@ -4,12 +4,13 @@ import NetworkExtension
 
 public final class MyProxyModule: Module {
     private let store = MyProxyStore()
-    private let mutationLock = NSLock()
+    private let mutationGate = MutationGate()
 
     public func definition() -> ModuleDefinition {
         Name("MyProxy")
         OnCreate {
             self.loadCore()
+            Task { await self.autoConnectIfNeeded() }
         }
         AsyncFunction("request") { (requestJSON: String) async -> String in
             await self.request(requestJSON)
@@ -31,17 +32,19 @@ public final class MyProxyModule: Module {
         switch op {
         case "snapshot": return await snapshot()
         case "select", "setMode", "setAutoConnect", "setFallback", "saveRule", "deleteRule", "removeSource":
-            return await persistMutation(text)
+            return await mutationGate.run { await self.persistMutation(text) }
         case "probe":
-            if let providerResponse = await sendProvider("{\"op\":\"probe\"}"), !Self.isOK(providerResponse) { return failure("probe_failed", "节点检测失败") }
-            return await snapshot()
+            return await mutationGate.run {
+                if let providerResponse = await self.sendProvider("{\"op\":\"probe\"}"), !Self.isOK(providerResponse) { return self.failure("probe_failed", "节点检测失败") }
+                return await self.snapshot()
+            }
         case "connect":
             return await connect()
         case "disconnect":
             return await disconnect()
         case "import":
             guard let value = request["text"] as? String, value.utf8.count <= 2_000_000 else { return failure("invalid_import", "节点内容为空或过大") }
-            return await persistMutation(text)
+            return await mutationGate.run { await self.persistMutation(text) }
         case "addSource", "refreshSource":
             let existing = sourceInfo(id: request["id"] as? String)
             let urlText = (request["url"] as? String) ?? existing?.url
@@ -52,14 +55,13 @@ public final class MyProxyModule: Module {
                 enriched["sourceURL"] = urlText
                 if let id = request["id"] as? String { enriched["sourceId"] = id }
                 if enriched["name"] == nil, let name = existing?.name { enriched["name"] = name }
-                return await persistMutation(Self.json(enriched))
+                return await mutationGate.run { await self.persistMutation(Self.json(enriched)) }
             } catch { return failure("source_fetch_failed", "订阅获取失败") }
         default: return failure("unsupported_operation", "暂不支持这个操作")
         }
     }
 
     private func persistMutation(_ request: String) async -> String {
-        mutationLock.lock(); defer { mutationLock.unlock() }
         let previous: String?
         do { previous = try store.read() } catch { previous = nil }
         let response = MyProxyNativeCore.call(request)
@@ -75,6 +77,16 @@ public final class MyProxyModule: Module {
             return failure("apply_failed", "配置已保存，但 VPN 应用失败")
         }
         return response
+    }
+
+    private func autoConnectIfNeeded() async {
+        let local = MyProxyNativeCore.call("{\"op\":\"snapshot\"}")
+        guard let data = local.data(using: .utf8), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let payload = root["data"] as? [String: Any], payload["autoConnect"] as? Bool == true,
+              let nodes = payload["nodes"] as? [[String: Any]], !nodes.isEmpty,
+              let manager = try? await vpnManager(), let session = manager.connection as? NETunnelProviderSession,
+              session.status != .connected, session.status != .connecting, session.status != .reasserting else { return }
+        _ = await mutationGate.run { await self.connect() }
     }
 
     private func connect() async -> String {
@@ -156,6 +168,18 @@ public final class MyProxyModule: Module {
     private static func data(_ value: String) -> Any? { (try? JSONSerialization.jsonObject(with: Data(value.utf8)) as? [String: Any])?["data"] }
     private static func json(_ value: [String: Any]) -> String { (try? String(data: JSONSerialization.data(withJSONObject: value), encoding: .utf8)) ?? "{}" }
     private func failure(_ code: String, _ message: String) -> String { Self.json(["ok": false, "error": ["code": code, "message": message]]) }
+}
+
+private actor MutationGate {
+    private var busy = false
+
+    func run(_ operation: () async -> String) async -> String {
+        while busy { await Task.yield() }
+        busy = true
+        let result = await operation()
+        busy = false
+        return result
+    }
 }
 
 private enum BoundedFetch {

@@ -22,9 +22,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
             let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.0"])
             ipv4.includedRoutes = [NEIPv4Route.default()]
+            ipv4.excludedRoutes = [
+                NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"),
+                NEIPv4Route(destinationAddress: "172.16.0.0", subnetMask: "255.240.0.0"),
+                NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0"),
+                NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
+                NEIPv4Route(destinationAddress: "169.254.0.0", subnetMask: "255.255.0.0")
+            ]
             settings.ipv4Settings = ipv4
             let ipv6 = NEIPv6Settings(addresses: ["fd00:1::1"], networkPrefixLengths: [126])
             ipv6.includedRoutes = [NEIPv6Route.default()]
+            ipv6.excludedRoutes = [
+                NEIPv6Route(destinationAddress: "fc00::", networkPrefixLength: 7),
+                NEIPv6Route(destinationAddress: "fe80::", networkPrefixLength: 10),
+                NEIPv6Route(destinationAddress: "::1", networkPrefixLength: 128)
+            ]
             settings.ipv6Settings = ipv6
             settings.dnsSettings = NEDNSSettings(servers: ["1.1.1.1", "9.9.9.9"])
             setTunnelNetworkSettings(settings) { [weak self] error in
@@ -139,6 +151,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
 private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobilePacketWriterProtocol {
     private let packetFlow: NEPacketTunnelFlow
+    private let stateLock = NSLock()
     private var engine: MobileEngine?
     private var readerRunning = true
 
@@ -160,14 +173,13 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
     }
 
     func close() {
-        readerRunning = false
-        engine?.close()
-        engine = nil
+        stateLock.lock(); readerRunning = false; let oldEngine = engine; engine = nil; stateLock.unlock()
+        oldEngine?.close()
     }
 
-    func closeConnections() { engine?.closeConnections() }
-    func snapshot() -> String { engine?.snapshot() ?? "{\"phase\":\"disconnected\"}" }
-    func probe() { engine?.probe() }
+    func closeConnections() { stateLock.lock(); let current = engine; stateLock.unlock(); current?.closeConnections() }
+    func snapshot() -> String { stateLock.lock(); let current = engine; stateLock.unlock(); return current?.snapshot() ?? "{\"phase\":\"disconnected\"}" }
+    func probe() { stateLock.lock(); let current = engine; stateLock.unlock(); current?.probe() }
 
     func decide(_ requestJSON: String?) -> String { MyProxyNativeCore.call(requestJSON ?? "{}") }
     func health(_ node: String?, delayMs: Int64, failed: Bool) { _ = MyProxyNativeCore.call(Self.healthRequest(node ?? "", delayMs, failed)) }
@@ -179,13 +191,15 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
     }
 
     private func readPackets() {
-        guard readerRunning else { return }
+        stateLock.lock(); let running = readerRunning; stateLock.unlock()
+        guard running else { return }
         packetFlow.readPackets { [weak self] packets, protocols in
-            guard let self, self.readerRunning else { return }
+            guard let self else { return }
+            self.stateLock.lock(); let running = self.readerRunning; let current = self.engine; self.stateLock.unlock()
+            guard running, let current else { return }
             for (index, packet) in packets.enumerated() {
-                guard let engine = self.engine else { return }
                 var error: NSError?
-                if !engine.writePacket(packet, error: &error) || error != nil { self.close(); return }
+                if !current.writePacket(packet, error: &error) || error != nil { self.close(); return }
                 _ = protocols[index]
             }
             self.readPackets()
