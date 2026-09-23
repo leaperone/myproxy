@@ -14,22 +14,9 @@ static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
 
 fn runtime() -> &'static Mutex<Runtime> { RUNTIME.get_or_init(|| Mutex::new(Runtime::new("android"))) }
 fn default_strategy() -> Strategy {
-    let mut s = Strategy::default();
-    s.mixed_port = 40808;
-    s.routing_profile = myproxy_core::RoutingProfile::Group;
-    s.unmatched_via = "节点选择".into();
-    s.groups.clear();
-    let mut selector = Group::all_nodes("节点选择".into(), "select".into());
-    selector.group_refs = ["美国优先", "日本优先", "香港优先"].into_iter().map(str::to_owned).collect();
-    s.groups.push(selector);
-    for (name, refs) in [("美国优先", ["美国", "日本", "香港"]), ("日本优先", ["日本", "香港", "美国"]), ("香港优先", ["香港", "美国", "日本"])] {
-        let mut group = Group::matching(name.into(), "fallback".into(), vec![], vec![]);
-        group.group_refs = refs.into_iter().map(str::to_owned).collect();
-        s.groups.push(group);
-    }
-    for (name, patterns) in [("美国", vec!["美国", "*|us|*", "United States", "🇺🇸"]), ("日本", vec!["日本", "*|jp|*", "Japan", "🇯🇵"]), ("香港", vec!["香港", "*|hk|*", "Hong Kong", "🇭🇰"])] {
-        s.groups.push(Group::matching(name.into(), "url-test".into(), vec![], patterns.into_iter().map(str::to_owned).collect()));
-    }
+    let mut s = myproxy_core::xray::default_strategy();
+    /* Keep this adapter local only to preserve the mobile ownership boundary. */
+    s.rule_sets.clear();
     s
 }
 impl Runtime {
