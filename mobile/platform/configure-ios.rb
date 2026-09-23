@@ -14,6 +14,7 @@ deployment_target = [Gem::Version.new(properties.fetch('ios.deploymentTarget', '
 properties['ios.deploymentTarget'] = deployment_target
 properties_path.write(JSON.pretty_generate(properties))
 repo_dir = Pathname.new(File.expand_path('.'))
+app_config = JSON.parse(repo_dir.join('mobile/app/app.json').read).fetch('expo')
 rel = ->(path) { Pathname.new(path).relative_path_from(project_dir).to_s }
 app = project.targets.find { |t| t.product_type == 'com.apple.product-type.application' } or abort 'application target not found'
 extension = project.targets.find { |t| t.name == 'MyProxyPacketTunnel' }
@@ -25,8 +26,8 @@ extension.build_configurations.each do |config|
   config.build_settings['INFOPLIST_FILE'] = rel.call(File.join(repo_dir, 'mobile/ios-extension/Info.plist'))
   config.build_settings['CODE_SIGN_ENTITLEMENTS'] = rel.call(File.join(repo_dir, 'mobile/ios-extension/MyProxyPacketTunnel.entitlements'))
   config.build_settings['SWIFT_VERSION'] = '5.0'
-  config.build_settings['MARKETING_VERSION'] = '0.0.10'
-  config.build_settings['CURRENT_PROJECT_VERSION'] = ENV.fetch('GITHUB_RUN_NUMBER', '1')
+  config.build_settings['MARKETING_VERSION'] = app_config.fetch('version')
+  config.build_settings['CURRENT_PROJECT_VERSION'] = app_config.fetch('ios').fetch('buildNumber', '1.1')
   config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = deployment_target
   config.build_settings['APPLICATION_EXTENSION_API_ONLY'] = 'YES'
   config.build_settings['OTHER_LDFLAGS'] = ['$(inherited)', '-lresolv', '-framework', 'Security', '-framework', 'CoreFoundation']

@@ -6,6 +6,7 @@ if [[ "${CI:-}" != true ]]; then
   echo 'Mobile builds run in GitHub Actions; no local SDK or dependency installation.' >&2
   exit 1
 fi
+node scripts/mobile/prepare-version.js
 ndk_version=27.1.12297006
 sdkmanager "ndk;$ndk_version"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk_version"

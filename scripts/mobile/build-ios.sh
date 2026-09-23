@@ -6,6 +6,7 @@ if [[ "${CI:-}" != true ]]; then
   echo 'Mobile builds run in GitHub Actions; no local SDK or dependency installation.' >&2
   exit 1
 fi
+node scripts/mobile/prepare-version.js
 framework_dir="$root_dir/mobile/app/modules/myproxy/ios/Frameworks"
 mkdir -p "$framework_dir" mobile/.build/artifacts mobile/.build/logs
 cargo build -p myproxy-mobile --release --target aarch64-apple-ios
