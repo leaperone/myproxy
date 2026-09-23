@@ -43,7 +43,7 @@ source_paths = Dir[File.join(repo_dir, 'mobile/ios-extension/Sources/*.swift')]
 source_paths.each do |absolute|
   path = rel.call(absolute)
   ref = project.files.find { |f| f.path == path } || group.new_file(path)
-  extension.sources_build_phase.add_file_reference(ref) unless extension.sources_build_phase.files.any? { |b| b.file_ref == ref }
+  extension.source_build_phase.add_file_reference(ref) unless extension.source_build_phase.files.any? { |b| b.file_ref == ref }
 end
 
 framework_paths = %w[MyProxyCore.xcframework MyProxyNetwork.xcframework].map do |name|
