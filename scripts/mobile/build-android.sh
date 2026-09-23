@@ -19,6 +19,8 @@ cp target/aarch64-linux-android/release/libmyproxy_mobile.so mobile/app/modules/
 if [[ ! -f mobile/app/modules/myproxy/android/libs/myproxy-network.aar ]]; then
   bash scripts/mobile/build-network.sh android
 fi
+unzip -p mobile/app/modules/myproxy/android/libs/myproxy-network.aar classes.jar > mobile/app/modules/myproxy/android/libs/myproxy-network.jar
+unzip -p mobile/app/modules/myproxy/android/libs/myproxy-network.aar jni/arm64-v8a/libgojni.so > mobile/app/modules/myproxy/android/src/main/jniLibs/arm64-v8a/libgojni.so
 cd "$root_dir/mobile/app"
 npm ci --no-audit --no-fund
 npx expo prebuild --platform android --no-install
