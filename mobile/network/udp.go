@@ -11,12 +11,12 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-func (e *Engine) acceptUDP(request *udp.ForwarderRequest) {
+func (e *Engine) acceptUDP(request *udp.ForwarderRequest) bool {
 	id:=request.ID()
-	r,host,err:=e.decide(id,"udp");if err!=nil{return}
-	f,ctx,err:=e.reserve(id,"udp",r,host);if err!=nil{return}
+	r,host,err:=e.decide(id,"udp");if err!=nil{return false}
+	f,ctx,err:=e.reserve(id,"udp",r,host);if err!=nil{return false}
 	var queue waiter.Queue
-	endpoint,endpointErr:=request.CreateEndpoint(&queue);if endpointErr!=nil{e.finish(f);return}
+	endpoint,endpointErr:=request.CreateEndpoint(&queue);if endpointErr!=nil{e.finish(f);return false}
 	local:=gonet.NewUDPConn(&queue,endpoint)
 	e.mu.Lock();f.local=local;e.mu.Unlock()
 	go func(){
@@ -34,6 +34,7 @@ func (e *Engine) acceptUDP(request *udp.ForwarderRequest) {
 		for {upstream.SetReadDeadline(time.Now().Add(90*time.Second));n,err:=upstream.Read(packet);if err!=nil{break};written,err:=local.Write(packet[:n]);f.down.Add(int64(written));e.down.Add(int64(written));if err!=nil{break}}
 		local.Close();upstream.Close();<-done
 	}()
+	return true
 }
 
 // DNS is carried over the already-selected node using TCP framing, so nodes

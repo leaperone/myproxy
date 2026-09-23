@@ -97,7 +97,7 @@ type Engine struct {
 	allowDirect bool
 	nodes []node
 	tags map[string]bool
-	startedAt int64
+	startedAt atomic.Int64
 	closed atomic.Bool
 	started atomic.Bool
 	probeBusy atomic.Bool
@@ -162,7 +162,9 @@ func NewEngine(renderJSON string, policy Policy, protector Protector, allowDirec
 	if err := e.stack.SetSpoofing(1,true); err != nil { e.Close(); return nil, errors.New("无法准备隧道地址") }
 	e.stack.SetRouteTable([]tcpip.Route{{Destination:header.IPv4EmptySubnet,NIC:1},{Destination:header.IPv6EmptySubnet,NIC:1}})
 	e.stack.SetTransportProtocolHandler(tcp.ProtocolNumber,tcp.NewForwarder(e.stack,32*1024,maxFlows,e.acceptTCP).HandlePacket)
-	e.stack.SetTransportProtocolHandler(udp.ProtocolNumber,udp.NewForwarder(e.stack,e.acceptUDP).HandlePacket)
+	e.stack.SetTransportProtocolHandler(udp.ProtocolNumber,func(id stack.TransportEndpointID,packet *stack.PacketBuffer)bool{
+		return e.acceptUDP(udp.NewForwarderRequest(e.stack,id,packet))
+	})
 	return e,nil
 }
 
@@ -178,7 +180,7 @@ func protectSocket(_, _ string, raw syscall.RawConn) error {
 
 func (e *Engine) Start(writer PacketWriter) error {
 	if writer == nil || e.closed.Load() || !e.started.CompareAndSwap(false,true) { return errors.New("隧道状态无效") }
-	e.startedAt = time.Now().UnixMilli()
+	e.startedAt.Store(time.Now().UnixMilli())
 	go func() {
 		for {
 			packet := e.link.ReadContext(e.ctx)
@@ -252,7 +254,8 @@ func (e *Engine) reserve(id stack.TransportEndpointID, network string, r route, 
 
 func (e *Engine) finish(f *flow) {
 	f.cancel()
-	if f.local!=nil { f.local.Close() }
+	e.mu.Lock();local:=f.local;e.mu.Unlock()
+	if local!=nil { local.Close() }
 	e.mu.Lock(); defer e.mu.Unlock()
 	if _,ok:=e.flows[f.view.ID]; !ok{return}
 	delete(e.flows,f.view.ID)
@@ -320,7 +323,7 @@ func (e *Engine) Close(){
 func (e *Engine) Snapshot()string{
 	e.mu.Lock();rows:=append([]flowView{},e.recent...);for _,f:=range e.flows{v:=f.view;v.UploadBytes=f.up.Load();v.DownloadBytes=f.down.Load();rows=append(rows,v)};e.mu.Unlock()
 	phase:="connecting";if e.closed.Load(){phase="disconnected"}else if e.started.Load(){phase="connected"}
-	var since any;if e.startedAt>0{since=e.startedAt}
+	var since any;if value:=e.startedAt.Load();value>0{since=value}
 	data,_:=json.Marshal(map[string]any{"phase":phase,"message":nil,"connectedAt":since,"uploadBytes":e.up.Load(),"downloadBytes":e.down.Load(),"connections":rows})
 	return string(data)
 }
