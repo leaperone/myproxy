@@ -1,6 +1,7 @@
 package one.leaper.myproxy
 
 import android.net.VpnService
+import one.leaper.myproxy.core.NativeCore
 import one.leaper.myproxy.network.mobile.Mobile
 import one.leaper.myproxy.network.mobile.MobileEngine
 import one.leaper.myproxy.network.mobile.MobilePolicy
@@ -14,7 +15,7 @@ internal class MyProxyNetworkBridge(
     private val policy = object : MobilePolicy {
         override fun decide(requestJSON: String): String = NativeCore.request(requestJSON)
         override fun health(node: String, delayMs: Long, failed: Boolean) {
-            NativeCore.request("{\"op\":\"health\",\"node\":\"${node.replace("\"", "")}\",\"delayMs\":$delayMs,\"failed\":$failed}")
+            NativeCore.request(org.json.JSONObject().put("op", "health").put("node", node).put("delayMs", delayMs).put("failed", failed).toString())
         }
     }
     private val protector = object : MobileProtector {

@@ -3,6 +3,7 @@
     "name": "MyProxy",
     "slug": "myproxy-xray",
     "version": "0.0.10",
+    "platforms": ["ios", "android"],
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
