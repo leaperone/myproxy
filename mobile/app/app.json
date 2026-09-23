@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "MyProxy Xray",
+    "slug": "myproxy-xray",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "scheme": "myproxy",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "one.leaper.myproxy.xray"
+    },
+    "android": {
+      "package": "one.leaper.myproxy.xray",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B1220"
+      }
+    },
+    "plugins": [
+      "expo-file-system"
+    ],
+    "extra": {
+      "channel": "xray"
+    }
+  }
+}
