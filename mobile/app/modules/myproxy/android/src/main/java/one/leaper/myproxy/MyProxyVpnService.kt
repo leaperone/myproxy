@@ -29,6 +29,8 @@ class MyProxyVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // A null intent or SERVICE_INTERFACE is how Always-on VPN may restart us.
         if (intent == null || intent.action == SERVICE_INTERFACE || intent.action == ACTION_CONNECT) startIfNeeded()
+        if (intent?.action == ACTION_APPLY) { if (started) applyCurrent() else startIfNeeded() }
+        if (intent?.action == ACTION_PROBE) { bridge?.probe(); bridge?.snapshot()?.let(::writeRuntime) }
         if (intent?.action == ACTION_DISCONNECT) stopVpn()
         return START_NOT_STICKY
     }
@@ -49,6 +51,7 @@ class MyProxyVpnService : VpnService() {
             bridge = MyProxyNetworkBridge(this, renderObj.optString("data"))
             bridge!!.startTun(tunnel!!.fd)
             started = true
+            writeRuntime(bridge!!.snapshot())
             updateNotification("MyProxy 已连接")
         } catch (_: Exception) {
             stopVpn()
@@ -63,11 +66,24 @@ class MyProxyVpnService : VpnService() {
         started = false
         try { bridge?.close() } catch (_: Exception) { }
         bridge = null
+        writeRuntime("{\"phase\":\"disconnected\",\"message\":null,\"connectedAt\":null,\"uploadBytes\":0,\"downloadBytes\":0,\"connections\":[]}")
         try { tunnel?.close() } catch (_: Exception) { }
         tunnel = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
+
+    private fun applyCurrent() {
+        try {
+            bridge?.close(); bridge = null
+            val render = JSONObject(NativeCore.request("{\"op\":\"render\"}"))
+            if (!render.optBoolean("ok")) throw IllegalStateException("render failed")
+            bridge = MyProxyNetworkBridge(this, render.optString("data")); bridge!!.startTun(tunnel?.fd ?: error("TUN closed"))
+            writeRuntime(bridge!!.snapshot())
+        } catch (_: Exception) { stopVpn() }
+    }
+
+    private fun writeRuntime(value: String) { MyProxyStore(applicationContext).writeRuntime(value) }
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= 26) getSystemService(NotificationManager::class.java)
@@ -81,6 +97,8 @@ class MyProxyVpnService : VpnService() {
     companion object {
         const val ACTION_CONNECT = "one.leaper.myproxy.action.CONNECT"
         const val ACTION_DISCONNECT = "one.leaper.myproxy.action.DISCONNECT"
+        const val ACTION_APPLY = "one.leaper.myproxy.action.APPLY"
+        const val ACTION_PROBE = "one.leaper.myproxy.action.PROBE"
         private const val CHANNEL = "myproxy-vpn"
     }
 }

@@ -20,7 +20,7 @@ internal class MyProxyController(private val context: Context) {
         }
         return@synchronized try {
             when (request.optString("op")) {
-                "snapshot" -> native("{\"op\":\"snapshot\"}")
+                "snapshot" -> mergeRuntime(native("{\"op\":\"snapshot\"}"))
                 "connect" -> invokeRuntime("connect", request)
                 "disconnect" -> invokeRuntime("disconnect", request)
                 "probe" -> invokeRuntime("probe", request)
@@ -76,6 +76,14 @@ internal class MyProxyController(private val context: Context) {
     private fun invokeRuntime(op: String, r: JSONObject): String = persistAfterNative(JSONObject(r.toString()).put("op", op))
 
     private fun native(request: String): String = NativeCore.request(request)
+
+    private fun mergeRuntime(response: String): String {
+        val value = store.readRuntime() ?: return response
+        return runCatching {
+            val root = JSONObject(response); val data = root.optJSONObject("data") ?: return response
+            data.put("runtime", JSONObject(value)); root.toString()
+        }.getOrDefault(response)
+    }
 
     private fun boundedFetch(url: String): String {
         val connection = URL(url).openConnection() as HttpURLConnection

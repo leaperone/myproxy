@@ -5,10 +5,11 @@ plugins {
 
 android {
     namespace 'one.leaper.myproxy'
-    compileSdk 35
+    compileSdk 37
     defaultConfig { minSdk 26 }
 }
 
 dependencies {
     implementation project(':expo-modules-core')
+    implementation files('libs/myproxy-network.aar')
 }

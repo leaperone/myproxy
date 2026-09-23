@@ -1,44 +1,30 @@
 package one.leaper.myproxy
 
 import android.net.VpnService
-import java.lang.reflect.Proxy
+import one.leaper.myproxy.network.mobile.Mobile
+import one.leaper.myproxy.network.mobile.MobileEngine
+import one.leaper.myproxy.network.mobile.MobilePolicy
+import one.leaper.myproxy.network.mobile.MobileProtector
 
-/**
- * Adapter for the gomobile ABI. Reflection keeps this module buildable before
- * the CI-generated AAR is present; a missing generated ABI is a hard runtime
- * error, never a simulated connected state.
- */
+/** Typed adapter for the CI-generated myproxy-network.aar. */
 internal class MyProxyNetworkBridge(
     private val service: VpnService,
-    private val renderJSON: String
+    renderJSON: String
 ) {
-    private var engine: Any? = null
-
-    fun startTun(fd: Int) {
-        val mobile = Class.forName("one.leaper.myproxy.network.mobile.Mobile")
-        val policyClass = Class.forName("one.leaper.myproxy.network.mobile.Policy")
-        val protectorClass = Class.forName("one.leaper.myproxy.network.mobile.Protector")
-        val policy = Proxy.newProxyInstance(policyClass.classLoader, arrayOf(policyClass)) { _, method, args ->
-            if (method.name == "decide") NativeCore.request(args?.firstOrNull()?.toString() ?: "{}") else null
+    private val policy = object : MobilePolicy {
+        override fun decide(requestJSON: String): String = NativeCore.request(requestJSON)
+        override fun health(node: String, delayMs: Long, failed: Boolean) {
+            NativeCore.request("{\"op\":\"health\",\"node\":\"${node.replace("\"", "")}\",\"delayMs\":$delayMs,\"failed\":$failed}")
         }
-        val protector = Proxy.newProxyInstance(protectorClass.classLoader, arrayOf(protectorClass)) { _, method, args ->
-            if (method.name == "protect") service.protect((args?.firstOrNull() as Number).toInt()) else null
-        }
-        val factory = mobile.methods.firstOrNull { it.name == "newEngine" && it.parameterTypes.size == 4 }
-            ?: error("gomobile Engine factory is unavailable")
-        engine = factory.invoke(null, renderJSON, policy, protector, true)
-        val start = engine!!.javaClass.methods.firstOrNull { it.name == "startTun" && it.parameterTypes.size == 1 }
-            ?: error("gomobile startTun is unavailable")
-        start.invoke(engine, fd.toLong())
     }
-
-    fun close() {
-        val current = engine ?: return
-        current.javaClass.methods.firstOrNull { it.name == "close" && it.parameterTypes.isEmpty() }?.invoke(current)
-        engine = null
+    private val protector = object : MobileProtector {
+        override fun protect(fd: Long): Boolean = service.protect(fd.toInt())
     }
+    private val engine: MobileEngine = Mobile.newEngine(renderJSON, policy, protector, true)
 
-    fun snapshot(): String = engine?.javaClass?.methods
-        ?.firstOrNull { it.name == "snapshot" && it.parameterTypes.isEmpty() }
-        ?.invoke(engine)?.toString() ?: "{\"phase\":\"disconnected\"}"
+    fun startTun(fd: Int) { engine.startTun(fd.toLong()) }
+    fun close() { engine.close() }
+    fun closeConnections() { engine.closeConnections() }
+    fun probe() { engine.probe() }
+    fun snapshot(): String = engine.snapshot()
 }

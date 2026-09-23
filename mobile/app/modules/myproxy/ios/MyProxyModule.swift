@@ -5,6 +5,15 @@ import NetworkExtension
 public final class MyProxyModule: Module {
     private let store = MyProxyStore()
 
+    public override init() {
+        super.init()
+        if let stored = try? store.read(), let document = stored {
+            _ = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": document]))
+        } else {
+            _ = MyProxyNativeCore.call("{\"op\":\"init\",\"platform\":\"ios\"}")
+        }
+    }
+
     public func definition() -> ModuleDefinition {
         Name("MyProxy")
         AsyncFunction("request") { (requestJSON: String) async -> String in
@@ -17,39 +26,42 @@ public final class MyProxyModule: Module {
               let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let op = request["op"] as? String else { return failure("invalid_request", "请求格式不正确") }
         switch op {
-        case "snapshot", "probe", "select", "setMode", "setAutoConnect", "setFallback", "saveRule", "deleteRule", "removeSource":
-            return persistMutation(text)
+        case "snapshot": return await snapshot()
+        case "probe", "select", "setMode", "setAutoConnect", "setFallback", "saveRule", "deleteRule", "removeSource":
+            return await persistMutation(text)
         case "connect":
             return await connect()
         case "disconnect":
             return await disconnect()
         case "import":
             guard let value = request["text"] as? String, value.utf8.count <= 2_000_000 else { return failure("invalid_import", "节点内容为空或过大") }
-            return persistMutation(text)
+            return await persistMutation(text)
         case "addSource", "refreshSource":
-            guard let urlText = request["url"] as? String, let url = URL(string: urlText), ["http", "https"].contains(url.scheme?.lowercased()) else { return failure("invalid_source", "订阅地址必须是 http 或 https") }
+            let urlText = (request["url"] as? String) ?? sourceURL(id: request["id"] as? String)
+            guard let urlText, let url = URL(string: urlText), ["http", "https"].contains(url.scheme?.lowercased()) else { return failure("invalid_source", "找不到有效的订阅地址") }
             do {
                 let fetched = try await BoundedFetch.fetch(url)
                 var enriched = request; enriched["op"] = "import"; enriched["text"] = fetched
-                return persistMutation(Self.json(enriched))
+                return await persistMutation(Self.json(enriched))
             } catch { return failure("source_fetch_failed", "订阅获取失败") }
         default: return failure("unsupported_operation", "暂不支持这个操作")
         }
     }
 
-    private func persistMutation(_ request: String) -> String {
+    private func persistMutation(_ request: String) async -> String {
         let response = MyProxyNativeCore.call(request)
         guard Self.isOK(response) else { return response }
         let exported = MyProxyNativeCore.call("{\"op\":\"export\"}")
         guard Self.isOK(exported), let document = Self.data(exported) as? String else { return failure("persist_failed", "配置验证通过，但保存失败") }
         do { try store.write(document) } catch { return failure("persist_failed", "配置保存失败") }
+        let providerOp = request.contains("\"op\":\"probe\"") ? "probe" : "apply"
+        _ = await sendProvider(Self.json(["op": providerOp]))
         return response
     }
 
     private func connect() async -> String {
-        let manager = NEVPNManager.shared()
         do {
-            try await manager.loadFromPreferences()
+            let manager = try await vpnManager()
             let configuration = NETunnelProviderProtocol()
             configuration.providerBundleIdentifier = "one.leaper.myproxy.xray.PacketTunnel"
             configuration.serverAddress = "MyProxy"
@@ -64,8 +76,45 @@ public final class MyProxyModule: Module {
     }
 
     private func disconnect() async -> String {
-        let manager = NEVPNManager.shared(); try? await manager.loadFromPreferences(); manager.connection.stopVPNTunnel()
+        if let manager = try? await vpnManager() { manager.connection.stopVPNTunnel() }
         return MyProxyNativeCore.call("{\"op\":\"snapshot\"}")
+    }
+
+    private func snapshot() async -> String {
+        let local = MyProxyNativeCore.call("{\"op\":\"snapshot\"}")
+        guard let manager = try? await vpnManager(), let session = manager.connection as? NETunnelProviderSession,
+              session.status == .connected || session.status == .connecting else { return local }
+        return await sendProvider("{\"op\":\"snapshot\"}") ?? local
+    }
+
+    private func sendProvider(_ request: String) async -> String? {
+        guard let manager = try? await vpnManager(), let session = manager.connection as? NETunnelProviderSession else { return nil }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
+            do {
+                try session.sendProviderMessage(Data(request.utf8)) { data in
+                    continuation.resume(returning: data.map { String(decoding: $0, as: UTF8.self) })
+                }
+            } catch { continuation.resume(returning: nil) }
+        }
+    }
+
+    private func vpnManager() async throws -> NETunnelProviderManager {
+        let managers: [NETunnelProviderManager] = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[NETunnelProviderManager], Error>) in
+            NETunnelProviderManager.loadAllFromPreferences { managers, error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: managers ?? []) }
+            }
+        }
+        if let existing = managers.first(where: { ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == "one.leaper.myproxy.xray.PacketTunnel" }) {
+            return existing
+        }
+        let manager = NETunnelProviderManager(); manager.localizedDescription = "MyProxy Xray"; return manager
+    }
+
+    private func sourceURL(id: String?) -> String? {
+        guard let id, let data = MyProxyNativeCore.call("{\"op\":\"snapshot\"}").data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sources = root["data"] as? [String: Any], let rows = sources["sources"] as? [[String: Any]] else { return nil }
+        return rows.first(where: { $0["id"] as? String == id })?["url"] as? String
     }
 
     private static func isOK(_ value: String) -> Bool { (try? JSONSerialization.jsonObject(with: Data(value.utf8)) as? [String: Any])?["ok"] as? Bool == true }

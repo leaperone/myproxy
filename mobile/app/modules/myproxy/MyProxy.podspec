@@ -5,6 +5,7 @@ Pod::Spec.new do |s|
   s.platforms      = { :ios => '15.0' }
   s.source         = { :path => '.' }
   s.source_files   = 'ios/*.swift'
+  s.vendored_frameworks = 'ios/Frameworks/MyProxyCore.xcframework', 'ios/Frameworks/MyProxyNetwork.xcframework'
   s.dependency 'ExpoModulesCore'
   s.frameworks     = 'NetworkExtension'
 end

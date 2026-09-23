@@ -34,7 +34,14 @@ class MyProxyModule : Module() {
                         context.stopService(Intent(context, MyProxyVpnService::class.java))
                         controller.request(requestJSON)
                     }
-                    else -> controller.request(requestJSON)
+                    else -> {
+                        val response = controller.request(requestJSON)
+                        if (op in setOf("probe", "select", "setMode", "setAutoConnect", "setFallback", "saveRule", "deleteRule", "removeSource", "import", "addSource", "refreshSource")) {
+                            val action = if (op == "probe") MyProxyVpnService.ACTION_PROBE else MyProxyVpnService.ACTION_APPLY
+                            runCatching { context.startService(Intent(context, MyProxyVpnService::class.java).setAction(action)) }
+                        }
+                        response
+                    }
                 }
             }
         }
