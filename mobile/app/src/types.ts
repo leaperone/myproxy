@@ -75,13 +75,6 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   runtime: { phase: 'disconnected', message: null, connectedAt: null, uploadBytes: 0, downloadBytes: 0, connections: [] },
 };
 
-export function isSnapshot(value: unknown): value is Snapshot {
-  if (!value || typeof value !== 'object') return false;
-  const item = value as Partial<Snapshot>;
-  return typeof item.revision === 'number' && typeof item.mode === 'string' && Array.isArray(item.groups) &&
-    !!item.runtime && typeof item.runtime === 'object' && typeof item.runtime.phase === 'string';
-}
-
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;

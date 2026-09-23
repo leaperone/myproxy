@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "MyProxy Xray",
+    "name": "MyProxy",
     "slug": "myproxy-xray",
-    "version": "0.1.0",
+    "version": "0.0.10",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
@@ -18,7 +18,9 @@
       }
     },
     "plugins": [
-      "expo-file-system"
+      "expo-file-system",
+      ["expo-camera", { "cameraPermission": "允许 MyProxy 使用相机扫描节点二维码" }],
+      "expo-document-picker"
     ],
     "extra": {
       "channel": "xray"
