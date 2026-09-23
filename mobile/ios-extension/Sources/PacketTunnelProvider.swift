@@ -8,6 +8,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let commandLock = NSRecursiveLock()
     private var lifecycleEpoch: UInt64 = 0
     private var engine: MyProxyPacketEngine?
+    private var monitor: DispatchSourceTimer?
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         commandLock.lock(); lifecycleEpoch &+= 1; let epoch = lifecycleEpoch; commandLock.unlock()
@@ -59,6 +60,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         return
                     }
                     self.engine = adapter
+                    self.startMonitoring()
                     self.commandLock.unlock()
                     completionHandler(nil)
                 } catch { completionHandler(error) }
@@ -69,7 +71,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         commandLock.lock(); defer { commandLock.unlock() }
         lifecycleEpoch &+= 1
+        monitor?.cancel(); monitor = nil
         engine?.close(); engine = nil; completionHandler()
+    }
+
+    private func startMonitoring() {
+        monitor?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        let epoch = lifecycleEpoch
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.commandLock.lock(); defer { self.commandLock.unlock() }
+            guard self.lifecycleEpoch == epoch, let current = self.engine else { return }
+            let data = Data(current.snapshot().utf8)
+            let runtime = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if runtime?["phase"] as? String == "disconnected" {
+                self.cancelTunnelWithError(TunnelError.engineStopped)
+            }
+        }
+        monitor = timer
+        timer.resume()
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
@@ -146,7 +168,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func data(_ value: String) -> Any? { (try? JSONSerialization.jsonObject(with: Data(value.utf8)) as? [String: Any])?["data"] }
     private static func json(_ value: [String: Any]) -> String { (try? String(data: JSONSerialization.data(withJSONObject: value), encoding: .utf8)) ?? "{}" }
 
-    enum TunnelError: Error { case missingDocument, invalidDocument, renderFailed, cancelled }
+    enum TunnelError: Error { case missingDocument, invalidDocument, renderFailed, cancelled, engineStopped }
 }
 
 private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobilePacketWriterProtocol {
@@ -180,8 +202,7 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
 
     func start() throws {
         guard let engine else { throw PacketEngineError.engineUnavailable }
-        var error: NSError?
-        guard engine.start(self, error: &error) else { throw error ?? PacketEngineError.engineUnavailable }
+        try engine.start(self)
         readPackets()
     }
 
@@ -211,8 +232,7 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
             self.stateLock.lock(); let running = self.readerRunning; let current = self.engine; self.stateLock.unlock()
             guard running, let current else { return }
             for (index, packet) in packets.enumerated() {
-                var error: NSError?
-                if !current.writePacket(packet, error: &error) || error != nil { self.close(); return }
+                do { try current.writePacket(packet) } catch { self.close(); return }
                 _ = protocols[index]
             }
             self.readPackets()
@@ -220,7 +240,9 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
     }
 
     private static func healthRequest(_ node: String, _ delay: Int64, _ failed: Bool) -> String {
-        "{\"op\":\"health\",\"node\":\"\(node.replacingOccurrences(of: "\\\"", with: ""))\",\"delayMs\":\(delay),\"failed\":\(failed ? "true" : "false")}"
+        let value: [String: Any] = ["op": "health", "node": node, "delayMs": delay, "failed": failed]
+        guard let data = try? JSONSerialization.data(withJSONObject: value) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
     }
 
     enum PacketEngineError: Error { case engineUnavailable }

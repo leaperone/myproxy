@@ -21,20 +21,21 @@ internal class MyProxyNetworkBridge(
     private val protector = object : Protector {
         override fun protect(fd: Long): Boolean = service.protect(fd.toInt())
     }
-    private val engine: Engine = Mobile.newEngine(renderJSON, policy, protector, true)
+    @Volatile private var engine: Engine? = Mobile.newEngine(renderJSON, policy, protector, true)
 
     init {
         val revision = org.json.JSONObject(renderJSON).getLong("revision")
         val result = org.json.JSONObject(NativeCore.request(org.json.JSONObject().put("op", "activate").put("revision", revision).toString()))
         if (!result.optBoolean("ok")) {
-            engine.close()
+            engine?.close()
+            engine = null
             throw IllegalStateException("配置已发生变化，请重新连接")
         }
     }
 
-    fun startTun(fd: Int) { engine.startTun(fd.toLong()) }
-    fun close() { engine.close() }
-    fun closeConnections() { engine.closeConnections() }
-    fun probe() { engine.probe() }
-    fun snapshot(): String = engine.snapshot()
+    fun startTun(fd: Int) { checkNotNull(engine).startTun(fd.toLong()) }
+    fun close() { val previous = engine; engine = null; previous?.close() }
+    fun closeConnections() { engine?.closeConnections() }
+    fun probe() { engine?.probe() }
+    fun snapshot(): String = engine?.snapshot() ?: "{\"phase\":\"disconnected\",\"message\":null,\"connectedAt\":null,\"uploadBytes\":0,\"downloadBytes\":0,\"connections\":[]}"
 }

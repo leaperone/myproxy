@@ -24,4 +24,4 @@ npm ci --no-audit --no-fund
 npx expo prebuild --platform android --no-install
 node "$root_dir/scripts/mobile/verify-autolinking.js" android
 cd android
-./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a -Pandroid.minSdkVersion=26 --no-daemon

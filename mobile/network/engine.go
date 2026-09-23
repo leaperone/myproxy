@@ -111,6 +111,7 @@ type Engine struct {
 	down             atomic.Int64
 	mu               sync.Mutex
 	flows            map[string]*flow
+	probing          map[string]bool
 	recent           []flowView
 	tun              *os.File
 	names            map[string]dnsName
@@ -156,7 +157,7 @@ func NewEngine(renderJSON string, policy Policy, protector Protector, allowDirec
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{ctx: ctx, cancel: cancel, policy: policy, protector: protector, allowDirect: allowDirect, revision: cfg.Revision,
-		nodes: cfg.Nodes, tags: make(map[string]bool), flows: make(map[string]*flow), names: make(map[string]dnsName)}
+		nodes: cfg.Nodes, tags: make(map[string]bool), flows: make(map[string]*flow), probing: make(map[string]bool), names: make(map[string]dnsName)}
 	for _, n := range cfg.Nodes {
 		if n.Tag == "" || e.tags[n.Tag] {
 			cancel()
@@ -468,6 +469,7 @@ func (e *Engine) acceptTCP(request *tcp.ForwarderRequest) {
 			close(done)
 		}()
 		copyTraffic(local, upstream, &f.down, &e.down)
+		if f.down.Load() == 0 && ctx.Err() == nil { e.failed(r) }
 		local.Close()
 		upstream.Close()
 		<-done
@@ -512,8 +514,8 @@ func (e *Engine) dial(ctx context.Context, r route, host string, port uint16, ne
 }
 
 func (e *Engine) failed(r route) {
-	if r.Node != nil {
-		e.policy.Health(*r.Node, -1, true)
+	if r.Node != nil && r.Tag != nil && !e.closed.Load() {
+		go e.checkNode(node{Name: *r.Node, Tag: *r.Tag})
 	}
 }
 
