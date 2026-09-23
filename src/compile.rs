@@ -112,7 +112,7 @@ fn try_compile_root(
     request: Option<&crate::network_extension::EnableRequest>,
 ) -> Result<serde_yaml::Mapping> {
     let mut root = serde_yaml::Mapping::new();
-    root.insert("allow-lan".into(), false.into());
+    root.insert("allow-lan".into(), strategy.mixed_lan.into());
     root.insert("bind-address".into(), "127.0.0.1".into());
     root.insert("mode".into(), "rule".into());
     root.insert("log-level".into(), "info".into());
@@ -542,15 +542,22 @@ fn insert_inbound_listeners(
 }
 
 fn push_mixed_listener(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strategy) {
-    let mut item = serde_yaml::Mapping::new();
-    item.insert("name".into(), "myproxy-mixed".into());
-    item.insert("type".into(), "mixed".into());
-    item.insert("listen".into(), "127.0.0.1".into());
-    item.insert("port".into(), strategy.mixed_port.into());
-    if let Some(proxy) = inbound_proxy(strategy.mixed_mode, strategy) {
-        item.insert("proxy".into(), proxy.into());
+    let hosts: &[(&str, &str)] = if strategy.mixed_lan {
+        &[("myproxy-mixed", "0.0.0.0"), ("myproxy-mixed-ipv6", "::")]
+    } else {
+        &[("myproxy-mixed", "127.0.0.1")]
+    };
+    for (name, host) in hosts {
+        let mut item = serde_yaml::Mapping::new();
+        item.insert("name".into(), (*name).into());
+        item.insert("type".into(), "mixed".into());
+        item.insert("listen".into(), (*host).into());
+        item.insert("port".into(), strategy.mixed_port.into());
+        if let Some(proxy) = inbound_proxy(strategy.mixed_mode, strategy) {
+            item.insert("proxy".into(), proxy.into());
+        }
+        listeners.push(serde_yaml::Value::Mapping(item));
     }
-    listeners.push(serde_yaml::Value::Mapping(item));
 }
 
 fn append_network_extension_listeners(
@@ -1054,6 +1061,57 @@ mod tests {
             Some(u64::from(strategy.mixed_port))
         );
         assert_eq!(proxy_field(mixed), None);
+        assert_eq!(
+            root.get("allow-lan").and_then(serde_yaml::Value::as_bool),
+            Some(false)
+        );
+        assert!(listeners(&root)
+            .into_iter()
+            .all(|item| listener_name(item) != "myproxy-mixed-ipv6"));
+    }
+
+    #[test]
+    fn mixed_lan_opens_mixed_only() {
+        let mut strategy = Strategy::default();
+        strategy.mixed_lan = true;
+        strategy.system_extension = true;
+        let root = compiled(&strategy);
+        assert_eq!(
+            root.get("allow-lan").and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            root.get("bind-address").and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            root.get("external-controller")
+                .and_then(serde_yaml::Value::as_str)
+                .and_then(|value| value.split(':').next()),
+            Some("127.0.0.1")
+        );
+        let mixed = mixed_listener(&root);
+        assert_eq!(
+            mixed.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("0.0.0.0")
+        );
+        let ipv6 = listeners(&root)
+            .into_iter()
+            .find(|item| listener_name(item) == "myproxy-mixed-ipv6")
+            .expect("ipv6 mixed");
+        assert_eq!(
+            ipv6.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("::")
+        );
+        assert_eq!(proxy_field(ipv6), None);
+        let socks = listeners(&root)
+            .into_iter()
+            .find(|item| listener_name(item) == "myproxy-network-extension-socks-ipv4")
+            .expect("extension socks");
+        assert_eq!(
+            socks.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1")
+        );
     }
 
     #[test]

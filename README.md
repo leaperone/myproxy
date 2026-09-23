@@ -2,7 +2,7 @@
 
 macOS menu-bar controller ([GPUI](https://github.com/zed-industries/zed)) for a bundled [mihomo](https://github.com/MetaCubeX/mihomo) core.
 
-Strategy JSON under `~/Library/Application Support/myproxy/` is the source of truth: subscriptions, node groups, rules, and Mixed port (HTTP + SOCKS5 on one loopback port). The UI is Chinese: **总览**, **连接**, **订阅**, **节点组**, **规则**, **设置**.
+Strategy JSON under `~/Library/Application Support/myproxy/` is the source of truth: subscriptions, node groups, rules, and Mixed port (HTTP + SOCKS5, loopback unless **设置** opens it to the LAN). The UI is Chinese: **总览**, **连接**, **订阅**, **节点组**, **规则**, **设置**.
 
 ## Install
 
