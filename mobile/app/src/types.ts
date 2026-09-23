@@ -27,6 +27,7 @@ export type Group = {
 export type Rule = { id: string; name: string; kind: string; value: string; via: string };
 export type Connection = {
   id: string;
+  active: boolean;
   host: string;
   port: number;
   network: string;
@@ -78,5 +79,6 @@ export const EMPTY_SNAPSHOT: Snapshot = {
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
