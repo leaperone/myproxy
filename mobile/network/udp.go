@@ -27,6 +27,7 @@ func (e *Engine) acceptUDP(request *udp.ForwarderRequest) bool {
 		done:=make(chan struct{})
 		go func(){
 			defer close(done)
+			defer upstream.Close()
 			packet:=make([]byte,65535)
 			for {local.SetReadDeadline(time.Now().Add(90*time.Second));n,err:=local.Read(packet);if err!=nil{return};written,err:=upstream.Write(packet[:n]);f.up.Add(int64(written));e.up.Add(int64(written));if err!=nil{return}}
 		}()

@@ -3,6 +3,7 @@
 package mobile
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -116,6 +117,18 @@ var process struct {
 	sync.Mutex
 	engine *Engine
 	registered bool
+}
+
+// Validate prepares an outbound configuration without replacing the current
+// engine or changing the process-wide socket protection owner.
+func Validate(renderJSON string) error {
+	var cfg render
+	if len(renderJSON)>8*1024*1024 || json.Unmarshal([]byte(renderJSON),&cfg)!=nil || len(cfg.Nodes)==0 {return errors.New("代理配置无效")}
+	config,err:=core.LoadConfig("json",bytes.NewReader([]byte(cfg.Config)))
+	if err!=nil{return errors.New("节点配置未通过 Xray 验证")}
+	instance,err:=core.New(config)
+	if err!=nil{return errors.New("节点配置未通过 Xray 验证")}
+	return instance.Close()
 }
 
 // NewEngine validates the complete outbound configuration before accepting any
