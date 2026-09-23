@@ -19,7 +19,7 @@ if [[ ! -f mobile/app/modules/myproxy/android/libs/myproxy-network.aar ]]; then
   bash scripts/mobile/build-network.sh android
 fi
 cd "$root_dir/mobile/app"
-npm install --no-audit --no-fund
+npm ci --no-audit --no-fund
 npx expo prebuild --platform android --no-install
 node "$root_dir/scripts/mobile/verify-autolinking.js" android
 cd android

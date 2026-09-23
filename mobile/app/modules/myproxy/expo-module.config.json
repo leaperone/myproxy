@@ -4,6 +4,7 @@
     "modules": ["one.leaper.myproxy.MyProxyModule"]
   },
   "apple": {
-    "modules": ["MyProxyModule"]
+    "modules": ["MyProxyModule"],
+    "podspecPath": "MyProxyNative.podspec"
   }
 }

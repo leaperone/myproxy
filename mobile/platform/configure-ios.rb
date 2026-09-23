@@ -29,6 +29,7 @@ extension.build_configurations.each do |config|
   config.build_settings['CURRENT_PROJECT_VERSION'] = ENV.fetch('GITHUB_RUN_NUMBER', '1')
   config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = deployment_target
   config.build_settings['APPLICATION_EXTENSION_API_ONLY'] = 'YES'
+  config.build_settings['OTHER_LDFLAGS'] = ['$(inherited)', '-lresolv', '-framework', 'Security', '-framework', 'CoreFoundation']
 end
 
 app.build_configurations.each do |config|
