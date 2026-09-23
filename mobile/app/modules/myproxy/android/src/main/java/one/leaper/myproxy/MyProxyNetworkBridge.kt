@@ -23,6 +23,15 @@ internal class MyProxyNetworkBridge(
     }
     private val engine: Engine = Mobile.newEngine(renderJSON, policy, protector, true)
 
+    init {
+        val revision = org.json.JSONObject(renderJSON).getLong("revision")
+        val result = org.json.JSONObject(NativeCore.request(org.json.JSONObject().put("op", "activate").put("revision", revision).toString()))
+        if (!result.optBoolean("ok")) {
+            engine.close()
+            throw IllegalStateException("配置已发生变化，请重新连接")
+        }
+    }
+
     fun startTun(fd: Int) { engine.startTun(fd.toLong()) }
     fun close() { engine.close() }
     fun closeConnections() { engine.closeConnections() }

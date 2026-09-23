@@ -101,6 +101,7 @@ type Engine struct {
 	allowDirect      bool
 	nodes            []node
 	tags             map[string]bool
+	revision         uint64
 	startedAt        atomic.Int64
 	closed           atomic.Bool
 	started          atomic.Bool
@@ -154,7 +155,7 @@ func NewEngine(renderJSON string, policy Policy, protector Protector, allowDirec
 		return nil, errors.New("Android 网络保护未准备好")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{ctx: ctx, cancel: cancel, policy: policy, protector: protector, allowDirect: allowDirect,
+	e := &Engine{ctx: ctx, cancel: cancel, policy: policy, protector: protector, allowDirect: allowDirect, revision: cfg.Revision,
 		nodes: cfg.Nodes, tags: make(map[string]bool), flows: make(map[string]*flow), names: make(map[string]dnsName)}
 	for _, n := range cfg.Nodes {
 		if n.Tag == "" || e.tags[n.Tag] {
@@ -367,6 +368,9 @@ func (e *Engine) decide(id stack.TransportEndpointID, network string) (route, st
 		return route{}, host, errors.New("路由决策失败")
 	}
 	r := reply.Data
+	if r.Revision != e.revision {
+		return r, host, errors.New("代理配置正在切换")
+	}
 	if r.Action == "direct" && e.allowDirect {
 		return r, host, nil
 	}

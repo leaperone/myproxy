@@ -25,6 +25,7 @@ struct Document {
 }
 fn schema() -> u32 { 1 }
 
+#[derive(Clone)]
 struct Runtime {
     document: Document,
     accepted: Catalog,
@@ -52,12 +53,18 @@ enum Command {
     Health { node: String, #[serde(rename = "delayMs")] delay_ms: Option<i64>, failed: bool },
     Route { host: String, hostname: Option<String>, port: u16, network: String },
     Render,
+    Activate { revision: u64 },
     Connect,
     Disconnect,
     Probe,
 }
 
-static RUNTIME: OnceLock<Mutex<Option<Runtime>>> = OnceLock::new();
+#[derive(Default)]
+struct State {
+    desired: Option<Runtime>,
+    applied: Option<Runtime>,
+}
+static RUNTIME: OnceLock<Mutex<State>> = OnceLock::new();
 
 impl Runtime {
     fn new(platform: Platform) -> Result<Self> {
@@ -68,6 +75,7 @@ impl Runtime {
 
     fn prepare(mut document: Document, platform: Platform, health: HashMap<String, NodeHealth>) -> Result<Self> {
         if document.schema != 1 { bail!("不支持这个配置版本") }
+        if document.revision > 9_007_199_254_740_991 { bail!("配置版本无效") }
         if document.catalog.nodes.len() > 2048 { bail!("手机配置最多支持 2048 个节点") }
         document.strategy.extension_mode = document.strategy.mixed_mode;
         validate_policy(&document.strategy, &document.catalog, platform)?;
@@ -232,8 +240,10 @@ fn policy_target_exists(document: &Document, name: &str) -> Result<()> {
 
 fn import(document: &mut Document, text: &str, name: Option<String>, source_id: Option<String>, source_url: Option<String>) -> Result<()> {
     if text.len() > 2_000_000 { bail!("导入内容超过 2 MB") }
-    if let Ok(imported) = serde_json::from_str::<Document>(text) { *document = imported; return Ok(()) }
-    if let Ok(strategy) = serde_json::from_str::<Strategy>(text) { document.strategy = strategy; return Ok(()) }
+    if source_id.is_none() && source_url.is_none() {
+        if let Ok(imported) = serde_json::from_str::<Document>(text) { *document = imported; return Ok(()) }
+        if let Ok(strategy) = serde_json::from_str::<Strategy>(text) { document.strategy = strategy; return Ok(()) }
+    }
     let raw_nodes = catalog::parse_subscription(text).context("未找到可导入的订阅或节点链接")?;
     if raw_nodes.is_empty() { bail!("订阅没有节点，保留原有配置") }
     let existing = source_id.as_ref().and_then(|id| document.strategy.subscriptions.iter().find(|s| &s.id == id)).cloned();
@@ -273,40 +283,58 @@ fn tag(name: &str) -> String {
 fn dispatch(request: &str) -> Result<Value> {
     if request.len() > 8*1024*1024 { bail!("请求过大") }
     let command: Command = serde_json::from_str(request).context("操作参数无效")?;
-    let mut state = RUNTIME.get_or_init(|| Mutex::new(None)).lock().map_err(|_| anyhow::anyhow!("核心状态不可用，请重新打开应用"))?;
+    let mut state = RUNTIME.get_or_init(|| Mutex::new(State::default())).lock().map_err(|_| anyhow::anyhow!("核心状态不可用，请重新打开应用"))?;
     match command {
         Command::Init { platform } => {
-            if state.is_none() { *state = Some(Runtime::new(platform)?); }
-            let runtime = state.as_ref().context("核心尚未初始化")?;
+            if state.desired.is_none() { state.desired = Some(Runtime::new(platform)?); }
+            let runtime = state.desired.as_ref().context("核心尚未初始化")?;
             if runtime.platform != platform { bail!("平台配置不一致") }
             Ok(runtime.snapshot())
         }
         Command::Load { document, platform } => {
             if document.len() > 8*1024*1024 { bail!("配置过大") }
             let document: Document = serde_json::from_str(&document).context("配置文档格式无效")?;
-            let health = state.as_ref().map(|s| s.health.clone()).unwrap_or_default();
-            *state = Some(Runtime::prepare(document, platform, health)?);
-            Ok(state.as_ref().context("核心尚未初始化")?.snapshot())
+            let health = state.desired.as_ref().map(|s| s.health.clone()).unwrap_or_default();
+            state.desired = Some(Runtime::prepare(document, platform, health)?);
+            Ok(state.desired.as_ref().context("核心尚未初始化")?.snapshot())
+        }
+        Command::Activate { revision } => {
+            let runtime = state.desired.as_ref().context("核心尚未初始化")?;
+            if revision != runtime.document.revision { bail!("配置已发生变化，请重新连接") }
+            state.applied = Some(runtime.clone());
+            Ok(Value::Null)
+        }
+        Command::Route { host, hostname, port, network } => {
+            state.applied.as_ref().context("代理配置尚未生效")?.route(host, hostname, port, network)
+        }
+        Command::Health { node, delay_ms, failed } => {
+            let matches_desired = match (&state.desired, &state.applied) {
+                (Some(desired), Some(applied)) => desired.accepted.nodes.iter().find(|n| n.name == node)
+                    .zip(applied.accepted.nodes.iter().find(|n| n.name == node)).is_some_and(|(a, b)| a.raw == b.raw),
+                _ => false,
+            };
+            if let Some(applied) = state.applied.as_mut() { update_health(applied, &node, delay_ms, failed); }
+            if matches_desired { if let Some(desired) = state.desired.as_mut() { update_health(desired, &node, delay_ms, failed); } }
+            Ok(Value::Null)
         }
         command => {
-            let runtime = state.as_mut().context("核心尚未初始化")?;
+            let runtime = state.desired.as_mut().context("核心尚未初始化")?;
             match command {
                 Command::Snapshot => Ok(runtime.snapshot()),
                 Command::Export => Ok(Value::String(serde_json::to_string(&runtime.document)?)),
                 Command::Render => runtime.render(),
-                Command::Route { host, hostname, port, network } => runtime.route(host, hostname, port, network),
-                Command::Health { node, delay_ms, failed } => {
-                    if runtime.accepted.nodes.iter().any(|n| n.name == node) {
-                        let health = runtime.health.entry(node).or_default();
-                        health.delay_ms = delay_ms.and_then(|v| u32::try_from(v).ok());
-                        health.failures = if failed { health.failures.saturating_add(1) } else { 0 };
-                    }
-                    Ok(Value::Null)
-                }
                 Command::Connect | Command::Disconnect | Command::Probe => bail!("连接操作需要通过系统 VPN 模块执行"),
                 command => runtime.mutate(command),
             }
         }
+    }
+}
+
+fn update_health(runtime: &mut Runtime, node: &str, delay_ms: Option<i64>, failed: bool) {
+    if runtime.accepted.nodes.iter().any(|n| n.name == node) {
+        let health = runtime.health.entry(node.into()).or_default();
+        health.delay_ms = delay_ms.and_then(|v| u32::try_from(v).ok());
+        health.failures = if failed { health.failures.saturating_add(1) } else { 0 };
     }
 }
 

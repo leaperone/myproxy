@@ -75,6 +75,7 @@ Private requests:
 - `load {document: string, platform: ...}` loads an exported document into this process after complete validation. Returns core snapshot.
 - `export` returns a serialized document string as data.
 - `render` returns `{config: string, nodes: [{name,tag}], revision}`. Xray JSON contains outbounds, no listening inbounds and no business routing. Stable node tags `node-<stable id or hash>` map back to node names. No disabled/invalid outbound is rendered.
+- `activate {revision}` publishes the prepared Rust policy only after the matching Xray engine is constructed and before it accepts packets. Configuration edits do not alter routing on the old running engine. A mismatched revision rejects activation.
 - `route {host, port, network: "tcp"|"udp"}` returns `{action: "proxy"|"direct"|"reject", tag: string|null, node: string|null, rule: string, chain: string[], revision}` using existing policy. Dynamic Direct is an Android-only capability; invalid iOS profile/direct rule must not silently broaden.
 - `health {node, delayMs: number|null, failed: boolean}` updates transient node health without persisting runtime metrics as configuration.
 

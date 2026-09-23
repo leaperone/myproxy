@@ -163,6 +163,19 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
             throw error ?? PacketEngineError.engineUnavailable
         }
         self.engine = value
+        guard let data = renderJSON.data(using: .utf8),
+              let render = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let revision = render["revision"] as? NSNumber else {
+            value.close()
+            throw PacketEngineError.engineUnavailable
+        }
+        let command = try JSONSerialization.data(withJSONObject: ["op": "activate", "revision": revision])
+        let response = MyProxyNativeCore.call(String(decoding: command, as: UTF8.self))
+        guard let responseData = response.data(using: .utf8),
+              let envelope = try JSONSerialization.jsonObject(with: responseData) as? [String: Any], envelope["ok"] as? Bool == true else {
+            value.close()
+            throw PacketEngineError.engineUnavailable
+        }
     }
 
     func start() throws {
