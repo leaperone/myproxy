@@ -116,6 +116,12 @@ jobs:
           go-version: '1.27.1'
           cache-dependency-path: mobile/network/go.sum
       - run: bash scripts/mobile/build-network.sh ios
+      - name: Compile Packet Tunnel bindings against the generated framework
+        run: |
+          framework_slice="$(find mobile/app/modules/myproxy/ios/Frameworks/MyProxyNetwork.xcframework -maxdepth 2 -type d -name 'MyProxyNetwork.framework' -path '*simulator*' -print -quit)"
+          xcrun swiftc -typecheck -swift-version 5 -parse-as-library -module-name MyProxyPacketTunnel \
+            -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" -target arm64-apple-ios16.4-simulator \
+            -F "$(dirname "$framework_slice")" mobile/ios-extension/Sources/*.swift
       - uses: actions/upload-artifact@v4
         with:
           name: ios-network-library
