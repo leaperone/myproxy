@@ -18,7 +18,10 @@ case "$platform" in
     export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.1.12297006"
     mkdir -p "$root_dir/mobile/app/modules/myproxy/android/libs"
     gomobile bind -target=android/arm64 -androidapi=24 -javapkg=one.leaper.myproxy.network \
+      '-ldflags=-checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384' \
       -o "$root_dir/mobile/app/modules/myproxy/android/libs/myproxy-network.aar" .
+    unzip -p "$root_dir/mobile/app/modules/myproxy/android/libs/myproxy-network.aar" classes.jar > /tmp/myproxy-network-classes.jar
+    javap -classpath /tmp/myproxy-network-classes.jar one.leaper.myproxy.network.mobile.Mobile one.leaper.myproxy.network.mobile.Engine one.leaper.myproxy.network.mobile.Policy
     ;;
   ios)
     mkdir -p "$root_dir/mobile/app/modules/myproxy/ios/Frameworks"

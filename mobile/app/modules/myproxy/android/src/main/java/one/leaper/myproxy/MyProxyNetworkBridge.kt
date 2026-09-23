@@ -3,25 +3,25 @@ package one.leaper.myproxy
 import android.net.VpnService
 import one.leaper.myproxy.core.NativeCore
 import one.leaper.myproxy.network.mobile.Mobile
-import one.leaper.myproxy.network.mobile.MobileEngine
-import one.leaper.myproxy.network.mobile.MobilePolicy
-import one.leaper.myproxy.network.mobile.MobileProtector
+import one.leaper.myproxy.network.mobile.Engine
+import one.leaper.myproxy.network.mobile.Policy
+import one.leaper.myproxy.network.mobile.Protector
 
 /** Typed adapter for the CI-generated myproxy-network.aar. */
 internal class MyProxyNetworkBridge(
     private val service: VpnService,
     renderJSON: String
 ) {
-    private val policy = object : MobilePolicy {
+    private val policy = object : Policy {
         override fun decide(requestJSON: String): String = NativeCore.request(requestJSON)
         override fun health(node: String, delayMs: Long, failed: Boolean) {
             NativeCore.request(org.json.JSONObject().put("op", "health").put("node", node).put("delayMs", delayMs).put("failed", failed).toString())
         }
     }
-    private val protector = object : MobileProtector {
+    private val protector = object : Protector {
         override fun protect(fd: Long): Boolean = service.protect(fd.toInt())
     }
-    private val engine: MobileEngine = Mobile.newEngine(renderJSON, policy, protector, true)
+    private val engine: Engine = Mobile.newEngine(renderJSON, policy, protector, true)
 
     fun startTun(fd: Int) { engine.startTun(fd.toLong()) }
     fun close() { engine.close() }

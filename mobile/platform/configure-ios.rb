@@ -25,6 +25,8 @@ extension.build_configurations.each do |config|
   config.build_settings['INFOPLIST_FILE'] = rel.call(File.join(repo_dir, 'mobile/ios-extension/Info.plist'))
   config.build_settings['CODE_SIGN_ENTITLEMENTS'] = rel.call(File.join(repo_dir, 'mobile/ios-extension/MyProxyPacketTunnel.entitlements'))
   config.build_settings['SWIFT_VERSION'] = '5.0'
+  config.build_settings['MARKETING_VERSION'] = '0.0.10'
+  config.build_settings['CURRENT_PROJECT_VERSION'] = ENV.fetch('GITHUB_RUN_NUMBER', '1')
   config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = deployment_target
   config.build_settings['APPLICATION_EXTENSION_API_ONLY'] = 'YES'
 end

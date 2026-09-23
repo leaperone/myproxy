@@ -7,3 +7,5 @@ The iOS packet interface uses public `NEPacketTunnelFlow` reads and writes. Andr
 The engine bounds concurrent flows, packet queues, DNS correlation and recent records. Internal node probes are excluded from user connection records. Observed DNS names are not assigned to an IP when multiple names share it. DNS datagrams use TCP to the chosen resolver through the selected node. Direct traffic is enabled only by the Android adapter.
 
 Build on GitHub Actions with the repository mobile scripts. A successful build is not a claim of device/VPN acceptance; that phase is intentionally deferred by the user.
+
+Android uses the linker flags from the pinned libXray Android build: `-checklinkname=0` for Xray's existing anet dependency, and a 16 KiB maximum page size. The Rust Android library uses the same page alignment. Reference: `XTLS/libXray` commit `5b7c5e07ef358b13acddc6f2b8e33949079f08e7`, `build/app/android.py`.

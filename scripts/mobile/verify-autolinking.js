@@ -2,7 +2,7 @@ const { execFileSync } = require('node:child_process');
 
 const platform = process.argv[2];
 if (!['apple', 'android'].includes(platform)) throw new Error('Unknown native platform');
-const resolved = JSON.parse(execFileSync('npx', ['expo-modules-autolinking', 'resolve', '--platform', platform], { encoding: 'utf8' }));
+const resolved = JSON.parse(execFileSync('npx', ['expo-modules-autolinking', 'resolve', '--platform', platform, '--json'], { encoding: 'utf8' }));
 const expected = platform === 'apple' ? 'MyProxyModule' : 'one.leaper.myproxy.MyProxyModule';
 function registered(value) {
   if (value === expected) return true;

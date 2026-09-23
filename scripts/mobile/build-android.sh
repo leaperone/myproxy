@@ -11,6 +11,7 @@ sdkmanager "ndk;$ndk_version"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk_version"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS='-C link-arg=-Wl,-z,max-page-size=16384'
 cargo build -p myproxy-mobile --release --target aarch64-linux-android
 mkdir -p mobile/app/modules/myproxy/android/src/main/jniLibs/arm64-v8a mobile/app/modules/myproxy/android/libs
 cp target/aarch64-linux-android/release/libmyproxy_mobile.so mobile/app/modules/myproxy/android/src/main/jniLibs/arm64-v8a/
