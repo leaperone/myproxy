@@ -175,7 +175,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: MyProxy-Xray-Android-${{ github.run_number }}
-          path: mobile/app/android/app/build/outputs/apk/release/*.apk
+          path: |
+            mobile/app/android/app/build/outputs/apk/release/*.apk
+            mobile/app/android/app/build/outputs/apk/release/build-manifest.json
           if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@v4

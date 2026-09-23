@@ -25,3 +25,5 @@ npx expo prebuild --platform android --no-install
 node "$root_dir/scripts/mobile/verify-autolinking.js" android
 cd android
 ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a -Pandroid.minSdkVersion=26 --build-cache --no-daemon
+python3 "$root_dir/scripts/mobile/verify-package.py" android app/build/outputs/apk/release/app-release.apk \
+  --report app/build/outputs/apk/release/build-manifest.json

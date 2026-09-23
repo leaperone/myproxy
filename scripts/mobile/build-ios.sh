@@ -38,3 +38,5 @@ xcodebuild -workspace "$workspace_path" -scheme "$scheme_name" -configuration Re
   archive > "$root_dir/mobile/.build/logs/device.log" 2>&1 || { tail -100 "$root_dir/mobile/.build/logs/device.log"; exit 1; }
 ditto -c -k --keepParent "$root_dir/mobile/.build/simulator/Build/Products/Release-iphonesimulator/$scheme_name.app" "$root_dir/mobile/.build/artifacts/MyProxy-iOS-Simulator.zip"
 ditto -c -k --keepParent "$root_dir/mobile/.build/MyProxy.xcarchive" "$root_dir/mobile/.build/artifacts/MyProxy-iOS-Unsigned.xcarchive.zip"
+python3 "$root_dir/scripts/mobile/verify-package.py" ios "$root_dir/mobile/.build/MyProxy.xcarchive/Products/Applications/$scheme_name.app" \
+  --report "$root_dir/mobile/.build/artifacts/build-manifest.json"
