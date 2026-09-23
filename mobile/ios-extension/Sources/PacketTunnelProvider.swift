@@ -21,6 +21,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let renderJSON = Self.json(config)
 
             let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+            settings.mtu = 1280
             let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.0"])
             ipv4.includedRoutes = [NEIPv4Route.default()]
             ipv4.excludedRoutes = [

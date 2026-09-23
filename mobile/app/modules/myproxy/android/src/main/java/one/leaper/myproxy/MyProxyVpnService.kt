@@ -59,7 +59,7 @@ class MyProxyVpnService : VpnService() {
         if (!renderObj.optBoolean("ok")) { failRuntime("代理配置无法启动"); return }
         try {
             val builder = Builder().setSession("MyProxy")
-                .setMtu(1500).addAddress("198.18.0.1", 30).addRoute("0.0.0.0", 0)
+                .setMtu(1280).addAddress("198.18.0.1", 30).addRoute("0.0.0.0", 0)
             if (Build.VERSION.SDK_INT >= 21) builder.addAddress("fd00:1::1", 126).addRoute("::", 0)
             builder.addDnsServer("1.1.1.1").addDnsServer("9.9.9.9")
             tunnel = builder.establish() ?: error("VpnService.Builder.establish failed")
