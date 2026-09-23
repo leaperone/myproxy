@@ -107,13 +107,13 @@ jobs:
 
   network-ios:
     needs: network
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: '26.6'
       - uses: actions/setup-go@v6
         with:
           go-version: '1.27.1'
@@ -194,13 +194,13 @@ jobs:
 
   ios:
     needs: [shared-core, network-ios, interface]
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: '26.6'
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
