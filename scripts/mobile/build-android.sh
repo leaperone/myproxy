@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+root_dir="$PWD"
+if [[ "${CI:-}" != true ]]; then
+  echo 'Mobile builds run in GitHub Actions; no local SDK or dependency installation.' >&2
+  exit 1
+fi
+ndk_version=27.1.12297006
+sdkmanager "ndk;$ndk_version" 'platforms;android-37' 'build-tools;37.0.0'
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk_version"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+cargo build -p myproxy-mobile --release --target aarch64-linux-android
+mkdir -p mobile/app/modules/myproxy/android/src/main/jniLibs/arm64-v8a mobile/app/modules/myproxy/android/libs
+cp target/aarch64-linux-android/release/libmyproxy_mobile.so mobile/app/modules/myproxy/android/src/main/jniLibs/arm64-v8a/
+go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260908204917-8b95e45f8d3e
+go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260908204917-8b95e45f8d3e
+export PATH="$(go env GOPATH)/bin:$PATH"
+cd mobile/network
+go mod tidy
+gomobile bind -target=android/arm64 -androidapi=24 -javapkg=one.leaper.myproxy.network -o "$root_dir/mobile/app/modules/myproxy/android/libs/myproxy-network.aar" .
+cd "$root_dir/mobile/app"
+npm install --no-audit --no-fund
+npx expo prebuild --platform android --no-install
+cd android
+./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon

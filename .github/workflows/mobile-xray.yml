@@ -1,0 +1,153 @@
+name: Xray mobile
+
+on:
+  push:
+    branches: [feat/xray-mobile]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-xray-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shared-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mobile-policy
+      - name: Compile the reused Rust core
+        run: cargo check -p myproxy-mobile
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-cargo-lock
+          path: Cargo.lock
+          retention-days: 7
+
+  network:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Compile the embedded Xray packet runtime
+        working-directory: mobile/network
+        run: |
+          go mod tidy
+          gofmt -w .
+          go build ./...
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-network-source
+          path: |
+            mobile/network/*.go
+            mobile/network/go.mod
+            mobile/network/go.sum
+          retention-days: 7
+
+  interface:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Resolve and compile Expo interface
+        working-directory: mobile/app
+        run: |
+          npm install --no-audit --no-fund
+          npx tsc --noEmit
+          npx expo export --platform all --output-dir /tmp/myproxy-js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-npm-lock
+          path: mobile/app/package-lock.json
+          retention-days: 7
+
+  android:
+    needs: [shared-core, network, interface]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: aarch64-linux-android
+      - uses: android-actions/setup-android@v3
+      - name: Build Android app with bundled JavaScript
+        run: bash scripts/mobile/build-android.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyProxy-Xray-Android-${{ github.run_number }}
+          path: mobile/app/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mobile-android-diagnostics
+          path: |
+            mobile/app/android/app/build/reports/
+            mobile/app/modules/myproxy/android/libs/myproxy-network.aar
+          retention-days: 3
+
+  ios:
+    needs: [shared-core, network, interface]
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Build iOS application and Packet Tunnel extension
+        run: bash scripts/mobile/build-ios.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyProxy-Xray-iOS-${{ github.run_number }}
+          path: mobile/.build/artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mobile-ios-diagnostics
+          path: |
+            mobile/.build/logs/
+            mobile/app/modules/myproxy/ios/Frameworks/MyProxyNetwork.xcframework/**/Headers/*.h
+          retention-days: 3
