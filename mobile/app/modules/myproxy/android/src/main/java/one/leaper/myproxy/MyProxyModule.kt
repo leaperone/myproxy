@@ -2,6 +2,7 @@ package one.leaper.myproxy
 
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import expo.modules.kotlin.functions.Coroutine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import android.content.Intent
@@ -18,7 +19,7 @@ class MyProxyModule : Module() {
 
     override fun definition() = ModuleDefinition {
         Name("MyProxy")
-        AsyncFunction("request") { requestJSON: String ->
+        AsyncFunction("request") Coroutine { requestJSON: String ->
             withContext(Dispatchers.IO) {
                 val context = requireNotNull(appContext.reactContext)
                 val op = runCatching { JSONObject(requestJSON).optString("op") }.getOrNull()
