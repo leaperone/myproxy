@@ -36,7 +36,7 @@ Build outputs stay in Actions artifacts:
 
 No simulator, SDK or dependency installation is needed to edit this checkout. `scripts/mobile/build-*.sh` run in CI. Package and core lockfiles are committed. Compilation and packaging are separate from device/network testing, which the user explicitly deferred for this implementation phase.
 
-iOS jobs use the hosted macOS 26 image and Xcode 26.6. Expo SDK 57 requires Xcode 26.4 / Swift 6.3 or newer; the macOS 15 image's older compiler cannot build its JSI layer. See [Expo's requirement clarification](https://github.com/expo/expo/issues/49214#issuecomment-4947165668) and the [SDK tool-version requirements](https://expo.dev/changelog/sdk-56#tool-version-bumps).
+iOS jobs use the hosted macOS 26 image and Xcode 26.6. Expo SDK 57 requires Xcode 26.4 / Swift 6.3 or newer; the macOS 15 image's older compiler cannot build its JSI layer. See [Expo's requirement clarification](https://github.com/expo/expo/issues/49214) and the [SDK tool-version requirements](https://expo.dev/changelog/sdk-56#tool-version-bumps).
 
 The application name remains MyProxy and the interface identifies the Xray channel. The base version follows the desktop Cargo package. iOS build numbers use the workflow run and attempt; Android uses a monotonically increasing integer derived from them.
 
