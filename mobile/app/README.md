@@ -4,7 +4,7 @@ This directory contains the Expo presentation layer for the Xray mobile channel.
 
 ## Local development
 
-The mobile app uses Expo SDK 57.0.24, React Native 0.87 and React 19.2. Expo's bundled native module map pins the companion packages in `package.json`. The repository does not commit a lockfile from a developer machine. CI installs the exact dependency graph and builds the iOS/Android artifacts remotely.
+The mobile app uses Expo SDK 57.0.24, React Native 0.87.1 and React 19.2.3. Expo's bundled native module map pins the companion packages in `package.json`; React 19.2.3 satisfies React Native 0.87.1's peer contract. The repository does not commit a lockfile from a developer machine. CI installs the exact dependency graph and builds the iOS/Android artifacts remotely.
 
 The app requires a custom development or release build because the local `MyProxy` Expo module owns the VPN bridge. Expo Go cannot provide that module. The native module exposes one method:
 
