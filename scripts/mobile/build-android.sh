@@ -14,12 +14,9 @@ export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
 cargo build -p myproxy-mobile --release --target aarch64-linux-android
 mkdir -p mobile/app/modules/myproxy/android/src/main/jniLibs/arm64-v8a mobile/app/modules/myproxy/android/libs
 cp target/aarch64-linux-android/release/libmyproxy_mobile.so mobile/app/modules/myproxy/android/src/main/jniLibs/arm64-v8a/
-go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260908204917-8b95e45f8d3e
-go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260908204917-8b95e45f8d3e
-export PATH="$(go env GOPATH)/bin:$PATH"
-cd mobile/network
-go mod tidy
-gomobile bind -target=android/arm64 -androidapi=24 -javapkg=one.leaper.myproxy.network -o "$root_dir/mobile/app/modules/myproxy/android/libs/myproxy-network.aar" .
+if [[ ! -f mobile/app/modules/myproxy/android/libs/myproxy-network.aar ]]; then
+  bash scripts/mobile/build-network.sh android
+fi
 cd "$root_dir/mobile/app"
 npm install --no-audit --no-fund
 npx expo prebuild --platform android --no-install

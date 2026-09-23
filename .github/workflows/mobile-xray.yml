@@ -80,8 +80,55 @@ jobs:
           path: mobile/app/package-lock.json
           retention-days: 7
 
+  network-android:
+    needs: network
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: mobile/network/go.sum
+      - uses: android-actions/setup-android@v3
+      - run: bash scripts/mobile/build-network.sh android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-network-library
+          path: mobile/app/modules/myproxy/android/libs/myproxy-network.aar
+          if-no-files-found: error
+          retention-days: 3
+
+  network-ios:
+    needs: network
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: mobile/network/go.sum
+      - run: bash scripts/mobile/build-network.sh ios
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-network-library
+          path: mobile/app/modules/myproxy/ios/Frameworks/MyProxyNetwork.xcframework
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-network-headers
+          path: mobile/app/modules/myproxy/ios/Frameworks/MyProxyNetwork.xcframework/**/Headers/*.h
+          retention-days: 3
+
   android:
-    needs: [shared-core, network, interface]
+    needs: [shared-core, network-android, interface]
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     steps:
@@ -102,6 +149,10 @@ jobs:
           toolchain: 1.98.1
           targets: aarch64-linux-android
       - uses: android-actions/setup-android@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-network-library
+          path: mobile/app/modules/myproxy/android/libs
       - name: Build Android app with bundled JavaScript
         run: bash scripts/mobile/build-android.sh
       - uses: actions/upload-artifact@v4
@@ -120,7 +171,7 @@ jobs:
           retention-days: 3
 
   ios:
-    needs: [shared-core, network, interface]
+    needs: [shared-core, network-ios, interface]
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -136,6 +187,10 @@ jobs:
         with:
           toolchain: 1.98.1
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-network-library
+          path: mobile/app/modules/myproxy/ios/Frameworks/MyProxyNetwork.xcframework
       - name: Build iOS application and Packet Tunnel extension
         run: bash scripts/mobile/build-ios.sh
       - uses: actions/upload-artifact@v4

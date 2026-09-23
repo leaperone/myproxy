@@ -14,12 +14,9 @@ xcodebuild -create-xcframework \
   -library target/aarch64-apple-ios/release/libmyproxy_mobile.a -headers crates/myproxy-mobile/include \
   -library target/aarch64-apple-ios-sim/release/libmyproxy_mobile.a -headers crates/myproxy-mobile/include \
   -output "$framework_dir/MyProxyCore.xcframework"
-go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260908204917-8b95e45f8d3e
-go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260908204917-8b95e45f8d3e
-export PATH="$(go env GOPATH)/bin:$PATH"
-cd mobile/network
-go mod tidy
-gomobile bind -target=ios/arm64,iossimulator/arm64 -iosversion=16.4 -o "$framework_dir/MyProxyNetwork.xcframework" .
+if [[ ! -d "$framework_dir/MyProxyNetwork.xcframework" ]]; then
+  bash scripts/mobile/build-network.sh ios
+fi
 cd "$root_dir/mobile/app"
 npm install --no-audit --no-fund
 npx expo prebuild --platform ios --no-install
