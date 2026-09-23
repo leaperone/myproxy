@@ -186,6 +186,10 @@ pub struct Strategy {
     /// When true, point macOS system HTTP/HTTPS/SOCKS at Mixed while connected.
     #[serde(default)]
     pub system_proxy: bool,
+    /// When true, the Mixed listener accepts LAN clients. Controller, DNS, and
+    /// System Extension SOCKS listeners stay on loopback.
+    #[serde(default)]
+    pub mixed_lan: bool,
     /// How Mixed inbound traffic is routed. Independent of `extension_mode`.
     #[serde(default)]
     pub mixed_mode: InboundMode,
@@ -310,6 +314,7 @@ impl Default for Strategy {
             system_extension: false,
             lan_capture: false,
             system_proxy: false,
+            mixed_lan: false,
             mixed_mode: InboundMode::Rule,
             extension_mode: InboundMode::Rule,
             global_selected: String::new(),
@@ -1434,6 +1439,7 @@ mod tests {
         let mut strategy: Strategy = serde_json::from_str(json).expect("parse schema 5");
         assert_eq!(strategy.mixed_mode, InboundMode::Rule);
         assert_eq!(strategy.extension_mode, InboundMode::Rule);
+        assert!(!strategy.mixed_lan);
         assert!(strategy.migrate());
         assert_eq!(strategy.schema, STRATEGY_SCHEMA);
         assert_eq!(strategy.mixed_mode, InboundMode::Rule);
