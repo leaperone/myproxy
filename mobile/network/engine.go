@@ -5,12 +5,14 @@ package mobile
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -70,6 +72,7 @@ type route struct {
 }
 
 type flowView struct {
+	Active        bool     `json:"active"`
 	ID            string   `json:"id"`
 	Host          string   `json:"host"`
 	Port          uint16   `json:"port"`
@@ -102,6 +105,7 @@ type Engine struct {
 	nodes            []node
 	tags             map[string]bool
 	revision         uint64
+	sessionID        string
 	startedAt        atomic.Int64
 	closed           atomic.Bool
 	started          atomic.Bool
@@ -156,7 +160,7 @@ func NewEngine(renderJSON string, policy Policy, protector Protector, allowDirec
 		return nil, errors.New("Android 网络保护未准备好")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{ctx: ctx, cancel: cancel, policy: policy, protector: protector, allowDirect: allowDirect, revision: cfg.Revision,
+	e := &Engine{ctx: ctx, cancel: cancel, policy: policy, protector: protector, allowDirect: allowDirect, revision: cfg.Revision, sessionID: rand.Text(),
 		nodes: cfg.Nodes, tags: make(map[string]bool), flows: make(map[string]*flow), probing: make(map[string]bool), names: make(map[string]dnsName)}
 	for _, n := range cfg.Nodes {
 		if n.Tag == "" || e.tags[n.Tag] {
@@ -396,7 +400,7 @@ func (e *Engine) reserve(id stack.TransportEndpointID, network string, r route, 
 	if chain == nil {
 		chain = []string{}
 	}
-	f := &flow{cancel: cancel, view: flowView{ID: strconv.FormatUint(e.sequence.Add(1), 10), Host: host, Port: id.LocalPort, Network: network, Outbound: outbound, Rule: r.Rule, Chain: chain, StartedAt: time.Now().UnixMilli()}}
+	f := &flow{cancel: cancel, view: flowView{Active: true, ID: e.sessionID + "-" + strconv.FormatUint(e.sequence.Add(1), 10), Host: host, Port: id.LocalPort, Network: network, Outbound: outbound, Rule: r.Rule, Chain: chain, StartedAt: time.Now().UnixMilli()}}
 	e.flows[f.view.ID] = f
 	return f, ctx, nil
 }
@@ -416,6 +420,7 @@ func (e *Engine) finish(f *flow) {
 	}
 	delete(e.flows, f.view.ID)
 	v := f.view
+	v.Active = false
 	v.UploadBytes = f.up.Load()
 	v.DownloadBytes = f.down.Load()
 	e.recent = append(e.recent, v)
@@ -579,6 +584,7 @@ func (e *Engine) Snapshot() string {
 		rows = append(rows, v)
 	}
 	e.mu.Unlock()
+	sort.Slice(rows, func(i,j int)bool { if rows[i].StartedAt != rows[j].StartedAt { return rows[i].StartedAt > rows[j].StartedAt }; return rows[i].ID > rows[j].ID })
 	phase := "connecting"
 	if e.closed.Load() {
 		phase = "disconnected"

@@ -63,7 +63,7 @@ Every successful public mutation returns a new snapshot. Rust produces these fie
 }
 ```
 
-Runtime phases: `disconnected`, `connecting`, `connected`, `disconnecting`, `error`. Flow rows: `{id, host, port, network, outbound, rule, chain: string[], uploadBytes, downloadBytes, startedAt}`. Times are Unix milliseconds. Engine returns bounded recent/active flow rows. Display IP when hostname is unobserved; do not invent app attribution. Connection records cover intercepted traffic only.
+Runtime phases: `disconnected`, `connecting`, `connected`, `disconnecting`, `error`. Flow rows: `{id, active, host, port, network, outbound, rule, chain: string[], uploadBytes, downloadBytes, startedAt}`. Times are Unix milliseconds. Engine returns bounded recent/active flow rows, newest first; active connections and ended history must be displayed distinctly. Display IP when hostname is unobserved; do not invent app attribution. Connection records cover intercepted traffic only.
 
 ## Rust native ABI and private commands
 
