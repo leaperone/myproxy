@@ -5,6 +5,7 @@ import Darwin
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let store = MyProxyStore()
+    private let commandLock = NSRecursiveLock()
     private var engine: MyProxyPacketEngine?
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
@@ -29,6 +30,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 do {
                     let adapter = try MyProxyPacketEngine(renderJSON: renderJSON, packetFlow: self.packetFlow)
                     try adapter.start()
+                    self.commandLock.lock(); defer { self.commandLock.unlock() }
                     self.engine = adapter
                     completionHandler(nil)
                 } catch { completionHandler(error) }
@@ -37,10 +39,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        commandLock.lock(); defer { commandLock.unlock() }
         engine?.close(); engine = nil; completionHandler()
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
+        commandLock.lock(); defer { commandLock.unlock() }
         let request = String(decoding: messageData, as: UTF8.self)
         let response: String
         if request.contains("\"op\":\"snapshot\"") {
@@ -57,21 +61,50 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func restartEngine() -> String {
+        let oldDocument = MyProxyNativeCore.call("{\"op\":\"export\"}")
+        guard Self.isOK(oldDocument), let oldText = Self.data(oldDocument) as? String else { return applyFailure() }
+        let oldRender: String
+        do { oldRender = try currentRenderJSON() } catch { return applyFailure() }
+        var oldClosed = false
         do {
             guard let document = try store.read() else { throw TunnelError.missingDocument }
             let loaded = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": document]))
             guard Self.isOK(loaded) else { throw TunnelError.invalidDocument }
-            let render = MyProxyNativeCore.call("{\"op\":\"render\"}")
-            guard Self.isOK(render), let config = Self.data(render) as? [String: Any] else { throw TunnelError.renderFailed }
-            let renderJSON = Self.json(config)
-            let newEngine = try MyProxyPacketEngine(renderJSON: renderJSON, packetFlow: packetFlow)
-            try newEngine.start()
+            let candidate = try currentRenderJSON()
+            var validationError: NSError?
+            MobileValidate(candidate, &validationError)
+            if let validationError { throw validationError }
+
             let oldEngine = engine
-            engine = newEngine
+            engine = nil
             oldEngine?.close()
+            oldClosed = true
+            let newEngine = try MyProxyPacketEngine(renderJSON: candidate, packetFlow: packetFlow)
+            try newEngine.start()
+            engine = newEngine
             return providerSnapshot()
-        } catch { return "{\"ok\":false,\"error\":{\"code\":\"apply_failed\",\"message\":\"配置已保存，但 VPN 应用失败\"}}" }
+        } catch {
+            _ = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": oldText]))
+            if oldClosed {
+                do {
+                    let restored = try MyProxyPacketEngine(renderJSON: oldRender, packetFlow: packetFlow)
+                    try restored.start(); engine = restored
+                    return applyFailure()
+                } catch {
+                    cancelTunnelWithError(error)
+                }
+            }
+            return applyFailure()
+        }
     }
+
+    private func currentRenderJSON() throws -> String {
+        let render = MyProxyNativeCore.call("{\"op\":\"render\"}")
+        guard Self.isOK(render), let config = Self.data(render) as? [String: Any] else { throw TunnelError.renderFailed }
+        return Self.json(config)
+    }
+
+    private func applyFailure() -> String { "{\"ok\":false,\"error\":{\"code\":\"apply_failed\",\"message\":\"配置已保存，但 VPN 应用失败\"}}" }
 
     private func providerSnapshot() -> String {
         let base = MyProxyNativeCore.call("{\"op\":\"snapshot\"}")
@@ -87,7 +120,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     enum TunnelError: Error { case missingDocument, invalidDocument, renderFailed }
 }
 
-private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileProtectorProtocol, MobilePacketWriterProtocol {
+private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobilePacketWriterProtocol {
     private let packetFlow: NEPacketTunnelFlow
     private var engine: MobileEngine?
     private var readerRunning = true
@@ -96,7 +129,7 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
         self.packetFlow = packetFlow
         super.init()
         var error: NSError?
-        guard let value = MobileNewEngine(renderJSON, self, self, false, &error) else {
+        guard let value = MobileNewEngine(renderJSON, self, nil, false, &error) else {
             throw error ?? PacketEngineError.engineUnavailable
         }
         self.engine = value
@@ -105,8 +138,7 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
     func start() throws {
         guard let engine else { throw PacketEngineError.engineUnavailable }
         var error: NSError?
-        engine.start(self, error: &error)
-        if let error { throw error }
+        guard engine.start(self, error: &error) else { throw error ?? PacketEngineError.engineUnavailable }
         readPackets()
     }
 
@@ -120,10 +152,10 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
     func snapshot() -> String { engine?.snapshot() ?? "{\"phase\":\"disconnected\"}" }
     func probe() { engine?.probe() }
 
-    func decide(_ requestJSON: String) -> String { MyProxyNativeCore.call(requestJSON) }
-    func health(_ node: String, delayMs: Int64, failed: Bool) { _ = MyProxyNativeCore.call(Self.healthRequest(node, delayMs, failed)) }
-    func protect(_ fd: Int64) -> Bool { true }
-    func writePacket(_ packet: Data) -> Bool {
+    func decide(_ requestJSON: String?) -> String { MyProxyNativeCore.call(requestJSON ?? "{}") }
+    func health(_ node: String?, delayMs: Int64, failed: Bool) { _ = MyProxyNativeCore.call(Self.healthRequest(node ?? "", delayMs, failed)) }
+    func writePacket(_ packet: Data?) -> Bool {
+        guard let packet else { return false }
         let version = packet.first.map { $0 >> 4 } ?? 0
         let family = version == 6 ? AF_INET6 : AF_INET
         return packetFlow.writePackets([packet], withProtocols: [NSNumber(value: family)])
@@ -136,8 +168,7 @@ private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobileP
             for (index, packet) in packets.enumerated() {
                 guard let engine = self.engine else { return }
                 var error: NSError?
-                engine.writePacket(packet, error: &error)
-                if error != nil { self.close(); return }
+                if !engine.writePacket(packet, error: &error) || error != nil { self.close(); return }
                 _ = protocols[index]
             }
             self.readPackets()
