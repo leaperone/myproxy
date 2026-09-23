@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: mobile-xray-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   shared-core:
@@ -148,6 +148,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
       - uses: actions/setup-go@v6
         with:
           go-version: '1.27.1'
@@ -156,6 +159,10 @@ jobs:
         with:
           toolchain: 1.98.1
           targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mobile-android
+          cache-on-failure: true
       - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
@@ -197,6 +204,10 @@ jobs:
         with:
           toolchain: 1.98.1
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mobile-ios
+          cache-on-failure: true
       - uses: actions/download-artifact@v4
         with:
           name: ios-network-library
