@@ -48,6 +48,19 @@ internal class MyProxyController(private val context: Context) {
         }
     }
 
+    fun shouldAutoConnect(): Boolean = synchronized(lock) {
+        if (store.read() == null || MyProxyVpnService.isActive()) return false
+        runCatching {
+            val data = JSONObject(native("{\"op\":\"snapshot\"}")).optJSONObject("data") ?: return false
+            if (!data.optBoolean("autoConnect")) return false
+            val nodes = data.optJSONArray("nodes") ?: return false
+            for (index in 0 until nodes.length()) {
+                if (nodes.optJSONObject(index)?.optBoolean("available", false) == true) return true
+            }
+            false
+        }.getOrDefault(false)
+    }
+
     private fun importText(r: JSONObject): String {
         val text = r.optString("text")
         if (text.isBlank() || text.length > 2_000_000) return error("invalid_import", "节点内容为空或过大")
