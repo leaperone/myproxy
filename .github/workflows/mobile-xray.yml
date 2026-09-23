@@ -95,6 +95,8 @@ jobs:
           go-version: '1.27.1'
           cache-dependency-path: mobile/network/go.sum
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - run: bash scripts/mobile/build-network.sh android
       - uses: actions/upload-artifact@v4
         with:
@@ -149,6 +151,8 @@ jobs:
           toolchain: 1.98.1
           targets: aarch64-linux-android
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - uses: actions/download-artifact@v4
         with:
           name: android-network-library
