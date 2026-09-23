@@ -20,6 +20,7 @@ fi
 cd "$root_dir/mobile/app"
 npm install --no-audit --no-fund
 npx expo prebuild --platform ios --no-install
+node "$root_dir/scripts/mobile/verify-autolinking.js" apple
 cd "$root_dir"
 ruby mobile/platform/configure-ios.rb
 cd mobile/app/ios

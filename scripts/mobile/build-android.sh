@@ -7,7 +7,7 @@ if [[ "${CI:-}" != true ]]; then
   exit 1
 fi
 ndk_version=27.1.12297006
-sdkmanager "ndk;$ndk_version" 'platforms;android-37' 'build-tools;37.0.0'
+sdkmanager "ndk;$ndk_version"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk_version"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
@@ -20,5 +20,6 @@ fi
 cd "$root_dir/mobile/app"
 npm install --no-audit --no-fund
 npx expo prebuild --platform android --no-install
+node "$root_dir/scripts/mobile/verify-autolinking.js" android
 cd android
 ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon

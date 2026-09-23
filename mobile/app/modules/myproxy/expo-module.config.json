@@ -1,9 +1,9 @@
 {
-  "platforms": ["android", "ios"],
+  "platforms": ["android", "apple"],
   "android": {
     "modules": ["one.leaper.myproxy.MyProxyModule"]
   },
-  "ios": {
+  "apple": {
     "modules": ["MyProxyModule"]
   }
 }
