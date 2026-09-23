@@ -22,6 +22,8 @@ unless extension
   extension = project.new_target(:app_extension, 'MyProxyPacketTunnel', :ios, deployment_target)
 end
 extension.build_configurations.each do |config|
+  config.build_settings['PRODUCT_NAME'] = 'MyProxyPacketTunnel'
+  config.build_settings['PRODUCT_MODULE_NAME'] = 'MyProxyPacketTunnel'
   config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] = 'one.leaper.myproxy.xray.PacketTunnel'
   config.build_settings['INFOPLIST_FILE'] = rel.call(File.join(repo_dir, 'mobile/ios-extension/Info.plist'))
   config.build_settings['CODE_SIGN_ENTITLEMENTS'] = rel.call(File.join(repo_dir, 'mobile/ios-extension/MyProxyPacketTunnel.entitlements'))
