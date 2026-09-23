@@ -6,24 +6,22 @@ public final class MyProxyModule: Module {
     private let store = MyProxyStore()
     private let mutationLock = NSLock()
 
-    public override init() {
-        super.init()
-        if let stored = try? store.read() {
-            if let document = stored {
-                _ = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": document]))
-            } else {
-                _ = MyProxyNativeCore.call("{\"op\":\"init\",\"platform\":\"ios\"}")
-            }
-        } else {
-            _ = MyProxyNativeCore.call("{\"op\":\"init\",\"platform\":\"ios\"}")
-        }
-    }
-
     public func definition() -> ModuleDefinition {
         Name("MyProxy")
+        OnCreate {
+            self.loadCore()
+        }
         AsyncFunction("request") { (requestJSON: String) async -> String in
             await self.request(requestJSON)
         }
+    }
+
+    private func loadCore() {
+        do {
+            if let document = try store.read() {
+                _ = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": document]))
+            } else { _ = MyProxyNativeCore.call("{\"op\":\"init\",\"platform\":\"ios\"}") }
+        } catch { _ = MyProxyNativeCore.call("{\"op\":\"init\",\"platform\":\"ios\"}") }
     }
 
     private func request(_ text: String) async -> String {
@@ -62,13 +60,14 @@ public final class MyProxyModule: Module {
 
     private func persistMutation(_ request: String) async -> String {
         mutationLock.lock(); defer { mutationLock.unlock() }
-        let previous = try? store.read()
+        let previous: String?
+        do { previous = try store.read() } catch { previous = nil }
         let response = MyProxyNativeCore.call(request)
         guard Self.isOK(response) else { return response }
         let exported = MyProxyNativeCore.call("{\"op\":\"export\"}")
         guard Self.isOK(exported), let document = Self.data(exported) as? String else { return failure("persist_failed", "配置验证通过，但保存失败") }
         do { try store.write(document) } catch {
-            if let previous, let oldDocument = previous { _ = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": oldDocument])) }
+            if let previous { _ = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": previous])) }
             return failure("persist_failed", "配置保存失败")
         }
         let providerOp = request.contains("\"op\":\"probe\"") ? "probe" : "apply"

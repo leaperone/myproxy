@@ -6,9 +6,11 @@ import Darwin
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let store = MyProxyStore()
     private let commandLock = NSRecursiveLock()
+    private var lifecycleEpoch: UInt64 = 0
     private var engine: MyProxyPacketEngine?
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        commandLock.lock(); lifecycleEpoch &+= 1; let epoch = lifecycleEpoch; commandLock.unlock()
         do {
             guard let document = try store.read() else { throw TunnelError.missingDocument }
             let loaded = MyProxyNativeCore.call(Self.json(["op": "load", "platform": "ios", "document": document]))
@@ -27,11 +29,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             settings.dnsSettings = NEDNSSettings(servers: ["1.1.1.1", "9.9.9.9"])
             setTunnelNetworkSettings(settings) { [weak self] error in
                 guard let self, error == nil else { completionHandler(error); return }
+                self.commandLock.lock()
+                guard epoch == self.lifecycleEpoch else {
+                    self.commandLock.unlock()
+                    completionHandler(TunnelError.cancelled)
+                    return
+                }
+                self.commandLock.unlock()
                 do {
                     let adapter = try MyProxyPacketEngine(renderJSON: renderJSON, packetFlow: self.packetFlow)
                     try adapter.start()
-                    self.commandLock.lock(); defer { self.commandLock.unlock() }
+                    self.commandLock.lock()
+                    guard epoch == self.lifecycleEpoch else {
+                        self.commandLock.unlock()
+                        adapter.close()
+                        completionHandler(TunnelError.cancelled)
+                        return
+                    }
                     self.engine = adapter
+                    self.commandLock.unlock()
                     completionHandler(nil)
                 } catch { completionHandler(error) }
             }
@@ -40,6 +56,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         commandLock.lock(); defer { commandLock.unlock() }
+        lifecycleEpoch &+= 1
         engine?.close(); engine = nil; completionHandler()
     }
 
@@ -117,7 +134,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func data(_ value: String) -> Any? { (try? JSONSerialization.jsonObject(with: Data(value.utf8)) as? [String: Any])?["data"] }
     private static func json(_ value: [String: Any]) -> String { (try? String(data: JSONSerialization.data(withJSONObject: value), encoding: .utf8)) ?? "{}" }
 
-    enum TunnelError: Error { case missingDocument, invalidDocument, renderFailed }
+    enum TunnelError: Error { case missingDocument, invalidDocument, renderFailed, cancelled }
 }
 
 private final class MyProxyPacketEngine: NSObject, MobilePolicyProtocol, MobilePacketWriterProtocol {
