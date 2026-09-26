@@ -7,6 +7,11 @@ use anyhow::{Context, Result};
 pub fn data_dir() -> Result<PathBuf> {
     let dir = match std::env::var_os("MYPROXY_DATA_DIR") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
+        // Unit tests take real operation locks and write intent files; they must
+        // never touch the running app's state.
+        _ if cfg!(test) => {
+            std::env::temp_dir().join(format!("myproxy-test-{}", std::process::id()))
+        }
         _ => dirs::data_dir()
             .context("no application support directory")?
             .join("myproxy"),
