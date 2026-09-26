@@ -270,32 +270,81 @@ fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
 }
 
 fn fetch_http_body(name: &str, url: &str) -> Result<String> {
-    // curl is available on macOS and lets us force IPv4. Do not fall back to
-    // a second HTTP client here: a broken DNS/IPv6 path would otherwise pay
-    // the full timeout twice for every subscription and make Apply appear
-    // hung. The previous catalog remains available to the caller.
-    fetch_http_body_curl_ipv4(url).with_context(|| format!("GET {name} via IPv4 curl"))
+    // curl is available on macOS and lets us force IPv4. Do not start a second
+    // direct attempt: a broken DNS/IPv6 path would otherwise pay the full
+    // timeout twice and make Apply appear hung. A transport failure may still
+    // succeed through the already applied Mixed listener. That retry uses the
+    // running core's port only after the controller accepts our secret.
+    match fetch_http_body_curl(url, None) {
+        Ok(body) => Ok(body),
+        Err(err) if transport_curl_failure(&err.to_string()) => {
+            let Some(proxy) = applied_mixed_proxy() else {
+                return Err(err).context(format!("GET {name} via IPv4 curl"));
+            };
+            log::info(
+                "catalog",
+                format!("{name} direct fetch failed, retrying via Mixed"),
+            );
+            match fetch_http_body_curl(url, Some(&proxy)) {
+                Ok(body) => Ok(body),
+                Err(proxy_err) => {
+                    bail!("GET {name} via IPv4 curl: {err:#}; Mixed retry: {proxy_err:#}")
+                }
+            }
+        }
+        Err(err) => Err(err).context(format!("GET {name} via IPv4 curl")),
+    }
 }
 
-fn fetch_http_body_curl_ipv4(url: &str) -> Result<String> {
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--ipv4",
-            "-A",
-            "clash.meta",
-            "--max-time",
-            SUBSCRIPTION_CURL_MAX_TIME,
-            "--connect-timeout",
-            SUBSCRIPTION_CURL_CONNECT_TIMEOUT,
-            url,
-        ])
-        .output()
-        .context("spawn curl")?;
+fn applied_mixed_proxy() -> Option<String> {
+    let port = crate::supervisor::Supervisor::shared().update_download_port()?;
+    crate::controller::ready(port).ok()?;
+    Some(format!("http://127.0.0.1:{port}"))
+}
+
+fn fetch_http_body_curl(url: &str, proxy: Option<&str>) -> Result<String> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-fsSL",
+        "--ipv4",
+        "-A",
+        "clash.meta",
+        "--max-time",
+        SUBSCRIPTION_CURL_MAX_TIME,
+        "--connect-timeout",
+        SUBSCRIPTION_CURL_CONNECT_TIMEOUT,
+    ]);
+    if let Some(proxy) = proxy {
+        command.args(["--proxy", proxy]);
+    }
+    let output = command.arg(url).output().context("spawn curl")?;
     if !output.status.success() {
-        bail!("curl IPv4 failed");
+        bail!("{}", curl_failure_detail(&output.stderr, url));
     }
     String::from_utf8(output.stdout).context("curl body is not UTF-8")
+}
+
+fn curl_failure_detail(stderr: &[u8], url: &str) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("curl failed");
+    let detail = line.strip_prefix("curl: ").unwrap_or(line);
+    let detail = if url.is_empty() {
+        detail.to_string()
+    } else {
+        detail.replace(url, "<subscription>")
+    };
+    detail.chars().take(240).collect()
+}
+
+fn transport_curl_failure(detail: &str) -> bool {
+    matches!(
+        detail.split_whitespace().next(),
+        Some("(6)" | "(7)" | "(28)" | "(35)" | "(52)" | "(56)")
+    )
 }
 
 fn parse_subscription(body: &str) -> Result<Vec<serde_yaml::Value>> {
@@ -484,5 +533,29 @@ mod tests {
         assert_eq!(catalog.filter_excluded_count(), 1);
         assert!(catalog.subscription_warning("A").is_some());
         assert!(catalog.subscription_warning("B").is_none());
+    }
+
+    #[test]
+    fn curl_failure_detail_keeps_the_timeout_reason_and_hides_the_url() {
+        let url = "https://sub.example/secret";
+        let stderr = format!("curl: (28) Operation timed out for {url} after 8005 milliseconds\n");
+        let detail = curl_failure_detail(stderr.as_bytes(), url);
+        assert_eq!(
+            detail,
+            "(28) Operation timed out for <subscription> after 8005 milliseconds"
+        );
+        assert!(!detail.contains(url));
+    }
+
+    #[test]
+    fn only_transport_curl_failures_retry_through_mixed() {
+        assert!(transport_curl_failure(
+            "(28) Operation timed out after 8005 milliseconds"
+        ));
+        assert!(transport_curl_failure("(7) Failed to connect"));
+        assert!(!transport_curl_failure(
+            "(22) The requested URL returned error: 404"
+        ));
+        assert!(!transport_curl_failure("curl body is not UTF-8"));
     }
 }
