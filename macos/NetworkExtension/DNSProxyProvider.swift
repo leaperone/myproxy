@@ -85,8 +85,8 @@ enum DNSRelayRoutingPolicy {
 /// private authenticated Mihomo SOCKS5 listener used by App Routing. Local
 /// resolvers are relayed directly so requests such as `192.168.1.1:53` do not
 /// make a redundant round trip through Mihomo or pollute its connection list.
-/// A relay failure is reported to the host heartbeat so the host can disable
-/// the DNS manager and restore the system resolver.
+/// A relay failure is reported to the host heartbeat as a waiting DNS phase.
+/// The host releases the DNS manager when the core cannot be recovered.
 final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     private let runtime = ProviderRuntimeState(providerName: "dns-proxy")
     private let flowDecisionCoordinator = NetworkExtensionFlowDecisionCoordinator()
