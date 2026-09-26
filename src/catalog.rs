@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -161,7 +159,7 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
     );
 
     for sub in &strategy.subscriptions {
-        match fetch_proxies(&sub.name, &sub.url, strategy.mixed_port) {
+        match fetch_proxies(&sub.name, &sub.url) {
             Ok(proxies) => {
                 let before = catalog.nodes.len();
                 for raw in proxies {
@@ -260,27 +258,27 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
     Ok(catalog)
 }
 
-fn fetch_proxies(name: &str, url: &str, mixed_port: u16) -> Result<Vec<serde_yaml::Value>> {
+fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
     let body = if let Some(path) = url.strip_prefix("file://") {
         fs::read_to_string(path).with_context(|| format!("read {name}"))?
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        fetch_http_body(name, url, mixed_port)?
+        fetch_http_body(name, url)?
     } else {
         fs::read_to_string(url).with_context(|| format!("read {name}"))?
     };
     parse_subscription(&body)
 }
 
-fn fetch_http_body(name: &str, url: &str, mixed_port: u16) -> Result<String> {
+fn fetch_http_body(name: &str, url: &str) -> Result<String> {
     // curl is available on macOS and lets us force IPv4. Do not start a second
     // direct attempt: a broken DNS/IPv6 path would otherwise pay the full
-    // timeout twice and make Apply appear hung. A direct failure may still
-    // succeed through Mixed when the core is already up, which is a different
-    // path rather than another direct client.
+    // timeout twice and make Apply appear hung. A transport failure may still
+    // succeed through the already applied Mixed listener. That retry uses the
+    // running core's port only after the controller accepts our secret.
     match fetch_http_body_curl(url, None) {
         Ok(body) => Ok(body),
-        Err(err) => {
-            let Some(proxy) = local_mixed_proxy(mixed_port) else {
+        Err(err) if transport_curl_failure(&err.to_string()) => {
+            let Some(proxy) = applied_mixed_proxy() else {
                 return Err(err).context(format!("GET {name} via IPv4 curl"));
             };
             log::info(
@@ -294,17 +292,14 @@ fn fetch_http_body(name: &str, url: &str, mixed_port: u16) -> Result<String> {
                 }
             }
         }
+        Err(err) => Err(err).context(format!("GET {name} via IPv4 curl")),
     }
 }
 
-fn local_mixed_proxy(port: u16) -> Option<String> {
-    if port == 0 {
-        return None;
-    }
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(80))
-        .ok()
-        .map(|_| format!("http://127.0.0.1:{port}"))
+fn applied_mixed_proxy() -> Option<String> {
+    let port = crate::supervisor::Supervisor::shared().update_download_port()?;
+    crate::controller::ready(port).ok()?;
+    Some(format!("http://127.0.0.1:{port}"))
 }
 
 fn fetch_http_body_curl(url: &str, proxy: Option<&str>) -> Result<String> {
@@ -324,23 +319,32 @@ fn fetch_http_body_curl(url: &str, proxy: Option<&str>) -> Result<String> {
     }
     let output = command.arg(url).output().context("spawn curl")?;
     if !output.status.success() {
-        bail!("{}", curl_failure_detail(&output.stderr));
+        bail!("{}", curl_failure_detail(&output.stderr, url));
     }
     String::from_utf8(output.stdout).context("curl body is not UTF-8")
 }
 
-fn curl_failure_detail(stderr: &[u8]) -> String {
+fn curl_failure_detail(stderr: &[u8], url: &str) -> String {
     let text = String::from_utf8_lossy(stderr);
     let line = text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("curl failed");
-    let detail: String = line.chars().take(240).collect();
-    detail
-        .strip_prefix("curl: ")
-        .unwrap_or(&detail)
-        .to_string()
+    let detail = line.strip_prefix("curl: ").unwrap_or(line);
+    let detail = if url.is_empty() {
+        detail.to_string()
+    } else {
+        detail.replace(url, "<subscription>")
+    };
+    detail.chars().take(240).collect()
+}
+
+fn transport_curl_failure(detail: &str) -> bool {
+    matches!(
+        detail.split_whitespace().next(),
+        Some("(6)" | "(7)" | "(28)" | "(35)" | "(52)" | "(56)")
+    )
 }
 
 fn parse_subscription(body: &str) -> Result<Vec<serde_yaml::Value>> {
@@ -532,18 +536,26 @@ mod tests {
     }
 
     #[test]
-    fn curl_failure_detail_keeps_the_timeout_reason() {
-        let detail = curl_failure_detail(
-            b"curl: (28) Operation timed out after 8005 milliseconds with 10934 bytes received\n",
-        );
+    fn curl_failure_detail_keeps_the_timeout_reason_and_hides_the_url() {
+        let url = "https://sub.example/secret";
+        let stderr = format!("curl: (28) Operation timed out for {url} after 8005 milliseconds\n");
+        let detail = curl_failure_detail(stderr.as_bytes(), url);
         assert_eq!(
             detail,
-            "(28) Operation timed out after 8005 milliseconds with 10934 bytes received"
+            "(28) Operation timed out for <subscription> after 8005 milliseconds"
         );
+        assert!(!detail.contains(url));
     }
 
     #[test]
-    fn closed_mixed_port_is_not_a_subscription_proxy() {
-        assert!(local_mixed_proxy(1).is_none());
+    fn only_transport_curl_failures_retry_through_mixed() {
+        assert!(transport_curl_failure(
+            "(28) Operation timed out after 8005 milliseconds"
+        ));
+        assert!(transport_curl_failure("(7) Failed to connect"));
+        assert!(!transport_curl_failure(
+            "(22) The requested URL returned error: 404"
+        ));
+        assert!(!transport_curl_failure("curl body is not UTF-8"));
     }
 }
