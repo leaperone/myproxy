@@ -431,11 +431,11 @@ impl Supervisor {
 
     fn prepare(&self, strategy: &Strategy, refresh: bool) -> Result<RuntimeConfig> {
         let catalog = if refresh {
-            catalog::refresh(strategy)?
+            catalog::refresh(strategy, self.update_download_port())?
         } else {
             match Catalog::load() {
                 Ok(cached) if cached.matches_strategy(strategy) => cached,
-                _ => catalog::refresh(strategy)?,
+                _ => catalog::refresh(strategy, self.update_download_port())?,
             }
         };
         if refresh

@@ -58,11 +58,7 @@ pub fn request(request: Request) -> Result<Snapshot> {
         }
         // An unbundled developer CLI cannot prove that the signed app released
         // DNS. Its synthetic Unbundled status must not authorize killing that core.
-        let uses_extension = Strategy::load().is_ok_and(|strategy| strategy.system_extension)
-            || Supervisor::shared()
-                .applied_strategy()
-                .is_some_and(|strategy| strategy.system_extension);
-        if uses_extension {
+        if unbundled_system_extension_in_play(false) {
             if matches!(request, Request::Status) {
                 return Ok(snapshot(&Supervisor::shared(), host_unavailable()));
             }
@@ -70,6 +66,36 @@ pub fn request(request: Request) -> Result<Snapshot> {
         }
     }
     execute(request)
+}
+
+/// Saved, applied, or about-to-write strategy uses System Extension on an
+/// unbundled macOS CLI. Bundled and non-macOS builds always return false.
+pub fn unbundled_system_extension_in_play(next_enables: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::login_item::is_bundled() {
+            return false;
+        }
+        next_enables
+            || Strategy::load().is_ok_and(|strategy| strategy.system_extension)
+            || Supervisor::shared()
+                .applied_strategy()
+                .is_some_and(|strategy| strategy.system_extension)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = next_enables;
+        false
+    }
+}
+
+/// Refuse a local strategy write from an unbundled macOS CLI when System
+/// Extension is already in play or the new strategy turns it on.
+pub fn refuse_unbundled_system_extension_write(next_enables: bool) -> Result<()> {
+    if unbundled_system_extension_in_play(next_enables) {
+        bail!("System Extension control requires the myproxyctl bundled with the signed app");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

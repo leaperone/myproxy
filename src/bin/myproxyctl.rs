@@ -193,6 +193,11 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn save_strategy(strategy: &Strategy) -> Result<()> {
+    host_control::refuse_unbundled_system_extension_write(strategy.system_extension)?;
+    strategy.save()
+}
+
 fn run(cli: Cli) -> Result<()> {
     let json = cli.json;
     match cli.command {
@@ -363,7 +368,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Port { port } => {
             let mut strategy = Strategy::load()?;
             strategy.mixed_port = port;
-            strategy.save()?;
+            save_strategy(&strategy)?;
             emit(
                 json,
                 serde_json::json!({"mixed_port": port, "status": "saved", "applied": false}),
@@ -381,7 +386,7 @@ fn run(cli: Cli) -> Result<()> {
             if on {
                 strategy.system_extension = false;
             }
-            strategy.save()?;
+            save_strategy(&strategy)?;
             emit(
                 json,
                 serde_json::json!({"tun": on, "extension": strategy.system_extension, "status": "saved", "applied": false}),
@@ -402,7 +407,7 @@ fn run(cli: Cli) -> Result<()> {
             if on {
                 strategy.tun = false;
             }
-            strategy.save()?;
+            save_strategy(&strategy)?;
             emit(
                 json,
                 serde_json::json!({"extension": on, "tun": strategy.tun, "status": "saved", "applied": false}),
@@ -419,7 +424,7 @@ fn run(cli: Cli) -> Result<()> {
                 if strategy.mixed_mode == InboundMode::Global {
                     strategy.ensure_global_selected();
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
             }
             emit(
                 json,
@@ -437,7 +442,7 @@ fn run(cli: Cli) -> Result<()> {
                 if strategy.extension_mode == InboundMode::Global {
                     strategy.ensure_global_selected();
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
             }
             emit(
                 json,
@@ -486,7 +491,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 strategy.set_global_selected(name.to_string());
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 if let Some(identity) = runtime {
                     supervisor
                         .select_proxy(identity, GLOBAL_GROUP, name)
@@ -542,7 +547,7 @@ fn run(cli: Cli) -> Result<()> {
                         };
                     }
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
             }
             let unmatched = myproxy::compile::unmatched_target(&strategy);
             emit(
@@ -582,7 +587,7 @@ fn run(cli: Cli) -> Result<()> {
                     strategy.set_routing_profile(RoutingProfile::Group);
                     strategy.unmatched_via = via.to_string();
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
             }
             let unmatched = myproxy::compile::unmatched_target(&strategy);
             emit(
@@ -604,7 +609,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut strategy = Strategy::load()?;
             if let Some(value) = set {
                 strategy.exclude_filter = value;
-                strategy.save()?;
+                save_strategy(&strategy)?;
             }
             emit(
                 json,
@@ -639,7 +644,7 @@ fn run(cli: Cli) -> Result<()> {
                 let name = name.unwrap_or_else(|| infer_name(&url));
                 let added = strategy.add_subscription(name.clone(), url);
                 let id = added.id.clone();
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "added", "id": id, "name": name}),
@@ -651,7 +656,7 @@ fn run(cli: Cli) -> Result<()> {
                 if !strategy.remove_subscription(&id) {
                     bail!("subscription not found");
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "removed", "id": id}),
@@ -663,7 +668,7 @@ fn run(cli: Cli) -> Result<()> {
                 let mut strategy = Strategy::load()?;
                 let edit = strategy.update_subscription(&key, patch)?;
                 if edit.changed() {
-                    strategy.save()?;
+                    save_strategy(&strategy)?;
                 }
                 emit(json, edit.to_json(), edit.summary());
             }
@@ -716,7 +721,7 @@ fn run(cli: Cli) -> Result<()> {
                 };
                 group.name_excludes = not_contains;
                 strategy.add_group(group);
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "added", "name": name}),
@@ -765,7 +770,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 let name = group.name.clone();
                 strategy.update_group(&id, group)?;
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "updated", "name": name}),
@@ -775,7 +780,7 @@ fn run(cli: Cli) -> Result<()> {
             GroupCmd::Remove { name } => {
                 let mut strategy = Strategy::load()?;
                 strategy.remove_group_checked(&name)?;
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "removed", "name": name}),
@@ -792,7 +797,7 @@ fn run(cli: Cli) -> Result<()> {
                         some.include.push(node.clone());
                     }
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "included", "group": group, "node": node}),
@@ -810,7 +815,7 @@ fn run(cli: Cli) -> Result<()> {
                         some.exclude.push(node.clone());
                     }
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "excluded", "group": group, "node": node}),
@@ -901,7 +906,7 @@ fn run(cli: Cli) -> Result<()> {
                     set.via,
                     set.matchers.len()
                 );
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(json, value, message);
             }
             RuleCmd::Remove { id } => {
@@ -909,7 +914,7 @@ fn run(cli: Cli) -> Result<()> {
                 if !strategy.remove_rule(&id) {
                     bail!("rule not found");
                 }
-                strategy.save()?;
+                save_strategy(&strategy)?;
                 emit(
                     json,
                     serde_json::json!({"status": "removed", "id": id}),
@@ -943,6 +948,8 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Commands::Import { path } => {
+            let pending = strategy::parse_import(&path)?;
+            host_control::refuse_unbundled_system_extension_write(pending.system_extension)?;
             let outcome = strategy::import_from(&path)?;
             emit(
                 json,
