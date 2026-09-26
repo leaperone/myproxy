@@ -231,6 +231,123 @@ pub struct Subscription {
     pub url: String,
 }
 
+/// Validated edit request. At least one field; every set field is trimmed and non-empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionPatch {
+    name: Option<String>,
+    url: Option<String>,
+}
+
+impl SubscriptionPatch {
+    /// Trims both fields. Errors when both are absent or a provided field is empty after trim.
+    pub fn new(name: Option<String>, url: Option<String>) -> Result<Self> {
+        Self::parse(name, url)
+    }
+
+    pub fn parse(name: Option<String>, url: Option<String>) -> Result<Self> {
+        let name = match name {
+            None => None,
+            Some(raw) => {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("subscription name cannot be empty");
+                }
+                Some(trimmed)
+            }
+        };
+        let url = match url {
+            None => None,
+            Some(raw) => {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("subscription URL cannot be empty");
+                }
+                Some(trimmed)
+            }
+        };
+        if name.is_none() && url.is_none() {
+            anyhow::bail!("nothing to change: pass --name and/or --url");
+        }
+        Ok(Self { name, url })
+    }
+}
+
+/// URL-free receipt from `update_subscription`. Safe to print, log, or serialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionEdit {
+    pub id: String,
+    pub name: String,
+    /// `Some(old)` iff the name changed, including case-only changes.
+    pub renamed_from: Option<String>,
+    pub url_changed: bool,
+    /// Count of individual strings rewritten (sources + node refs). 0 when not renamed.
+    pub refs_rewritten: usize,
+}
+
+impl SubscriptionEdit {
+    pub fn changed(&self) -> bool {
+        self.renamed_from.is_some() || self.url_changed
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": if self.changed() { "updated" } else { "unchanged" },
+            "id": self.id,
+            "name": self.name,
+            "renamed_from": self.renamed_from,
+            "url_changed": self.url_changed,
+            "refs_rewritten": self.refs_rewritten,
+        })
+    }
+
+    pub fn summary(&self) -> String {
+        if !self.changed() {
+            return format!("unchanged {} {}", self.id, self.name);
+        }
+        let mut detail = Vec::new();
+        if let Some(old) = &self.renamed_from {
+            detail.push(format!("renamed from {old}"));
+            if self.refs_rewritten > 0 {
+                detail.push(format!("{} references rewritten", self.refs_rewritten));
+            }
+        }
+        if self.url_changed {
+            detail.push("url changed".into());
+        }
+        format!(
+            "updated {} {} ({}; not applied)",
+            self.id,
+            self.name,
+            detail.join(", ")
+        )
+    }
+
+    pub fn status_zh(&self) -> String {
+        if !self.changed() {
+            return "订阅未变更。".into();
+        }
+        let mut parts = Vec::new();
+        if self.renamed_from.is_some() {
+            if self.refs_rewritten > 0 {
+                parts.push(format!(
+                    "订阅已改名为 {}，已同步 {} 处引用",
+                    self.name, self.refs_rewritten
+                ));
+            } else {
+                parts.push(format!("订阅已改名为 {}", self.name));
+            }
+        }
+        if self.url_changed {
+            if parts.is_empty() {
+                parts.push("订阅 URL 已更新".into());
+            } else {
+                parts.push("URL 已更新".into());
+            }
+        }
+        format!("{}，尚未应用。请刷新订阅并应用。", parts.join("，"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Group {
     pub id: String,
@@ -367,6 +484,136 @@ impl Strategy {
             url,
         });
         self.subscriptions.last().expect("just pushed")
+    }
+
+    /// Exact id first, then name via `eq_ignore_ascii_case`.
+    pub fn find_subscription(&self, key: &str) -> Option<&Subscription> {
+        self.subscriptions
+            .iter()
+            .find(|sub| sub.id == key)
+            .or_else(|| {
+                self.subscriptions
+                    .iter()
+                    .find(|sub| sub.name.eq_ignore_ascii_case(key))
+            })
+    }
+
+    /// All-or-nothing. On `Err`, `self` is unchanged. Idempotent on a second identical patch.
+    pub fn update_subscription(
+        &mut self,
+        key: &str,
+        patch: SubscriptionPatch,
+    ) -> Result<SubscriptionEdit> {
+        let index = self
+            .subscriptions
+            .iter()
+            .position(|sub| sub.id == key)
+            .or_else(|| {
+                self.subscriptions
+                    .iter()
+                    .position(|sub| sub.name.eq_ignore_ascii_case(key))
+            })
+            .with_context(|| format!("subscription not found: {key}"))?;
+        let current = &self.subscriptions[index];
+        let next_name = patch.name.unwrap_or_else(|| current.name.clone());
+        let next_url = patch.url.unwrap_or_else(|| current.url.clone());
+        validate_name("subscription", &next_name)?;
+        if self
+            .subscriptions
+            .iter()
+            .enumerate()
+            .any(|(i, sub)| i != index && sub.name.eq_ignore_ascii_case(&next_name))
+        {
+            anyhow::bail!("duplicate subscription name: {next_name}");
+        }
+        let renamed = next_name != current.name;
+        let url_changed = next_url != current.url;
+        let id = current.id.clone();
+        let old_name = current.name.clone();
+        let refs_rewritten = if renamed {
+            self.rewrite_subscription_refs(index, &next_name)
+        } else {
+            0
+        };
+        self.subscriptions[index].name = next_name.clone();
+        self.subscriptions[index].url = next_url;
+        Ok(SubscriptionEdit {
+            id,
+            name: next_name,
+            renamed_from: renamed.then_some(old_name),
+            url_changed,
+            refs_rewritten,
+        })
+    }
+
+    fn rewrite_subscription_refs(&mut self, index: usize, new: &str) -> usize {
+        let old = self.subscriptions[index].name.clone();
+        let subscriptions = self.subscriptions.clone();
+        let group_names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
+        let mut count = 0;
+        for group in &mut self.groups {
+            for source in &mut group.sources {
+                if source.eq_ignore_ascii_case(&old) {
+                    *source = new.to_string();
+                    count += 1;
+                }
+            }
+            dedupe_ci_keep_first(&mut group.sources);
+
+            for name in &mut group.include {
+                if let Some(renamed) =
+                    rewrite_owned_node_name(&subscriptions, &group_names, name, index, new)
+                {
+                    *name = renamed;
+                    count += 1;
+                }
+            }
+            dedupe_exact_keep_first(&mut group.include);
+
+            for name in &mut group.exclude {
+                if let Some(renamed) =
+                    rewrite_owned_node_name(&subscriptions, &group_names, name, index, new)
+                {
+                    *name = renamed;
+                    count += 1;
+                }
+            }
+            dedupe_exact_keep_first(&mut group.exclude);
+
+            if let Some(renamed) =
+                rewrite_owned_node_name(&subscriptions, &group_names, &group.selected, index, new)
+            {
+                group.selected = renamed;
+                count += 1;
+            }
+        }
+
+        if let Some(renamed) = rewrite_owned_node_name(
+            &subscriptions,
+            &group_names,
+            &self.global_selected,
+            index,
+            new,
+        ) {
+            self.global_selected = renamed;
+            count += 1;
+        }
+
+        for set in &mut self.rule_sets {
+            if let Some(renamed) =
+                rewrite_target_ref(&subscriptions, &group_names, &set.via, index, new)
+            {
+                set.via = renamed;
+                count += 1;
+            }
+        }
+        if let Some(renamed) =
+            rewrite_target_ref(&subscriptions, &group_names, &self.unmatched_via, index, new)
+        {
+            self.unmatched_via = renamed;
+            count += 1;
+        }
+        count
     }
 
     /// Validate persisted intent without fetching subscriptions or touching the running core.
@@ -1004,6 +1251,78 @@ fn validate_name(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn node_owner_index(subscriptions: &[Subscription], raw: &str) -> Option<usize> {
+    subscriptions
+        .iter()
+        .enumerate()
+        .filter(|(_, sub)| {
+            crate::catalog::strip_node_display_prefix(raw, &sub.name).is_some()
+        })
+        .max_by_key(|(_, sub)| sub.name.len())
+        .map(|(index, _)| index)
+}
+
+fn group_name_resolves(group_names: &[String], name: &str) -> bool {
+    group_names
+        .iter()
+        .any(|group| group.eq_ignore_ascii_case(name))
+        || ((name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("proxy"))
+            && group_names.iter().any(|group| {
+                group == "PROXY" || group.eq_ignore_ascii_case("default")
+            }))
+}
+
+fn rewrite_owned_node_name(
+    subscriptions: &[Subscription],
+    group_names: &[String],
+    raw: &str,
+    index: usize,
+    new: &str,
+) -> Option<String> {
+    if raw.is_empty() || group_name_resolves(group_names, raw) {
+        return None;
+    }
+    if node_owner_index(subscriptions, raw)? != index {
+        return None;
+    }
+    let old = &subscriptions[index].name;
+    let rest = crate::catalog::strip_node_display_prefix(raw, old)?;
+    Some(crate::catalog::node_display_name(new, rest))
+}
+
+fn rewrite_target_ref(
+    subscriptions: &[Subscription],
+    group_names: &[String],
+    raw: &str,
+    index: usize,
+    new: &str,
+) -> Option<String> {
+    if crate::gfw::gfw_group(raw).is_some() || raw.starts_with("group:") {
+        return None;
+    }
+    if let Some(node) = raw.strip_prefix("node:") {
+        return rewrite_owned_node_name(subscriptions, group_names, node, index, new)
+            .map(|renamed| format!("node:{renamed}"));
+    }
+    if raw.eq_ignore_ascii_case("DIRECT") || raw.eq_ignore_ascii_case("REJECT") {
+        return None;
+    }
+    if group_name_resolves(group_names, raw) {
+        return None;
+    }
+    rewrite_owned_node_name(subscriptions, group_names, raw, index, new)
+}
+
+fn dedupe_ci_keep_first(items: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(item.to_ascii_lowercase()));
+}
+
+fn dedupe_exact_keep_first(items: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(item.clone()));
+}
+
 pub(crate) fn reserved_proxy_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
@@ -1608,5 +1927,225 @@ mod tests {
             "keep-me"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sub(id: &str, name: &str, url: &str) -> Subscription {
+        Subscription {
+            id: id.into(),
+            name: name.into(),
+            url: url.into(),
+        }
+    }
+
+    fn strategy_with_subs(subs: Vec<Subscription>) -> Strategy {
+        let mut strategy = Strategy::default();
+        strategy.subscriptions = subs;
+        strategy
+    }
+
+    #[test]
+    fn subscription_patch_rejects_empty() {
+        assert!(SubscriptionPatch::new(None, None).is_err());
+        assert!(SubscriptionPatch::new(Some("".into()), None).is_err());
+        assert!(SubscriptionPatch::new(None, Some("  ".into())).is_err());
+        assert!(SubscriptionPatch::parse(Some("".into()), Some("https://x".into())).is_err());
+        let patch = SubscriptionPatch::new(Some("  HK  ".into()), None).expect("name");
+        let mut strategy = strategy_with_subs(vec![sub("1", "old", "https://a")]);
+        let edit = strategy
+            .update_subscription("1", patch)
+            .expect("update");
+        assert_eq!(edit.name, "HK");
+    }
+
+    #[test]
+    fn find_subscription_by_id_and_name() {
+        let strategy = strategy_with_subs(vec![sub("abc", "HongKong", "https://a")]);
+        assert_eq!(strategy.find_subscription("abc").unwrap().name, "HongKong");
+        assert_eq!(
+            strategy.find_subscription("hongkong").unwrap().id,
+            "abc"
+        );
+        assert!(strategy.find_subscription("missing").is_none());
+    }
+
+    #[test]
+    fn update_subscription_not_found_and_duplicate() {
+        let mut strategy = strategy_with_subs(vec![
+            sub("1", "A", "https://a"),
+            sub("2", "B", "https://b"),
+        ]);
+        let before = strategy.clone();
+        let err = strategy
+            .update_subscription("missing", SubscriptionPatch::new(Some("X".into()), None).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("subscription not found"));
+        assert_eq!(strategy, before);
+
+        let err = strategy
+            .update_subscription("1", SubscriptionPatch::new(Some("b".into()), None).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate subscription name"));
+        assert_eq!(strategy, before);
+    }
+
+    #[test]
+    fn url_only_patch_rewrites_nothing() {
+        let mut strategy = strategy_with_subs(vec![sub("1", "A", "https://a")]);
+        let mut group = Group::all_nodes("PROXY".into(), "select".into());
+        group.sources = vec!["A".into()];
+        group.include = vec!["A · n1".into()];
+        strategy.groups = vec![group];
+        let edit = strategy
+            .update_subscription(
+                "1",
+                SubscriptionPatch::new(None, Some("https://b".into())).unwrap(),
+            )
+            .expect("url");
+        assert!(edit.changed());
+        assert!(edit.url_changed);
+        assert!(edit.renamed_from.is_none());
+        assert_eq!(edit.refs_rewritten, 0);
+        assert_eq!(strategy.groups[0].sources, vec!["A".to_string()]);
+        assert_eq!(strategy.groups[0].include, vec!["A · n1".to_string()]);
+        assert_eq!(strategy.subscriptions[0].url, "https://b");
+    }
+
+    #[test]
+    fn rename_rewrites_sources_pins_and_targets() {
+        let mut strategy = strategy_with_subs(vec![sub("1", "Old", "https://a")]);
+        let mut group = Group::all_nodes("PROXY".into(), "select".into());
+        group.sources = vec!["old".into(), "Other".into()];
+        group.include = vec!["Old · pin".into(), "Other · x".into()];
+        group.exclude = vec!["Old · block".into()];
+        group.selected = "Old · pick".into();
+        strategy.groups = vec![group];
+        strategy.global_selected = "Old · g".into();
+        strategy.unmatched_via = "Old · bare".into();
+        strategy.rule_sets = vec![RuleSet {
+            id: "r1".into(),
+            name: "r1".into(),
+            via: "node:Old · via".into(),
+            matchers: vec![],
+        }];
+        strategy.rule_sets.push(RuleSet {
+            id: "r2".into(),
+            name: "r2".into(),
+            via: "gfw:PROXY".into(),
+            matchers: vec![],
+        });
+        strategy.rule_sets.push(RuleSet {
+            id: "r3".into(),
+            name: "r3".into(),
+            via: "DIRECT".into(),
+            matchers: vec![],
+        });
+        strategy.rule_sets.push(RuleSet {
+            id: "r4".into(),
+            name: "r4".into(),
+            via: "group:PROXY".into(),
+            matchers: vec![],
+        });
+
+        let edit = strategy
+            .update_subscription(
+                "Old",
+                SubscriptionPatch::new(Some("New".into()), None).unwrap(),
+            )
+            .expect("rename");
+        assert_eq!(edit.renamed_from.as_deref(), Some("Old"));
+        assert_eq!(edit.refs_rewritten, 7);
+        assert_eq!(strategy.subscriptions[0].name, "New");
+        assert_eq!(
+            strategy.groups[0].sources,
+            vec!["New".to_string(), "Other".to_string()]
+        );
+        assert_eq!(
+            strategy.groups[0].include,
+            vec!["New · pin".to_string(), "Other · x".to_string()]
+        );
+        assert_eq!(strategy.groups[0].exclude, vec!["New · block".to_string()]);
+        assert_eq!(strategy.groups[0].selected, "New · pick");
+        assert_eq!(strategy.global_selected, "New · g");
+        assert_eq!(strategy.unmatched_via, "New · bare");
+        assert_eq!(strategy.rule_sets[0].via, "node:New · via");
+        assert_eq!(strategy.rule_sets[1].via, "gfw:PROXY");
+        assert_eq!(strategy.rule_sets[2].via, "DIRECT");
+        assert_eq!(strategy.rule_sets[3].via, "group:PROXY");
+    }
+
+    #[test]
+    fn longest_prefix_ownership_disambiguates_nested_names() {
+        let mut strategy = strategy_with_subs(vec![
+            sub("1", "A", "https://a"),
+            sub("2", "A · X", "https://x"),
+        ]);
+        let mut group = Group::all_nodes("PROXY".into(), "select".into());
+        group.include = vec!["A · n".into(), "A · X · n".into()];
+        strategy.groups = vec![group];
+
+        strategy
+            .update_subscription("1", SubscriptionPatch::new(Some("B".into()), None).unwrap())
+            .expect("rename A");
+        assert_eq!(
+            strategy.groups[0].include,
+            vec!["B · n".to_string(), "A · X · n".to_string()]
+        );
+
+        strategy
+            .update_subscription("2", SubscriptionPatch::new(Some("C".into()), None).unwrap())
+            .expect("rename A · X");
+        assert_eq!(
+            strategy.groups[0].include,
+            vec!["B · n".to_string(), "C · n".to_string()]
+        );
+    }
+
+    #[test]
+    fn group_named_like_node_is_not_rewritten() {
+        let mut strategy = strategy_with_subs(vec![sub("1", "Old", "https://a")]);
+        strategy.groups = vec![
+            Group::all_nodes("PROXY".into(), "select".into()),
+            Group::all_nodes("Old · x".into(), "select".into()),
+        ];
+        strategy.rule_sets = vec![RuleSet {
+            id: "r1".into(),
+            name: "r1".into(),
+            via: "Old · x".into(),
+            matchers: vec![],
+        }];
+        strategy
+            .update_subscription("1", SubscriptionPatch::new(Some("New".into()), None).unwrap())
+            .expect("rename");
+        assert_eq!(strategy.rule_sets[0].via, "Old · x");
+        assert_eq!(strategy.groups[1].name, "Old · x");
+    }
+
+    #[test]
+    fn case_only_rename_rewrites_node_prefix() {
+        let mut strategy = strategy_with_subs(vec![sub("1", "hk", "https://a")]);
+        let mut group = Group::all_nodes("PROXY".into(), "select".into());
+        group.include = vec!["hk · n1".into()];
+        strategy.groups = vec![group];
+        let edit = strategy
+            .update_subscription("1", SubscriptionPatch::new(Some("HK".into()), None).unwrap())
+            .expect("case");
+        assert_eq!(edit.renamed_from.as_deref(), Some("hk"));
+        assert_eq!(strategy.groups[0].include, vec!["HK · n1".to_string()]);
+    }
+
+    #[test]
+    fn second_identical_patch_is_idempotent() {
+        let mut strategy = strategy_with_subs(vec![sub("1", "Old", "https://a")]);
+        let mut group = Group::all_nodes("PROXY".into(), "select".into());
+        group.sources = vec!["Old".into()];
+        strategy.groups = vec![group];
+        let patch = SubscriptionPatch::new(Some("New".into()), Some("https://b".into())).unwrap();
+        let first = strategy.update_subscription("1", patch.clone()).expect("first");
+        assert!(first.changed());
+        assert_eq!(first.refs_rewritten, 1);
+        let second = strategy.update_subscription("1", patch).expect("second");
+        assert!(!second.changed());
+        assert_eq!(second.refs_rewritten, 0);
+        assert_eq!(strategy.groups[0].sources, vec!["New".to_string()]);
     }
 }

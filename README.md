@@ -65,6 +65,7 @@ myproxyctl --json import ~/Downloads/myproxy-strategy-2026-09-10.json
 
 ```sh
 cargo run --bin myproxyctl -- subscription add 'https://…' --name Example
+cargo run --bin myproxyctl -- subscription set Example --name HK
 cargo run --bin myproxyctl -- filter --set '(?i)(流量|剩余|到期|官网)'
 cargo run --bin myproxyctl -- group add PROXY --all
 cargo run --bin myproxyctl -- rule add --name GitHub --keyword github --via PROXY

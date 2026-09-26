@@ -27,7 +27,7 @@ use myproxy::network_extension::{self, Phase, RuntimeStatus};
 use myproxy::setup::{self, SetupNext};
 use myproxy::strategy::{
     join_list, parse_list, Group, InboundMode, Matcher, RoutingProfile, RuleSet, Strategy,
-    GLOBAL_GROUP,
+    Subscription as StrategySubscription, SubscriptionPatch, GLOBAL_GROUP,
 };
 use myproxy::supervisor::{CoreHealth, OperationState, RuntimeIdentity, Supervisor};
 use myproxy::updates::{self, UpdateChannel};
@@ -887,6 +887,116 @@ impl Render for RuleSetEditor {
     }
 }
 
+struct SubscriptionEditor {
+    parent: Entity<AppView>,
+    /// Stable id captured at open so a concurrent rename cannot retarget commit.
+    id: String,
+    name: Entity<InputState>,
+    url: Entity<InputState>,
+    notice: String,
+}
+
+impl SubscriptionEditor {
+    fn new(
+        parent: Entity<AppView>,
+        existing: StrategySubscription,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("订阅名")
+                .default_value(existing.name)
+        });
+        let url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://…/clash.yaml")
+                .default_value(existing.url)
+        });
+        Self {
+            parent,
+            id: existing.id,
+            name,
+            url,
+            notice: String::new(),
+        }
+    }
+
+    fn commit(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let name = self.name.read(cx).value().to_string();
+        let url = self.url.read(cx).value().to_string();
+        let patch = match SubscriptionPatch::new(Some(name), Some(url)) {
+            Ok(patch) => patch,
+            Err(err) => {
+                self.notice = err.to_string();
+                cx.notify();
+                return false;
+            }
+        };
+        let id = self.id.clone();
+        let result = self.parent.update(cx, |parent, cx| {
+            let previous = parent.strategy.clone();
+            let edit = parent
+                .strategy
+                .update_subscription(&id, patch)
+                .map_err(|e| format!("保存失败：{e}"))?;
+            if !edit.changed() {
+                parent.close_subscription_modal("订阅未变更。", cx);
+                return Ok(());
+            }
+            if parent.persist() {
+                parent.close_subscription_modal(&edit.status_zh(), cx);
+                Ok(())
+            } else {
+                parent.strategy = previous;
+                Err(parent.status.clone())
+            }
+        });
+        match result {
+            Ok(()) => true,
+            Err(msg) => {
+                self.notice = msg;
+                cx.notify();
+                false
+            }
+        }
+    }
+}
+
+impl Render for SubscriptionEditor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        v_flex()
+            .gap_3()
+            .when(!self.notice.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child(self.notice.clone()),
+                )
+            })
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_xs().child("订阅名"))
+                    .child(Input::new(&self.name)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_xs().child("订阅 URL"))
+                    .child(Input::new(&self.url)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("改名会同步节点组来源与钉住节点；保存后需刷新订阅并应用。"),
+            )
+    }
+}
+
 fn default_via(strategy: &Strategy) -> String {
     strategy
         .groups
@@ -1045,6 +1155,7 @@ pub struct AppView {
     group_edit_id: Option<String>,
     rule_modal_open: bool,
     rule_edit_id: Option<String>,
+    subscription_modal_open: bool,
     rule_query: Entity<InputState>,
     global_query: Entity<InputState>,
     filter_input: Entity<InputState>,
@@ -1204,7 +1315,8 @@ impl AppView {
                             this.clear_live();
                             dirty = true;
                         }
-                        let editing = this.group_modal_open || this.rule_modal_open;
+                        let editing =
+                            this.group_modal_open || this.rule_modal_open || this.subscription_modal_open;
                         if !this.is_busy() {
                             if let Some(path) = strategy_path.as_deref() {
                                 let stamp = file_stamp(path);
@@ -1331,6 +1443,7 @@ impl AppView {
             group_edit_id: None,
             rule_modal_open: false,
             rule_edit_id: None,
+            subscription_modal_open: false,
             rule_query,
             global_query,
             filter_input: cx.new(|cx| {
@@ -2383,6 +2496,81 @@ impl AppView {
                 .child(editor.clone())
         });
         initial_focus.focus(window, cx);
+    }
+
+    fn open_subscription_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        window.close_all_dialogs(cx);
+        let existing = self
+            .strategy
+            .subscriptions
+            .iter()
+            .find(|sub| sub.id == id)
+            .cloned();
+        let Some(existing) = existing else {
+            self.status = "找不到这个订阅。".into();
+            return;
+        };
+        self.subscription_modal_open = true;
+        let parent = cx.entity();
+        let editor = cx.new(|cx| SubscriptionEditor::new(parent.clone(), existing, window, cx));
+        let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
+        window.open_dialog(cx, move |dialog, _window, _| {
+            dialog
+                .title("编辑订阅")
+                .width(px(560.))
+                .overlay_closable(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .on_ok({
+                            let editor = editor.clone();
+                            move |_, window, cx| editor.update(cx, |ed, cx| ed.commit(window, cx))
+                        })
+                        .on_cancel({
+                            let parent = parent.clone();
+                            move |_, _, cx| {
+                                parent.update(cx, |this, cx| {
+                                    this.subscription_modal_open = false;
+                                    cx.notify();
+                                });
+                                true
+                            }
+                        }),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("sub-dialog-cancel").label("取消").on_click(
+                                |_, window, cx| window.dispatch_action(Box::new(Cancel), cx),
+                            ),
+                        )
+                        .child(
+                            Button::new("sub-dialog-ok")
+                                .primary()
+                                .label("保存")
+                                .on_click(|_, window, cx| {
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                }),
+                        ),
+                )
+                .on_close({
+                    let parent = parent.clone();
+                    move |_, _, cx| {
+                        parent.update(cx, |this, cx| {
+                            this.subscription_modal_open = false;
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(editor.clone())
+        });
+        initial_focus.focus(window, cx);
+    }
+
+    fn close_subscription_modal(&mut self, status: &str, cx: &mut Context<Self>) {
+        self.subscription_modal_open = false;
+        self.status = status.into();
+        cx.notify();
     }
 
     fn set_selected_rule_via(&mut self, id: &str, via: &str, cx: &mut Context<Self>) {
@@ -3535,33 +3723,54 @@ impl AppView {
                                     div()
                                         .flex_1()
                                         .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
                                         .text_xs()
                                         .font_family(theme.mono_font_family.clone())
                                         .text_color(theme.muted_foreground)
                                         .child(sub.url.clone()),
                                 )
                                 .child(
-                                    Button::new(SharedString::from(format!("del-sub-{id}")))
-                                        .small()
-                                        .danger()
-                                        .label("删除")
-                                        .disabled(self.is_busy())
-                                        .on_click(move |_, _, app| {
-                                            entity.update(app, |this, cx| {
-                                                if this.is_busy() {
-                                                    return;
-                                                }
-                                                let previous = this.strategy.clone();
-                                                this.strategy.remove_subscription(&id);
-                                                if this.persist() {
-                                                    this.status =
-                                                        "订阅已删除，尚未应用。请应用配置。".into();
-                                                } else {
-                                                    this.strategy = previous;
-                                                }
-                                                cx.notify();
-                                            });
-                                        }),
+                                    h_flex()
+                                        .gap_2()
+                                        .child({
+                                            let entity = entity.clone();
+                                            let id = id.clone();
+                                            Button::new(SharedString::from(format!("edit-sub-{id}")))
+                                                .small()
+                                                .label("编辑")
+                                                .disabled(self.is_busy())
+                                                .on_click(move |_, window, app| {
+                                                    entity.update(app, |this, cx| {
+                                                        this.open_subscription_dialog(
+                                                            &id, window, cx,
+                                                        );
+                                                    });
+                                                })
+                                        })
+                                        .child(
+                                            Button::new(SharedString::from(format!("del-sub-{id}")))
+                                                .small()
+                                                .danger()
+                                                .label("删除")
+                                                .disabled(self.is_busy())
+                                                .on_click(move |_, _, app| {
+                                                    entity.update(app, |this, cx| {
+                                                        if this.is_busy() {
+                                                            return;
+                                                        }
+                                                        let previous = this.strategy.clone();
+                                                        this.strategy.remove_subscription(&id);
+                                                        if this.persist() {
+                                                            this.status =
+                                                                "订阅已删除，尚未应用。请应用配置。".into();
+                                                        } else {
+                                                            this.strategy = previous;
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
                                 ),
                         )
                         .when_some(warning, |this, warning| {
@@ -3972,7 +4181,7 @@ impl AppView {
             cx.notify();
             return;
         }
-        if self.group_modal_open || self.rule_modal_open {
+        if self.group_modal_open || self.rule_modal_open || self.subscription_modal_open {
             self.status = "请先关闭编辑窗口再导入。".into();
             cx.notify();
             return;

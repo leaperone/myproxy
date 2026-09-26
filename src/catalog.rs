@@ -14,6 +14,24 @@ use crate::strategy::Strategy;
 const SUBSCRIPTION_CURL_MAX_TIME: &str = "8";
 const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "3";
 
+/// Separator between subscription name and upstream proxy name in catalog nodes.
+pub const NODE_DISPLAY_SEP: &str = " · ";
+
+/// Catalog / pin display name: `"{subscription} · {original}"`.
+pub fn node_display_name(subscription: &str, original: &str) -> String {
+    format!("{subscription}{NODE_DISPLAY_SEP}{original}")
+}
+
+/// Prefix used to own a catalog node name for a subscription.
+pub fn node_display_prefix(subscription: &str) -> String {
+    format!("{subscription}{NODE_DISPLAY_SEP}")
+}
+
+/// Rest of a node name after `"{subscription} · "`, if present.
+pub fn strip_node_display_prefix<'a>(raw: &'a str, subscription: &str) -> Option<&'a str> {
+    raw.strip_prefix(&node_display_prefix(subscription))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     pub nodes: Vec<Node>,
@@ -180,7 +198,7 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
                         continue;
                     }
                     let mut prefixed = raw.clone();
-                    let name = format!("{} · {}", sub.name, original);
+                    let name = node_display_name(&sub.name, &original);
                     if let serde_yaml::Value::Mapping(map) = &mut prefixed {
                         map.insert(
                             serde_yaml::Value::String("name".into()),
@@ -557,5 +575,15 @@ mod tests {
             "(22) The requested URL returned error: 404"
         ));
         assert!(!transport_curl_failure("curl body is not UTF-8"));
+    }
+
+    #[test]
+    fn node_display_name_uses_middle_dot_sep() {
+        assert_eq!(node_display_name("HK", "东京"), "HK · 东京");
+        assert_eq!(node_display_prefix("HK"), "HK · ");
+        assert_eq!(strip_node_display_prefix("HK · 东京", "HK"), Some("东京"));
+        assert_eq!(strip_node_display_prefix("HK · X · n", "HK"), Some("X · n"));
+        assert_eq!(strip_node_display_prefix("A · X · n", "A · X"), Some("n"));
+        assert_eq!(strip_node_display_prefix("other", "HK"), None);
     }
 }
