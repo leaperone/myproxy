@@ -80,6 +80,7 @@ struct HealthWatch {
     last: CoreHealth,
     fails: u32,
     recoveries: u32,
+    released: Option<String>,
 }
 
 impl Default for HealthWatch {
@@ -90,6 +91,7 @@ impl Default for HealthWatch {
             last: CoreHealth::idle(),
             fails: 0,
             recoveries: 0,
+            released: None,
         }
     }
 }
@@ -364,15 +366,14 @@ impl Supervisor {
     }
 
     pub fn last_health(&self) -> CoreHealth {
+        let watch = self.health.lock().expect("supervisor health lock");
         if !is_wanted() {
-            return CoreHealth::idle();
+            return CoreHealth {
+                note: watch.released.clone(),
+                ..CoreHealth::idle()
+            };
         }
-        let mut health = self
-            .health
-            .lock()
-            .expect("supervisor health lock")
-            .last
-            .clone();
+        let mut health = watch.last.clone();
         health.wanted = true;
         health
     }
@@ -872,8 +873,7 @@ impl Supervisor {
 
     pub fn observe(&self, _draft: &Strategy) -> CoreHealth {
         if !is_wanted() {
-            self.reset_health();
-            return CoreHealth::idle();
+            return self.last_health();
         }
         if self.is_busy() {
             return self.last_health();
@@ -940,45 +940,57 @@ impl Supervisor {
             RecoveryStep::Confirm => "正在确认",
             RecoveryStep::Wait => "等待自动重试",
             RecoveryStep::Recover => return self.recover(runtime, now),
-            RecoveryStep::GiveUp => return self.give_up(reason),
+            RecoveryStep::GiveUp => return self.give_up(runtime.generation, reason),
         };
         let health = CoreHealth::failing(&format!("{reason}；{note}"));
         self.store_health(health.clone());
         health
     }
 
-    // A dead core behind live NEDNSProxy or a system proxy blackholes the whole
-    // machine, so exhausting recovery releases them exactly like a disconnect.
-    fn give_up(&self, reason: &str) -> CoreHealth {
+    // Capture and DNS fail open to Direct without a backend, but a system proxy
+    // left on a dead Mixed port breaks every proxied app, so exhausting
+    // recovery releases everything exactly like a disconnect.
+    fn give_up(&self, generation: u64, reason: &str) -> CoreHealth {
         let Ok(mut operation) = acquire_operation_with_timeout(Duration::ZERO) else {
             return self.last_health();
         };
         if *operation._state || !is_wanted() {
-            return CoreHealth::idle();
+            return self.last_health();
+        }
+        if RuntimeConfig::load()
+            .ok()
+            .flatten()
+            .map(|current| current.generation)
+            != Some(generation)
+        {
+            return self.last_health();
         }
         log::error("supervisor", format!("core recovery exhausted: {reason}"));
-        let result = set_wanted(false)
-            .and_then(|()| operation.show(OperationState::Disconnecting))
-            .and_then(|()| self.disconnect_inner(None));
-        let note = match &result {
-            Ok(()) => format!("核心多次恢复失败，已断开并恢复系统网络设置：{reason}"),
+        let _ = operation.show(OperationState::Disconnecting);
+        let result = self.disconnect_inner(None).and_then(|()| set_wanted(false));
+        match result {
+            Ok(()) => {
+                let note = format!("核心多次恢复失败，已自动断开并恢复系统网络设置：{reason}");
+                let mut watch = self.health.lock().expect("supervisor health lock");
+                *watch = HealthWatch::default();
+                watch.released = Some(note.clone());
+                CoreHealth {
+                    note: Some(note),
+                    ..CoreHealth::idle()
+                }
+            }
             Err(error) => {
                 log::error(
                     "supervisor",
                     format!("give-up disconnect failed: {error:#}"),
                 );
-                format!("核心多次恢复失败，断开未完成：{error:#}")
+                OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
+                let health =
+                    CoreHealth::failing(&format!("核心多次恢复失败，自动断开未完成，将重试：{error:#}"));
+                self.store_health(health.clone());
+                health
             }
-        };
-        OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
-        let health = CoreHealth {
-            wanted: false,
-            ready: false,
-            note: Some(note),
-            proxy_now: String::new(),
-        };
-        self.store_health(health.clone());
-        health
+        }
     }
 
     fn recover(&self, mut runtime: RuntimeConfig, now: Instant) -> CoreHealth {
@@ -1514,10 +1526,11 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_recovery_gives_up_instead_of_holding_capture() {
-        let now = Instant::now();
+    fn recovery_gives_up_only_after_exhausting_retries() {
+        let then = Instant::now();
+        let now = then + RECOVER_INTERVAL * 2;
         let recent = Some(now);
-        let old = now.checked_sub(RECOVER_INTERVAL * 2);
+        let old = Some(then);
         assert_eq!(recovery_step(2, 0, None, now), RecoveryStep::Confirm);
         assert_eq!(recovery_step(3, 0, None, now), RecoveryStep::Recover);
         assert_eq!(recovery_step(3, 1, recent, now), RecoveryStep::Wait);
