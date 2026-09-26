@@ -889,8 +889,7 @@ impl Render for RuleSetEditor {
 
 struct SubscriptionEditor {
     parent: Entity<AppView>,
-    /// Stable id captured at open so a concurrent rename cannot retarget commit.
-    id: String,
+    edit_id: String,
     name: Entity<InputState>,
     url: Entity<InputState>,
     notice: String,
@@ -915,7 +914,7 @@ impl SubscriptionEditor {
         });
         Self {
             parent,
-            id: existing.id,
+            edit_id: existing.id,
             name,
             url,
             notice: String::new(),
@@ -933,12 +932,12 @@ impl SubscriptionEditor {
                 return false;
             }
         };
-        let id = self.id.clone();
+        let edit_id = self.edit_id.clone();
         let result = self.parent.update(cx, |parent, cx| {
             let previous = parent.strategy.clone();
             let edit = parent
                 .strategy
-                .update_subscription(&id, patch)
+                .update_subscription(&edit_id, patch)
                 .map_err(|e| format!("保存失败：{e}"))?;
             if !edit.changed() {
                 parent.close_subscription_modal("订阅未变更。", cx);

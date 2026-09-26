@@ -239,7 +239,6 @@ pub struct SubscriptionPatch {
 }
 
 impl SubscriptionPatch {
-    /// Trims both fields. Errors when both are absent or a provided field is empty after trim.
     pub fn new(name: Option<String>, url: Option<String>) -> Result<Self> {
         Self::parse(name, url)
     }

@@ -14,7 +14,6 @@ use crate::strategy::Strategy;
 const SUBSCRIPTION_CURL_MAX_TIME: &str = "8";
 const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "3";
 
-/// Separator between subscription name and upstream proxy name in catalog nodes.
 pub const NODE_DISPLAY_SEP: &str = " · ";
 
 /// Catalog / pin display name: `"{subscription} · {original}"`.
@@ -22,12 +21,10 @@ pub fn node_display_name(subscription: &str, original: &str) -> String {
     format!("{subscription}{NODE_DISPLAY_SEP}{original}")
 }
 
-/// Prefix used to own a catalog node name for a subscription.
 pub fn node_display_prefix(subscription: &str) -> String {
     format!("{subscription}{NODE_DISPLAY_SEP}")
 }
 
-/// Rest of a node name after `"{subscription} · "`, if present.
 pub fn strip_node_display_prefix<'a>(raw: &'a str, subscription: &str) -> Option<&'a str> {
     raw.strip_prefix(&node_display_prefix(subscription))
 }
