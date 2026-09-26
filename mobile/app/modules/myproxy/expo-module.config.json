@@ -1,0 +1,10 @@
+{
+  "platforms": ["android", "apple"],
+  "android": {
+    "modules": ["one.leaper.myproxy.MyProxyModule"]
+  },
+  "apple": {
+    "modules": ["MyProxyModule"],
+    "podspecPath": "MyProxyNative.podspec"
+  }
+}

@@ -173,6 +173,8 @@ It checks HTTP and SOCKS access on the original port before reporting success.
 
 ## Routing and runtime state
 
+The iOS and Android Xray applications are developed separately under [mobile](mobile/README.md). They share the desktop Rust policy sources, use Expo for the mobile interface, and use native VPN services with an embedded Xray runtime. Their GitHub Actions builds do not update the desktop channels.
+
 `strategy.json` stores the saved configuration. Saving, applying, Mihomo readiness,
 System Extension activation, and DNS readiness are separate states. Apply validates
 the candidate before replacing a running configuration; a failed activation reports
