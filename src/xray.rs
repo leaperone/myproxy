@@ -398,11 +398,32 @@ fn prepare(strategy: &Strategy, catalog: &Catalog) -> Result<Arc<Runtime>> {
     result
 }
 
+fn proxy_server_dns() -> serde_json::Value {
+    json!({
+        "queryStrategy": "UseIPv4",
+        "disableFallback": true,
+        "servers": crate::compile::DNS_NAMESERVERS.iter().map(|ip| format!("tcp://{ip}")).collect::<Vec<_>>()
+    })
+}
+
+fn proxy_server_dns_rule() -> serde_json::Value {
+    json!({
+        "ip": crate::compile::DNS_NAMESERVERS.iter().map(|ip| format!("{ip}/32")).collect::<Vec<_>>(),
+        "port": "53",
+        "network": "tcp",
+        "outboundTag": "dns-direct"
+    })
+}
+
 fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Result<Arc<Runtime>> {
     let mut accepted = catalog.clone();
     accepted.nodes.clear();
     let mut inbounds = Vec::new();
-    let mut outbounds = vec![json!({"tag":"reject", "protocol":"blackhole"})];
+    let mut outbounds = vec![
+        json!({"tag":"reject", "protocol":"blackhole"}),
+        // Direct TCP DNS for proxy server names. This must not become the default outbound.
+        json!({"tag":"dns-direct", "protocol":"freedom"}),
+    ];
     let mut rules = Vec::new();
     let mut lanes = HashMap::new();
     let mut warnings = Vec::new();
@@ -459,7 +480,10 @@ fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Res
     }
     // The only routing in Xray binds each private entrance to a single outbound.
     // Public routing and group selection are performed before reaching Xray.
-    let config = json!({"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":outbounds,
+    // Keep this rule last so a client's query to a resolver still uses its node.
+    rules.push(proxy_server_dns_rule());
+    let config = json!({"log":{"loglevel":"warning"},"dns":proxy_server_dns(),
+        "inbounds":inbounds,"outbounds":outbounds,
         "routing":{"domainStrategy":"AsIs","rules":rules}});
     let path = directory.join("core.json");
     paths::atomic_write(&path, &serde_json::to_vec(&config)?)?;
