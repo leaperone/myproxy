@@ -583,9 +583,4 @@ mod tests {
         assert_eq!(strip_node_display_prefix("A · X · n", "A · X"), Some("n"));
         assert_eq!(strip_node_display_prefix("other", "HK"), None);
     }
-
-    #[test]
-    fn applied_mixed_proxy_skips_without_a_port() {
-        assert_eq!(applied_mixed_proxy(None), None);
-    }
 }

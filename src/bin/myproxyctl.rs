@@ -194,7 +194,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn save_strategy(strategy: &Strategy) -> Result<()> {
-    host_control::refuse_unbundled_system_extension_write(strategy.system_extension)?;
+    host_control::refuse_unbundled_extension_enable(strategy.system_extension)?;
     strategy.save()
 }
 
@@ -949,8 +949,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Import { path } => {
             let pending = strategy::parse_import(&path)?;
-            host_control::refuse_unbundled_system_extension_write(pending.system_extension)?;
-            let outcome = strategy::import_from(&path)?;
+            host_control::refuse_unbundled_extension_enable(pending.system_extension)?;
+            let outcome = strategy::import_strategy(pending)?;
             emit(
                 json,
                 serde_json::json!({
