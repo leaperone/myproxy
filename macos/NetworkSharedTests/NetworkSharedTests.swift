@@ -1,6 +1,6 @@
 import Foundation
 
-// Assert harness: CommandLineTools on this machine cannot import XCTest or Testing.
+// The repo has no SwiftPM or Xcode test target, so this is a plain executable harness.
 
 enum ExpectationFailure: Error, CustomStringConvertible {
     case message(String)
@@ -90,7 +90,7 @@ private func flowSource(
     )
 }
 
-private func engine(rules: [CaptureRule], capturePrivateNetworks: Bool = true) throws -> CaptureRuleEngine {
+private func engine(rules: [CaptureRule], capturePrivateNetworks: Bool = false) throws -> CaptureRuleEngine {
     try CaptureRuleEngine(
         snapshot: CaptureConfigurationSnapshot(
             revision: 1,
@@ -474,6 +474,92 @@ struct NetworkSharedTests {
                 .defaultDirect,
                 "no match evidence"
             )
+        }
+
+        run.test("capture_trusted_component_bypasses_matching_rule") {
+            let rule = try CaptureRule(
+                id: "all-example",
+                priority: 10,
+                destinations: [.host(try HostMatcher(kind: .suffix, value: "example.com"))],
+                action: .mihomo(.group("PROXY"))
+            )
+            let decision = try engine(rules: [rule]).evaluate(
+                context(
+                    source: flowSource(isTrustedMyproxyComponent: true),
+                    destination: try FlowDestination(hostname: "www.example.com", port: 443)
+                )
+            )
+            try expectEqual(decision.cause, .builtInBypass(.trustedmyproxyComponent), "trusted cause")
+            try expectEqual(decision.action, .direct, "trusted action")
+        }
+
+        run.test("capture_local_destinations_bypass_rules") {
+            let rules = [
+                try CaptureRule(
+                    id: "loopback",
+                    priority: 10,
+                    destinations: [.network(try IPNetwork("127.0.0.0/8"))],
+                    action: .reject
+                ),
+                try CaptureRule(
+                    id: "lan",
+                    priority: 20,
+                    destinations: [.network(try IPNetwork("192.168.0.0/16"))],
+                    action: .reject
+                ),
+                try CaptureRule(
+                    id: "local-suffix",
+                    priority: 30,
+                    destinations: [.host(try HostMatcher(kind: .suffix, value: "local"))],
+                    action: .reject
+                ),
+            ]
+            let lan = try FlowDestination(ipAddress: try IPAddress("192.168.1.10"), port: 80)
+            let defaults = try engine(rules: rules)
+            try expectEqual(
+                defaults.evaluate(context(
+                    source: flowSource(),
+                    destination: try FlowDestination(ipAddress: try IPAddress("127.0.0.1"), port: 7890)
+                )).cause,
+                .builtInBypass(.loopback),
+                "loopback"
+            )
+            try expectEqual(
+                defaults.evaluate(context(source: flowSource(), destination: lan)).cause,
+                .builtInBypass(.privateNetwork),
+                "private network by default"
+            )
+            try expectEqual(
+                defaults.evaluate(context(
+                    source: flowSource(),
+                    destination: try FlowDestination(hostname: "printer.local", port: 631)
+                )).cause,
+                .builtInBypass(.localHostname),
+                "local hostname"
+            )
+            let lanCapture = try engine(rules: rules, capturePrivateNetworks: true)
+            try expectEqual(
+                lanCapture.evaluate(context(source: flowSource(), destination: lan)).cause,
+                .matchedRule("lan"),
+                "private network when LAN capture is on"
+            )
+        }
+
+        run.test("capture_rule_carries_profile_rules_fallback") {
+            let rule = try CaptureRule(
+                id: "group-pin",
+                priority: 10,
+                destinations: [.host(try HostMatcher(kind: .suffix, value: "example.com"))],
+                action: .mihomo(.group("Telegram")),
+                unavailableFallback: .profileRules
+            )
+            let decision = try engine(rules: [rule]).evaluate(
+                context(
+                    source: flowSource(),
+                    destination: try FlowDestination(hostname: "api.example.com", port: 443)
+                )
+            )
+            try expectEqual(decision.unavailableFallback, .profileRules, "fallback carried")
         }
 
         let total = run.passed + run.failed

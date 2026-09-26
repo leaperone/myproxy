@@ -7,6 +7,7 @@ out="${1:-target/network-shared-tests}"
 arch="$(uname -m)"
 target="${arch}-apple-macosx14.0"
 mkdir -p "$out"
+shopt -s nullglob
 
 shared_sources=(macos/NetworkShared/*.swift)
 test_sources=(macos/NetworkSharedTests/*.swift)
