@@ -17,13 +17,19 @@ impl CaptureService {
         if !resolvers.status.success() { bail!("无法读取系统 DNS 设置：scutil 退出码 {:?}", resolvers.status.code()); }
         let resolvers = system_resolvers(&String::from_utf8_lossy(&resolvers.stdout));
         if resolvers.is_empty() { bail!("系统没有返回 DNS 服务器，系统接管未启用"); }
-        let direct_dns_resolver = select_resolver(&resolvers, |ip| {
+        let answered = select_resolver(&resolvers, |ip| {
             match probe_dns_answer(std::net::SocketAddr::new(ip,53)) {
                 Ok(()) => true,
                 Err(error) => { crate::log::warn("xray-dns", format!("system resolver TCP probe {ip}: {error:#}")); false }
             }
-        })
-            .context("系统 DNS 服务器没有响应，系统接管未启用；本地代理继续可用")?;
+        });
+        if answered.is_none() {
+            crate::log::warn(
+                "xray-dns",
+                "system resolvers did not answer a TCP probe; enabling capture and proving DNS after the proxy is up",
+            );
+        }
+        let direct_dns_resolver = choose_direct_resolver(answered, &resolvers);
         let admission = admission::AdmissionService::start(Arc::new(ApplicationRouting { direct_dns: DirectDns { selected: direct_dns_resolver, system_resolvers: resolvers } }))?;
         let (username, password) = admission.probe_credentials();
         let request = EnableRequest {
@@ -65,6 +71,10 @@ fn system_resolvers(output: &str) -> Vec<std::net::IpAddr> {
         if resolvers.len() == 4 { break; }
     }
     resolvers
+}
+
+fn choose_direct_resolver(answered: Option<String>, resolvers: &[std::net::IpAddr]) -> String {
+    answered.unwrap_or_else(|| resolvers[0].to_string())
 }
 
 fn select_resolver(resolvers: &[std::net::IpAddr], probe: impl Fn(std::net::IpAddr)->bool + Sync) -> Option<String> {
@@ -185,6 +195,22 @@ impl DirectDns {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_dns_keeps_the_first_system_resolver_when_none_answer() {
+        let resolvers = vec![
+            "1.1.1.1".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+        ];
+        assert_eq!(
+            super::choose_direct_resolver(None, &resolvers),
+            "1.1.1.1"
+        );
+        assert_eq!(
+            super::choose_direct_resolver(Some("8.8.8.8".into()), &resolvers),
+            "8.8.8.8"
+        );
+    }
+
     #[test]
     fn captured_dns_uses_a_resolver_for_the_selected_route() {
         use super::{DirectDns, policy::Route};

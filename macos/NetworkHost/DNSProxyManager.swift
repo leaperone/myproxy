@@ -1,5 +1,6 @@
 @preconcurrency import Darwin
 @preconcurrency import Foundation
+import MyproxyNetworkShared
 @preconcurrency import NetworkExtension
 
 enum SystemDNSProbe: Sendable, Equatable {
@@ -51,11 +52,23 @@ actor AppleDNSProxyManager {
     /// `getaddrinfo` is the path NEDNSProxy actually intercepts. A SOCKS
     /// probe of :1053 can succeed while this call hangs.
     func proveSystemResolver() async -> SystemDNSProbe {
-        var last = await probeSystemResolverOnce()
+        #if MYPROXY_XRAY
+        // mDNSResponder owns this lookup, and the first one races Xray's
+        // listener. One 3s miss was disabling system capture while DNS bytes
+        // were already moving.
+        var last = await probeSystemResolverOnce(timeout: 5)
+        if last == .unproven {
+            AppLog.info("ne-host", "system resolver probe=unproven; retrying")
+            try? await Task.sleep(for: .milliseconds(400))
+            last = await probeSystemResolverOnce(timeout: 5)
+        }
+        #else
+        var last = await probeSystemResolverOnce(timeout: 3)
+        #endif
         guard last == .clear else { return last }
         for _ in 0..<3 {
             try? await Task.sleep(for: .milliseconds(400))
-            last = await probeSystemResolverOnce()
+            last = await probeSystemResolverOnce(timeout: 3)
             if last != .clear { return last }
         }
         return last
@@ -91,7 +104,7 @@ actor AppleDNSProxyManager {
         self.manager = nil
     }
 
-    private func probeSystemResolverOnce() async -> SystemDNSProbe {
+    private func probeSystemResolverOnce(timeout: TimeInterval) async -> SystemDNSProbe {
         let reply = OnceReply<SystemDNSProbe>()
         do {
             return try await withCheckedThrowingContinuation { continuation in
@@ -99,7 +112,7 @@ actor AppleDNSProxyManager {
                 Thread.detachNewThread {
                     reply.finish(.success(resolveExampleComARecord()))
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
                     reply.finish(.success(.unproven))
                 }
             }
@@ -151,15 +164,24 @@ private func isPreferenceTimeout(_ error: Error) -> Bool {
 }
 
 private func resolveExampleComARecord() -> SystemDNSProbe {
+    // A cached example.com answer returns before NEDNSProxy is on the path and
+    // lets capture stay up while later lookups hang. A fresh name has to reach
+    // the resolver; NXDOMAIN still proves that it answered.
+    let name = "myproxy-\(UUID().uuidString.lowercased()).example.com"
     var hints = addrinfo()
     hints.ai_family = AF_INET
     hints.ai_socktype = SOCK_STREAM
     var result: UnsafeMutablePointer<addrinfo>?
-    let status = getaddrinfo("example.com", nil, &hints, &result)
+    let status = name.withCString { pointer in
+        getaddrinfo(pointer, nil, &hints, &result)
+    }
     defer {
         if let result {
             freeaddrinfo(result)
         }
+    }
+    if status == EAI_NONAME {
+        return .clear
     }
     guard status == 0 else { return .unproven }
     var cursor = result
