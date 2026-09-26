@@ -987,7 +987,9 @@ impl Supervisor {
                 OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
                 let health =
                     CoreHealth::failing(&format!("核心多次恢复失败，自动断开未完成，将重试：{error:#}"));
-                self.store_health(health.clone());
+                let mut watch = self.health.lock().expect("supervisor health lock");
+                watch.last_recover = Some(Instant::now());
+                watch.last = health.clone();
                 health
             }
         }
@@ -1094,10 +1096,10 @@ fn recovery_step(
 ) -> RecoveryStep {
     if fails < FAIL_BEFORE_RETRY {
         RecoveryStep::Confirm
-    } else if recoveries >= MAX_RECOVERIES {
-        RecoveryStep::GiveUp
     } else if last_recover.is_some_and(|at| now.duration_since(at) < RECOVER_INTERVAL) {
         RecoveryStep::Wait
+    } else if recoveries >= MAX_RECOVERIES {
+        RecoveryStep::GiveUp
     } else {
         RecoveryStep::Recover
     }
@@ -1536,7 +1538,8 @@ mod tests {
         assert_eq!(recovery_step(3, 1, recent, now), RecoveryStep::Wait);
         assert_eq!(recovery_step(3, 4, old, now), RecoveryStep::Recover);
         assert_eq!(recovery_step(2, 5, recent, now), RecoveryStep::Confirm);
-        assert_eq!(recovery_step(3, 5, recent, now), RecoveryStep::GiveUp);
+        assert_eq!(recovery_step(3, 5, recent, now), RecoveryStep::Wait);
+        assert_eq!(recovery_step(3, 5, old, now), RecoveryStep::GiveUp);
     }
 
     #[test]
