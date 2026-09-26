@@ -5,7 +5,7 @@ use myproxy::controller;
 use myproxy::host_control::{self, Request, Snapshot};
 use myproxy::network_extension;
 use myproxy::paths;
-use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy, GLOBAL_GROUP};
+use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy, SubscriptionPatch, GLOBAL_GROUP};
 use myproxy::supervisor::Supervisor;
 
 #[derive(Parser)]
@@ -95,6 +95,15 @@ enum SubCmd {
     },
     Remove {
         id: String,
+    },
+    /// Rename and/or change URL. Persist-only; rewrites group sources and node references.
+    Set {
+        /// Subscription id or name (case-insensitive).
+        key: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -648,6 +657,15 @@ fn run(cli: Cli) -> Result<()> {
                     serde_json::json!({"status": "removed", "id": id}),
                     format!("removed {id}"),
                 );
+            }
+            SubCmd::Set { key, name, url } => {
+                let patch = SubscriptionPatch::new(name, url)?;
+                let mut strategy = Strategy::load()?;
+                let edit = strategy.update_subscription(&key, patch)?;
+                if edit.changed() {
+                    strategy.save()?;
+                }
+                emit(json, edit.to_json(), edit.summary());
             }
         },
         Commands::Group { cmd } => match cmd {
