@@ -22,6 +22,19 @@ fn isolated() -> Guard {
 }
 
 #[test]
+fn proxy_server_dns_uses_tcp_and_does_not_fall_back_to_the_system_resolver() {
+    let dns = proxy_server_dns();
+    assert_eq!(dns["disableFallback"], true);
+    assert_eq!(dns["queryStrategy"], "UseIPv4");
+    assert_eq!(dns["servers"], serde_json::json!(["tcp://1.1.1.1", "tcp://8.8.8.8"]));
+    let rule = proxy_server_dns_rule();
+    assert_eq!(rule["outboundTag"], "dns-direct");
+    assert_eq!(rule["network"], "tcp");
+    assert_eq!(rule["port"], "53");
+    assert_eq!(rule["ip"], serde_json::json!(["1.1.1.1/32", "8.8.8.8/32"]));
+}
+
+#[test]
 #[cfg(feature = "xray-channel")]
 fn xray_data_ignores_inherited_production_override() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());

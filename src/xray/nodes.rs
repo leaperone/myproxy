@@ -40,7 +40,26 @@ pub fn render(node: &Node, tag: &str) -> Result<Value> {
     if let Some(stream) = stream_settings(&node.raw, &kind)? {
         outbound.insert("streamSettings".into(), stream);
     }
+    // The core process bypasses the system DNS proxy, so the Go resolver's UDP
+    // query to the system nameserver times out. Resolve the server name first.
+    use_configured_dns(&mut outbound);
     Ok(Value::Object(outbound))
+}
+
+fn use_configured_dns(outbound: &mut Map<String, Value>) {
+    let stream = outbound
+        .entry("streamSettings".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(stream) = stream else {
+        return;
+    };
+    let sockopt = stream
+        .entry("sockopt".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(sockopt) = sockopt else {
+        return;
+    };
+    sockopt.insert("domainStrategy".into(), "UseIPv4".into());
 }
 
 fn shadowsocks(raw: &YamlValue, address: &str, port: u16) -> Result<Value> {
@@ -395,6 +414,11 @@ mod tests {
     use super::*;
     fn node(kind: &str) -> Node {
         Node { name: "fixture".into(), subscription: "test".into(), raw: serde_yaml::from_str(&format!("name: fixture\ntype: {kind}\nserver: example.com\nport: 443\nuuid: 00000000-0000-4000-8000-000000000001\ncipher: aes-128-gcm\npassword: fixture-password\nnetwork: tcp\ntls: true\n")).unwrap() }
+    }
+    #[test]
+    fn dials_server_names_through_the_core_dns_client() {
+        let value = render(&node("vless"), "stable-tag").unwrap();
+        assert_eq!(value["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");
     }
     #[test]
     fn renders_supported_protocols() {
