@@ -521,6 +521,7 @@ public struct CaptureRuleEngine: Sendable {
         // macOS natively can never connect. Mihomo restores the domain and
         // applies the same DIRECT rule from its own rule list.
         guard decision.action == .direct,
+              case .matchedRule = decision.cause,
               let address = context.destination.ipAddress,
               DNSProxyUpstreamResolver.mihomoFakeIPNetwork.contains(address)
         else { return decision }
