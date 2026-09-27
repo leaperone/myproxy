@@ -297,10 +297,24 @@ final class UDPFlowSession: @unchecked Sendable {
         let plan: UDPFlowInterceptionPlan
         if initialPlanAvailable,
            initialPlan.configurationRevision == revision,
-           initialPlan.initialDestination == destination,
-           queryScope == nil {
+           initialPlan.initialDestination == destination {
             initialPlanAvailable = false
-            plan = initialPlan
+            if queryScope == nil {
+                plan = initialPlan
+            } else {
+                // The payload refined the route, so the activity published at
+                // start never gets a conversation of its own.
+                observerFactory(initialPlan.activity.flowIdentifier)(
+                    AppRoutingRelaySnapshot(
+                        state: .completed,
+                        uploadBytes: 0,
+                        downloadBytes: 0,
+                        error: nil,
+                        localPort: nil
+                    )
+                )
+                plan = planner(destination, queryScope)
+            }
         } else {
             plan = planner(destination, queryScope)
         }

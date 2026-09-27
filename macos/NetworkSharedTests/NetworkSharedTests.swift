@@ -573,28 +573,31 @@ struct NetworkSharedTests {
         }
 
         run.test("dns_query_scope_from_message") {
+            func scope(_ message: Data) -> DNSQueryScope? {
+                DNSQueryScope.questionName(in: message).map { DNSQueryScope(name: $0) }
+            }
             try expectEqual(
                 DNSQueryScope.questionName(in: dnsQuery(["www", "youtube", "com"])),
                 "www.youtube.com",
                 "question name"
             )
-            try expectEqual(DNSQueryScope(message: dnsQuery(["www", "youtube", "com"])), .remote, "public name")
-            try expectEqual(DNSQueryScope(message: dnsQuery(["nas", "lan"])), .local, ".lan")
-            try expectEqual(DNSQueryScope(message: dnsQuery(["printer", "local"])), .local, ".local")
-            try expectEqual(DNSQueryScope(message: dnsQuery(["router", "home", "arpa"])), .local, ".home.arpa")
-            try expectEqual(DNSQueryScope(message: dnsQuery(["nas"])), .local, "single label")
+            try expectEqual(scope(dnsQuery(["www", "youtube", "com"])), .remote, "public name")
+            try expectEqual(scope(dnsQuery(["nas", "lan"])), .local, ".lan")
+            try expectEqual(scope(dnsQuery(["printer", "local"])), .local, ".local")
+            try expectEqual(scope(dnsQuery(["router", "home", "arpa"])), .local, ".home.arpa")
+            try expectEqual(scope(dnsQuery(["nas"])), .local, "single label")
             try expectEqual(
-                DNSQueryScope(message: dnsQuery(["1", "0", "168", "192", "in-addr", "arpa"])),
+                scope(dnsQuery(["1", "0", "168", "192", "in-addr", "arpa"])),
                 .local,
                 "reverse lookup"
             )
-            try expectEqual(DNSQueryScope(message: Data([0x12, 0x34])), nil, "truncated")
+            try expectEqual(scope(Data([0x12, 0x34])), nil, "truncated")
             var noQuestion = [UInt8](dnsQuery(["example", "com"]))
             noQuestion[5] = 0
-            try expectEqual(DNSQueryScope(message: Data(noQuestion)), nil, "no question")
+            try expectEqual(scope(Data(noQuestion)), nil, "no question")
             var overrun = [UInt8](dnsQuery(["example", "com"]))
             overrun[12] = 40
-            try expectEqual(DNSQueryScope(message: Data(overrun)), nil, "label overruns message")
+            try expectEqual(scope(Data(overrun)), nil, "label overruns message")
         }
 
         run.test("dns_route_sends_public_queries_to_mihomo") {
@@ -603,12 +606,14 @@ struct NetworkSharedTests {
             func route(
                 _ destination: SOCKS5Endpoint,
                 trusted: Bool = false,
-                scope: DNSQueryScope?
+                scope: DNSQueryScope?,
+                mihomoAvailable: Bool = true
             ) -> DNSRelayRoute {
                 DNSRelayRoutingPolicy.route(
                     destination: destination,
                     isTrustedMyproxyComponent: trusted,
-                    queryScope: scope
+                    queryScope: scope,
+                    mihomoAvailable: mihomoAvailable
                 )
             }
             try expectEqual(route(router, scope: .remote), .mihomo, "public name to router")
@@ -616,6 +621,18 @@ struct NetworkSharedTests {
             try expectEqual(route(router, scope: nil), .directLocalResolver, "unparsed query to router")
             try expectEqual(route(google, scope: .remote), .mihomo, "public resolver")
             try expectEqual(route(google, scope: nil), .mihomo, "public resolver before first datagram")
+            try expectEqual(route(google, scope: .native), .directNativeFlow, "DIRECT app lookup")
+            try expectEqual(
+                route(router, scope: .remote, mihomoAvailable: false),
+                .directMihomoUnavailable,
+                "Mihomo down"
+            )
+            try expectEqual(
+                DNSRelayRoute.directMihomoUnavailable.target(for: router, resolvers: []),
+                router,
+                "Mihomo down keeps the addressed resolver"
+            )
+            try expectEqual(route(router, scope: .native), .directNativeFlow, "DIRECT app lookup via router")
             try expectEqual(
                 route(google, trusted: true, scope: .remote),
                 .directTrustedComponent,
@@ -643,6 +660,11 @@ struct NetworkSharedTests {
                 DNSRelayRoute.directLocalResolver.target(for: router, resolvers: [cloudflare]),
                 router,
                 "LAN resolver kept"
+            )
+            try expectEqual(
+                DNSRelayRoute.directNativeFlow.target(for: router, resolvers: [cloudflare]),
+                router,
+                "DIRECT app keeps its resolver"
             )
             try expectEqual(
                 DNSRelayRoute.directLocalResolver.target(for: lanName, resolvers: [cloudflare]),

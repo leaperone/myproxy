@@ -236,6 +236,9 @@ public enum DNSProxyUpstreamResolver {
 public enum DNSQueryScope: Hashable, Sendable {
     case local
     case remote
+    /// A public name the app's connection would reach unrelayed (a DIRECT
+    /// rule), so a fake-ip answer would be unusable.
+    case native
 
     public init(name: String) {
         let normalized = name
@@ -253,14 +256,9 @@ public enum DNSQueryScope: Hashable, Sendable {
         self = isLocal ? .local : .remote
     }
 
-    /// Classifies the first question of a DNS message; `nil` when the payload
-    /// is not a parseable query.
-    public init?(message: Data) {
-        guard let name = Self.questionName(in: message) else { return nil }
-        self.init(name: name)
-    }
-
-    static func questionName(in message: Data) -> String? {
+    /// First question name of a DNS message; `nil` when the payload is not a
+    /// parseable query.
+    public static func questionName(in message: Data) -> String? {
         let bytes = [UInt8](message)
         guard bytes.count > 12, bytes[4] != 0 || bytes[5] != 0 else { return nil }
         var labels: [String] = []
@@ -279,6 +277,10 @@ public enum DNSQueryScope: Hashable, Sendable {
 public enum DNSRelayRoute: Equatable, Sendable {
     case directTrustedComponent
     case directLocalResolver
+    case directNativeFlow
+    /// Mihomo's backend probe keeps failing; answer from a real resolver
+    /// until it recovers rather than leaving system lookups unanswered.
+    case directMihomoUnavailable
     case mihomo
 
     /// Every route is dialed from the provider's own socket, which DNS
@@ -290,7 +292,8 @@ public enum DNSRelayRoute: Equatable, Sendable {
         resolvers: [SOCKS5Endpoint]
     ) -> SOCKS5Endpoint {
         switch self {
-        case .directTrustedComponent, .directLocalResolver:
+        case .directTrustedComponent, .directLocalResolver, .directNativeFlow,
+             .directMihomoUnavailable:
             DNSProxyUpstreamResolver.relayDestination(for: destination, resolvers: resolvers)
         case .mihomo:
             DNSProxyUpstreamResolver.mihomoDNS
@@ -302,10 +305,14 @@ public enum DNSRelayRoutingPolicy {
     public static func route(
         destination: SOCKS5Endpoint,
         isTrustedMyproxyComponent: Bool,
-        queryScope: DNSQueryScope?
+        queryScope: DNSQueryScope?,
+        mihomoAvailable: Bool
     ) -> DNSRelayRoute {
         if isTrustedMyproxyComponent {
             return .directTrustedComponent
+        }
+        if queryScope == .native {
+            return .directNativeFlow
         }
         if let domain = destination.address.domain, DNSQueryScope(name: domain) == .local {
             return .directLocalResolver
@@ -313,6 +320,6 @@ public enum DNSRelayRoutingPolicy {
         if destination.address.ipAddress?.isLocalNetwork == true, queryScope != .remote {
             return .directLocalResolver
         }
-        return .mihomo
+        return mihomoAvailable ? .mihomo : .directMihomoUnavailable
     }
 }

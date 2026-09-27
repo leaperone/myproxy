@@ -323,7 +323,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         let route = DNSRelayRoutingPolicy.route(
             destination: destination,
             isTrustedMyproxyComponent: flowDecisionCoordinator.isTrustedMyproxyComponent(tcpFlow),
-            queryScope: nil
+            queryScope: nil,
+            mihomoAvailable: runtimeState.mihomoAvailable
         )
         tcpRelays.startDirect(
             flow: tcpFlow,
@@ -544,7 +545,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             route: DNSRelayRoutingPolicy.route(
                 destination: initialDestination,
                 isTrustedMyproxyComponent: sourceIsTrusted,
-                queryScope: nil
+                queryScope: nil,
+                mihomoAvailable: runtimeState.mihomoAvailable
             ),
             parentIdentifier: parentIdentifier,
             resolvers: runtimeState.upstreamResolvers
@@ -554,7 +556,14 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             id: parentIdentifier,
             flow: flow,
             initialPlan: initialPlan,
-            queryScope: { DNSQueryScope(message: $0) },
+            queryScope: { [weak self] message in
+                guard let name = DNSQueryScope.questionName(in: message) else { return nil }
+                let scope = DNSQueryScope(name: name)
+                guard scope == .remote,
+                      self?.flowDecisionCoordinator.passesNatively(flow, hostname: name) == true
+                else { return scope }
+                return .native
+            },
             planner: { [weak self] destination, queryScope in
                 guard let self else {
                     return initialPlan
@@ -566,7 +575,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                     route: DNSRelayRoutingPolicy.route(
                         destination: destination,
                         isTrustedMyproxyComponent: sourceIsTrusted,
-                        queryScope: queryScope
+                        queryScope: queryScope,
+                        mihomoAvailable: currentState.mihomoAvailable
                     ),
                     parentIdentifier: parentIdentifier,
                     resolvers: currentState.upstreamResolvers
@@ -652,6 +662,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             "Trusted myproxy DNS egress relayed directly."
         case .directLocalResolver:
             "LAN DNS query relayed to its resolver."
+        case .directNativeFlow:
+            "DNS for a DIRECT connection relayed to its resolver."
+        case .directMihomoUnavailable:
+            "Mihomo is unavailable; DNS relayed to a real resolver."
         case .mihomo:
             "DNS relayed to Mihomo's fake-ip DNS."
         }
@@ -690,10 +704,16 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     private func runtimeDataPlaneSnapshot() -> (
         reporter: DNSProxyRuntimeReporter?,
         proxy: ProviderSOCKSConfiguration?,
-        upstreamResolvers: [SOCKS5Endpoint]
+        upstreamResolvers: [SOCKS5Endpoint],
+        mihomoAvailable: Bool
     ) {
         backendProbeLock.lock()
-        let snapshot = (reporter, proxy, upstreamResolvers)
+        let snapshot = (
+            reporter,
+            proxy,
+            upstreamResolvers,
+            consecutiveBackendProbeFailures < Self.backendProbeFailureThreshold
+        )
         backendProbeLock.unlock()
         return snapshot
     }

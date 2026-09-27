@@ -220,6 +220,26 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         )
     }
 
+    /// Whether the transparent proxy would pass this app's connection to
+    /// `hostname` to macOS unrelayed, so its lookup must return a real address
+    /// rather than a Mihomo fake-ip. The port is unknown at lookup time; host
+    /// capture rules carry no port ranges.
+    func passesNatively(_ flow: NEAppProxyFlow, hostname: String) -> Bool {
+        let outcome = decide(
+            flow: flow,
+            endpoint: FlowRemoteEndpoint(host: hostname, port: "443"),
+            transportProtocol: .tcp,
+            state: snapshotState(),
+            remoteHostname: hostname
+        )
+        switch outcome.decision.disposition {
+        case .direct, .failOpen:
+            return true
+        case .reject, .mihomo:
+            return false
+        }
+    }
+
     @available(macOS 15.0, *)
     func planUDPFlow(
         _ flow: NEAppProxyUDPFlow,

@@ -107,9 +107,10 @@ application support directory.
   disabled, the core is kept so system resolution is not blackholed.
 - With System Extension on, public lookups (including public names asked of the
   router) are answered by Mihomo's fake-ip DNS, so apps see `198.18.x` addresses
-  and Mihomo applies domain rules when they connect. While the core restarts,
-  public lookups fail until it is back; if recovery gives up, DNS interception
-  is released with capture. LAN names such as `.lan`, `.local`, and single-label
+  and Mihomo applies domain rules when they connect. Apps and names that a rule
+  sends DIRECT get real addresses. If the core stops answering, lookups fall back
+  to a real resolver once the provider's health probe confirms it, and return to
+  fake-ip when it recovers. LAN names such as `.lan`, `.local`, and single-label
   hosts still go to the LAN resolver. When a lookup goes direct and macOS
   reports the queried name instead of a resolver address, the provider uses the
   strategy's `dns.nameserver` list. DNS readiness reported in the app proves the
