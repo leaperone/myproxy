@@ -281,12 +281,19 @@ public enum DNSRelayRoute: Equatable, Sendable {
     case directLocalResolver
     case mihomo
 
-    public var bypassesMihomo: Bool {
+    /// Every route is dialed from the provider's own socket, which DNS
+    /// interception does not see. Mihomo's DNS is reached directly rather than
+    /// through a SOCKS listener, whose `proxy:` in proxy/global mode would carry
+    /// the loopback query to the remote node.
+    public func target(
+        for destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint]
+    ) -> SOCKS5Endpoint {
         switch self {
         case .directTrustedComponent, .directLocalResolver:
-            true
+            DNSProxyUpstreamResolver.relayDestination(for: destination, resolvers: resolvers)
         case .mihomo:
-            false
+            DNSProxyUpstreamResolver.mihomoDNS
         }
     }
 }

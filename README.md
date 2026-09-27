@@ -104,16 +104,16 @@ application support directory.
   **显示直连** reveals only DIRECT connections recorded by the core.
 - System Extension DNS interception stays coupled to the core: disconnect waits
   until capture and DNS are down before stopping Mihomo. If NEDNSProxy cannot be
-  disabled, the core is kept so system resolution is not blackholed. When the
-  private SOCKS backend is down, the DNS provider relays queries directly.
+  disabled, the core is kept so system resolution is not blackholed.
 - With System Extension on, public lookups (including public names asked of the
   router) are answered by Mihomo's fake-ip DNS, so apps see `198.18.x` addresses
-  and Mihomo applies domain rules when they connect. LAN names such as `.lan`,
-  `.local`, and single-label hosts still go to the LAN resolver. When a lookup
-  goes direct and macOS reports the queried name instead of a resolver address,
-  the provider uses the strategy's `dns.nameserver` list. DNS readiness reported
-  in the app proves the private SOCKS relay is reachable, not that every lookup
-  resolves.
+  and Mihomo applies domain rules when they connect. While the core restarts,
+  public lookups fail until it is back; if recovery gives up, DNS interception
+  is released with capture. LAN names such as `.lan`, `.local`, and single-label
+  hosts still go to the LAN resolver. When a lookup goes direct and macOS
+  reports the queried name instead of a resolver address, the provider uses the
+  strategy's `dns.nameserver` list. DNS readiness reported in the app proves the
+  private SOCKS listener is reachable, not that every lookup resolves.
 
 Source checks and builds do not verify macOS approval, DNS forwarding, or actual
 traffic. Those require acceptance on the signed installed application.

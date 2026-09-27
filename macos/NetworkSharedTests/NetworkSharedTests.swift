@@ -633,6 +633,24 @@ struct NetworkSharedTests {
             )
         }
 
+        run.test("dns_route_target") {
+            let router = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("192.168.0.1")), port: 53)
+            let cloudflare = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("1.1.1.1")), port: 53)
+            let mihomo = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("127.0.0.1")), port: 1053)
+            let lanName = SOCKS5Endpoint(address: try SOCKS5Address(domain: "nas.lan"), port: 53)
+            try expectEqual(DNSRelayRoute.mihomo.target(for: router, resolvers: [cloudflare]), mihomo, "Mihomo fake-ip DNS")
+            try expectEqual(
+                DNSRelayRoute.directLocalResolver.target(for: router, resolvers: [cloudflare]),
+                router,
+                "LAN resolver kept"
+            )
+            try expectEqual(
+                DNSRelayRoute.directLocalResolver.target(for: lanName, resolvers: [cloudflare]),
+                cloudflare,
+                "name endpoint dials a resolver address"
+            )
+        }
+
         let total = run.passed + run.failed
         print("\(run.passed) passed, \(run.failed) failed, \(total) total")
         if run.failed > 0 {

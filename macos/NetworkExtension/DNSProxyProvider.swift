@@ -36,10 +36,10 @@ enum DNSProxyBootstrapError: LocalizedError {
 }
 
 /// DNS proxy entry point. Public queries, including public names sent to a LAN
-/// resolver such as the DHCP router, go through the profile-rules SOCKS5
-/// listener to Mihomo's fake-ip DNS. A group listener is never used because
-/// its `proxy:` would carry the loopback query to the remote node. LAN names
-/// and unparseable queries to a LAN resolver stay direct.
+/// resolver such as the DHCP router, are answered by Mihomo's fake-ip DNS.
+/// LAN names, unparseable queries to a LAN resolver, and Mihomo's own lookups
+/// go to the resolver they address. The private SOCKS5 listener is probed as
+/// the core's liveness signal but carries no DNS.
 /// A relay failure is reported to the host heartbeat as a waiting DNS phase.
 /// The host releases the DNS manager when the core cannot be recovered.
 final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
@@ -310,10 +310,6 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             reject(flow, category: .flowConversionFailed)
             return true
         }
-        let relayTarget = relayDestination(
-            for: destination,
-            resolvers: runtimeState.upstreamResolvers
-        )
         let identifier = UUID()
         runtimeState.reporter?.beginFlow(identifier, transportProtocol: .tcp)
         let reporter = runtimeState.reporter
@@ -329,31 +325,12 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             isTrustedMyproxyComponent: flowDecisionCoordinator.isTrustedMyproxyComponent(tcpFlow),
             queryScope: nil
         )
-        if route.bypassesMihomo {
-            // Mihomo's own DNS egress must not be sent back through Mihomo's
-            // SOCKS listener. Relay it from the provider process, whose own
-            // sockets are outside the DNS interception path, to break the
-            // otherwise recursive DNS→SOCKS→DNS loop.
-            tcpRelays.startDirect(
-                flow: tcpFlow,
-                destination: relayTarget,
-                relayNote: directRelayNote(for: route),
-                activityObserver: observer
-            )
-        } else {
-            guard let proxy = runtimeState.proxy else {
-                reject(flow, category: .backendUnavailable)
-                return true
-            }
-            tcpRelays.startMihomo(
-                flow: tcpFlow,
-                proxy: proxy,
-                destination: DNSProxyUpstreamResolver.mihomoDNS,
-                directFallbackDestination: relayTarget,
-                unavailableFallback: .direct,
-                activityObserver: observer
-            )
-        }
+        tcpRelays.startDirect(
+            flow: tcpFlow,
+            destination: route.target(for: destination, resolvers: runtimeState.upstreamResolvers),
+            relayNote: directRelayNote(for: route),
+            activityObserver: observer
+        )
         return true
     }
 
@@ -564,7 +541,6 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         let sourceIsTrusted = flowDecisionCoordinator.isTrustedMyproxyComponent(flow)
         let initialPlan = dnsPlan(
             destination: initialDestination,
-            proxy: runtimeState.proxy,
             route: DNSRelayRoutingPolicy.route(
                 destination: initialDestination,
                 isTrustedMyproxyComponent: sourceIsTrusted,
@@ -587,7 +563,6 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
                 guard currentState.proxy != nil else { return initialPlan }
                 return self.dnsPlan(
                     destination: destination,
-                    proxy: currentState.proxy,
                     route: DNSRelayRoutingPolicy.route(
                         destination: destination,
                         isTrustedMyproxyComponent: sourceIsTrusted,
@@ -622,14 +597,12 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
 
     private func dnsPlan(
         destination: SOCKS5Endpoint,
-        proxy: ProviderSOCKSConfiguration?,
         route: DNSRelayRoute,
         parentIdentifier: UUID,
         resolvers: [SOCKS5Endpoint]
     ) -> UDPFlowInterceptionPlan {
-        let bypassMihomo = route.bypassesMihomo
         let decision = FlowTrafficDecision(
-            disposition: bypassMihomo ? .direct : .mihomo(.profileRules),
+            disposition: .direct,
             reason: route == .directTrustedComponent
                 ? .rule(.builtInBypass(.trustedmyproxyComponent))
                 : .rule(.defaultDirect)
@@ -653,8 +626,8 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             ),
             transportProtocol: .udp,
             decision: decision,
-            configuredAction: bypassMihomo ? .direct : .mihomo(.profileRules),
-            effectiveAction: bypassMihomo ? .direct : .mihomo(.profileRules),
+            configuredAction: .direct,
+            effectiveAction: .direct,
             relayState: .pending,
             payloadBytesAreMeasured: true,
             uploadDatagrams: 0,
@@ -664,39 +637,21 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         return UDPFlowInterceptionPlan(
             decision: decision,
             initialDestination: destination,
-            mihomoDestination: DNSProxyUpstreamResolver.mihomoDNS,
-            directDestination: relayDestination(
-                for: destination,
-                resolvers: resolvers
-            ),
-            proxy: proxy,
+            mihomoDestination: nil,
+            directDestination: route.target(for: destination, resolvers: resolvers),
+            proxy: nil,
             unavailableFallback: .direct,
             activity: activity,
             parentFlowIdentifier: parentIdentifier
         )
     }
 
-    /// macOS reports the *queried name* as the endpoint of system-resolver DNS
-    /// flows, so the endpoint the provider sees is not the resolver it must
-    /// reach. Those flows are answered through the configured upstream
-    /// resolvers; the original endpoint stays the conversation key and the
-    /// endpoint the app receives its reply from.
-    private func relayDestination(
-        for destination: SOCKS5Endpoint,
-        resolvers: [SOCKS5Endpoint]
-    ) -> SOCKS5Endpoint {
-        DNSProxyUpstreamResolver.relayDestination(
-            for: destination,
-            resolvers: resolvers
-        )
-    }
-
     private func directRelayNote(for route: DNSRelayRoute) -> String {
         switch route {
         case .directTrustedComponent:
-            "Trusted myproxy DNS egress bypassed the private SOCKS listener."
+            "Trusted myproxy DNS egress relayed directly."
         case .directLocalResolver:
-            "Local DNS resolver bypassed the private SOCKS listener."
+            "LAN DNS query relayed to its resolver."
         case .mihomo:
             "DNS relayed to Mihomo's fake-ip DNS."
         }
