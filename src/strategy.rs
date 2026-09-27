@@ -1653,9 +1653,12 @@ pub struct ImportOutcome {
     pub backup: Option<PathBuf>,
 }
 
-/// Replace the live `strategy.json` after writing `strategy.json.bak-import-*`.
 pub fn import_from(path: &Path) -> Result<ImportOutcome> {
-    let strategy = parse_import(path)?;
+    import_strategy(parse_import(path)?)
+}
+
+/// Replace the live `strategy.json` after writing `strategy.json.bak-import-*`.
+pub fn import_strategy(strategy: Strategy) -> Result<ImportOutcome> {
     let current = paths::strategy_path()?;
     let backup = backup_strategy_at(&current)?;
     strategy.save()?;

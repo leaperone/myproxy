@@ -160,7 +160,7 @@ impl Catalog {
     }
 }
 
-pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
+pub fn refresh(strategy: &Strategy, mixed_port: Option<u16>) -> Result<Catalog> {
     strategy.validate()?;
     let exclude = Regex::new(&strategy.exclude_filter)
         .context("invalid exclude_filter regex")
@@ -174,7 +174,7 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
     );
 
     for sub in &strategy.subscriptions {
-        match fetch_proxies(&sub.name, &sub.url) {
+        match fetch_proxies(&sub.name, &sub.url, mixed_port) {
             Ok(proxies) => {
                 let before = catalog.nodes.len();
                 for raw in proxies {
@@ -273,27 +273,27 @@ pub fn refresh(strategy: &Strategy) -> Result<Catalog> {
     Ok(catalog)
 }
 
-fn fetch_proxies(name: &str, url: &str) -> Result<Vec<serde_yaml::Value>> {
+fn fetch_proxies(name: &str, url: &str, mixed_port: Option<u16>) -> Result<Vec<serde_yaml::Value>> {
     let body = if let Some(path) = url.strip_prefix("file://") {
         fs::read_to_string(path).with_context(|| format!("read {name}"))?
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        fetch_http_body(name, url)?
+        fetch_http_body(name, url, mixed_port)?
     } else {
         fs::read_to_string(url).with_context(|| format!("read {name}"))?
     };
     parse_subscription(&body)
 }
 
-fn fetch_http_body(name: &str, url: &str) -> Result<String> {
+fn fetch_http_body(name: &str, url: &str, mixed_port: Option<u16>) -> Result<String> {
     // curl is available on macOS and lets us force IPv4. Do not start a second
     // direct attempt: a broken DNS/IPv6 path would otherwise pay the full
     // timeout twice and make Apply appear hung. A transport failure may still
     // succeed through the already applied Mixed listener. That retry uses the
-    // running core's port only after the controller accepts our secret.
+    // caller's Mixed port only after the controller accepts our secret.
     match fetch_http_body_curl(url, None) {
         Ok(body) => Ok(body),
         Err(err) if transport_curl_failure(&err.to_string()) => {
-            let Some(proxy) = applied_mixed_proxy() else {
+            let Some(proxy) = applied_mixed_proxy(mixed_port) else {
                 return Err(err).context(format!("GET {name} via IPv4 curl"));
             };
             log::info(
@@ -311,8 +311,8 @@ fn fetch_http_body(name: &str, url: &str) -> Result<String> {
     }
 }
 
-fn applied_mixed_proxy() -> Option<String> {
-    let port = crate::supervisor::Supervisor::shared().update_download_port()?;
+fn applied_mixed_proxy(mixed_port: Option<u16>) -> Option<String> {
+    let port = mixed_port?;
     crate::controller::ready(port).ok()?;
     Some(format!("http://127.0.0.1:{port}"))
 }
