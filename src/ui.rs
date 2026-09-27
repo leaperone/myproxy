@@ -1791,7 +1791,13 @@ impl AppView {
 
     fn core_status_label(&self) -> &'static str {
         match self.operation {
-            OperationState::Connecting | OperationState::Disconnecting => "启动中",
+            OperationState::Connecting => "启动中",
+            OperationState::Disconnecting => "停止中",
+            _ if self.connected
+                && (self.traffic_error.is_some() || self.proxy_error.is_some()) =>
+            {
+                "无响应"
+            }
             _ if self.connected => "已就绪",
             _ if self.wanted || self.operation == OperationState::Error => "异常",
             _ => "未连接",
@@ -1799,18 +1805,32 @@ impl AppView {
     }
 
     fn extension_status_label(&self) -> &'static str {
-        if !self.applied.system_extension {
+        let status = &self.extension_status;
+        if !self.applied.system_extension
+            && status.observed
+            && matches!(
+                status.phase,
+                Phase::Disabled | Phase::Unsupported | Phase::Unbundled
+            )
+        {
             "关闭"
         } else {
-            self.extension_status.phase_label()
+            status.phase_label()
         }
     }
 
     fn dns_status_label(&self) -> &'static str {
-        if !self.applied.system_extension {
+        let status = &self.extension_status;
+        if !self.applied.system_extension
+            && status.observed
+            && matches!(
+                status.dns_phase,
+                network_extension::DnsPhase::Disabled | network_extension::DnsPhase::Unknown
+            )
+        {
             "关闭"
         } else {
-            self.extension_status.dns_label()
+            status.dns_label()
         }
     }
 
@@ -3133,11 +3153,13 @@ impl AppView {
         let dns_label = self.dns_status_label();
         let core_color = match core_label {
             "已就绪" => theme.success,
-            "异常" => theme.warning,
-            "启动中" => theme.accent,
+            "异常" | "无响应" => theme.warning,
+            "启动中" | "停止中" => theme.accent,
             _ => theme.muted_foreground,
         };
-        let extension_color = if extension_label == "关闭"
+        let extension_color = if !self.extension_status.observed {
+            theme.warning
+        } else if extension_label == "关闭"
             || matches!(
                 self.extension_status.phase,
                 Phase::Disabled | Phase::Unsupported | Phase::Unbundled
@@ -3153,15 +3175,19 @@ impl AppView {
         } else {
             theme.accent
         };
-        let dns_color = if dns_label == "关闭"
+        let dns_color = if !self.extension_status.observed {
+            theme.warning
+        } else if dns_label == "关闭"
             || matches!(
                 self.extension_status.dns_phase,
-                network_extension::DnsPhase::Disabled | network_extension::DnsPhase::Unknown
+                network_extension::DnsPhase::Disabled
             ) {
             theme.muted_foreground
         } else if matches!(
             self.extension_status.dns_phase,
-            network_extension::DnsPhase::Failed | network_extension::DnsPhase::Waiting
+            network_extension::DnsPhase::Failed
+                | network_extension::DnsPhase::Waiting
+                | network_extension::DnsPhase::Unknown
         ) {
             theme.warning
         } else if matches!(
@@ -4469,19 +4495,24 @@ impl AppView {
         .detach();
     }
 
-    fn begin_import_strategy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn import_blocked(&self) -> Option<&'static str> {
         if self.is_busy() {
-            self.status = "正在处理上一项操作。".into();
-            cx.notify();
-            return;
+            Some("正在处理上一项操作。")
+        } else if self.group_modal_open || self.rule_modal_open || self.subscription_modal_open {
+            Some("请先关闭编辑窗口再导入。")
+        } else {
+            None
         }
+    }
+
+    fn begin_import_strategy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.file_dialog_pending {
             self.status = "文件面板已打开。".into();
             cx.notify();
             return;
         }
-        if self.group_modal_open || self.rule_modal_open || self.subscription_modal_open {
-            self.status = "请先关闭编辑窗口再导入。".into();
+        if let Some(reason) = self.import_blocked() {
+            self.status = reason.into();
             cx.notify();
             return;
         }
@@ -4506,6 +4537,11 @@ impl AppView {
                         return;
                     }
                 };
+                if let Some(reason) = this.import_blocked() {
+                    this.status = reason.into();
+                    cx.notify();
+                    return;
+                }
                 match myproxy::strategy::parse_import(&path) {
                     Ok(preview) => this.open_import_confirm(path, preview, window, cx),
                     Err(error) => {
