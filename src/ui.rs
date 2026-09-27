@@ -1141,6 +1141,7 @@ pub struct AppView {
     applied: Strategy,
     catalog: Catalog,
     status: String,
+    health_note: Option<String>,
     connected: bool,
     wanted: bool,
     busy: bool,
@@ -1424,6 +1425,7 @@ impl AppView {
         let this = Self {
             page: initial_page(),
             sidebar_compact: false,
+            health_note: None,
             status: if catalog.nodes.is_empty() {
                 "策略已加载。先添加订阅并刷新，再连接。".into()
             } else {
@@ -1754,14 +1756,18 @@ impl AppView {
             }
             dirty = true;
         }
-        if let Some(note) = health.note {
-            if self.status != note {
+        let note_changed = health.note != self.health_note;
+        self.health_note = health.note.clone();
+        match health.note {
+            Some(note) if note_changed => {
                 self.status = note;
                 dirty = true;
             }
-        } else if became_ready {
-            self.status = format!("Mixed 已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
-            dirty = true;
+            None if became_ready => {
+                self.status = format!("Mixed 已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
+                dirty = true;
+            }
+            _ => {}
         }
         dirty
     }

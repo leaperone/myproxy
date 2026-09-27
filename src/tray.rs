@@ -179,7 +179,7 @@ fn menu_face() -> MenuFace {
             extension.dns_label()
         ),
         _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "核心尚未就绪".into()),
-        _ => "未连接".into(),
+        _ => health.note.clone().unwrap_or_else(|| "未连接".into()),
     };
     if !busy && operation == OperationState::Error {
         status = health

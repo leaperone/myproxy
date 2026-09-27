@@ -80,6 +80,7 @@ struct HealthWatch {
     last: CoreHealth,
     fails: u32,
     recoveries: u32,
+    released: Option<String>,
 }
 
 impl Default for HealthWatch {
@@ -90,6 +91,7 @@ impl Default for HealthWatch {
             last: CoreHealth::idle(),
             fails: 0,
             recoveries: 0,
+            released: None,
         }
     }
 }
@@ -364,15 +366,14 @@ impl Supervisor {
     }
 
     pub fn last_health(&self) -> CoreHealth {
+        let watch = self.health.lock().expect("supervisor health lock");
         if !is_wanted() {
-            return CoreHealth::idle();
+            return CoreHealth {
+                note: watch.released.clone(),
+                ..CoreHealth::idle()
+            };
         }
-        let mut health = self
-            .health
-            .lock()
-            .expect("supervisor health lock")
-            .last
-            .clone();
+        let mut health = watch.last.clone();
         health.wanted = true;
         health
     }
@@ -872,8 +873,7 @@ impl Supervisor {
 
     pub fn observe(&self, _draft: &Strategy) -> CoreHealth {
         if !is_wanted() {
-            self.reset_health();
-            return CoreHealth::idle();
+            return self.last_health();
         }
         if self.is_busy() {
             return self.last_health();
@@ -936,21 +936,63 @@ impl Supervisor {
             watch.fails = watch.fails.saturating_add(1);
             (watch.fails, watch.recoveries, watch.last_recover)
         };
-        let note = if recoveries >= MAX_RECOVERIES {
-            "已停止自动恢复，请手动连接"
-        } else if fails < FAIL_BEFORE_RETRY {
-            "正在确认"
-        } else if last_recover
-            .map(|at| now.duration_since(at) < RECOVER_INTERVAL)
-            .unwrap_or(false)
-        {
-            "等待自动重试"
-        } else {
-            return self.recover(runtime, now);
+        let note = match recovery_step(fails, recoveries, last_recover, now) {
+            RecoveryStep::Confirm => "正在确认",
+            RecoveryStep::Wait => "等待自动重试",
+            RecoveryStep::Recover => return self.recover(runtime, now),
+            RecoveryStep::GiveUp => return self.give_up(runtime.generation, reason),
         };
         let health = CoreHealth::failing(&format!("{reason}；{note}"));
         self.store_health(health.clone());
         health
+    }
+
+    // Capture and DNS fail open to Direct without a backend, but a system proxy
+    // left on a dead Mixed port breaks every proxied app, so exhausting
+    // recovery releases everything exactly like a disconnect.
+    fn give_up(&self, generation: u64, reason: &str) -> CoreHealth {
+        let Ok(mut operation) = acquire_operation_with_timeout(Duration::ZERO) else {
+            return self.last_health();
+        };
+        if *operation._state || !is_wanted() {
+            return self.last_health();
+        }
+        if RuntimeConfig::load()
+            .ok()
+            .flatten()
+            .map(|current| current.generation)
+            != Some(generation)
+        {
+            return self.last_health();
+        }
+        log::error("supervisor", format!("core recovery exhausted: {reason}"));
+        let _ = operation.show(OperationState::Disconnecting);
+        let result = self.disconnect_inner(None).and_then(|()| set_wanted(false));
+        match result {
+            Ok(()) => {
+                let note = format!("核心多次恢复失败，已自动断开并恢复系统网络设置：{reason}");
+                let mut watch = self.health.lock().expect("supervisor health lock");
+                *watch = HealthWatch::default();
+                watch.released = Some(note.clone());
+                CoreHealth {
+                    note: Some(note),
+                    ..CoreHealth::idle()
+                }
+            }
+            Err(error) => {
+                log::error(
+                    "supervisor",
+                    format!("give-up disconnect failed: {error:#}"),
+                );
+                OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
+                let health =
+                    CoreHealth::failing(&format!("核心多次恢复失败，自动断开未完成，将重试：{error:#}"));
+                let mut watch = self.health.lock().expect("supervisor health lock");
+                watch.last_recover = Some(Instant::now());
+                watch.last = health.clone();
+                health
+            }
+        }
     }
 
     fn recover(&self, mut runtime: RuntimeConfig, now: Instant) -> CoreHealth {
@@ -1035,6 +1077,31 @@ impl Supervisor {
 
     fn store_health(&self, health: CoreHealth) {
         self.health.lock().expect("supervisor health lock").last = health;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryStep {
+    Confirm,
+    Wait,
+    Recover,
+    GiveUp,
+}
+
+fn recovery_step(
+    fails: u32,
+    recoveries: u32,
+    last_recover: Option<Instant>,
+    now: Instant,
+) -> RecoveryStep {
+    if fails < FAIL_BEFORE_RETRY {
+        RecoveryStep::Confirm
+    } else if last_recover.is_some_and(|at| now.duration_since(at) < RECOVER_INTERVAL) {
+        RecoveryStep::Wait
+    } else if recoveries >= MAX_RECOVERIES {
+        RecoveryStep::GiveUp
+    } else {
+        RecoveryStep::Recover
     }
 }
 
@@ -1458,6 +1525,21 @@ mod tests {
         started.recv().unwrap();
         assert_eq!(queued.join().unwrap(), "application is shutting down");
         *OPERATION.lock().unwrap() = false;
+    }
+
+    #[test]
+    fn recovery_gives_up_only_after_exhausting_retries() {
+        let then = Instant::now();
+        let now = then + RECOVER_INTERVAL * 2;
+        let recent = Some(now);
+        let old = Some(then);
+        assert_eq!(recovery_step(2, 0, None, now), RecoveryStep::Confirm);
+        assert_eq!(recovery_step(3, 0, None, now), RecoveryStep::Recover);
+        assert_eq!(recovery_step(3, 1, recent, now), RecoveryStep::Wait);
+        assert_eq!(recovery_step(3, 4, old, now), RecoveryStep::Recover);
+        assert_eq!(recovery_step(2, 5, recent, now), RecoveryStep::Confirm);
+        assert_eq!(recovery_step(3, 5, recent, now), RecoveryStep::Wait);
+        assert_eq!(recovery_step(3, 5, old, now), RecoveryStep::GiveUp);
     }
 
     #[test]
