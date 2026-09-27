@@ -1276,7 +1276,7 @@ fn reclaim_owned_mihomo(mixed_port: Option<u16>, already_stopped: Option<i32>) -
     }
     let mut stopped = already_stopped.is_some();
     for pid in pids {
-        if already_stopped == Some(pid) || !is_our_mihomo_pid(pid) {
+        if already_stopped == Some(pid) || !is_leftover_mihomo_pid(pid) {
             continue;
         }
         log::info("supervisor", format!("stopping leftover mihomo pid {pid}"));
@@ -1412,6 +1412,39 @@ fn is_our_mihomo_pid(pid: i32) -> bool {
     process_exe(pid)
         .map(|exe| is_our_mihomo_exe(&exe))
         .unwrap_or(false)
+}
+
+/// Sparkle deletes the previous bundle after an update, so a core left running
+/// from it has no readable executable path; its `-d` argument still names our data dir.
+/// Only reclaim may act on that, never adopt it.
+fn is_leftover_mihomo_pid(pid: i32) -> bool {
+    match process_exe(pid) {
+        Some(exe) => is_our_mihomo_exe(&exe),
+        None => match (paths::data_dir(), process_command(pid)) {
+            (Ok(data_dir), Some(command)) => is_mihomo_command_for(&command, &data_dir),
+            _ => false,
+        },
+    }
+}
+
+fn is_mihomo_command_for(command: &str, data_dir: &Path) -> bool {
+    let Some((program, args)) = command.split_once(" -d ") else {
+        return false;
+    };
+    let data_dir = data_dir.to_string_lossy();
+    program.rsplit('/').next() == Some("mihomo")
+        && args
+            .strip_prefix(data_dir.as_ref())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
+fn process_command(pid: i32) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
 }
 
 fn process_exe(pid: i32) -> Option<PathBuf> {
@@ -1606,6 +1639,33 @@ mod tests {
         assert!(!is_our_mihomo_exe(Path::new(
             "/Applications/myproxy.app/Contents/MacOS/myproxy"
         )));
+    }
+
+    #[test]
+    fn mihomo_with_our_data_dir_is_ours_even_without_exe() {
+        let data_dir = Path::new("/Users/me/Library/Application Support/myproxy");
+        let ours = "/Applications/myproxy.app/Contents/MacOS/mihomo -d /Users/me/Library/Application Support/myproxy -f /Users/me/Library/Application Support/myproxy/runtime.yaml";
+        assert!(is_mihomo_command_for(ours, data_dir));
+        assert!(is_mihomo_command_for(
+            "/tmp/old.app/Contents/MacOS/mihomo -d /Users/me/Library/Application Support/myproxy",
+            data_dir
+        ));
+        assert!(!is_mihomo_command_for(
+            "/opt/homebrew/bin/mihomo -d /Users/me/.config/mihomo",
+            data_dir
+        ));
+        assert!(!is_mihomo_command_for(
+            "/opt/homebrew/bin/mihomo -d /Users/me/Library/Application Support/myproxy-other",
+            data_dir
+        ));
+        assert!(!is_mihomo_command_for(
+            "/Applications/myproxy.app/Contents/MacOS/myproxy -d /Users/me/Library/Application Support/myproxy",
+            data_dir
+        ));
+        assert!(!is_mihomo_command_for(
+            "/Applications/myproxy.app/Contents/MacOS/mihomo -f /tmp/runtime.yaml",
+            data_dir
+        ));
     }
 
     #[test]
