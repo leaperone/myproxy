@@ -516,6 +516,27 @@ public struct CaptureRuleEngine: Sendable {
         _ context: FlowContext,
         sourceEvaluationMode: SourceEvaluationMode
     ) -> RuleDecision {
+        let decision = ruleDecision(context, sourceEvaluationMode: sourceEvaluationMode)
+        // A fake-ip address only means something to Mihomo, so passing it to
+        // macOS natively can never connect. Mihomo restores the domain and
+        // applies the same DIRECT rule from its own rule list.
+        guard decision.action == .direct,
+              case .matchedRule = decision.cause,
+              let address = context.destination.ipAddress,
+              DNSProxyUpstreamResolver.mihomoFakeIPNetwork.contains(address)
+        else { return decision }
+        return RuleDecision(
+            action: .mihomo(.profileRules),
+            unavailableFallback: .direct,
+            cause: decision.cause,
+            evidence: decision.evidence
+        )
+    }
+
+    private func ruleDecision(
+        _ context: FlowContext,
+        sourceEvaluationMode: SourceEvaluationMode
+    ) -> RuleDecision {
         if let reason = builtInBypass.reason(for: context) {
             return RuleDecision(
                 action: .direct,

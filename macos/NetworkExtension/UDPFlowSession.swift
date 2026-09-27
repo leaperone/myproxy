@@ -93,6 +93,7 @@ final class UDPFlowSession: @unchecked Sendable {
     private struct ConversationKey: Hashable, Sendable {
         let destination: SOCKS5Endpoint
         let revision: UInt64
+        let queryScope: DNSQueryScope?
     }
 
     private final class ConversationRecord: @unchecked Sendable {
@@ -119,7 +120,8 @@ final class UDPFlowSession: @unchecked Sendable {
     private let flow: NEAppProxyUDPFlow
     private let initialPlan: UDPFlowInterceptionPlan
     private let queue: DispatchQueue
-    private let planner: @Sendable (SOCKS5Endpoint) -> UDPFlowInterceptionPlan
+    private let queryScope: @Sendable (Data) -> DNSQueryScope?
+    private let planner: @Sendable (SOCKS5Endpoint, DNSQueryScope?) -> UDPFlowInterceptionPlan
     private let revisionProvider: @Sendable () -> UInt64
     private let activitySink: @Sendable (AppRoutingActivity) -> Void
     private let observerFactory:
@@ -149,7 +151,8 @@ final class UDPFlowSession: @unchecked Sendable {
         id: UUID,
         flow: NEAppProxyUDPFlow,
         initialPlan: UDPFlowInterceptionPlan,
-        planner: @escaping @Sendable (SOCKS5Endpoint) -> UDPFlowInterceptionPlan,
+        queryScope: @escaping @Sendable (Data) -> DNSQueryScope?,
+        planner: @escaping @Sendable (SOCKS5Endpoint, DNSQueryScope?) -> UDPFlowInterceptionPlan,
         revisionProvider: @escaping @Sendable () -> UInt64,
         activitySink: @escaping @Sendable (AppRoutingActivity) -> Void,
         observerFactory:
@@ -161,6 +164,7 @@ final class UDPFlowSession: @unchecked Sendable {
         self.id = id
         self.flow = flow
         self.initialPlan = initialPlan
+        self.queryScope = queryScope
         self.planner = planner
         self.revisionProvider = revisionProvider
         self.activitySink = activitySink
@@ -256,7 +260,10 @@ final class UDPFlowSession: @unchecked Sendable {
         }
 
         do {
-            let record = try conversationRecord(for: datagram.endpoint)
+            let record = try conversationRecord(
+                for: datagram.endpoint,
+                queryScope: queryScope(datagram.payload)
+            )
             record.pendingPayloads.append(datagram.payload)
             drain(record)
         } catch {
@@ -266,10 +273,15 @@ final class UDPFlowSession: @unchecked Sendable {
     }
 
     private func conversationRecord(
-        for destination: SOCKS5Endpoint
+        for destination: SOCKS5Endpoint,
+        queryScope: DNSQueryScope?
     ) throws -> ConversationRecord {
         let revision = revisionProvider()
-        let key = ConversationKey(destination: destination, revision: revision)
+        let key = ConversationKey(
+            destination: destination,
+            revision: revision,
+            queryScope: queryScope
+        )
         if let existing = records[key] { return existing }
         guard records.count < Limits.maximumConversations else {
             throw UDPFlowSessionError.tooManyConversations(
@@ -287,9 +299,24 @@ final class UDPFlowSession: @unchecked Sendable {
            initialPlan.configurationRevision == revision,
            initialPlan.initialDestination == destination {
             initialPlanAvailable = false
-            plan = initialPlan
+            if queryScope == nil {
+                plan = initialPlan
+            } else {
+                // The payload refined the route, so the activity published at
+                // start never gets a conversation of its own.
+                observerFactory(initialPlan.activity.flowIdentifier)(
+                    AppRoutingRelaySnapshot(
+                        state: .completed,
+                        uploadBytes: 0,
+                        downloadBytes: 0,
+                        error: nil,
+                        localPort: nil
+                    )
+                )
+                plan = planner(destination, queryScope)
+            }
         } else {
-            plan = planner(destination)
+            plan = planner(destination, queryScope)
         }
 
         let record = ConversationRecord(key: key, plan: plan)
@@ -1299,7 +1326,8 @@ final class UDPFlowSessionRegistry: @unchecked Sendable {
         id: UUID,
         flow: NEAppProxyUDPFlow,
         initialPlan: UDPFlowInterceptionPlan,
-        planner: @escaping @Sendable (SOCKS5Endpoint) -> UDPFlowInterceptionPlan,
+        queryScope: @escaping @Sendable (Data) -> DNSQueryScope? = { _ in nil },
+        planner: @escaping @Sendable (SOCKS5Endpoint, DNSQueryScope?) -> UDPFlowInterceptionPlan,
         revisionProvider: @escaping @Sendable () -> UInt64,
         activitySink: @escaping @Sendable (AppRoutingActivity) -> Void,
         observerFactory:
@@ -1315,6 +1343,7 @@ final class UDPFlowSessionRegistry: @unchecked Sendable {
             id: id,
             flow: flow,
             initialPlan: initialPlan,
+            queryScope: queryScope,
             planner: planner,
             revisionProvider: revisionProvider,
             activitySink: activitySink,

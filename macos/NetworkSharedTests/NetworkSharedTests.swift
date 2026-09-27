@@ -562,6 +562,151 @@ struct NetworkSharedTests {
             try expectEqual(decision.unavailableFallback, .profileRules, "fallback carried")
         }
 
+        run.test("capture_direct_to_fake_ip_relays_through_mihomo") {
+            let rule = try CaptureRule(
+                id: "direct-host",
+                priority: 0,
+                destinations: [.host(try HostMatcher(kind: .suffix, value: "example.cn"))],
+                action: .direct,
+                unavailableFallback: .direct
+            )
+            let rules = try engine(rules: [rule])
+            let fake = try rules.evaluate(
+                context(
+                    source: flowSource(),
+                    destination: try FlowDestination(
+                        hostname: "www.example.cn",
+                        ipAddress: try IPAddress("198.18.0.7"),
+                        port: 443
+                    )
+                )
+            )
+            try expectEqual(fake.action, .mihomo(.profileRules), "fake-ip never passes natively")
+            try expectEqual(fake.cause, .matchedRule("direct-host"), "cause kept")
+            let real = try rules.evaluate(
+                context(
+                    source: flowSource(),
+                    destination: try FlowDestination(
+                        hostname: "www.example.cn",
+                        ipAddress: try IPAddress("110.242.68.66"),
+                        port: 443
+                    )
+                )
+            )
+            try expectEqual(real.action, .direct, "real address stays direct")
+        }
+
+        func dnsQuery(_ labels: [String]) -> Data {
+            var bytes: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            for label in labels {
+                bytes.append(UInt8(label.utf8.count))
+                bytes.append(contentsOf: label.utf8)
+            }
+            bytes.append(contentsOf: [0x00, 0x00, 0x01, 0x00, 0x01])
+            return Data(bytes)
+        }
+
+        run.test("dns_query_scope_from_message") {
+            func scope(_ message: Data) -> DNSQueryScope? {
+                DNSQueryScope.questionName(in: message).map { DNSQueryScope(name: $0) }
+            }
+            try expectEqual(
+                DNSQueryScope.questionName(in: dnsQuery(["www", "youtube", "com"])),
+                "www.youtube.com",
+                "question name"
+            )
+            try expectEqual(scope(dnsQuery(["www", "youtube", "com"])), .remote, "public name")
+            try expectEqual(scope(dnsQuery(["nas", "lan"])), .local, ".lan")
+            try expectEqual(scope(dnsQuery(["printer", "local"])), .local, ".local")
+            try expectEqual(scope(dnsQuery(["router", "home", "arpa"])), .local, ".home.arpa")
+            try expectEqual(scope(dnsQuery(["nas"])), .local, "single label")
+            try expectEqual(
+                scope(dnsQuery(["1", "0", "168", "192", "in-addr", "arpa"])),
+                .local,
+                "reverse lookup"
+            )
+            try expectEqual(scope(Data([0x12, 0x34])), nil, "truncated")
+            var noQuestion = [UInt8](dnsQuery(["example", "com"]))
+            noQuestion[5] = 0
+            try expectEqual(scope(Data(noQuestion)), nil, "no question")
+            var overrun = [UInt8](dnsQuery(["example", "com"]))
+            overrun[12] = 40
+            try expectEqual(scope(Data(overrun)), nil, "label overruns message")
+        }
+
+        run.test("dns_route_sends_public_queries_to_mihomo") {
+            let router = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("192.168.0.1")), port: 53)
+            let google = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("8.8.8.8")), port: 53)
+            func route(
+                _ destination: SOCKS5Endpoint,
+                trusted: Bool = false,
+                scope: DNSQueryScope?,
+                mihomoAvailable: Bool = true
+            ) -> DNSRelayRoute {
+                DNSRelayRoutingPolicy.route(
+                    destination: destination,
+                    isTrustedMyproxyComponent: trusted,
+                    queryScope: scope,
+                    mihomoAvailable: mihomoAvailable
+                )
+            }
+            try expectEqual(route(router, scope: .remote), .mihomo, "public name to router")
+            try expectEqual(route(router, scope: .local), .directLocalResolver, "LAN name to router")
+            try expectEqual(route(router, scope: nil), .directLocalResolver, "unparsed query to router")
+            try expectEqual(route(google, scope: .remote), .mihomo, "public resolver")
+            try expectEqual(route(google, scope: nil), .mihomo, "public resolver before first datagram")
+            try expectEqual(route(google, scope: .native), .directNativeFlow, "DIRECT app lookup")
+            try expectEqual(
+                route(router, scope: .remote, mihomoAvailable: false),
+                .directMihomoUnavailable,
+                "Mihomo down"
+            )
+            try expectEqual(
+                DNSRelayRoute.directMihomoUnavailable.target(for: router, resolvers: []),
+                router,
+                "Mihomo down keeps the addressed resolver"
+            )
+            try expectEqual(route(router, scope: .native), .directNativeFlow, "DIRECT app lookup via router")
+            try expectEqual(
+                route(google, trusted: true, scope: .remote),
+                .directTrustedComponent,
+                "Mihomo's own upstream lookup"
+            )
+            try expectEqual(
+                route(SOCKS5Endpoint(address: try SOCKS5Address(domain: "nas.lan"), port: 53), scope: nil),
+                .directLocalResolver,
+                "LAN name endpoint"
+            )
+            try expectEqual(
+                route(SOCKS5Endpoint(address: try SOCKS5Address(domain: "www.youtube.com"), port: 53), scope: nil),
+                .mihomo,
+                "public name endpoint"
+            )
+        }
+
+        run.test("dns_route_target") {
+            let router = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("192.168.0.1")), port: 53)
+            let cloudflare = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("1.1.1.1")), port: 53)
+            let mihomo = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("127.0.0.1")), port: 1053)
+            let lanName = SOCKS5Endpoint(address: try SOCKS5Address(domain: "nas.lan"), port: 53)
+            try expectEqual(DNSRelayRoute.mihomo.target(for: router, resolvers: [cloudflare]), mihomo, "Mihomo fake-ip DNS")
+            try expectEqual(
+                DNSRelayRoute.directLocalResolver.target(for: router, resolvers: [cloudflare]),
+                router,
+                "LAN resolver kept"
+            )
+            try expectEqual(
+                DNSRelayRoute.directNativeFlow.target(for: router, resolvers: [cloudflare]),
+                router,
+                "DIRECT app keeps its resolver"
+            )
+            try expectEqual(
+                DNSRelayRoute.directLocalResolver.target(for: lanName, resolvers: [cloudflare]),
+                cloudflare,
+                "name endpoint dials a resolver address"
+            )
+        }
+
         let total = run.passed + run.failed
         print("\(run.passed) passed, \(run.failed) failed, \(total) total")
         if run.failed > 0 {

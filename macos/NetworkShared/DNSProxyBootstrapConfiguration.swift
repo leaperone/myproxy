@@ -221,4 +221,108 @@ public enum DNSProxyUpstreamResolver {
         }
         return endpoint(for: defaults[0])!
     }
+
+    /// Mihomo's fake-ip DNS listener, `127.0.0.1:compile::DNS_LISTEN_PORT`.
+    /// Queries relayed through Mihomo are answered here rather than by a
+    /// public resolver, whose answers are poisoned on direct paths; the fake
+    /// address lets Mihomo restore the domain when the app connects.
+    public static let mihomoDNS = SOCKS5Endpoint(
+        address: SOCKS5Address(ipAddress: try! IPAddress("127.0.0.1")),
+        port: 1053
+    )
+
+    /// Mihomo's `fake-ip-range` (`198.18.0.1/16` in `compile::insert_dns`).
+    public static let mihomoFakeIPNetwork = try! IPNetwork("198.18.0.0/16")
+}
+
+/// Whether a DNS query must stay with the LAN resolver that received it.
+public enum DNSQueryScope: Hashable, Sendable {
+    case local
+    case remote
+    /// A public name the app's connection would reach unrelayed (a DIRECT
+    /// rule), so a fake-ip answer would be unusable.
+    case native
+
+    public init(name: String) {
+        let normalized = name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let isLocal = !normalized.contains(".")
+            || normalized == "localdomain"
+            || normalized.hasSuffix(".local")
+            || normalized.hasSuffix(".lan")
+            || normalized.hasSuffix(".localdomain")
+            || normalized.hasSuffix(".home.arpa")
+            || normalized.hasSuffix(".in-addr.arpa")
+            || normalized.hasSuffix(".ip6.arpa")
+        self = isLocal ? .local : .remote
+    }
+
+    /// First question name of a DNS message; `nil` when the payload is not a
+    /// parseable query.
+    public static func questionName(in message: Data) -> String? {
+        let bytes = [UInt8](message)
+        guard bytes.count > 12, bytes[4] != 0 || bytes[5] != 0 else { return nil }
+        var labels: [String] = []
+        var index = 12
+        while index < bytes.count {
+            let length = Int(bytes[index])
+            if length == 0 { return labels.joined(separator: ".") }
+            guard length < 64, index + 1 + length <= bytes.count else { return nil }
+            labels.append(String(decoding: bytes[(index + 1)...(index + length)], as: UTF8.self))
+            index += 1 + length
+        }
+        return nil
+    }
+}
+
+public enum DNSRelayRoute: Equatable, Sendable {
+    case directTrustedComponent
+    case directLocalResolver
+    case directNativeFlow
+    /// Mihomo's backend probe keeps failing; answer from a real resolver
+    /// until it recovers rather than leaving system lookups unanswered.
+    case directMihomoUnavailable
+    case mihomo
+
+    /// Every route is dialed from the provider's own socket, which DNS
+    /// interception does not see. Mihomo's DNS is reached directly rather than
+    /// through a SOCKS listener, whose `proxy:` in proxy/global mode would carry
+    /// the loopback query to the remote node.
+    public func target(
+        for destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint]
+    ) -> SOCKS5Endpoint {
+        switch self {
+        case .directTrustedComponent, .directLocalResolver, .directNativeFlow,
+             .directMihomoUnavailable:
+            DNSProxyUpstreamResolver.relayDestination(for: destination, resolvers: resolvers)
+        case .mihomo:
+            DNSProxyUpstreamResolver.mihomoDNS
+        }
+    }
+}
+
+public enum DNSRelayRoutingPolicy {
+    public static func route(
+        destination: SOCKS5Endpoint,
+        isTrustedMyproxyComponent: Bool,
+        queryScope: DNSQueryScope?,
+        mihomoAvailable: Bool
+    ) -> DNSRelayRoute {
+        if isTrustedMyproxyComponent {
+            return .directTrustedComponent
+        }
+        if queryScope == .native {
+            return .directNativeFlow
+        }
+        if let domain = destination.address.domain, DNSQueryScope(name: domain) == .local {
+            return .directLocalResolver
+        }
+        if destination.address.ipAddress?.isLocalNetwork == true, queryScope != .remote {
+            return .directLocalResolver
+        }
+        return mihomoAvailable ? .mihomo : .directMihomoUnavailable
+    }
 }
