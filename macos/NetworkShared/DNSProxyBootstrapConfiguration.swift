@@ -221,4 +221,91 @@ public enum DNSProxyUpstreamResolver {
         }
         return endpoint(for: defaults[0])!
     }
+
+    /// Mihomo's fake-ip DNS listener, `127.0.0.1:compile::DNS_LISTEN_PORT`.
+    /// Queries relayed through Mihomo are answered here rather than by a
+    /// public resolver, whose answers are poisoned on direct paths; the fake
+    /// address lets Mihomo restore the domain when the app connects.
+    public static let mihomoDNS = SOCKS5Endpoint(
+        address: SOCKS5Address(ipAddress: try! IPAddress("127.0.0.1")),
+        port: 1053
+    )
+}
+
+/// Whether a DNS query must stay with the LAN resolver that received it.
+public enum DNSQueryScope: Hashable, Sendable {
+    case local
+    case remote
+
+    public init(name: String) {
+        let normalized = name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let isLocal = !normalized.contains(".")
+            || normalized == "localdomain"
+            || normalized.hasSuffix(".local")
+            || normalized.hasSuffix(".lan")
+            || normalized.hasSuffix(".localdomain")
+            || normalized.hasSuffix(".home.arpa")
+            || normalized.hasSuffix(".in-addr.arpa")
+            || normalized.hasSuffix(".ip6.arpa")
+        self = isLocal ? .local : .remote
+    }
+
+    /// Classifies the first question of a DNS message; `nil` when the payload
+    /// is not a parseable query.
+    public init?(message: Data) {
+        guard let name = Self.questionName(in: message) else { return nil }
+        self.init(name: name)
+    }
+
+    static func questionName(in message: Data) -> String? {
+        let bytes = [UInt8](message)
+        guard bytes.count > 12, bytes[4] != 0 || bytes[5] != 0 else { return nil }
+        var labels: [String] = []
+        var index = 12
+        while index < bytes.count {
+            let length = Int(bytes[index])
+            if length == 0 { return labels.joined(separator: ".") }
+            guard length < 64, index + 1 + length <= bytes.count else { return nil }
+            labels.append(String(decoding: bytes[(index + 1)...(index + length)], as: UTF8.self))
+            index += 1 + length
+        }
+        return nil
+    }
+}
+
+public enum DNSRelayRoute: Equatable, Sendable {
+    case directTrustedComponent
+    case directLocalResolver
+    case mihomo
+
+    public var bypassesMihomo: Bool {
+        switch self {
+        case .directTrustedComponent, .directLocalResolver:
+            true
+        case .mihomo:
+            false
+        }
+    }
+}
+
+public enum DNSRelayRoutingPolicy {
+    public static func route(
+        destination: SOCKS5Endpoint,
+        isTrustedMyproxyComponent: Bool,
+        queryScope: DNSQueryScope?
+    ) -> DNSRelayRoute {
+        if isTrustedMyproxyComponent {
+            return .directTrustedComponent
+        }
+        if let domain = destination.address.domain, DNSQueryScope(name: domain) == .local {
+            return .directLocalResolver
+        }
+        if destination.address.ipAddress?.isLocalNetwork == true, queryScope != .remote {
+            return .directLocalResolver
+        }
+        return .mihomo
+    }
 }

@@ -562,6 +562,77 @@ struct NetworkSharedTests {
             try expectEqual(decision.unavailableFallback, .profileRules, "fallback carried")
         }
 
+        func dnsQuery(_ labels: [String]) -> Data {
+            var bytes: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            for label in labels {
+                bytes.append(UInt8(label.utf8.count))
+                bytes.append(contentsOf: label.utf8)
+            }
+            bytes.append(contentsOf: [0x00, 0x00, 0x01, 0x00, 0x01])
+            return Data(bytes)
+        }
+
+        run.test("dns_query_scope_from_message") {
+            try expectEqual(
+                DNSQueryScope.questionName(in: dnsQuery(["www", "youtube", "com"])),
+                "www.youtube.com",
+                "question name"
+            )
+            try expectEqual(DNSQueryScope(message: dnsQuery(["www", "youtube", "com"])), .remote, "public name")
+            try expectEqual(DNSQueryScope(message: dnsQuery(["nas", "lan"])), .local, ".lan")
+            try expectEqual(DNSQueryScope(message: dnsQuery(["printer", "local"])), .local, ".local")
+            try expectEqual(DNSQueryScope(message: dnsQuery(["router", "home", "arpa"])), .local, ".home.arpa")
+            try expectEqual(DNSQueryScope(message: dnsQuery(["nas"])), .local, "single label")
+            try expectEqual(
+                DNSQueryScope(message: dnsQuery(["1", "0", "168", "192", "in-addr", "arpa"])),
+                .local,
+                "reverse lookup"
+            )
+            try expectEqual(DNSQueryScope(message: Data([0x12, 0x34])), nil, "truncated")
+            var noQuestion = [UInt8](dnsQuery(["example", "com"]))
+            noQuestion[5] = 0
+            try expectEqual(DNSQueryScope(message: Data(noQuestion)), nil, "no question")
+            var overrun = [UInt8](dnsQuery(["example", "com"]))
+            overrun[12] = 40
+            try expectEqual(DNSQueryScope(message: Data(overrun)), nil, "label overruns message")
+        }
+
+        run.test("dns_route_sends_public_queries_to_mihomo") {
+            let router = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("192.168.0.1")), port: 53)
+            let google = SOCKS5Endpoint(address: SOCKS5Address(ipAddress: try IPAddress("8.8.8.8")), port: 53)
+            func route(
+                _ destination: SOCKS5Endpoint,
+                trusted: Bool = false,
+                scope: DNSQueryScope?
+            ) -> DNSRelayRoute {
+                DNSRelayRoutingPolicy.route(
+                    destination: destination,
+                    isTrustedMyproxyComponent: trusted,
+                    queryScope: scope
+                )
+            }
+            try expectEqual(route(router, scope: .remote), .mihomo, "public name to router")
+            try expectEqual(route(router, scope: .local), .directLocalResolver, "LAN name to router")
+            try expectEqual(route(router, scope: nil), .directLocalResolver, "unparsed query to router")
+            try expectEqual(route(google, scope: .remote), .mihomo, "public resolver")
+            try expectEqual(route(google, scope: nil), .mihomo, "public resolver before first datagram")
+            try expectEqual(
+                route(google, trusted: true, scope: .remote),
+                .directTrustedComponent,
+                "Mihomo's own upstream lookup"
+            )
+            try expectEqual(
+                route(SOCKS5Endpoint(address: try SOCKS5Address(domain: "nas.lan"), port: 53), scope: nil),
+                .directLocalResolver,
+                "LAN name endpoint"
+            )
+            try expectEqual(
+                route(SOCKS5Endpoint(address: try SOCKS5Address(domain: "www.youtube.com"), port: 53), scope: nil),
+                .mihomo,
+                "public name endpoint"
+            )
+        }
+
         let total = run.passed + run.failed
         print("\(run.passed) passed, \(run.failed) failed, \(total) total")
         if run.failed > 0 {

@@ -169,7 +169,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             id: parentFlowIdentifier,
             flow: flow,
             initialPlan: plan,
-            planner: { destination in
+            planner: { destination, _ in
                 coordinator.planUDPDatagram(
                     flow,
                     destination: destination,
