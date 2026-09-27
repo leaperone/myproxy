@@ -1276,7 +1276,7 @@ fn reclaim_owned_mihomo(mixed_port: Option<u16>, already_stopped: Option<i32>) -
     }
     let mut stopped = already_stopped.is_some();
     for pid in pids {
-        if already_stopped == Some(pid) || !is_our_mihomo_pid(pid) {
+        if already_stopped == Some(pid) || !is_leftover_mihomo_pid(pid) {
             continue;
         }
         log::info("supervisor", format!("stopping leftover mihomo pid {pid}"));
@@ -1408,16 +1408,23 @@ fn is_our_mihomo_exe(exe: &Path) -> bool {
         .any(|component| component.as_os_str() == "myproxy.app")
 }
 
+fn is_our_mihomo_pid(pid: i32) -> bool {
+    process_exe(pid)
+        .map(|exe| is_our_mihomo_exe(&exe))
+        .unwrap_or(false)
+}
+
 /// Sparkle deletes the previous bundle after an update, so a core left running
 /// from it has no readable executable path; its `-d` argument still names our data dir.
-fn is_our_mihomo_pid(pid: i32) -> bool {
-    if process_exe(pid).is_some_and(|exe| is_our_mihomo_exe(&exe)) {
-        return true;
+/// Only reclaim may act on that, never adopt it.
+fn is_leftover_mihomo_pid(pid: i32) -> bool {
+    match process_exe(pid) {
+        Some(exe) => is_our_mihomo_exe(&exe),
+        None => match (paths::data_dir(), process_command(pid)) {
+            (Ok(data_dir), Some(command)) => is_mihomo_command_for(&command, &data_dir),
+            _ => false,
+        },
     }
-    let (Ok(data_dir), Some(command)) = (paths::data_dir(), process_command(pid)) else {
-        return false;
-    };
-    is_mihomo_command_for(&command, &data_dir)
 }
 
 fn is_mihomo_command_for(command: &str, data_dir: &Path) -> bool {
@@ -1653,6 +1660,10 @@ mod tests {
         ));
         assert!(!is_mihomo_command_for(
             "/Applications/myproxy.app/Contents/MacOS/myproxy -d /Users/me/Library/Application Support/myproxy",
+            data_dir
+        ));
+        assert!(!is_mihomo_command_for(
+            "/Applications/myproxy.app/Contents/MacOS/mihomo -f /tmp/runtime.yaml",
             data_dir
         ));
     }
