@@ -47,6 +47,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     private let flowDecisionCoordinator = NetworkExtensionFlowDecisionCoordinator()
     private let tcpRelays = TCPFlowRelayRegistry()
     private let udpSessions = UDPFlowSessionRegistry()
+    private let mihomoDNSHealth = MihomoDNSHealth()
     private var reporter: DNSProxyRuntimeReporter?
     private var proxy: ProviderSOCKSConfiguration?
     private var upstreamResolvers: [SOCKS5Endpoint] = []
@@ -289,6 +290,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         timer?.cancel()
         cancelBackendProbeConfirmationTimer(confirmationTimer)
         probe?.cancel()
+        mihomoDNSHealth.stop()
         backendProbeQueue.async { [self] in
             pendingStartCompletion?.call(DNSProxyBootstrapError.cancelledDuringStartup)
             tcpRelays.cancelAll()
@@ -388,6 +390,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     }
 
     private func startPeriodicBackendProbe() {
+        mihomoDNSHealth.start()
         backendProbeLock.lock()
         guard backendProbeTimer == nil, !backendProbingSuspended else {
             backendProbeLock.unlock()
@@ -409,6 +412,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
     }
 
     private func suspendBackendProbing() {
+        mihomoDNSHealth.stop()
         backendProbeLock.lock()
         backendProbingSuspended = true
         backendProbeGeneration &+= 1
@@ -713,6 +717,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             proxy,
             upstreamResolvers,
             consecutiveBackendProbeFailures < Self.backendProbeFailureThreshold
+                && mihomoDNSHealth.isHealthy
         )
         backendProbeLock.unlock()
         return snapshot

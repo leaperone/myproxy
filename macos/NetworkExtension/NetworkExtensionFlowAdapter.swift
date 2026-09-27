@@ -220,22 +220,27 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         )
     }
 
-    /// Whether the transparent proxy would pass this app's connection to
-    /// `hostname` to macOS unrelayed, so its lookup must return a real address
-    /// rather than a Mihomo fake-ip. The port is unknown at lookup time; host
-    /// capture rules carry no port ranges.
+    /// Whether this app's connections to `hostname` pass to macOS unrelayed by
+    /// an app-only rule, so its lookup must return a real address rather than a
+    /// Mihomo fake-ip. A hostname DIRECT rule does not count: an app that
+    /// connects by address would lose the hostname, while a fake-ip lets Mihomo
+    /// restore it and apply the same rule. The port is unknown at lookup time;
+    /// host capture rules carry no port ranges.
     func passesNatively(_ flow: NEAppProxyFlow, hostname: String) -> Bool {
-        let outcome = decide(
+        let currentState = snapshotState()
+        let decision = decide(
             flow: flow,
             endpoint: FlowRemoteEndpoint(host: hostname, port: "443"),
             transportProtocol: .tcp,
-            state: snapshotState(),
+            state: currentState,
             remoteHostname: hostname
-        )
-        switch outcome.decision.disposition {
-        case .direct, .failOpen:
+        ).decision
+        switch (decision.disposition, decision.reason) {
+        case (.failOpen, _):
             return true
-        case .reject, .mihomo:
+        case let (.direct, .rule(.matchedRule(identifier))):
+            return currentState.rulesByIdentifier[identifier]?.destinations.isEmpty == true
+        default:
             return false
         }
     }

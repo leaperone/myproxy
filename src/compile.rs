@@ -440,6 +440,7 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     );
     dns.insert("ipv6".into(), true.into());
     dns.insert("enhanced-mode".into(), "fake-ip".into());
+    // Mirrored by `DNSProxyUpstreamResolver.mihomoFakeIPNetwork`.
     dns.insert("fake-ip-range".into(), "198.18.0.1/16".into());
     dns.insert(
         "fake-ip-filter".into(),

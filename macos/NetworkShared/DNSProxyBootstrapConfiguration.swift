@@ -230,6 +230,9 @@ public enum DNSProxyUpstreamResolver {
         address: SOCKS5Address(ipAddress: try! IPAddress("127.0.0.1")),
         port: 1053
     )
+
+    /// Mihomo's `fake-ip-range` (`198.18.0.1/16` in `compile::insert_dns`).
+    public static let mihomoFakeIPNetwork = try! IPNetwork("198.18.0.0/16")
 }
 
 /// Whether a DNS query must stay with the LAN resolver that received it.

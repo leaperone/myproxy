@@ -562,6 +562,40 @@ struct NetworkSharedTests {
             try expectEqual(decision.unavailableFallback, .profileRules, "fallback carried")
         }
 
+        run.test("capture_direct_to_fake_ip_relays_through_mihomo") {
+            let rule = try CaptureRule(
+                id: "direct-host",
+                priority: 0,
+                destinations: [.host(try HostMatcher(kind: .suffix, value: "example.cn"))],
+                action: .direct,
+                unavailableFallback: .direct
+            )
+            let rules = try engine(rules: [rule])
+            let fake = try rules.evaluate(
+                context(
+                    source: flowSource(),
+                    destination: try FlowDestination(
+                        hostname: "www.example.cn",
+                        ipAddress: try IPAddress("198.18.0.7"),
+                        port: 443
+                    )
+                )
+            )
+            try expectEqual(fake.action, .mihomo(.profileRules), "fake-ip never passes natively")
+            try expectEqual(fake.cause, .matchedRule("direct-host"), "cause kept")
+            let real = try rules.evaluate(
+                context(
+                    source: flowSource(),
+                    destination: try FlowDestination(
+                        hostname: "www.example.cn",
+                        ipAddress: try IPAddress("110.242.68.66"),
+                        port: 443
+                    )
+                )
+            )
+            try expectEqual(real.action, .direct, "real address stays direct")
+        }
+
         func dnsQuery(_ labels: [String]) -> Data {
             var bytes: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
             for label in labels {
