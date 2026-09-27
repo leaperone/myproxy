@@ -11,6 +11,7 @@ Runtime safety: empty groups use an unavailable REJECT sentinel, never implicit 
 ```sh
 scripts/fetch-mihomo.sh
 scripts/fetch-sparkle.sh
+scripts/test-network-shared.sh # Swift SOCKS5 codec / capture rule tests
 scripts/dev.sh                 # local watchexec restart
 scripts/install-macbook-air.sh # signed /Applications app on macbook-air, mixed-port 7891
 scripts/dev-air.sh             # refused; use install-macbook-air.sh
