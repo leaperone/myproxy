@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::button::{
-    Button, ButtonGroup, ButtonVariants as _, Toggle, ToggleGroup, ToggleVariants as _,
+    Button, ButtonGroup, ButtonVariant, ButtonVariants as _, Toggle, ToggleGroup,
+    ToggleVariants as _,
 };
 use gpui_kit::component::dialog::{Cancel, Confirm, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
@@ -1175,6 +1177,8 @@ pub struct AppView {
     delaying: HashSet<String>,
     window_active: bool,
     log_generation: u64,
+    log_lines: Vec<String>,
+    file_dialog_pending: bool,
     connection_filters: ConnectionFilters,
     runtime: Option<RuntimeIdentity>,
     operation: OperationState,
@@ -1374,6 +1378,7 @@ impl AppView {
                             let stamp = log::stamp();
                             if stamp != this.log_generation {
                                 this.log_generation = stamp;
+                                this.log_lines = log::recent(80);
                                 dirty = true;
                             }
                         }
@@ -1470,6 +1475,8 @@ impl AppView {
             delaying: HashSet::new(),
             window_active: true,
             log_generation: log::stamp(),
+            log_lines: log::recent(80),
+            file_dialog_pending: false,
             pending_port_input: None,
             pending_filter_input: None,
             connection_filters: ConnectionFilters::default(),
@@ -1779,6 +1786,46 @@ impl AppView {
             "核心异常"
         } else {
             "未连接"
+        }
+    }
+
+    fn core_status_label(&self) -> &'static str {
+        match self.operation {
+            OperationState::Connecting => "启动中",
+            OperationState::Disconnecting => "停止中",
+            _ if self.connected => "已就绪",
+            _ if self.wanted || self.operation == OperationState::Error => "异常",
+            _ => "未连接",
+        }
+    }
+
+    fn extension_status_label(&self) -> &'static str {
+        let status = &self.extension_status;
+        if !self.applied.system_extension
+            && status.observed
+            && matches!(
+                status.phase,
+                Phase::Disabled | Phase::Unsupported | Phase::Unbundled
+            )
+        {
+            "关闭"
+        } else {
+            status.phase_label()
+        }
+    }
+
+    fn dns_status_label(&self) -> &'static str {
+        let status = &self.extension_status;
+        if !self.applied.system_extension
+            && status.observed
+            && matches!(
+                status.dns_phase,
+                network_extension::DnsPhase::Disabled | network_extension::DnsPhase::Unknown
+            )
+        {
+            "关闭"
+        } else {
+            status.dns_label()
         }
     }
 
@@ -2620,6 +2667,191 @@ impl AppView {
         }
     }
 
+    fn confirm_remove_selected_rule(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        let name = self
+            .strategy
+            .rule_sets
+            .iter()
+            .find(|set| set.id == id)
+            .map(|set| set.name.clone())
+            .unwrap_or_else(|| id.to_string());
+        let id = id.to_string();
+        self.open_danger_confirm(
+            window,
+            cx,
+            "删除规则",
+            format!("删除规则「{name}」？"),
+            "删除",
+            move |this, window, cx| {
+                this.remove_selected_rule(&id, window, cx);
+            },
+        );
+    }
+
+    fn confirm_remove_group(
+        &mut self,
+        id: &str,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        let id = id.to_string();
+        let name = name.to_string();
+        self.open_danger_confirm(
+            window,
+            cx,
+            "删除节点组",
+            format!("删除节点组「{name}」？"),
+            "删除",
+            move |this, window, cx| {
+                this.remove_group(&id, window, cx);
+            },
+        );
+    }
+
+    fn remove_group(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+        let previous = self.strategy.clone();
+        let close_modal = self.group_edit_id.as_deref() == Some(id);
+        if let Err(err) = self.strategy.remove_group_checked(id) {
+            self.status = format!("无法删除节点组：{err:#}");
+            cx.notify();
+            return;
+        }
+        if self.persist_and_apply(cx) {
+            if close_modal {
+                self.group_modal_open = false;
+                self.group_edit_id = None;
+                window.close_dialog(cx);
+            }
+        } else {
+            self.strategy = previous;
+        }
+        cx.notify();
+    }
+
+    fn confirm_remove_subscription(
+        &mut self,
+        id: &str,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        let id = id.to_string();
+        let name = name.to_string();
+        self.open_danger_confirm(
+            window,
+            cx,
+            "删除订阅",
+            format!("删除订阅「{name}」？"),
+            "删除",
+            move |this, _window, cx| {
+                this.remove_subscription(&id, cx);
+            },
+        );
+    }
+
+    fn remove_subscription(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+        let previous = self.strategy.clone();
+        self.strategy.remove_subscription(id);
+        if self.persist() {
+            self.status = "订阅已删除，尚未应用。请应用配置。".into();
+        } else {
+            self.strategy = previous;
+        }
+        cx.notify();
+    }
+
+    fn confirm_close_all_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+        self.open_danger_confirm(
+            window,
+            cx,
+            "关闭全部连接",
+            "关闭全部连接？",
+            "关闭",
+            move |this, _window, cx| {
+                this.close_connections(None, cx);
+            },
+        );
+    }
+
+    fn open_danger_confirm(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        title: impl Into<SharedString>,
+        body: impl Into<SharedString>,
+        confirm_label: &'static str,
+        on_confirm: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let title = title.into();
+        let body = body.into();
+        let parent = cx.entity();
+        let on_confirm = std::rc::Rc::new(on_confirm);
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(title.clone())
+                .width(px(420.))
+                .overlay_closable(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok({
+                            let parent = parent.clone();
+                            let on_confirm = on_confirm.clone();
+                            move |_, window, cx| {
+                                parent.update(cx, |this, cx| on_confirm(this, window, cx));
+                                true
+                            }
+                        }),
+                )
+                .child(div().text_sm().child(body.clone()))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("danger-confirm-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(Cancel), cx)
+                                }),
+                        )
+                        .child(
+                            Button::new("danger-confirm-ok")
+                                .danger()
+                                .label(confirm_label)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(Confirm { secondary: false }),
+                                        cx,
+                                    )
+                                }),
+                        ),
+                )
+        });
+    }
+
     fn live_group(&self, group: &Group) -> Option<&LiveGroup> {
         self.proxy_groups
             .iter()
@@ -2910,33 +3142,56 @@ impl Render for AppView {
 
 impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        let connected = self.connected;
         let busy = self.is_busy();
-        let warn_live = !busy
-            && (self.wanted && !connected
-                || self.traffic_error.is_some()
-                || self.proxy_error.is_some());
-        let live_label = if busy {
-            self.operation_label().to_string()
-        } else if connected && self.traffic_has_rate {
-            format!(
-                "已连接 · ↑{} · ↓{}",
-                controller::format_rate(self.traffic_up),
-                controller::format_rate(self.traffic_down)
-            )
-        } else if connected && self.traffic_error.is_some() {
-            "读不到核心状态".into()
-        } else if connected {
-            "已连接".into()
-        } else if self.wanted {
-            self.status
-                .lines()
-                .next()
-                .filter(|line| !line.is_empty())
-                .unwrap_or("核心异常")
-                .to_string()
+        let core_label = self.core_status_label();
+        let extension_label = self.extension_status_label();
+        let dns_label = self.dns_status_label();
+        let core_color = match core_label {
+            "已就绪" => theme.success,
+            "异常" => theme.warning,
+            "启动中" | "停止中" => theme.accent,
+            _ => theme.muted_foreground,
+        };
+        let extension_color = if !self.extension_status.observed {
+            theme.warning
+        } else if extension_label == "关闭"
+            || matches!(
+                self.extension_status.phase,
+                Phase::Disabled | Phase::Unsupported | Phase::Unbundled
+            ) {
+            theme.muted_foreground
+        } else if matches!(
+            self.extension_status.phase,
+            Phase::Failed | Phase::WaitingApproval | Phase::RequiresReboot
+        ) {
+            theme.warning
+        } else if matches!(self.extension_status.phase, Phase::Running) {
+            theme.success
         } else {
-            "未连接".into()
+            theme.accent
+        };
+        let dns_color = if !self.extension_status.observed {
+            theme.warning
+        } else if dns_label == "关闭"
+            || matches!(
+                self.extension_status.dns_phase,
+                network_extension::DnsPhase::Disabled
+            ) {
+            theme.muted_foreground
+        } else if matches!(
+            self.extension_status.dns_phase,
+            network_extension::DnsPhase::Failed
+                | network_extension::DnsPhase::Waiting
+                | network_extension::DnsPhase::Unknown
+        ) {
+            theme.warning
+        } else if matches!(
+            self.extension_status.dns_phase,
+            network_extension::DnsPhase::Running
+        ) {
+            theme.success
+        } else {
+            theme.accent
         };
         TitleBar::new().child(
             h_flex()
@@ -2958,17 +3213,23 @@ impl AppView {
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(status_dot(theme, connected && !warn_live))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if warn_live {
-                                    theme.warning
-                                } else {
-                                    theme.muted_foreground
-                                })
-                                .child(live_label),
-                        )
+                        .child(status_pill(theme, "核心", core_label, core_color))
+                        .child(status_pill(
+                            theme,
+                            "系统接管",
+                            extension_label,
+                            extension_color,
+                        ))
+                        .child(status_pill(theme, "DNS", dns_label, dns_color))
+                        .when(self.connected && self.traffic_has_rate, |this| {
+                            this.child(
+                                div().text_xs().text_color(theme.muted_foreground).child(format!(
+                                    "↑{} · ↓{}",
+                                    controller::format_rate(self.traffic_up),
+                                    controller::format_rate(self.traffic_down)
+                                )),
+                            )
+                        })
                         .when(self.is_dirty() || self.external_change_pending, |this| {
                             this.child(
                                 Button::new("apply")
@@ -3512,8 +3773,12 @@ impl AppView {
                                                 .label("关闭核心全部连接")
                                                 .disabled(self.is_busy())
                                                 .tooltip("关闭 Mihomo 全部连接，包含当前筛选外的连接")
-                                                .on_click(move |_, _, app| {
-                                                    entity.update(app, |this, cx| this.close_connections(None, cx));
+                                                .on_click(move |_, window, app| {
+                                                    entity.update(app, |this, cx| {
+                                                        this.confirm_close_all_connections(
+                                                            window, cx,
+                                                        );
+                                                    });
                                                 })
                                         }),
                                 )
@@ -3560,6 +3825,7 @@ impl AppView {
                 },
             )
             .when(connected && !self.traffic.connections.is_empty(), |this| {
+                let row_count = filtered.len();
                 this.child(
                     v_flex()
                         .id("connection-list")
@@ -3568,52 +3834,83 @@ impl AppView {
                         .min_w_0()
                         .w_full()
                         .overflow_x_scroll()
-                        .overflow_y_scroll()
-                        .child(v_flex().min_w(px(920.)).w_full().gap_1()
-                        .child(connection_header_row(
-                            entity.clone(),
-                            theme,
-                            &self.traffic.connections,
-                            &self.connection_filters,
-                        ))
-                        .when(filtered.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(if self.connection_filters.show_direct {
-                                        "没有符合筛选的连接。"
-                                    } else {
-                                        "没有符合筛选的连接。打开「显示直连」可查看直连。"
-                                    }),
-                            )
-                        })
-                        .children(filtered.into_iter().map(|conn| {
-                            render_connection_row(
-                                entity.clone(),
-                                theme,
-                                conn,
-                                via_choices(&self.strategy, &self.catalog, None),
-                                self.is_busy(),
-                            )
-                        }))
-                        .when(
-                            self.traffic.connection_count > self.traffic.connections.len(),
-                            |this| {
-                                this.child(
-                                    div().px_3().py_2().text_xs().text_color(muted_fg).child(
-                                        format!(
-                                            "当前仅加载流量最高的 {} 条，核心共 {} 条；筛选只作用于已加载列表。",
-                                            self.traffic.connections.len(),
-                                            self.traffic.connection_count
-                                        ),
-                                    ),
-                                )
-                            },
+                        .child(
+                            v_flex()
+                                .min_w(px(920.))
+                                .w_full()
+                                .flex_1()
+                                .min_h_0()
+                                .gap_1()
+                                .child(connection_header_row(
+                                    entity.clone(),
+                                    theme,
+                                    &self.traffic.connections,
+                                    &self.connection_filters,
+                                ))
+                                .when(row_count == 0, |this| {
+                                    this.child(
+                                        div()
+                                            .px_3()
+                                            .py_2()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child(if self.connection_filters.show_direct {
+                                                "没有符合筛选的连接。"
+                                            } else {
+                                                "没有符合筛选的连接。打开「显示直连」可查看直连。"
+                                            }),
+                                    )
+                                })
+                                .when(row_count > 0, |this| {
+                                    this.child(
+                                        uniform_list(
+                                            "connection-rows",
+                                            row_count,
+                                            cx.processor(|this, range: Range<usize>, _window, cx| {
+                                                let filtered = controller::filter_connections(
+                                                    &this.traffic.connections,
+                                                    &this.connection_filters,
+                                                );
+                                                let theme = cx.theme().clone();
+                                                let choices =
+                                                    via_choices(&this.strategy, &this.catalog, None);
+                                                let busy = this.is_busy();
+                                                let entity = cx.entity();
+                                                range
+                                                    .filter_map(|ix| {
+                                                        filtered.get(ix).map(|conn| {
+                                                            render_connection_row(
+                                                                entity.clone(),
+                                                                &theme,
+                                                                conn,
+                                                                choices.clone(),
+                                                                busy,
+                                                            )
+                                                        })
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            }),
+                                        )
+                                        .flex_1()
+                                        .w_full(),
+                                    )
+                                })
+                                .when(
+                                    self.traffic.connection_count > self.traffic.connections.len(),
+                                    |this| {
+                                        this.child(
+                                            div().px_3().py_2().text_xs().text_color(muted_fg).child(
+                                                format!(
+                                                    "当前仅加载流量最高的 {} 条，核心共 {} 条；筛选只作用于已加载列表。",
+                                                    self.traffic.connections.len(),
+                                                    self.traffic.connection_count
+                                                ),
+                                            ),
+                                        )
+                                    },
+                                ),
                         ),
-                ))
+                )
             })
     }
 
@@ -3759,21 +4056,15 @@ impl AppView {
                                                 .danger()
                                                 .label("删除")
                                                 .disabled(self.is_busy())
-                                                .on_click(move |_, _, app| {
-                                                    entity.update(app, |this, cx| {
-                                                        if this.is_busy() {
-                                                            return;
-                                                        }
-                                                        let previous = this.strategy.clone();
-                                                        this.strategy.remove_subscription(&id);
-                                                        if this.persist() {
-                                                            this.status =
-                                                                "订阅已删除，尚未应用。请应用配置。".into();
-                                                        } else {
-                                                            this.strategy = previous;
-                                                        }
-                                                        cx.notify();
-                                                    });
+                                                .on_click({
+                                                    let name = sub.name.clone();
+                                                    move |_, window, app| {
+                                                        entity.update(app, |this, cx| {
+                                                            this.confirm_remove_subscription(
+                                                                &id, &name, window, cx,
+                                                            );
+                                                        });
+                                                    }
                                                 }),
                                         ),
                                 ),
@@ -4153,9 +4444,14 @@ impl AppView {
         )
     }
 
-    fn export_strategy(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn export_strategy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_busy() {
             self.status = "正在处理上一项操作。".into();
+            cx.notify();
+            return;
+        }
+        if self.file_dialog_pending {
+            self.status = "文件面板已打开。".into();
             cx.notify();
             return;
         }
@@ -4164,49 +4460,94 @@ impl AppView {
         }
         self.strategy.exclude_filter = self.filter_input.read(cx).value().to_string();
         let default_name = myproxy::strategy::default_export_name();
-        match crate::file_dialog::save_strategy(&default_name) {
-            Ok(crate::file_dialog::FileDialogChoice::Cancelled) => {}
-            Ok(crate::file_dialog::FileDialogChoice::Path(path)) => {
-                match myproxy::strategy::export_to(&self.strategy, &path) {
-                    Ok(()) => self.status = format!("已导出到 {}", path.display()),
-                    Err(error) => {
-                        log::error("ui", format!("export strategy failed: {error:#}"));
-                        self.status = format!("导出失败：{error:#}");
-                    }
-                }
-            }
-            Err(error) => self.status = format!("无法打开保存面板：{error:#}"),
-        }
+        let strategy = self.strategy.clone();
+        self.file_dialog_pending = true;
         cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = cx
+                .background_executor()
+                .spawn(async move { crate::file_dialog::save_strategy(&default_name) })
+                .await;
+            this.update_in(cx, |this, _window, cx| {
+                this.file_dialog_pending = false;
+                match choice {
+                    Ok(crate::file_dialog::FileDialogChoice::Cancelled) => {}
+                    Ok(crate::file_dialog::FileDialogChoice::Path(path)) => {
+                        match myproxy::strategy::export_to(&strategy, &path) {
+                            Ok(()) => this.status = format!("已导出到 {}", path.display()),
+                            Err(error) => {
+                                log::error("ui", format!("export strategy failed: {error:#}"));
+                                this.status = format!("导出失败：{error:#}");
+                            }
+                        }
+                    }
+                    Err(error) => this.status = format!("无法打开保存面板：{error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn import_blocked(&self) -> Option<&'static str> {
+        if self.is_busy() {
+            Some("正在处理上一项操作。")
+        } else if self.group_modal_open || self.rule_modal_open || self.subscription_modal_open {
+            Some("请先关闭编辑窗口再导入。")
+        } else {
+            None
+        }
     }
 
     fn begin_import_strategy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_busy() {
-            self.status = "正在处理上一项操作。".into();
+        if self.file_dialog_pending {
+            self.status = "文件面板已打开。".into();
             cx.notify();
             return;
         }
-        if self.group_modal_open || self.rule_modal_open || self.subscription_modal_open {
-            self.status = "请先关闭编辑窗口再导入。".into();
+        if let Some(reason) = self.import_blocked() {
+            self.status = reason.into();
             cx.notify();
             return;
         }
-        let path = match crate::file_dialog::open_strategy() {
-            Ok(crate::file_dialog::FileDialogChoice::Cancelled) => return,
-            Ok(crate::file_dialog::FileDialogChoice::Path(path)) => path,
-            Err(error) => {
-                self.status = format!("无法打开文件面板：{error:#}");
-                cx.notify();
-                return;
-            }
-        };
-        match myproxy::strategy::parse_import(&path) {
-            Ok(preview) => self.open_import_confirm(path, preview, window, cx),
-            Err(error) => {
-                self.status = format!("无法读取配置：{error:#}");
-                cx.notify();
-            }
-        }
+        self.file_dialog_pending = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = cx
+                .background_executor()
+                .spawn(async move { crate::file_dialog::open_strategy() })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.file_dialog_pending = false;
+                let path = match choice {
+                    Ok(crate::file_dialog::FileDialogChoice::Cancelled) => {
+                        cx.notify();
+                        return;
+                    }
+                    Ok(crate::file_dialog::FileDialogChoice::Path(path)) => path,
+                    Err(error) => {
+                        this.status = format!("无法打开文件面板：{error:#}");
+                        cx.notify();
+                        return;
+                    }
+                };
+                if let Some(reason) = this.import_blocked() {
+                    this.status = reason.into();
+                    cx.notify();
+                    return;
+                }
+                match myproxy::strategy::parse_import(&path) {
+                    Ok(preview) => this.open_import_confirm(path, preview, window, cx),
+                    Err(error) => {
+                        this.status = format!("无法读取配置：{error:#}");
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_import_confirm(
@@ -5284,8 +5625,8 @@ impl AppView {
                         .border_1()
                         .border_color(theme.border)
                         .bg(theme.group_box)
-                        .children(log::recent(80).into_iter().map(|line| {
-                            let color = match log::Level::from_line(&line) {
+                        .children(self.log_lines.iter().map(|line| {
+                            let color = match log::Level::from_line(line) {
                                 Some(log::Level::Error) | Some(log::Level::Warn) => {
                                     Some(theme.warning)
                                 }
@@ -5298,7 +5639,7 @@ impl AppView {
                                 .text_xs()
                                 .font_family(theme.mono_font_family.clone())
                                 .when_some(color, |this, color| this.text_color(color))
-                                .child(line)
+                                .child(line.clone())
                         })),
                 ),
         )
@@ -5619,6 +5960,7 @@ fn render_group_card(
                         })
                         .child({
                             let entity = entity.clone();
+                            let name = group_name.clone();
                             Button::new(SharedString::from(format!("del-group-{del_id}")))
                                 .small()
                                 .danger()
@@ -5626,33 +5968,9 @@ fn render_group_card(
                                 .disabled(busy)
                                 .on_click(move |_, window, app| {
                                     app.stop_propagation();
-                                    let close_modal = entity.read(app).group_edit_id.as_deref()
-                                        == Some(del_id.as_str());
-                                    let removed = entity.update(app, |this, cx| {
-                                        if this.is_busy() {
-                                            return false;
-                                        }
-                                        let previous = this.strategy.clone();
-                                        if let Err(err) =
-                                            this.strategy.remove_group_checked(&del_id)
-                                        {
-                                            this.status = format!("无法删除节点组：{err:#}");
-                                            cx.notify();
-                                            return false;
-                                        }
-                                        let applied = this.persist_and_apply(cx);
-                                        if applied && close_modal {
-                                            this.group_modal_open = false;
-                                            this.group_edit_id = None;
-                                        } else if !applied {
-                                            this.strategy = previous;
-                                        }
-                                        cx.notify();
-                                        applied
+                                    entity.update(app, |this, cx| {
+                                        this.confirm_remove_group(&del_id, &name, window, cx);
                                     });
-                                    if close_modal && removed {
-                                        window.close_dialog(app);
-                                    }
                                 })
                         }),
                 ),
@@ -6298,7 +6616,7 @@ fn render_rule_set_card(
                     .separator()
                     .item(PopupMenuItem::new("删除").on_click(move |_, window, app| {
                         del_entity.update(app, |this, cx| {
-                            this.remove_selected_rule(&del_id, window, cx);
+                            this.confirm_remove_selected_rule(&del_id, window, cx);
                             cx.notify();
                         });
                     }))
@@ -6332,7 +6650,7 @@ fn render_rule_set_card(
                         .on_click(move |_, window, app| {
                             app.stop_propagation();
                             entity.update(app, |this, cx| {
-                                this.remove_selected_rule(&del_id, window, cx);
+                                this.confirm_remove_selected_rule(&del_id, window, cx);
                                 cx.notify();
                             });
                         })
@@ -6414,6 +6732,19 @@ fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
         .text_color(color)
         .text_xs()
         .child(text.to_string())
+}
+
+fn status_pill(theme: &Theme, label: &str, value: &str, color: Hsla) -> impl IntoElement {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(pill(theme, value, color))
 }
 
 fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
