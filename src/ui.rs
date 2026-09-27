@@ -1793,11 +1793,6 @@ impl AppView {
         match self.operation {
             OperationState::Connecting => "启动中",
             OperationState::Disconnecting => "停止中",
-            _ if self.connected
-                && (self.traffic_error.is_some() || self.proxy_error.is_some()) =>
-            {
-                "无响应"
-            }
             _ if self.connected => "已就绪",
             _ if self.wanted || self.operation == OperationState::Error => "异常",
             _ => "未连接",
@@ -3153,7 +3148,7 @@ impl AppView {
         let dns_label = self.dns_status_label();
         let core_color = match core_label {
             "已就绪" => theme.success,
-            "异常" | "无响应" => theme.warning,
+            "异常" => theme.warning,
             "启动中" | "停止中" => theme.accent,
             _ => theme.muted_foreground,
         };
