@@ -75,9 +75,11 @@ pub fn request(request: Request) -> Result<Snapshot> {
 /// Only the signed app can realize a System Extension intent, so an unbundled
 /// macOS CLI may edit strategy but not turn System Extension on.
 pub fn refuse_unbundled_extension_enable(next_enables: bool) -> Result<()> {
-    let bundled = !cfg!(target_os = "macos") || crate::login_item::is_bundled();
+    if !cfg!(target_os = "macos") || crate::login_item::is_bundled() {
+        return Ok(());
+    }
     let saved = Strategy::load().is_ok_and(|strategy| strategy.system_extension);
-    if !bundled && turns_on_extension(saved, next_enables) {
+    if turns_on_extension(saved, next_enables) {
         bail!("Turning on System Extension requires the myproxyctl bundled with the signed app");
     }
     Ok(())
