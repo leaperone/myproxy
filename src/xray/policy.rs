@@ -4,11 +4,30 @@ use std::net::IpAddr;
 use crate::catalog::{self, Catalog};
 use crate::controller::{LiveGroup, LiveMember};
 use crate::strategy::{Group, InboundMode, RoutingProfile, Strategy};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealthState {
+    Unprobed,
+    Checking,
+    Degraded,
+    Unavailable,
+    Healthy,
+}
+
+impl Default for HealthState {
+    fn default() -> Self { Self::Unprobed }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NodeHealth {
     pub delay_ms: Option<u32>,
     pub failures: u32,
+    pub destination_failures: u32,
+    pub state: HealthState,
+    pub last_check_ms: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,7 +90,7 @@ fn group<'a>(strategy: &'a Strategy, name: &str) -> Option<&'a Group> {
 }
 
 fn healthy(name: &str, health: &HashMap<String, NodeHealth>) -> bool {
-    health.get(name).map_or(true, |item| item.failures < 2)
+    health.get(name).map_or(true, |item| item.failures < 2 && !matches!(item.state, HealthState::Unavailable))
 }
 
 fn append_route(chain: &mut Vec<String>, route: &Route) {
@@ -518,6 +537,7 @@ pub fn groups(
                 },
             ])
             .collect(),
+        health_summary: None,
     }];
     let mut cache = HashMap::new();
     result.extend(strategy.groups.iter().map(|group| {
@@ -536,6 +556,26 @@ pub fn groups(
             Route::Direct => "DIRECT".into(),
             Route::Reject => "REJECT".into(),
         };
+        let health_summary = {
+            let leaf_names = catalog::resolve_group_members_with_strategy(strategy, &group.name, catalog)
+                .unwrap_or_default();
+            if leaf_names.is_empty() {
+                None
+            } else {
+                let available = leaf_names
+                    .iter()
+                    .filter(|name| health.get(*name).is_some_and(|item| item.failures < 2 && item.delay_ms.is_some()))
+                    .count();
+                let unavailable = leaf_names
+                    .iter()
+                    .filter(|name| health.get(*name).is_some_and(|item| item.failures >= 2))
+                    .count();
+                let pending = leaf_names.len().saturating_sub(available + unavailable);
+                Some(format!(
+                    "健康探测：可用 {available} · 探测失败 {unavailable} · 待复测 {pending} · 每 30 秒重试"
+                ))
+            }
+        };
         LiveGroup {
             name: group.name.clone(),
             kind: group.kind.clone(),
@@ -550,6 +590,7 @@ pub fn groups(
                     name,
                 })
                 .collect(),
+            health_summary,
         }
     }));
     result
@@ -691,6 +732,7 @@ mod tests {
                 NodeHealth {
                     delay_ms: Some(100),
                     failures: 0,
+                    ..Default::default()
                 },
             ),
             (
@@ -698,6 +740,7 @@ mod tests {
                 NodeHealth {
                     delay_ms: Some(10),
                     failures: 0,
+                    ..Default::default()
                 },
             ),
         ]);
@@ -801,6 +844,7 @@ mod tests {
                 NodeHealth {
                     delay_ms: Some(90),
                     failures: 0,
+                    ..Default::default()
                 },
             ),
             (
@@ -808,6 +852,7 @@ mod tests {
                 NodeHealth {
                     delay_ms: Some(10),
                     failures: 0,
+                    ..Default::default()
                 },
             ),
         ]);
@@ -845,8 +890,33 @@ mod tests {
         };
         let health = values.into_iter().map(|(name, delay)| (name.into(), NodeHealth {
             delay_ms: Some(delay), failures: 0,
+            ..Default::default()
         })).collect();
         (strategy, catalog, health)
+    }
+
+    #[test]
+    fn destination_errors_do_not_remove_nodes_but_failed_probe_rounds_do() {
+        let (strategy, catalog, mut health) = regional_fixture();
+        for item in health.values_mut() { item.destination_failures = 100; }
+        let selected = |health: &HashMap<String, NodeHealth>| decide(&strategy, &catalog, health, "example.com", 443, None).route;
+        assert_eq!(selected(&health), Route::Node("美国 fast".into()));
+        for name in ["美国 slow", "美国 fast"] {
+            crate::xray::health::record_probe(health.get_mut(name).unwrap(), Err("both HTTPS probes timed out".into()), 100);
+        }
+        assert!(matches!(selected(&health), Route::Node(_)));
+        for name in ["美国 slow", "美国 fast"] {
+            crate::xray::health::record_probe(health.get_mut(name).unwrap(), Err("both HTTPS probes timed out".into()), 200);
+        }
+        assert_eq!(selected(&health), Route::Node("日本 fast".into()));
+        for name in ["日本 fast", "香港 fast"] {
+            for time in [100, 200] {
+                crate::xray::health::record_probe(health.get_mut(name).unwrap(), Err("both HTTPS probes timed out".into()), time);
+            }
+        }
+        assert_eq!(selected(&health), Route::Reject);
+        crate::xray::health::record_probe(health.get_mut("美国 fast").unwrap(), Ok(80), 300);
+        assert_eq!(selected(&health), Route::Node("美国 fast".into()));
     }
 
     #[test]

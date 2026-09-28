@@ -129,6 +129,25 @@ group cannot be deleted until those references are removed.
 Routing changes close old flows without restarting Xray. Disconnect confirms
 both capture and DNS are disabled before stopping their relay or core.
 
+Xray resolves proxy server addresses over TCP using the current system DNS
+servers, with fallback between those servers. This bootstrap traffic has its
+own Direct route; DNS requested through a proxy still follows the selected node.
+Health checks run about every 30 seconds with at most eight concurrent workers.
+They try the gstatic HTTPS 204 endpoint, then Cloudflare if the first check fails.
+Two consecutive rounds in which both checks fail exclude a node from automatic
+selection. Excluded nodes keep being checked and return after a successful check.
+A connection failure to an individual website does not mark the entire node down.
+The node cards show probe counts and states; member tooltips show the last check,
+last success, and failure reason. The CLI status includes the same node diagnostics.
+
+Update metadata and archives use the current Mixed proxy first, then retry
+directly if that request or response body fails. Direct retries ignore proxy
+environment variables. Archives are staged to a private temporary file; a partial
+download is discarded before retrying and never passed to Sparkle as a complete
+archive. Settings shows the download path, progress, fallback reason, and Sparkle
+outcome. Download completion still requires Sparkle signature verification and
+installation.
+
 Rule mode supports application rules for captured traffic, exact/suffix/keyword/
 wildcard domains, CIDRs, optional TCP/UDP qualifiers, and imported geographic or
 domain categories. Domain and IP data are evaluated in the app. The local

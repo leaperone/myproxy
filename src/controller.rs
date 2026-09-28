@@ -198,6 +198,9 @@ pub struct LiveGroup {
     pub kind: String,
     pub now: String,
     pub members: Vec<LiveMember>,
+    /// Xray-only summary of the background node probes. Mihomo gets no
+    /// summary because its controller already owns the health state.
+    pub health_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -643,6 +646,7 @@ impl LiveGroup {
             kind: normalize_group_kind(&raw.kind),
             now: raw.now.clone(),
             members,
+            health_summary: None,
         })
     }
 }

@@ -20,6 +20,8 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/xray-build
       XRAY_BINARY: ${{ github.workspace }}/resources/xray/xray
+      MYPROXY_DATA_DIR: ${{ github.workspace }}/.test-data/myproxy
+      MYPROXY_XRAY_DATA_DIR: ${{ github.workspace }}/.test-data/myproxy-xray
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -42,6 +44,7 @@ jobs:
           key: xray-test
           cache-on-failure: true
       - run: python3 scripts/check-xray-boundary.py
+      - run: python3 scripts/test-xray-boundary.py
       - run: python3 scripts/test-install-xray-recovery.py
       - run: python3 scripts/test-xray-resource-limits.py
       - run: python3 scripts/test-xray-release-metadata.py
@@ -56,8 +59,10 @@ jobs:
             src/backend.rs
             src/xray/
       - run: cargo test --locked --lib -- --test-threads=1
+      - run: cargo check --locked --quiet
       - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
       - run: scripts/fetch-sparkle.sh
+      - run: cargo test --locked --bin myproxy --features sparkle,xray-channel sparkle::tests -- --test-threads=1
       - run: cargo build --locked --bins --features sparkle,xray-channel
       - name: Set Xray release metadata
         id: metadata

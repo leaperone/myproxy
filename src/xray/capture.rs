@@ -73,6 +73,23 @@ fn system_resolvers(output: &str) -> Vec<std::net::IpAddr> {
     resolvers
 }
 
+pub(crate) fn system_resolvers_for_bootstrap() -> Result<Vec<std::net::IpAddr>> {
+    let output = if cfg!(target_os = "macos") {
+        let result = std::process::Command::new("/usr/sbin/scutil").arg("--dns").output()
+            .context("无法读取当前系统 DNS 设置")?;
+        if !result.status.success() { bail!("scutil --dns 退出码 {:?}", result.status.code()); }
+        String::from_utf8_lossy(&result.stdout).into_owned()
+    } else {
+        std::fs::read_to_string("/etc/resolv.conf").context("无法读取系统 DNS 设置")?
+    };
+    let parsed = if cfg!(target_os = "macos") {
+        system_resolvers(&output)
+    } else {
+        output.lines().filter_map(|line| line.trim().strip_prefix("nameserver ")?.trim().parse().ok()).take(4).collect()
+    };
+    Ok(parsed)
+}
+
 fn choose_direct_resolver(answered: Option<String>, resolvers: &[std::net::IpAddr]) -> String {
     answered.unwrap_or_else(|| resolvers[0].to_string())
 }

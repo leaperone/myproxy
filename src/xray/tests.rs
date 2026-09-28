@@ -22,16 +22,19 @@ fn isolated() -> Guard {
 }
 
 #[test]
-fn proxy_server_dns_uses_tcp_and_does_not_fall_back_to_the_system_resolver() {
-    let dns = proxy_server_dns();
-    assert_eq!(dns["disableFallback"], true);
+fn proxy_server_dns_uses_system_addresses_with_fallback_and_a_private_tag() {
+    let resolvers = ["119.29.29.29".parse().unwrap(), "223.5.5.5".parse().unwrap(), "2606:4700:4700::1111".parse().unwrap()];
+    let dns = proxy_server_dns_with_resolvers(&resolvers);
+    assert_eq!(dns["disableFallback"], false);
+    assert_eq!(dns["tag"], "myproxy-node-dns");
     assert_eq!(dns["queryStrategy"], "UseIPv4");
-    assert_eq!(dns["servers"], serde_json::json!(["tcp://1.1.1.1", "tcp://8.8.8.8"]));
-    let rule = proxy_server_dns_rule();
+    assert_eq!(dns["servers"], serde_json::json!(["tcp://119.29.29.29:53", "tcp://223.5.5.5:53", "tcp://[2606:4700:4700::1111]:53"]));
+    let rule = proxy_server_dns_rule_with_resolvers(&resolvers);
     assert_eq!(rule["outboundTag"], "dns-direct");
     assert_eq!(rule["network"], "tcp");
     assert_eq!(rule["port"], "53");
-    assert_eq!(rule["ip"], serde_json::json!(["1.1.1.1/32", "8.8.8.8/32"]));
+    assert_eq!(rule["inboundTag"], serde_json::json!(["myproxy-node-dns"]));
+    assert_eq!(rule["ip"], serde_json::json!(["119.29.29.29/32", "223.5.5.5/32", "2606:4700:4700::1111/128"]));
 }
 
 #[test]
@@ -416,8 +419,8 @@ fn nested_region_fallback_changes_real_xray_egress_without_core_restart() {
     let runtime = active().unwrap();
     let _probe = runtime.probe_lock.lock().unwrap();
     *runtime.health.write().unwrap() = HashMap::from([
-        ("A".into(), policy::NodeHealth { delay_ms: Some(80), failures: 0 }),
-        ("B".into(), policy::NodeHealth { delay_ms: Some(5), failures: 0 }),
+        ("A".into(), policy::NodeHealth { delay_ms: Some(80), failures: 0, ..Default::default() }),
+        ("B".into(), policy::NodeHealth { delay_ms: Some(5), failures: 0, ..Default::default() }),
     ]);
     let pid = runtime.child.lock().unwrap().id();
     assert!(request(strategy.mixed_port, "http").ends_with("REGION_US"));

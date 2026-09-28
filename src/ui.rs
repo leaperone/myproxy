@@ -1144,6 +1144,9 @@ pub struct AppView {
     applied: Strategy,
     catalog: Catalog,
     status: String,
+    health_note: Option<String>,
+    update_status: String,
+    node_health_details: HashMap<String, (String, String)>,
     connected: bool,
     wanted: bool,
     busy: bool,
@@ -1311,6 +1314,19 @@ impl AppView {
                     .update(cx, |this, cx| {
                         let started = Instant::now();
                         let mut dirty = this.sync_runtime();
+                        let update_status = crate::sparkle::status();
+                        if this.update_status != update_status {
+                            this.update_status = update_status;
+                            dirty = true;
+                        }
+                        if backend::is_xray() && this.page == Page::Groups {
+                            let details = myproxy::xray::node_health().unwrap_or_default()
+                                .iter().map(|node| (node.name.clone(), node_health_text(node))).collect();
+                            if this.node_health_details != details {
+                                this.node_health_details = details;
+                                dirty = true;
+                            }
+                        }
                         if !this.is_busy() && !this.wanted && this.connected {
                             this.connected = false;
                             this.clear_live();
@@ -1430,6 +1446,9 @@ impl AppView {
             } else {
                 "策略已加载。在总览连接；改端口或过滤器后点「应用」。".into()
             },
+            health_note: None,
+            update_status: crate::sparkle::status(),
+            node_health_details: HashMap::new(),
             connected: false,
             wanted,
             busy: false,
@@ -1754,12 +1773,19 @@ impl AppView {
             }
             dirty = true;
         }
+        let recovered = self.health_note.is_some()
+            && health.note.is_none()
+            && self.health_note.as_deref() == Some(self.status.as_str());
+        if self.health_note != health.note {
+            self.health_note = health.note.clone();
+            dirty = true;
+        }
         if let Some(note) = health.note {
             if self.status != note {
                 self.status = note;
                 dirty = true;
             }
-        } else if became_ready {
+        } else if became_ready || recovered {
             self.status = format!("代理已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
             dirty = true;
         }
@@ -2560,19 +2586,22 @@ impl AppView {
     fn group_now_label(&self, group: &Group) -> String {
         if self.connected {
             let mut current = group.name.clone();
+            let mut route = Vec::new();
             let mut visited = std::collections::HashSet::new();
             for _ in 0..64 {
                 if !visited.insert(current.to_ascii_lowercase()) { return "不可用".into(); }
                 let Some(live) = self.proxy_groups.iter().find(|item| item.name == current) else {
                     return "等待核心状态".into();
                 };
-                if live.members.is_empty() { return "不可用".into(); }
+                if live.members.is_empty() { return "组内没有节点，请检查筛选条件".into(); }
                 if live.now.is_empty() { return "等待核心状态".into(); }
-                if live.now == "REJECT" { return "暂无可用节点".into(); }
+                if live.now == "REJECT" { return "没有可用出口，请查看选点和探测记录".into(); }
                 if live.now == "DIRECT" { return "直连".into(); }
                 let Some(child) = self.strategy.groups.iter().find(|item| item.name == live.now || item.id == live.now || item.name.eq_ignore_ascii_case(&live.now)) else {
-                    return live.now.clone();
+                    route.push(live.now.clone());
+                    return route.join(" → ");
                 };
+                route.push(child.name.clone());
                 current = child.name.clone();
             }
             return "不可用".into();
@@ -2862,12 +2891,18 @@ impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let connected = self.connected;
         let busy = self.is_busy();
+        let exit_unavailable = backend::is_xray()
+            && connected
+            && self.supervisor.last_health().proxy_now == "REJECT";
         let warn_live = !busy
             && (self.wanted && !connected
+                || exit_unavailable
                 || self.traffic_error.is_some()
                 || self.proxy_error.is_some());
         let live_label = if busy {
             self.operation_label().to_string()
+        } else if exit_unavailable {
+            "核心运行中 · 当前出口不可用".into()
         } else if connected && self.traffic_has_rate {
             format!(
                 "已连接 · ↑{} · ↓{}",
@@ -3186,14 +3221,20 @@ impl AppView {
     }
 
     fn xray_overview(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
-        let title = if self.connected { "已连接" } else if self.wanted { "连接需要处理" } else { "未连接" };
+        let exit_unavailable = self.connected && self.supervisor.last_health().proxy_now == "REJECT";
+        let title = if exit_unavailable { "核心运行中，出口需要处理" } else if self.connected { "已连接" } else if self.wanted { "连接需要处理" } else { "未连接" };
         v_flex().gap_4()
             .child(page_title(theme,"MyProxy","添加代理，选择出口，然后连接。"))
             .child(panel(theme,"连接",h_flex().items_center().justify_between()
                 .child(v_flex().gap_2()
                     .child(div().text_lg().font_semibold().child(title))
-                    .child(div().text_sm().child(if self.connected && self.strategy.mixed_mode == InboundMode::Rule { "按规则为每条连接选择出口".to_string() } else if self.connected { format!("当前出口：{}",self.overview_proxy_label()) } else { format!("HTTP 和 SOCKS5 共用 127.0.0.1:{}",self.strategy.mixed_port) })))
+                    .child(div().text_sm().child(if self.connected && self.strategy.mixed_mode == InboundMode::Rule { format!("按规则分流 · 默认出口：{}", self.overview_proxy_label()) } else if self.connected { format!("当前出口：{}",self.overview_proxy_label()) } else { format!("HTTP 和 SOCKS5 共用 127.0.0.1:{}",self.strategy.mixed_port) })))
                 .child(self.overview_connect_button(cx,true))))
+            .when_some(self.health_note.clone(), |view, note| view.child(
+                div().text_sm().text_color(theme.warning).child(note)))
+            .child(h_flex().gap_3().flex_wrap()
+                .child(metric(theme,"系统接管",self.extension_status.phase_label()))
+                .child(metric(theme,"DNS",self.extension_status.dns_label())))
             .when(self.catalog.nodes.is_empty(), |view| view.child(
                 Button::new("xray-add-proxy").primary().label("添加代理").on_click(self.select_page(cx,Page::Subscriptions))))
             .child(panel(theme,"使用方式",v_flex().gap_3()
@@ -3768,7 +3809,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "节点组",
-                if backend::is_xray() { "展开节点组，点击方案或节点即可切换。自动组可以固定选择，也可以恢复自动。" } else { "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件。" },
+                if backend::is_xray() { "展开节点组，点击方案或节点即可切换。自动组每 30 秒探测一次，连续失败会暂时跳过，并显示可用、暂停和未完成数量。" } else { "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件。" },
             ))
             .child(
                 h_flex().child({
@@ -3838,6 +3879,9 @@ impl AppView {
                 let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
                 let now = self.group_now_label(group);
                 let active_choice = self.live_group(group).map(|live| live.now.as_str()).unwrap_or(&group.selected);
+                let health_summary = self
+                    .live_group(group)
+                    .and_then(|live| live.health_summary.clone());
                 let members: Vec<(String, Option<u32>)> = member_names
                     .into_iter()
                     .filter(|name| name.to_lowercase().contains(&query))
@@ -3855,6 +3899,8 @@ impl AppView {
                     accent,
                     &now,
                     active_choice,
+                    health_summary.as_deref(),
+                    &self.node_health_details,
                     &members,
                     group.kind == "select" || backend::is_xray(),
                     self.delaying.contains(&group.name),
@@ -5110,6 +5156,9 @@ impl AppView {
         let entity = cx.entity();
         let version = updates::VERSION;
         let channel = self.strategy.update_channel.unwrap_or_default();
+        let transport = crate::sparkle::snapshot();
+        let update_status = transport.detail.clone();
+        let updating = matches!(transport.phase, "checking" | "connecting" | "reading" | "fallback" | "validating" | "installing");
         let hint = match channel {
             UpdateChannel::Prod => {
                 "仅接收正式版本。切回后，会在发布比当前版本更新的正式版时更新。相邻正式版走增量包。"
@@ -5186,8 +5235,19 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("已连接时，检查更新与下载走 Mixed；未连接则直连。"),
+                        .child("已连接时优先走当前代理；代理失败会自动回落直连。未连接时使用直连。"),
                 )
+                .when(!update_status.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(if transport.phase == "error" || transport.phase == "fallback" { theme.warning } else { theme.foreground })
+                            .child(update_status.clone()),
+                    )
+                })
+                .when_some(transport.fallback_reason.clone(), |this, reason| {
+                    this.child(div().text_xs().text_color(theme.muted_foreground).child(format!("代理尝试失败原因：{reason}")))
+                })
                 .when(!crate::sparkle::available(), |this| {
                     this.child(
                         div()
@@ -5199,16 +5259,12 @@ impl AppView {
                 .child({
                     let entity = entity.clone();
                     Button::new("check-updates")
-                        .label("检查更新")
-                        .disabled(!crate::sparkle::available())
+                        .label(if updating { "正在处理更新…" } else if transport.phase == "error" { "重试检查更新" } else { "检查更新" })
+                        .disabled(!crate::sparkle::available() || updating)
                         .on_click(move |_, _, app| {
                             crate::sparkle::check();
                             entity.update(app, |this, cx| {
-                                this.status = if crate::sparkle::available() {
-                                    "已请求检查更新。".into()
-                                } else {
-                                    "此构建没有更新器。".into()
-                                };
+                                this.status = crate::sparkle::status();
                                 cx.notify();
                             });
                         })
@@ -5510,6 +5566,24 @@ fn format_delay(delay: Option<u32>) -> String {
     }
 }
 
+fn node_health_text(node: &myproxy::xray::NodeHealthSnapshot) -> (String, String) {
+    use myproxy::xray::policy::HealthState;
+    let state = match &node.state {
+        HealthState::Unprobed => "等待首次探测",
+        HealthState::Checking => "正在探测",
+        HealthState::Degraded => "一轮失败，待复测",
+        HealthState::Unavailable => "探测失败",
+        HealthState::Healthy => "正常",
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis() as u64;
+    let age = |time: Option<u64>| time.map(|time| format!("{} 秒前", now.saturating_sub(time) / 1000))
+        .unwrap_or_else(|| "尚无记录".into());
+    let mut detail = format!("{state} · 最近探测 {} · 最近成功 {}", age(node.last_check_ms), age(node.last_success_ms));
+    if let Some(error) = &node.last_error { detail.push_str(&format!("\n{error}")); }
+    (state.to_string(), detail)
+}
+
 fn render_group_card(
     entity: Entity<AppView>,
     theme: &Theme,
@@ -5519,6 +5593,8 @@ fn render_group_card(
     accent: Hsla,
     now: &str,
     active_choice: &str,
+    health_summary: Option<&str>,
+    node_health_details: &HashMap<String, (String, String)>,
     members: &[(String, Option<u32>)],
     can_select: bool,
     delaying: bool,
@@ -5659,6 +5735,9 @@ fn render_group_card(
             now,
             group.policy_label()
         )))
+        .when_some(health_summary, |view, summary| {
+            view.child(div().text_xs().text_color(muted_fg).child(summary.to_string()))
+        })
         .when(backend::is_xray() && group.kind != "select" && !group.selected.is_empty(), |view| {
             let entity = entity.clone();
             let group_id = id.clone();
@@ -5673,10 +5752,17 @@ fn render_group_card(
                     .gap_1()
                     .children(shown.into_iter().map(|(name, delay)| {
                         let delay_text = format_delay(delay);
-                        let label = if delay_text.is_empty() {
+                        let mut label = if delay_text.is_empty() {
                             name.clone()
                         } else {
                             format!("{name}  {delay_text}")
+                        };
+                        let tooltip = match node_health_details.get(&name) {
+                            Some((state, detail)) => {
+                                label.push_str(&format!(" · {state}"));
+                                format!("{name}\n{detail}")
+                            }
+                            None => name.clone(),
                         };
                         let is_now = name == active_choice;
                         let entity = entity.clone();
@@ -5687,7 +5773,7 @@ fn render_group_card(
                                 .label(label)
                                 .max_w_full()
                                 .overflow_hidden()
-                                .tooltip(name.clone())
+                                .tooltip(tooltip)
                                 .selected(is_now)
                                 .disabled(busy)
                                 .accessibility_label(format!("选择 {name}"))
