@@ -362,7 +362,8 @@ pub fn open_release(
 
 /// Fetch and validate a complete response before returning it. The callback
 /// is invoked before each route attempt and while reading its body, allowing
-/// the local feed to expose proxy/direct fallback progress.
+/// the local feed to expose proxy/direct fallback progress. Returning false
+/// cancels the transfer and suppresses retries.
 pub fn fetch_release_bytes_with_progress<F>(
     url: &str,
     mixed_port: Option<u16>,
@@ -370,7 +371,7 @@ pub fn fetch_release_bytes_with_progress<F>(
     progress: F,
 ) -> Result<(Vec<u8>, ReleasePath), String>
 where
-    F: FnMut(ReleaseProgress),
+    F: FnMut(ReleaseProgress) -> bool,
 {
     let mut staged = fetch_release_to_temp_with_limit(url, mixed_port, timeout, 16 * 1024 * 1024, progress)?;
     staged.rewind().map_err(|_| "staged update rewind failed".to_string())?;
@@ -386,7 +387,7 @@ pub fn fetch_release_to_temp_with_progress<F>(
     progress: F,
 ) -> Result<StagedRelease, String>
 where
-    F: FnMut(ReleaseProgress),
+    F: FnMut(ReleaseProgress) -> bool,
 {
     fetch_release_to_temp_with_limit(url, mixed_port, timeout, 2 * 1024 * 1024 * 1024, progress)
 }
@@ -399,7 +400,7 @@ fn fetch_release_to_temp_with_limit<F>(
     progress: F,
 ) -> Result<StagedRelease, String>
 where
-    F: FnMut(ReleaseProgress),
+    F: FnMut(ReleaseProgress) -> bool,
 {
     fetch_with_opener(url, mixed_port, max_bytes, progress, |url, port, path| {
         open_release_once(url, port, timeout, "GET", path)
@@ -414,7 +415,7 @@ fn fetch_with_opener<F, O>(
     mut open: O,
 ) -> Result<StagedRelease, String>
 where
-    F: FnMut(ReleaseProgress),
+    F: FnMut(ReleaseProgress) -> bool,
     O: FnMut(&str, Option<u16>, ReleasePath) -> Result<ReleaseResponse, String>,
 {
     if !allowed_release_url(url) { return Err("blocked update host".to_string()); }
@@ -426,9 +427,11 @@ where
     let mut failures = Vec::new();
     for (attempt, (port, path)) in attempts.into_iter().enumerate() {
         if attempt > 0 {
-            progress(ReleaseProgress::Fallback { path, reason: failures.last().cloned().unwrap_or_else(|| "current proxy failed".into()) });
+            if !progress(ReleaseProgress::Fallback { path, reason: failures.last().cloned().unwrap_or_else(|| "current proxy failed".into()) }) {
+                return Err("update transfer cancelled".into());
+            }
         } else {
-            progress(ReleaseProgress::Attempting { path });
+            if !progress(ReleaseProgress::Attempting { path }) { return Err("update transfer cancelled".into()); }
         }
         let opened = match open(url, port, path) {
             Ok(opened) => opened,
@@ -440,7 +443,9 @@ where
                 continue;
             }
         };
-        progress(ReleaseProgress::Reading { path, bytes: 0, total: opened.content_length });
+        if !progress(ReleaseProgress::Reading { path, bytes: 0, total: opened.content_length }) {
+            return Err("update transfer cancelled".into());
+        }
         let expected = opened.content_length;
         if expected.unwrap_or(0) > max_bytes {
             failures.push(format!("{}: response too large", path.label()));
@@ -458,7 +463,7 @@ where
         let mut staged = StagedRelease { file, path, content_length: 0, fallback_reason: failures.first().cloned(), location };
         let mut reader = opened.response.into_reader();
         let result = stage_body(&mut reader, &mut staged.file, expected, max_bytes, |bytes| {
-            progress(ReleaseProgress::Reading { path, bytes, total: expected });
+            progress(ReleaseProgress::Reading { path, bytes, total: expected })
         });
         match result {
             Ok(bytes) => {
@@ -466,13 +471,14 @@ where
                 staged.rewind().map_err(|_| "staged update rewind failed".to_string())?;
                 return Ok(staged);
             }
+            Err(error) if error == "update transfer cancelled" => return Err(error),
             Err(error) => failures.push(format!("{}: {error}", path.label())),
         }
     }
     Err(format!("update request failed ({})", failures.join("; ")))
 }
 
-fn stage_body<R: Read, F: FnMut(u64)>(reader: &mut R, file: &mut File, expected: Option<u64>, max: u64, mut progress: F) -> Result<u64, String> {
+fn stage_body<R: Read, F: FnMut(u64) -> bool>(reader: &mut R, file: &mut File, expected: Option<u64>, max: u64, mut progress: F) -> Result<u64, String> {
     let mut bytes = 0u64;
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -481,7 +487,7 @@ fn stage_body<R: Read, F: FnMut(u64)>(reader: &mut R, file: &mut File, expected:
         bytes = bytes.saturating_add(count as u64);
         if bytes > max { return Err("response body too large".into()); }
         file.write_all(&buf[..count]).map_err(|_| "staging file write failed")?;
-        progress(bytes);
+        if !progress(bytes) { return Err("update transfer cancelled".into()); }
     }
     if bytes == 0 { return Err("empty update response".into()); }
     if let Some(expected) = expected {
@@ -513,7 +519,7 @@ mod tests {
     #[test]
     fn proxy_success_never_attempts_direct_and_cleans_up_after_delivery() {
         let mut attempted = Vec::new();
-        let mut staged = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| {}, |_, port, path| {
+        let mut staged = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| true, |_, port, path| {
             attempted.push((port, path));
             Ok(fixture(path, "archive", Some(7)))
         }).unwrap();
@@ -533,7 +539,7 @@ mod tests {
     fn proxy_connection_failure_retries_direct_and_preserves_reason() {
         let mut attempted = Vec::new();
         let mut events = Vec::new();
-        let mut staged = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |event| events.push(event), |_, port, path| {
+        let mut staged = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |event| { events.push(event); true }, |_, port, path| {
             attempted.push((port, path));
             if port.is_some() { Err("connection refused".into()) }
             else { Ok(fixture(path, "direct", Some(6))) }
@@ -548,7 +554,7 @@ mod tests {
     #[test]
     fn truncated_proxy_body_is_discarded_before_direct_retry() {
         let mut attempted = Vec::new();
-        let mut staged = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| {}, |_, port, path| {
+        let mut staged = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| true, |_, port, path| {
             attempted.push(port);
             Ok(if port.is_some() { fixture(path, "bad", Some(10)) } else { fixture(path, "complete", Some(8)) })
         }).unwrap();
@@ -560,7 +566,7 @@ mod tests {
 
     #[test]
     fn both_routes_failing_report_both_causes() {
-        let error = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| {}, |_, port, _| {
+        let error = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| true, |_, port, _| {
             Err(if port.is_some() { "proxy refused" } else { "TLS failed" }.into())
         }).unwrap_err();
         assert!(error.contains("proxy refused"));
@@ -570,7 +576,7 @@ mod tests {
     #[test]
     fn direct_only_does_not_claim_proxy_failure() {
         let mut attempts = Vec::new();
-        let mut staged = fetch_with_opener(FIXTURE_URL, None, 20, |_| {}, |_, port, path| {
+        let mut staged = fetch_with_opener(FIXTURE_URL, None, 20, |_| true, |_, port, path| {
             attempts.push((port, path));
             Ok(fixture(path, "direct", None))
         }).unwrap();
@@ -581,11 +587,11 @@ mod tests {
 
     #[test]
     fn blocked_hosts_and_redirects_are_never_retried() {
-        assert!(fetch_with_opener("http://example.com/app.zip", Some(40999), 20, |_| {}, |_, _, _| {
+        assert!(fetch_with_opener("http://example.com/app.zip", Some(40999), 20, |_| true, |_, _, _| {
             panic!("blocked URL must not be requested")
         }).is_err());
         let mut attempts = 0;
-        let result = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| {}, |_, _, _| {
+        let result = fetch_with_opener(FIXTURE_URL, Some(40999), 20, |_| true, |_, _, _| {
             attempts += 1;
             Err("blocked redirect host example.com".into())
         });
@@ -596,9 +602,19 @@ mod tests {
     #[test]
     fn oversized_and_empty_responses_do_not_become_download_success() {
         for (body, length) in [("", None), ("", Some(0)), ("too big", None), ("size", Some(99))] {
-            let result = fetch_with_opener(FIXTURE_URL, None, 4, |_| {}, |_, _, path| Ok(fixture(path, body, length)));
+            let result = fetch_with_opener(FIXTURE_URL, None, 4, |_| true, |_, _, path| Ok(fixture(path, body, length)));
             assert!(result.is_err(), "body={body:?}, length={length:?}");
         }
+    }
+
+    #[test]
+    fn cancelled_body_does_not_start_a_direct_retry() {
+        let mut attempts = Vec::new();
+        let result = fetch_with_opener(FIXTURE_URL, Some(40999), 20,
+            |event| !matches!(event, ReleaseProgress::Reading { bytes, .. } if bytes > 0),
+            |_, port, path| { attempts.push(port); Ok(fixture(path, "archive", Some(7))) });
+        assert_eq!(result.unwrap_err(), "update transfer cancelled");
+        assert_eq!(attempts, [Some(40999)]);
     }
 
     #[test]
@@ -657,8 +673,8 @@ mod tests {
     fn staging_rejects_short_and_empty_bodies() {
         let dir = std::env::temp_dir().join(format!("myproxy-test-{}", uuid::Uuid::new_v4().simple()));
         let mut file = OpenOptions::new().read(true).write(true).create(true).open(&dir).unwrap();
-        assert!(stage_body(&mut &b"abc"[..], &mut file, Some(4), 100, |_| {}).is_err());
-        assert!(stage_body(&mut &b""[..], &mut file, Some(1), 100, |_| {}).is_err());
+        assert!(stage_body(&mut &b"abc"[..], &mut file, Some(4), 100, |_| true).is_err());
+        assert!(stage_body(&mut &b""[..], &mut file, Some(1), 100, |_| true).is_err());
         let _ = fs::remove_file(dir);
     }
 
@@ -666,11 +682,11 @@ mod tests {
     fn staging_rejects_size_limit_and_preserves_exact_body() {
         let dir = std::env::temp_dir().join(format!("myproxy-test-{}", uuid::Uuid::new_v4().simple()));
         let mut file = OpenOptions::new().read(true).write(true).create(true).open(&dir).unwrap();
-        assert!(stage_body(&mut &b"abcd"[..], &mut file, None, 3, |_| {}).is_err());
+        assert!(stage_body(&mut &b"abcd"[..], &mut file, None, 3, |_| true).is_err());
         let _ = fs::remove_file(dir);
         let dir = std::env::temp_dir().join(format!("myproxy-test-{}", uuid::Uuid::new_v4().simple()));
         let mut file = OpenOptions::new().read(true).write(true).create_new(true).open(&dir).unwrap();
-        assert_eq!(stage_body(&mut &b"abc"[..], &mut file, Some(3), 3, |_| {}).unwrap(), 3);
+        assert_eq!(stage_body(&mut &b"abc"[..], &mut file, Some(3), 3, |_| true).unwrap(), 3);
         use std::io::Seek;
         file.rewind().unwrap();
         let mut body = Vec::new(); file.read_to_end(&mut body).unwrap();

@@ -263,6 +263,7 @@ fn handle_feed_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
                     format!("正在通过{}读取更新信息（{bytes}/{}）。", path.label(), total.map(|v| v.to_string()).unwrap_or_else(|| "未知".into())),
                 ),
             }
+            accepts(&snapshot(), operation)
         }) {
             Ok((body, path)) => {
                 set_transport(operation, "validating", route_name(path), format!("已通过{}取得更新信息，正在检查版本。", path.label()));
@@ -334,6 +335,7 @@ fn stream_asset(
                 format!("正在通过{}读取更新包（{bytes}/{}）。", path.label(), total.map(|v| v.to_string()).unwrap_or_else(|| "未知".into())),
             ),
         }
+        accepts(&snapshot(), operation)
     }) {
         Ok(mut staged) => {
             staged.rewind()?;
