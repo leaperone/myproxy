@@ -32,6 +32,7 @@ static SNAPSHOT: Mutex<UpdateTransportSnapshot> = Mutex::new(UpdateTransportSnap
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateTransportSnapshot {
+    pub operation: u64,
     pub phase: &'static str,
     pub route: &'static str,
     pub detail: String,
@@ -40,7 +41,7 @@ pub struct UpdateTransportSnapshot {
 
 impl UpdateTransportSnapshot {
     const fn idle() -> Self {
-        Self { phase: "idle", route: "none", detail: String::new(), fallback_reason: None }
+        Self { operation: 0, phase: "idle", route: "none", detail: String::new(), fallback_reason: None }
     }
 }
 
@@ -53,12 +54,33 @@ pub fn status() -> String {
 }
 
 fn set_status(message: impl Into<String>) {
-    set_transport("idle", "none", message);
+    let current = snapshot();
+    if current.phase == "idle" {
+        set_transport(current.operation, "idle", "none", message);
+    }
 }
 
-fn set_transport(phase: &'static str, route: &'static str, detail: impl Into<String>) {
+fn accepts(snapshot: &UpdateTransportSnapshot, operation: u64) -> bool {
+    snapshot.operation == operation && snapshot.phase != "cancelled"
+}
+
+#[cfg(all(target_os = "macos", feature = "sparkle"))]
+#[no_mangle]
+pub extern "C" fn myproxy_sparkle_begin_check() -> u64 {
+    let mut snapshot = SNAPSHOT.lock().expect("update status");
+    let operation = snapshot.operation.saturating_add(1);
+    *snapshot = UpdateTransportSnapshot {
+        operation, phase: "checking", route: "none",
+        detail: "正在检查更新，优先使用当前代理，失败后尝试直连。".into(),
+        fallback_reason: None,
+    };
+    operation
+}
+
+fn set_transport(operation: u64, phase: &'static str, route: &'static str, detail: impl Into<String>) {
     let detail = detail.into();
     if let Ok(mut snapshot) = SNAPSHOT.lock() {
+        if !accepts(&snapshot, operation) { return; }
         if snapshot.phase != phase || snapshot.route != route {
             if phase == "fallback" || phase == "error" {
                 myproxy::log::warn("updates", &detail);
@@ -68,26 +90,25 @@ fn set_transport(phase: &'static str, route: &'static str, detail: impl Into<Str
         }
         let fallback_reason = if route == "direct-fallback" || phase == "error" {
             snapshot.fallback_reason.clone()
-        } else {
-            None
-        };
-        *snapshot = UpdateTransportSnapshot { phase, route, detail, fallback_reason };
+        } else { None };
+        *snapshot = UpdateTransportSnapshot { operation, phase, route, detail, fallback_reason };
     }
 }
 
-fn note_fallback(reason: &str) {
+fn note_fallback(operation: u64, reason: &str) {
     if let Ok(mut snapshot) = SNAPSHOT.lock() {
-        snapshot.fallback_reason = Some(reason.to_string());
+        if accepts(&snapshot, operation) { snapshot.fallback_reason = Some(reason.to_string()); }
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "sparkle"))]
 #[no_mangle]
-pub unsafe extern "C" fn myproxy_sparkle_event(event: i32, value: *const std::os::raw::c_char) {
+pub unsafe extern "C" fn myproxy_sparkle_event(operation: u64, event: i32, value: *const std::os::raw::c_char) {
     let value = if value.is_null() { String::new() } else {
         std::ffi::CStr::from_ptr(value).to_string_lossy().chars().take(160).collect()
     };
     let current = snapshot();
+    if !accepts(&current, operation) { return; }
     let (phase, message) = match event {
         1 => ("available", format!("发现新版本 {value}，可以下载更新。")),
         2 => ("no-update", "当前通道没有可用更新。".into()),
@@ -97,7 +118,7 @@ pub unsafe extern "C" fn myproxy_sparkle_event(event: i32, value: *const std::os
         6 => ("cancelled", "更新已取消，当前版本继续运行。".into()),
         _ => return,
     };
-    set_transport(phase, current.route, message);
+    set_transport(operation, phase, current.route, message);
 }
 
 fn route_name(path: ReleasePath) -> &'static str {
@@ -147,7 +168,6 @@ pub fn check() {
         myproxy::log::info("sparkle", "updater not linked in this build");
         return;
     }
-    set_transport("checking", "none", "正在检查更新：优先使用当前代理，失败后自动直连回落。");
     #[cfg(all(target_os = "macos", feature = "sparkle"))]
     unsafe {
         myproxy_sparkle_check();
@@ -211,6 +231,12 @@ fn handle_feed_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
     };
     let path = target.split('?').next().unwrap_or("");
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let Some(operation) = query.split('&').find_map(|part| part.strip_prefix("operation=")?.parse::<u64>().ok()) else {
+        return write_http(&mut stream, 400, "text/plain", b"missing update operation");
+    };
+    if !accepts(&snapshot(), operation) {
+        return write_http(&mut stream, 409, "text/plain", b"expired update operation");
+    }
     let mixed = Supervisor::shared().update_download_port();
     if path == "/appcast.xml" {
         let remote = REMOTE_FEED
@@ -223,15 +249,15 @@ fn handle_feed_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
         match fetch_release_bytes_with_progress(&remote, mixed, Duration::from_secs(30), |progress| {
             match progress {
                 ReleaseProgress::Fallback { path, reason } => {
-                    note_fallback(&reason);
-                    set_transport("fallback", route_name(path), format!("当前代理失败：{reason}。正在尝试直连。"));
+                    note_fallback(operation, &reason);
+                    set_transport(operation, "fallback", route_name(path), format!("当前代理失败：{reason}。正在尝试直连。"));
                 },
-                ReleaseProgress::Attempting { path } => set_transport(
+                ReleaseProgress::Attempting { path } => set_transport(operation,
                     "connecting",
                     route_name(path),
                     format!("正在通过{}检查更新。", path.label()),
                 ),
-                ReleaseProgress::Reading { path, bytes, total } => set_transport(
+                ReleaseProgress::Reading { path, bytes, total } => set_transport(operation,
                     "reading",
                     route_name(path),
                     format!("正在通过{}读取更新信息（{bytes}/{}）。", path.label(), total.map(|v| v.to_string()).unwrap_or_else(|| "未知".into())),
@@ -239,10 +265,11 @@ fn handle_feed_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             }
         }) {
             Ok((body, path)) => {
-                set_transport("validating", route_name(path), format!("已通过{}取得更新信息，正在检查版本。", path.label()));
+                set_transport(operation, "validating", route_name(path), format!("已通过{}取得更新信息，正在检查版本。", path.label()));
                 let xml = String::from_utf8_lossy(&body);
                 let rewritten =
-                    rewrite_appcast_enclosures(&xml, FEED_PORT.load(Ordering::Relaxed));
+                    rewrite_appcast_enclosures(&xml, FEED_PORT.load(Ordering::Relaxed))
+                        .replace("?u=", &format!("?operation={operation}&amp;u="));
                 if method == "HEAD" {
                     return write_http_head(&mut stream, 200, "application/xml", rewritten.len());
                 }
@@ -250,7 +277,7 @@ fn handle_feed_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             }
             Err(err) => {
                 let route = if mixed.is_some() { "代理和直连都失败" } else { "直连失败" };
-                set_transport("error", "none", format!("更新检查失败：{route}。{err}"));
+                set_transport(operation, "error", "none", format!("更新检查失败：{route}。{err}"));
                 myproxy::log::error(
                     "sparkle",
                     format!("feed fetch failed from {}: {err}", release_url_host(&remote)),
@@ -259,10 +286,10 @@ fn handle_feed_conn(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             }
         }
     } else if path == "/asset" || path.starts_with("/asset/") {
-        let Some(url) = decode_asset_query(query) else {
+        let Some(url) = query.split('&').find_map(decode_asset_query) else {
             return write_http(&mut stream, 400, "text/plain", b"bad asset");
         };
-        stream_asset(&mut stream, &method, &url, mixed)
+        stream_asset(&mut stream, &method, &url, mixed, operation)
     } else {
         write_http(&mut stream, 404, "text/plain", b"not found")
     }
@@ -273,19 +300,18 @@ fn stream_asset(
     method: &str,
     url: &str,
     mixed: Option<u16>,
+    operation: u64,
 ) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let head = method.eq_ignore_ascii_case("HEAD");
     if head {
         return match open_release(url, mixed, Duration::from_secs(900), method) {
             Ok(opened) => {
-                let path = opened.path;
-                set_transport("complete", route_name(path), format!("更新包检查成功：{}。", path.label()));
                 write_asset_head(stream, opened.content_length, archive_filename(url))
             }
             Err(err) => {
                 let route = if mixed.is_some() { "代理和直连都失败" } else { "直连失败" };
-                set_transport("error", "none", format!("更新包下载失败：{route}。{err}"));
+                set_transport(operation, "error", "none", format!("更新包下载失败：{route}。{err}"));
                 myproxy::log::error("sparkle", format!("asset fetch failed from {}: {err}", release_url_host(url)));
                 write_http(stream, 502, "text/plain", b"asset fetch failed")
             }
@@ -294,15 +320,15 @@ fn stream_asset(
     match fetch_release_to_temp_with_progress(url, mixed, Duration::from_secs(900), |progress| {
         match progress {
             ReleaseProgress::Fallback { path, reason } => {
-                note_fallback(&reason);
-                set_transport("fallback", route_name(path), format!("当前代理失败：{reason}。正在直连重试下载。"));
+                note_fallback(operation, &reason);
+                set_transport(operation, "fallback", route_name(path), format!("当前代理失败：{reason}。正在直连重试下载。"));
             },
-            ReleaseProgress::Attempting { path } => set_transport(
+            ReleaseProgress::Attempting { path } => set_transport(operation,
                 "connecting",
                 route_name(path),
                 format!("正在通过{}下载更新包。", path.label()),
             ),
-            ReleaseProgress::Reading { path, bytes, total } => set_transport(
+            ReleaseProgress::Reading { path, bytes, total } => set_transport(operation,
                 "reading",
                 route_name(path),
                 format!("正在通过{}读取更新包（{bytes}/{}）。", path.label(), total.map(|v| v.to_string()).unwrap_or_else(|| "未知".into())),
@@ -316,7 +342,7 @@ fn stream_asset(
             write_asset_head(stream, Some(staged.content_length), archive_filename(url))?;
             stream.flush()?;
             if let Err(error) = std::io::copy(&mut staged.file, stream) {
-                set_transport("error", route_name(staged_path), "向更新器传输更新包中断，请重试检查更新。");
+                set_transport(operation, "error", route_name(staged_path), "向更新器传输更新包中断，请重试检查更新。");
                 return Err(error);
             }
             myproxy::log::info(
@@ -328,18 +354,53 @@ fn stream_asset(
                     staged_path.label()
                 ),
             );
-            set_transport("validating", route_name(staged_path), format!("更新包已通过{}下载，等待签名校验。", staged_path.label()));
+            set_transport(operation, "validating", route_name(staged_path), format!("更新包已通过{}下载，等待签名校验。", staged_path.label()));
             Ok(())
         }
         Err(err) => {
             let route = if mixed.is_some() { "代理和直连都失败" } else { "直连失败" };
-            set_transport("error", "none", format!("更新包下载失败：{route}。{err}"));
+            set_transport(operation, "error", "none", format!("更新包下载失败：{route}。{err}"));
             myproxy::log::error(
                 "sparkle",
                 format!("asset fetch failed from {}: {err}", release_url_host(url)),
             );
             write_http(stream, 502, "text/plain", b"asset fetch failed")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_transfers_cannot_overwrite_a_retry_or_a_cancellation() {
+        *SNAPSHOT.lock().unwrap() = UpdateTransportSnapshot {
+            operation: 22, phase: "reading", route: "proxy", detail: "current download".into(), fallback_reason: None,
+        };
+        set_transport(21, "error", "none", "old error");
+        assert_eq!(snapshot().detail, "current download");
+        set_transport(22, "cancelled", "proxy", "cancelled");
+        set_transport(22, "validating", "proxy", "old completion");
+        assert_eq!(snapshot().detail, "cancelled");
+        *SNAPSHOT.lock().unwrap() = UpdateTransportSnapshot {
+            operation: 23, phase: "checking", route: "none", detail: "new check".into(), fallback_reason: None,
+        };
+        set_transport(22, "error", "none", "late abort");
+        assert_eq!(snapshot().detail, "new check");
+        *SNAPSHOT.lock().unwrap() = UpdateTransportSnapshot::idle();
+    }
+
+    #[test]
+    fn update_operation_is_not_forwarded_to_the_remote_asset_url() {
+        let remote = "https://github.com/leaperone/myproxy/releases/download/test/app.zip";
+        let xml = format!("<enclosure url=\"{remote}\" />");
+        let local = rewrite_appcast_enclosures(&xml, 8090)
+            .replace("?u=", "?operation=23&amp;u=");
+        let decoded = local.replace("&amp;", "&");
+        let query = decoded.split('?').nth(1).unwrap().split('"').next().unwrap();
+        assert_eq!(query.split('&').find_map(decode_asset_query).as_deref(), Some(remote));
+        assert!(decoded.contains("/asset/app.zip?operation=23&u="));
     }
 }
 

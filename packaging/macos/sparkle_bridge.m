@@ -5,51 +5,60 @@ static SPUStandardUpdaterController *gController;
 static NSString *gFeedURL;
 static NSInteger gChannel;
 extern void myproxy_sparkle_mark_update_resume(void);
-extern void myproxy_sparkle_event(int event, const char *value);
+extern unsigned long long myproxy_sparkle_begin_check(void);
+extern void myproxy_sparkle_event(unsigned long long operation, int event, const char *value);
 
 @interface MyproxyUpdaterDelegate : NSObject <SPUUpdaterDelegate>
+@property(nonatomic) unsigned long long operation;
 @end
 
 @implementation MyproxyUpdaterDelegate
+- (BOOL)updater:(SPUUpdater *)updater mayPerformUpdateCheck:(SPUUpdateCheck)updateCheck error:(NSError * __autoreleasing *)error {
+    (void)updater;
+    (void)updateCheck;
+    (void)error;
+    self.operation = myproxy_sparkle_begin_check();
+    return YES;
+}
 - (void)updater:(SPUUpdater *)updater didFindValidUpdate:(SUAppcastItem *)item {
     (void)updater;
-    myproxy_sparkle_event(1, item.displayVersionString.UTF8String);
+    myproxy_sparkle_event(self.operation, 1, item.displayVersionString.UTF8String);
 }
 - (void)updaterDidNotFindUpdate:(SPUUpdater *)updater error:(NSError *)error {
     (void)updater;
     (void)error;
-    myproxy_sparkle_event(2, NULL);
+    myproxy_sparkle_event(self.operation, 2, NULL);
 }
 - (void)updater:(SPUUpdater *)updater didDownloadUpdate:(SUAppcastItem *)item {
     (void)updater;
     (void)item;
-    myproxy_sparkle_event(3, NULL);
+    myproxy_sparkle_event(self.operation, 3, NULL);
 }
 - (void)updater:(SPUUpdater *)updater willInstallUpdate:(SUAppcastItem *)item {
     (void)updater;
     (void)item;
-    myproxy_sparkle_event(4, NULL);
+    myproxy_sparkle_event(self.operation, 4, NULL);
 }
 - (void)updater:(SPUUpdater *)updater didAbortWithError:(NSError *)error {
     (void)updater;
     if (error.code == SUNoUpdateError) {
-        myproxy_sparkle_event(2, NULL);
+        myproxy_sparkle_event(self.operation, 2, NULL);
         return;
     }
     if (error.code == SUInstallationCanceledError) {
-        myproxy_sparkle_event(6, NULL);
+        myproxy_sparkle_event(self.operation, 6, NULL);
         return;
     }
     NSString *reason = [NSString stringWithFormat:@"%@ %ld", error.domain, (long)error.code];
-    myproxy_sparkle_event(5, reason.UTF8String);
+    myproxy_sparkle_event(self.operation, 5, reason.UTF8String);
 }
 - (void)userDidCancelDownload:(SPUUpdater *)updater {
     (void)updater;
-    myproxy_sparkle_event(6, NULL);
+    myproxy_sparkle_event(self.operation, 6, NULL);
 }
 - (NSString *)feedURLStringForUpdater:(SPUUpdater *)updater {
     (void)updater;
-    return gFeedURL;
+    return [NSString stringWithFormat:@"%@?operation=%llu", gFeedURL, self.operation];
 }
 - (NSSet<NSString *> *)allowedChannelsForUpdater:(SPUUpdater *)updater {
     (void)updater;
@@ -100,6 +109,8 @@ void myproxy_sparkle_check(void) {
         if (gController == nil) {
             return;
         }
-        [gController checkForUpdates:nil];
+        if (gController.updater.canCheckForUpdates) {
+            [gController checkForUpdates:nil];
+        }
     }
 }

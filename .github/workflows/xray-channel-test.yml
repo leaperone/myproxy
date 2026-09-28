@@ -60,6 +60,7 @@ jobs:
       - run: cargo test --locked --lib -- --test-threads=1
       - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
       - run: scripts/fetch-sparkle.sh
+      - run: cargo test --locked --bin myproxy --features sparkle,xray-channel sparkle::tests -- --test-threads=1
       - run: cargo build --locked --bins --features sparkle,xray-channel
       - name: Set Xray release metadata
         id: metadata
