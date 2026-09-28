@@ -2595,7 +2595,7 @@ impl AppView {
                 };
                 if live.members.is_empty() { return "组内没有节点，请检查筛选条件".into(); }
                 if live.now.is_empty() { return "等待核心状态".into(); }
-                if live.now == "REJECT" { return "探测未通过，正在自动复测".into(); }
+                if live.now == "REJECT" { return "没有可用出口，请查看选点和探测记录".into(); }
                 if live.now == "DIRECT" { return "直连".into(); }
                 let Some(child) = self.strategy.groups.iter().find(|item| item.name == live.now || item.id == live.now || item.name.eq_ignore_ascii_case(&live.now)) else {
                     route.push(live.now.clone());

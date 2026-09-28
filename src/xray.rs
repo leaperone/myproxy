@@ -648,7 +648,12 @@ impl Runtime {
         }
         let mut decision = self.decision(host, port, "tcp", ingress);
         let stream = match decision.route {
-            Route::Reject => bail!("规则拒绝连接，或所选组中没有可用节点"),
+            Route::Reject => {
+                if decision.chain.len() <= 1 {
+                    bail!("连接被规则「{}」拒绝", decision.rule);
+                }
+                bail!("节点组没有可用出口：{}。请查看节点组的选择和探测记录", decision.chain.join(" → "));
+            },
             Route::Direct => dial_direct(host, port)?,
             Route::Node(name) => {
                 let lane = self.lanes.get(&name).context("所选节点不可用")?;
@@ -931,7 +936,23 @@ pub fn status() -> Result<XrayStatus> {
         default_target,
     );
     let current = decision.chain.last().cloned().unwrap_or_default();
-    let note = if !running { Some("Xray 已退出，请重新连接".into()) } else if !capture_ready { Some("代理入口已启动，系统接管或 DNS 尚未就绪".into()) } else if current == "REJECT" { Some("当前节点组没有可用节点，正在等待健康探测恢复".into()) } else { None };
+    let note = if !running {
+        Some("Xray 已退出，请重新连接".into())
+    } else if !capture_ready {
+        Some("代理入口已启动，系统接管或 DNS 尚未就绪".into())
+    } else if current != "REJECT" {
+        None
+    } else if default_target.eq_ignore_ascii_case("REJECT") {
+        Some("当前出口设置为拒绝连接。".into())
+    } else {
+        let group = default_target.strip_prefix("group:").unwrap_or(default_target);
+        let leaves = catalog::resolve_group_members_with_strategy(&strategy, group, &runtime.catalog).unwrap_or_default();
+        if leaves.is_empty() {
+            Some(format!("节点组 {group} 没有匹配的节点，请检查来源和筛选条件。"))
+        } else {
+            Some(format!("节点组 {group} 暂无可用出口。请查看选点和探测记录；后台仍在自动复测。"))
+        }
+    };
     let health = runtime.health.read().expect("health");
     let health_snapshot = runtime.catalog.nodes.iter().map(|node| {
         let item = health.get(&node.name).cloned().unwrap_or_default();
