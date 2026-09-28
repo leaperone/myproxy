@@ -20,8 +20,8 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/xray-build
       XRAY_BINARY: ${{ github.workspace }}/resources/xray/xray
-      MYPROXY_DATA_DIR: ${{ runner.temp }}/myproxy-test-data
-      MYPROXY_XRAY_DATA_DIR: ${{ runner.temp }}/myproxy-xray-test-data
+      MYPROXY_DATA_DIR: ${{ github.workspace }}/.test-data/myproxy
+      MYPROXY_XRAY_DATA_DIR: ${{ github.workspace }}/.test-data/myproxy-xray
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
