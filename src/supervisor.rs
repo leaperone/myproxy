@@ -986,7 +986,9 @@ impl Supervisor {
             }
             let health = if status.ready {
                 let mut health = CoreHealth::ready(status.current);
-                if !status.warnings.is_empty() {
+                if let Some(note) = status.note {
+                    health.note = Some(note);
+                } else if !status.warnings.is_empty() {
                     health.note = Some(format!("已连接；{} 个节点配置需要处理。{}", status.warnings.len(),status.warnings[0]));
                 }
                 health

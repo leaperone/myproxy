@@ -170,6 +170,10 @@ fn menu_face() -> MenuFace {
         OperationState::Applying => "正在应用策略…".into(),
         OperationState::Disconnecting => "正在断开…".into(),
         _ if busy => "正在处理操作…".into(),
+        _ if myproxy::backend::is_xray() && health.ready && health.proxy_now == "REJECT" => health
+            .note
+            .clone()
+            .unwrap_or_else(|| "核心运行中，当前代理出口不可用；正在自动复测".into()),
         _ if health.ready && runtime.is_some() => format!(
             "Mixed 已就绪 · {} · 系统接管 {} · DNS {}",
             runtime

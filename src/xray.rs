@@ -3,6 +3,9 @@ pub mod admission;
 pub mod update_resume;
 pub mod geo;
 mod capture;
+mod health;
+#[cfg(test)]
+mod dns_tests;
 pub mod nodes;
 pub mod policy;
 pub mod relay;
@@ -24,7 +27,7 @@ use crate::{
     controller, paths,
 };
 use anyhow::{bail, Context, Result};
-use policy::{NodeHealth, Route};
+use policy::{HealthState, NodeHealth, Route};
 use relay::{Dialed, Dialer, MixedServer};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -33,7 +36,6 @@ static OPERATION: Mutex<()> = Mutex::new(());
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SERVICE: OnceLock<Mutex<Service>> = OnceLock::new();
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
-const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
 /// The Xray channel owns a loopback relay in addition to the core and may
 /// briefly hold several descriptors per active flow. macOS launchd commonly
@@ -112,6 +114,7 @@ struct Runtime {
     warnings: Vec<String>,
     directory: PathBuf,
     probe_lock: Mutex<()>,
+    bootstrap_dns: Vec<std::net::IpAddr>,
 }
 
 impl Drop for Runtime {
@@ -138,6 +141,19 @@ pub struct XrayStatus {
     pub current: String,
     pub warnings: Vec<String>,
     pub note: Option<String>,
+    pub health: Vec<NodeHealthSnapshot>,
+    pub bootstrap_dns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeHealthSnapshot {
+    pub name: String,
+    pub state: HealthState,
+    pub delay_ms: Option<u32>,
+    pub last_check_ms: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub destination_failures: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -398,24 +414,38 @@ fn prepare(strategy: &Strategy, catalog: &Catalog) -> Result<Arc<Runtime>> {
     result
 }
 
-fn proxy_server_dns() -> serde_json::Value {
+fn proxy_server_dns_with_resolvers(resolvers: &[std::net::IpAddr]) -> serde_json::Value {
     json!({
         "queryStrategy": "UseIPv4",
-        "disableFallback": true,
-        "servers": crate::compile::DNS_NAMESERVERS.iter().map(|ip| format!("tcp://{ip}")).collect::<Vec<_>>()
+        "tag": "myproxy-node-dns",
+        "disableFallback": false,
+        "servers": resolvers.iter().map(|ip| match ip {
+            std::net::IpAddr::V4(ip) => format!("tcp://{ip}:53"),
+            std::net::IpAddr::V6(ip) => format!("tcp://[{ip}]:53"),
+        }).collect::<Vec<_>>()
     })
 }
 
-fn proxy_server_dns_rule() -> serde_json::Value {
+fn proxy_server_dns_rule_with_resolvers(resolvers: &[std::net::IpAddr]) -> serde_json::Value {
     json!({
-        "ip": crate::compile::DNS_NAMESERVERS.iter().map(|ip| format!("{ip}/32")).collect::<Vec<_>>(),
+        "ip": resolvers.iter().map(|ip| match ip {
+            std::net::IpAddr::V4(ip) => format!("{ip}/32"),
+            std::net::IpAddr::V6(ip) => format!("{ip}/128"),
+        }).collect::<Vec<_>>(),
+        "inboundTag": ["myproxy-node-dns"],
         "port": "53",
         "network": "tcp",
         "outboundTag": "dns-direct"
     })
 }
 
+
 fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Result<Arc<Runtime>> {
+    let bootstrap_dns = capture::system_resolvers_for_bootstrap()
+        .context("读取系统 DNS 设置失败，无法解析代理服务器")?;
+    if bootstrap_dns.is_empty() {
+        bail!("未找到系统 DNS 服务器，无法解析代理节点地址")
+    }
     let mut accepted = catalog.clone();
     accepted.nodes.clear();
     let mut inbounds = Vec::new();
@@ -481,8 +511,8 @@ fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Res
     // The only routing in Xray binds each private entrance to a single outbound.
     // Public routing and group selection are performed before reaching Xray.
     // Keep this rule last so a client's query to a resolver still uses its node.
-    rules.push(proxy_server_dns_rule());
-    let config = json!({"log":{"loglevel":"warning"},"dns":proxy_server_dns(),
+    rules.push(proxy_server_dns_rule_with_resolvers(&bootstrap_dns));
+    let config = json!({"log":{"loglevel":"warning"},"dns":proxy_server_dns_with_resolvers(&bootstrap_dns),
         "inbounds":inbounds,"outbounds":outbounds,
         "routing":{"domainStrategy":"AsIs","rules":rules}});
     let path = directory.join("core.json");
@@ -524,6 +554,7 @@ fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Res
         warnings,
         directory,
         probe_lock: Mutex::new(()),
+        bootstrap_dns,
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -626,8 +657,7 @@ impl Runtime {
                     Err(error) => {
                         let mut health = self.health.write().expect("health");
                         let item = health.entry(name).or_default();
-                        item.failures = item.failures.saturating_add(1);
-                        item.delay_ms = None;
+                        item.destination_failures = item.destination_failures.saturating_add(1);
                         drop(health);
                         if decision.allow_direct_fallback {
                             decision.chain.push("DIRECT".into());
@@ -658,43 +688,26 @@ impl Runtime {
                         if self.stopped.load(Ordering::Acquire) {
                             return;
                         }
-                        let credentials = format!("{}:{}", lane.username, lane.password);
-                        let start = Instant::now();
-                        let output = Command::new("/usr/bin/curl")
-                            .args([
-                                "-q",
-                                "--silent",
-                                "--output",
-                                "/dev/null",
-                                "--write-out",
-                                "%{http_code}",
-                                "--connect-timeout",
-                                "2",
-                                "--max-time",
-                                "3",
-                                "--noproxy",
-                                "",
-                                "--proxy",
-                                &format!("socks5h://{}", lane.address),
-                                "--proxy-user",
-                                &credentials,
-                                PROBE_URL,
-                            ])
-                            .env_remove("ALL_PROXY")
-                            .env_remove("HTTPS_PROXY")
-                            .env_remove("HTTP_PROXY")
-                            .output();
-                        let alive = output
-                            .is_ok_and(|result| result.status.success() && result.stdout == b"204");
+                        let previous = {
+                            let mut health = self.health.write().expect("health");
+                            let item = health.entry((*name).clone()).or_default();
+                            let previous = item.state.clone();
+                            item.state = HealthState::Checking;
+                            previous
+                        };
+                        let result = health::probe_lane(lane.address, &lane.username, &lane.password);
+                        if self.stopped.load(Ordering::Acquire) { return; }
                         let mut health = self.health.write().expect("health");
                         let item = health.entry((*name).clone()).or_default();
-                        if alive {
-                            item.delay_ms =
-                                Some(start.elapsed().as_millis().min(u32::MAX as u128) as u32);
-                            item.failures = 0;
-                        } else {
-                            item.delay_ms = None;
-                            item.failures = item.failures.saturating_add(1);
+                        health::record_probe(item, result, epoch_ms());
+                        if item.state != previous {
+                            let detail = format!("{name}: {:?}，连续失败 {} 轮{}", item.state, item.failures,
+                                item.last_error.as_ref().map(|error| format!("；{error}")).unwrap_or_default());
+                            if item.state == HealthState::Healthy {
+                                crate::log::info("xray-health", detail);
+                            } else {
+                                crate::log::warn("xray-health", detail);
+                            }
                         }
                     }
                 });
@@ -703,9 +716,15 @@ impl Runtime {
     }
 }
 
+fn epoch_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+        .as_millis().min(u64::MAX as u128) as u64
+}
+
 fn start_probes(runtime: &Arc<Runtime>) {
     let weak = Arc::downgrade(runtime);
     std::thread::spawn(move || loop {
+        let round_started = Instant::now();
         {
             let Some(runtime) = weak.upgrade() else {
                 return;
@@ -715,8 +734,8 @@ fn start_probes(runtime: &Arc<Runtime>) {
             }
             runtime.probe();
         }
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_secs(1));
+        while round_started.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(250));
             if weak
                 .upgrade()
                 .is_none_or(|runtime| runtime.stopped.load(Ordering::Acquire))
@@ -886,6 +905,8 @@ pub fn status() -> Result<XrayStatus> {
             current: String::new(),
             warnings: vec![],
             note: None,
+            health: vec![],
+            bootstrap_dns: vec![],
         });
     };
     let running = runtime.core_alive();
@@ -910,6 +931,12 @@ pub fn status() -> Result<XrayStatus> {
         default_target,
     );
     let current = decision.chain.last().cloned().unwrap_or_default();
+    let note = if !running { Some("Xray 已退出，请重新连接".into()) } else if !capture_ready { Some("代理入口已启动，系统接管或 DNS 尚未就绪".into()) } else if current == "REJECT" { Some("当前节点组没有可用节点，正在等待健康探测恢复".into()) } else { None };
+    let health = runtime.health.read().expect("health");
+    let health_snapshot = runtime.catalog.nodes.iter().map(|node| {
+        let item = health.get(&node.name).cloned().unwrap_or_default();
+        NodeHealthSnapshot { name: node.name.clone(), state: item.state, delay_ms: item.delay_ms, last_check_ms: item.last_check_ms, last_success_ms: item.last_success_ms, last_error: item.last_error, destination_failures: item.destination_failures }
+    }).collect();
     Ok(XrayStatus {
         wanted: true,
         running,
@@ -918,7 +945,9 @@ pub fn status() -> Result<XrayStatus> {
         mixed_port: Some(strategy.mixed_port),
         current,
         warnings: runtime.warnings.clone(),
-        note: if !running { Some("Xray 已退出，请重新连接".into()) } else if !capture_ready { Some("代理入口已启动，系统接管或 DNS 尚未就绪".into()) } else { None },
+        note,
+        health: health_snapshot,
+        bootstrap_dns: runtime.bootstrap_dns.iter().map(ToString::to_string).collect(),
     })
 }
 pub fn groups() -> Result<Vec<controller::LiveGroup>> {
@@ -926,6 +955,19 @@ pub fn groups() -> Result<Vec<controller::LiveGroup>> {
     let strategy = runtime.strategy.read().expect("strategy");
     let health = runtime.health.read().expect("health");
     Ok(policy::groups(&strategy, &runtime.catalog, &health))
+}
+
+/// Read-only per-node diagnostics for the Xray channel. The snapshot is
+/// intentionally separate from routing decisions so callers can show pending,
+/// degraded and unavailable nodes without inferring health from the selected
+/// chain.
+pub fn node_health() -> Result<Vec<NodeHealthSnapshot>> {
+    let runtime = active()?;
+    let health = runtime.health.read().expect("health");
+    Ok(runtime.catalog.nodes.iter().map(|node| {
+        let item = health.get(&node.name).cloned().unwrap_or_default();
+        NodeHealthSnapshot { name: node.name.clone(), state: item.state, delay_ms: item.delay_ms, last_check_ms: item.last_check_ms, last_success_ms: item.last_success_ms, last_error: item.last_error, destination_failures: item.destination_failures }
+    }).collect())
 }
 pub fn traffic() -> Result<controller::TrafficSnapshot> {
     let (entrance, capture) = {
