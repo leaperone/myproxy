@@ -6,6 +6,10 @@ description = "GPUI controller for a bundled mihomo core"
 publish = false
 repository = "https://github.com/leaperone/myproxy"
 
+[workspace]
+members = ["crates/myproxy-core", "crates/myproxy-mobile"]
+resolver = "2"
+
 [features]
 default = []
 sparkle = []

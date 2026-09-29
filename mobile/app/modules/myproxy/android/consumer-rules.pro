@@ -1,0 +1,3 @@
+-keep class one.leaper.myproxy.core.NativeCore { *; }
+-keep class one.leaper.myproxy.network.** { *; }
+-keep class go.** { *; }
