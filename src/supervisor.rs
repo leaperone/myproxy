@@ -655,6 +655,16 @@ impl Supervisor {
         if !is_wanted() {
             bail!("连接操作已取消");
         }
+        // Mihomo persists SelectAble state for fallback/url-test groups too.
+        // Clear that state after every reload so a stale pin from an older
+        // runtime cannot hold a dead node in front of the health checker.
+        for group in strategy
+            .groups
+            .iter()
+            .filter(|group| matches!(group.kind.as_str(), "fallback" | "url-test"))
+        {
+            controller::clear_auto_selection(strategy.mixed_port, &group.name)?;
+        }
         let notes = controller::restore_selections(strategy.mixed_port, strategy)?;
         let groups = controller::fetch_proxies(strategy.mixed_port)?;
         for saved in strategy
