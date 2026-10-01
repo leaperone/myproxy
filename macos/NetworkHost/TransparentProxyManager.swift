@@ -20,7 +20,17 @@ actor AppleTransparentProxyManager {
     }
 
     func configure(_ configuration: [String: NSObject]) async throws {
-        let manager = try await loadOwnedManager() ?? NETransparentProxyManager()
+        let manager: NETransparentProxyManager
+        do {
+            manager = try await loadOwnedManager() ?? NETransparentProxyManager()
+        } catch let failure as NetworkExtensionControlFailure
+            where failure.message.contains("loadAllFromPreferences") {
+            // nehelper can leave loadAllFromPreferences without a callback
+            // while the old preference is wedged. A fresh manager can still
+            // replace that preference; failing here prevents recovery.
+            AppLog.warn("ne-host", "loadAllFromPreferences timed out; creating a fresh manager")
+            manager = NETransparentProxyManager()
+        }
         try Task.checkCancellation()
         let providerProtocol = NETunnelProviderProtocol()
         providerProtocol.providerBundleIdentifier = providerBundleIdentifier
@@ -59,8 +69,14 @@ actor AppleTransparentProxyManager {
     }
 
     func connectionStatus() async throws -> Bool {
+        // Once this actor has configured the provider, keep using the owned
+        // manager instance. Re-running loadAllFromPreferences for every
+        // status poll can hang in nehelper and falsely report a failed
+        // provider even though the existing connection is healthy.
+        if let manager {
+            return manager.connection.status == .connected
+        }
         guard let loaded = try await loadOwnedManager() else { return false }
-        try await load(loaded)
         manager = loaded
         return loaded.connection.status == .connected
     }
