@@ -15,7 +15,7 @@ use myproxy::supervisor::Supervisor;
 
 use ui::AppView;
 
-gpui_kit::actions!(app, [About, CheckForUpdates, Quit]);
+gpui_kit::actions!(app, [About, CheckForUpdates, CloseWindow, Quit]);
 
 fn main() {
     let host_control_launch = std::env::args().any(|arg| arg == "--host-control");
@@ -119,12 +119,16 @@ fn open_main_window(cx: &mut App) {
 fn install_app_menu(cx: &mut App) {
     cx.on_action(|_: &About, _cx| show_about());
     cx.on_action(|_: &CheckForUpdates, _cx| sparkle::check());
+    cx.on_action(|_: &CloseWindow, cx| close_window(cx));
     cx.on_action(|_: &Quit, cx| quit_app(cx));
+    cx.bind_keys([KeyBinding::new("cmd-w", CloseWindow, None)]);
     cx.set_menus([Menu::new("MyProxy").items([
         MenuItem::action("About MyProxy", About),
         MenuItem::action("Check for Updates…", CheckForUpdates).disabled(!sparkle::available()),
         MenuItem::separator(),
         MenuItem::action("Quit MyProxy", Quit),
+    ]), Menu::new("Window").items([
+        MenuItem::action("Close Window", CloseWindow),
     ])]);
 }
 
@@ -170,6 +174,12 @@ pub(crate) fn quit_app(cx: &mut App) {
         });
     })
     .detach();
+}
+
+fn close_window(cx: &mut App) {
+    if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
 }
 
 pub(crate) fn show_main_window(cx: &mut App) {
