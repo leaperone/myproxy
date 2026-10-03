@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "name": "MyProxy Browser Rules",
+  "version": "0.1.0",
+  "description": "按网站规则把 Safari 请求交给本机 myproxy。",
+  "author": "leaperone",
+  "browser_action": {
+    "default_title": "MyProxy",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "permissions": [
+    "<all_urls>",
+    "activeTab",
+    "nativeMessaging",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ]
+}

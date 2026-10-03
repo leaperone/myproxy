@@ -41,6 +41,23 @@ scripts/release-macos.sh          # zip + appcast into dist/
 cargo run --bin myproxyctl -- capabilities
 ```
 
+### Browser extension
+
+The browser extension lives under [`browser-extension/`](browser-extension/). It
+keeps only browser-scoped website rules and sends matching requests to the
+existing Mixed listener; nodes, subscriptions, DNS, and routing remain owned by
+myproxy.
+
+```sh
+scripts/package-browser-extension.sh chromium
+scripts/package-browser-extension.sh firefox
+scripts/package-browser-extension.sh safari
+```
+
+Chrome/Edge use a PAC script and Firefox uses the WebExtension proxy listener.
+Safari has no WebExtension proxy API, so its packaged resources use the native
+messaging protocol documented in [`browser-extension/safari/native-bridge.md`](browser-extension/safari/native-bridge.md).
+
 Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy.log`; 设置 → 日志 shows the tail. Subscription URLs are never written.
 
 ## CLI
