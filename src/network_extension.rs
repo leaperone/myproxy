@@ -175,6 +175,44 @@ impl RuntimeStatus {
     pub fn is_pending(&self) -> bool {
         matches!(self.phase, Phase::Requesting | Phase::Stopping)
     }
+
+    /// Report contradictory or incomplete runtime observations so callers do
+    /// not mistake a stale provider reply for a healthy capture session.
+    pub fn consistency_warnings(&self, required: bool) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.observed {
+            warnings.push("系统接管状态未观测到，不能证明已启用或已关闭".into());
+            return warnings;
+        }
+        if self.capture_enabled && self.phase != Phase::Running {
+            warnings.push(format!(
+                "captureEnabled=true，但系统接管 phase={}；运行状态与捕获标志不一致",
+                self.phase.label()
+            ));
+        }
+        if self.phase == Phase::Running && self.dns_phase != DnsPhase::Running {
+            warnings.push(format!(
+                "系统接管正在运行，但 DNS phase={}；系统 DNS 可能未被接管",
+                self.dns_phase.label()
+            ));
+        }
+        if self.phase == Phase::Running && !self.capture_enabled {
+            warnings.push("系统接管报告正在运行，但 captureEnabled=false".into());
+        }
+        if required && (self.phase != Phase::Running || self.dns_phase != DnsPhase::Running) {
+            warnings.push("配置要求系统接管，但捕获或 DNS 尚未就绪".into());
+        }
+        if self
+            .applied_revision
+            .is_some_and(|revision| revision != self.desired_revision)
+        {
+            warnings.push(format!(
+                "系统接管 revision 未同步：desired={} applied={:?}",
+                self.desired_revision, self.applied_revision
+            ));
+        }
+        warnings
+    }
 }
 
 fn unavailable_status() -> RuntimeStatus {
