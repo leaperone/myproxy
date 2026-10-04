@@ -76,7 +76,24 @@ myproxyctl --json status
 myproxyctl --json group list
 myproxyctl --json export
 myproxyctl --json import ~/Downloads/myproxy-strategy-2026-09-10.json
+myproxyctl --json monitor --once
+myproxyctl --json monitor --interval 10
+myproxyctl log --source mihomo --lines 200
 ```
+
+`status --json` and `monitor --json` expose core readiness separately from the
+controller, System Extension, and DNS. `core_health` includes the active proxy
+member, the last probe time, consecutive probe failures, automatic recovery
+count, and the latest failure reason. `extension_warnings` flags contradictory
+observations such as `captureEnabled=true` while the provider reports
+`disabled`. `egress_ok`, `egress_delay_ms`, `egress_checked_at`, and
+`egress_error` are a separate low-frequency real outbound probe through the
+currently selected member. `monitor` emits one JSON object per line
+and keeps polling until interrupted; `--once` is suitable for a health check.
+Automatic fallback and url-test member changes are recorded as
+`proxy-group` events in `myproxy.log`. The application log rotates at 1.5 MB;
+the Mihomo log is appended across restarts and rotates at 10 MB. Use
+`myproxyctl log --source app|mihomo` to inspect either stream.
 
 `export` writes the current `strategy.json` (default `~/Downloads/myproxy-strategy-YYYY-MM-DD.json`). `import` replaces the live file after writing `strategy.json.bak-import-*` and does not apply; run `apply` if the core should pick it up. The **设置 → 配置** panel does the same with a file dialog.
 

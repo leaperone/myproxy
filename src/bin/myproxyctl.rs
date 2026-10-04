@@ -5,8 +5,11 @@ use myproxy::controller;
 use myproxy::host_control::{self, Request, Snapshot};
 use myproxy::network_extension;
 use myproxy::paths;
-use myproxy::strategy::{self, InboundMode, Matcher, RoutingProfile, Strategy, SubscriptionPatch, GLOBAL_GROUP};
+use myproxy::strategy::{
+    self, InboundMode, Matcher, RoutingProfile, Strategy, SubscriptionPatch, GLOBAL_GROUP,
+};
 use myproxy::supervisor::Supervisor;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "myproxyctl", version = myproxy::updates::VERSION, about = "Configure myproxy without the window")]
@@ -21,8 +24,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Capabilities,
-    Log,
+    Log {
+        /// app or mihomo
+        #[arg(long, default_value = "app", value_parser = ["app", "mihomo"])]
+        source: String,
+        #[arg(long, default_value_t = 80)]
+        lines: usize,
+    },
     Status,
+    /// Continuously emit runtime health snapshots. Use --json for JSONL.
+    Monitor {
+        #[arg(long, default_value_t = 10)]
+        interval: u64,
+        #[arg(long)]
+        once: bool,
+    },
     Apply,
     Connect,
     Disconnect,
@@ -222,6 +238,7 @@ fn run(cli: Cli) -> Result<()> {
                 "export",
                 "import",
                 "log",
+                "monitor",
             ];
             emit(
                 json,
@@ -229,12 +246,15 @@ fn run(cli: Cli) -> Result<()> {
                 commands.join(" "),
             );
         }
-        Commands::Log => {
-            let path = paths::app_log_path()?;
+        Commands::Log { source, lines } => {
+            let path = match source.as_str() {
+                "mihomo" => paths::mihomo_log_path()?,
+                _ => paths::app_log_path()?,
+            };
             if !path.exists() {
                 emit(
                     json,
-                    serde_json::json!({"lines": [], "path": path.display().to_string()}),
+                    serde_json::json!({"source": source, "lines": [], "path": path.display().to_string()}),
                     format!("no log yet: {}", path.display()),
                 );
                 return Ok(());
@@ -243,7 +263,7 @@ fn run(cli: Cli) -> Result<()> {
             let lines: Vec<_> = text
                 .lines()
                 .rev()
-                .take(80)
+                .take(lines)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -251,12 +271,40 @@ fn run(cli: Cli) -> Result<()> {
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"lines": lines, "path": path.display().to_string()})
+                    serde_json::json!({"source": source, "lines": lines, "path": path.display().to_string()})
                 );
             } else {
                 for line in lines {
                     println!("{line}");
                 }
+            }
+        }
+        Commands::Monitor { interval, once } => {
+            let interval = interval.max(1);
+            loop {
+                match host_control::request(Request::Status) {
+                    Ok(snapshot) => emit_monitor(json, &snapshot),
+                    Err(error) if once => return Err(error),
+                    Err(error) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "observed_at": unix_millis(),
+                                    "error": format!("{error:#}"),
+                                    "app_log": paths::app_log_path()?.display().to_string(),
+                                    "mihomo_log": paths::mihomo_log_path()?.display().to_string(),
+                                })
+                            );
+                        } else {
+                            eprintln!("monitor error: {error:#}");
+                        }
+                    }
+                }
+                if once {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(interval));
             }
         }
         Commands::Status => {
@@ -265,7 +313,9 @@ fn run(cli: Cli) -> Result<()> {
             let snapshot = host_control::request(Request::Status)?;
             let runtime = snapshot.runtime;
             let controller_ready = snapshot.controller_ready;
+            let core_health = snapshot.core_health;
             let extension = snapshot.extension;
+            let extension_warnings = snapshot.extension_warnings;
             let unmatched = myproxy::compile::unmatched_target(&strategy);
             emit(json, serde_json::json!({
                 "mixed_port": strategy.mixed_port,
@@ -284,20 +334,27 @@ fn run(cli: Cli) -> Result<()> {
                 "groups": strategy.groups.len(),
                 "rules": strategy.rule_sets.len(),
                 "operation": snapshot.operation,
+                "core_health": core_health,
                 "runtime": runtime.as_ref().map(|identity| serde_json::json!({
                     "generation": identity.generation,
                     "mixed_port": identity.mixed_port,
                     "controller_ready": controller_ready,
                 })),
                 "extension_runtime": extension,
+                "extension_warnings": &extension_warnings,
                 "strategy": paths::strategy_path()?.display().to_string(),
             }), format!(
-                "saved mixed-port {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
+                "saved mixed-port {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  controller {}  core {} proxy {} failures {} recoveries {} egress {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
                 strategy.mixed_port, strategy.mixed_mode.as_str(), strategy.tun,
                 strategy.system_extension, strategy.routing_profile.as_str(), unmatched,
                 runtime.as_ref().map(|identity| format!("mixed-port {} (generation {})", identity.mixed_port, identity.generation))
                     .unwrap_or_else(|| "disconnected / unverified".into()),
                 if controller_ready { "ready" } else { "unavailable" },
+                if core_health.ready { "ready" } else { "unavailable" },
+                if core_health.proxy_now.is_empty() { "-" } else { &core_health.proxy_now },
+                core_health.consecutive_failures,
+                core_health.recoveries,
+                format_egress(&core_health),
                 if extension.observed { extension.phase_label() } else { "unknown" },
                 if extension.observed { extension.dns_label() } else { "unknown" },
                 strategy.subscriptions.len(), catalog.nodes.len(), catalog.excluded.len(),
@@ -313,6 +370,9 @@ fn run(cli: Cli) -> Result<()> {
                 if let Some(message) = extension.dns_message {
                     println!("{message}");
                 }
+                for warning in &extension_warnings {
+                    println!("warning: {warning}");
+                }
                 println!("strategy {}", paths::strategy_path()?.display());
             }
         }
@@ -323,6 +383,7 @@ fn run(cli: Cli) -> Result<()> {
             let strategy = Strategy::load()?;
             let snapshot = host_control::request(Request::Connect)?;
             let extension = &snapshot.extension;
+            let extension_warnings = &snapshot.extension_warnings;
             let runtime = snapshot.runtime;
             emit(
                 json,
@@ -330,6 +391,7 @@ fn run(cli: Cli) -> Result<()> {
                     "status": "core_ready",
                     "mixed_port": runtime.as_ref().map(|identity| identity.mixed_port),
                     "extension_runtime": extension,
+                    "extension_warnings": extension_warnings,
                     "extension_request_cancelled": false,
                 }),
                 format!(
@@ -347,12 +409,14 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Disconnect => {
             let snapshot = host_control::request(Request::Disconnect)?;
             let extension = &snapshot.extension;
+            let extension_warnings = &snapshot.extension_warnings;
             let complete = network_extension::capture_released_for_core_stop(extension);
             emit(
                 json,
                 serde_json::json!({
                     "status": if complete { "disconnected" } else { "core_stopped" },
                     "extension_runtime": extension,
+                    "extension_warnings": extension_warnings,
                     "extension_request_cancelled": false,
                 }),
                 format!(
@@ -991,6 +1055,7 @@ fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
         .as_ref()
         .context("Host omitted the applied catalog")?;
     let extension = &snapshot.extension;
+    let extension_warnings = &snapshot.extension_warnings;
     let running = snapshot.runtime.is_some();
     emit(
         json,
@@ -1002,7 +1067,9 @@ fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
             "fetch_failures": catalog.fetch_failures,
             "refresh_warnings": catalog.refresh_warnings,
             "runtime_yaml": paths::runtime_yaml_path()?.display().to_string(),
-            "extension_runtime": extension, "extension_request_cancelled": false,
+            "extension_runtime": extension,
+            "extension_warnings": extension_warnings,
+            "extension_request_cancelled": false,
         }),
         format!(
             "{}: {} nodes, {} excluded; extension {}; DNS {}",
@@ -1021,6 +1088,9 @@ fn report_applied(json: bool, snapshot: Snapshot) -> Result<()> {
         for warning in &catalog.refresh_warnings {
             println!("{warning}");
         }
+        for warning in extension_warnings {
+            println!("warning: {warning}");
+        }
     }
     host_control::check_outcome(&snapshot)
 }
@@ -1031,6 +1101,76 @@ fn emit(json: bool, value: serde_json::Value, human: impl std::fmt::Display) {
     } else {
         println!("{human}");
     }
+}
+
+fn emit_monitor(json: bool, snapshot: &Snapshot) {
+    let runtime = snapshot.runtime.map(|identity| {
+        serde_json::json!({
+            "generation": identity.generation,
+            "mixed_port": identity.mixed_port,
+            "controller_ready": snapshot.controller_ready,
+        })
+    });
+    let value = serde_json::json!({
+        "observed_at": unix_millis(),
+        "operation": snapshot.operation,
+        "core_health": &snapshot.core_health,
+        "runtime": runtime,
+        "extension_runtime": &snapshot.extension,
+        "extension_warnings": &snapshot.extension_warnings,
+        "extension_required": snapshot.extension_required,
+        "app_log": paths::app_log_path().ok().map(|path| path.display().to_string()),
+        "mihomo_log": paths::mihomo_log_path().ok().map(|path| path.display().to_string()),
+    });
+    if json {
+        println!("{value}");
+    } else {
+        let health = &snapshot.core_health;
+        let extension = &snapshot.extension;
+        println!(
+            "core={} wanted={} proxy={} failures={} recoveries={} egress={} controller={} | extension={} dns={}{}",
+            if health.ready { "ready" } else { "failed" },
+            health.wanted,
+            if health.proxy_now.is_empty() {
+                "-"
+            } else {
+                &health.proxy_now
+            },
+            health.consecutive_failures,
+            health.recoveries,
+            format_egress(health),
+            if snapshot.controller_ready { "ready" } else { "down" },
+            extension.phase_label(),
+            extension.dns_label(),
+            health
+                .note
+                .as_deref()
+                .map(|note| format!(" note={note}"))
+                .unwrap_or_default(),
+        );
+        for warning in &snapshot.extension_warnings {
+            println!("warning: {warning}");
+        }
+    }
+}
+
+fn format_egress(health: &myproxy::supervisor::CoreHealth) -> String {
+    match health.egress_ok {
+        Some(true) => health
+            .egress_delay_ms
+            .map(|delay| format!("ok/{delay}ms"))
+            .unwrap_or_else(|| "ok".into()),
+        Some(false) => "failed".into(),
+        None => "unprobed".into(),
+    }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn infer_name(_url: &str) -> String {
