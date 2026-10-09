@@ -110,13 +110,13 @@ fn patch_connection_address(outbound: &mut Value, resolved: &str, original: &str
     if matches!(security, Some("tls" | "reality")) {
         let settings_key = if security == Some("reality") { "realitySettings" } else { "tlsSettings" };
         if let Some(Value::Object(settings)) = stream.get_mut(settings_key) {
-            settings.entry("serverName".into()).or_insert_with(|| Value::String(original.into()));
+            settings.entry("serverName").or_insert_with(|| Value::String(original.into()));
         }
     }
     if let Some(Value::Object(ws)) = stream.get_mut("wsSettings") {
-        let headers = ws.entry("headers".into()).or_insert_with(|| Value::Object(Map::new()));
+        let headers = ws.entry("headers").or_insert_with(|| Value::Object(Map::new()));
         if let Value::Object(headers) = headers {
-            headers.entry("Host".into()).or_insert_with(|| Value::String(original.into()));
+            headers.entry("Host").or_insert_with(|| Value::String(original.into()));
         }
     }
 }
