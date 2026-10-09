@@ -51,6 +51,32 @@ enum DNSRelayRoute: Equatable, Sendable {
 }
 
 enum DNSRelayRoutingPolicy {
+    /// Xray's own DNS bootstrap sockets already target the configured resolver
+    /// addresses. Keep those TCP/UDP flows outside App Admission and the
+    /// private SOCKS listener. Sending them through admission creates a
+    /// DNS -> SOCKS -> DNS loop while the transparent proxy is active.
+    static func isUpstreamResolver(
+        _ destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint]
+    ) -> Bool {
+        guard destination.port == DNSProxyUpstreamResolver.defaultPort,
+              let address = destination.address.ipAddress?.presentation
+        else { return false }
+        return resolvers.contains {
+            $0.port == DNSProxyUpstreamResolver.defaultPort
+                && $0.address.ipAddress?.presentation == address
+        }
+    }
+
+    static func bypassForXrayBootstrap(
+        _ destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint]
+    ) -> DNSRelayRoute? {
+        isUpstreamResolver(destination, resolvers: resolvers)
+            ? .directTrustedComponent
+            : nil
+    }
+
     static func route(
         destination: SOCKS5Endpoint,
         isTrustedMyproxyComponent: Bool
@@ -367,6 +393,18 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             reporter?.observe(snapshot, flowIdentifier: identifier, transportProtocol: .tcp)
         }
         #if MYPROXY_XRAY
+        if let route = DNSRelayRoutingPolicy.bypassForXrayBootstrap(
+            destination,
+            resolvers: runtimeState.upstreamResolvers
+        ) {
+            tcpRelays.startDirect(
+                flow: tcpFlow,
+                destination: destination,
+                relayNote: directRelayNote(for: route),
+                activityObserver: observer
+            )
+            return true
+        }
         let admission = flowDecisionCoordinator.planDNSFlow(tcpFlow, destination: destination, transport: .tcp)
         switch admission.decision.disposition {
         case .direct:
@@ -786,13 +824,26 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
 
     #if MYPROXY_XRAY
     private func admissionUDPPlan(flow: NEAppProxyUDPFlow, destination: SOCKS5Endpoint, parentIdentifier: UUID) -> UDPFlowInterceptionPlan {
+        let runtimeState = runtimeDataPlaneSnapshot()
+        if let route = DNSRelayRoutingPolicy.bypassForXrayBootstrap(
+            destination,
+            resolvers: runtimeState.upstreamResolvers
+        ) {
+            return dnsPlan(
+                destination: destination,
+                proxy: nil,
+                route: route,
+                parentIdentifier: parentIdentifier,
+                resolvers: runtimeState.upstreamResolvers
+            )
+        }
         let admission = flowDecisionCoordinator.planDNSFlow(flow, destination: destination, transport: .udp, parentFlowIdentifier: parentIdentifier)
         let route: DNSRelayRoute = switch admission.decision.disposition {
         case .mihomo: .mihomo(.profileRules)
         case .direct: .directLocalResolver
         default: .mihomo(.profileRules)
         }
-        let base = dnsPlan(destination: destination, proxy: admission.proxy, route: route, parentIdentifier: parentIdentifier, resolvers: runtimeDataPlaneSnapshot().upstreamResolvers)
+        let base = dnsPlan(destination: destination, proxy: admission.proxy, route: route, parentIdentifier: parentIdentifier, resolvers: runtimeState.upstreamResolvers)
         return UDPFlowInterceptionPlan(decision: admission.decision, initialDestination: destination, mihomoDestination: admission.target, directDestination: admission.target, proxy: admission.proxy, unavailableFallback: .reject, activity: base.activity, parentFlowIdentifier: parentIdentifier)
     }
     #endif

@@ -45,6 +45,7 @@ jobs:
           cache-on-failure: true
       - run: python3 scripts/check-xray-boundary.py
       - run: python3 scripts/test-xray-boundary.py
+      - run: python3 scripts/test-xray-boundary.py
       - run: python3 scripts/test-install-xray-recovery.py
       - run: python3 scripts/test-xray-resource-limits.py
       - run: python3 scripts/test-xray-release-metadata.py
@@ -59,6 +60,7 @@ jobs:
             src/backend.rs
             src/xray/
       - run: cargo test --locked --lib -- --test-threads=1
+      - run: cargo check --locked --quiet
       - run: cargo check --locked --quiet
       - run: cargo test --locked --lib --features xray-channel xray -- --test-threads=1
       - run: scripts/fetch-sparkle.sh

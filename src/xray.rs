@@ -11,7 +11,7 @@ pub mod policy;
 pub mod relay;
 pub mod udp;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -468,6 +468,12 @@ fn prepare_in(strategy: &Strategy, catalog: &Catalog, directory: PathBuf) -> Res
                 continue;
             }
         };
+        let mut outbound = outbound;
+        if nodes::resolve_node_address(node, &mut outbound).is_some() {
+            crate::log::info("xray-dns", format!("节点 {} 已准备连接地址", node.name));
+        } else {
+            crate::log::warn("xray-dns", format!("节点 {} 的服务器地址未能预解析，保留域名", node.name));
+        }
         let check = directory.join("node-check.json");
         paths::atomic_write(
             &check,
@@ -684,8 +690,33 @@ impl Runtime {
         let Ok(_lock) = self.probe_lock.try_lock() else {
             return;
         };
-        let lanes: Vec<_> = self.lanes.iter().collect();
-        // Eight workers bound background HTTP probes, including large subscriptions.
+        let strategy = self.strategy.read().expect("strategy").clone();
+        let mut active_nodes = HashSet::new();
+        for group in &strategy.groups {
+            if let Ok(nodes) = crate::catalog::resolve_group_members_with_strategy(
+                &strategy,
+                &group.name,
+                &self.catalog,
+            ) {
+                active_nodes.extend(nodes);
+            }
+        }
+        if !strategy.global_selected.is_empty()
+            && self.catalog.nodes.iter().any(|node| node.name == strategy.global_selected)
+        {
+            active_nodes.insert(strategy.global_selected.clone());
+        }
+        let lanes: Vec<_> = if active_nodes.is_empty() {
+            self.lanes.iter().collect()
+        } else {
+            self.lanes
+                .iter()
+                .filter(|(name, _)| active_nodes.contains(name.as_str()))
+                .collect()
+        };
+        // Eight workers bound background HTTP probes. Only nodes reachable from
+        // a configured group are probed; dormant subscriptions must not consume
+        // DNS and health capacity or make unrelated groups flap.
         std::thread::scope(|scope| {
             for chunk in lanes.chunks(lanes.len().div_ceil(8).max(1)) {
                 scope.spawn(move || {
