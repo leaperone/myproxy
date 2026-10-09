@@ -691,29 +691,12 @@ impl Runtime {
             return;
         };
         let strategy = self.strategy.read().expect("strategy").clone();
-        let mut active_nodes = HashSet::new();
-        for group in &strategy.groups {
-            if let Ok(nodes) = crate::catalog::resolve_group_members_with_strategy(
-                &strategy,
-                &group.name,
-                &self.catalog,
-            ) {
-                active_nodes.extend(nodes);
-            }
-        }
-        if !strategy.global_selected.is_empty()
-            && self.catalog.nodes.iter().any(|node| node.name == strategy.global_selected)
-        {
-            active_nodes.insert(strategy.global_selected.clone());
-        }
-        let lanes: Vec<_> = if active_nodes.is_empty() {
-            self.lanes.iter().collect()
-        } else {
-            self.lanes
-                .iter()
-                .filter(|(name, _)| active_nodes.contains(name.as_str()))
-                .collect()
-        };
+        let active_nodes = active_probe_nodes(&strategy, &self.catalog);
+        let lanes: Vec<_> = self
+            .lanes
+            .iter()
+            .filter(|(name, _)| active_nodes.contains(name.as_str()))
+            .collect();
         // Eight workers bound background HTTP probes. Only nodes reachable from
         // a configured group are probed; dormant subscriptions must not consume
         // DNS and health capacity or make unrelated groups flap.
@@ -750,6 +733,25 @@ impl Runtime {
             }
         });
     }
+}
+
+fn active_probe_nodes(strategy: &Strategy, catalog: &Catalog) -> HashSet<String> {
+    let mut active_nodes = HashSet::new();
+    for group in &strategy.groups {
+        if let Ok(nodes) = crate::catalog::resolve_group_members_with_strategy(
+            strategy,
+            &group.name,
+            catalog,
+        ) {
+            active_nodes.extend(nodes);
+        }
+    }
+    if !strategy.global_selected.is_empty()
+        && catalog.nodes.iter().any(|node| node.name == strategy.global_selected)
+    {
+        active_nodes.insert(strategy.global_selected.clone());
+    }
+    active_nodes
 }
 
 fn epoch_ms() -> u64 {

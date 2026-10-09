@@ -38,6 +38,37 @@ fn proxy_server_dns_uses_system_addresses_with_fallback_and_a_private_tag() {
 }
 
 #[test]
+fn background_probes_only_resolved_group_members() {
+    let mut strategy = default_strategy();
+    strategy.global_selected.clear();
+    strategy.groups = vec![Group::matching(
+        "美国".into(),
+        "fallback".into(),
+        Vec::new(),
+        vec!["美国".into()],
+    )];
+    let catalog = Catalog {
+        nodes: vec![
+            Node {
+                name: "美国 01".into(),
+                subscription: "fixture".into(),
+                raw: serde_yaml::from_str("name: 美国 01").unwrap(),
+            },
+            Node {
+                name: "日本 01".into(),
+                subscription: "fixture".into(),
+                raw: serde_yaml::from_str("name: 日本 01").unwrap(),
+            },
+        ],
+        ..Catalog::default()
+    };
+    assert_eq!(active_probe_nodes(&strategy, &catalog), ["美国 01".to_string()].into_iter().collect());
+
+    strategy.groups[0].name_contains = vec!["不存在".into()];
+    assert!(active_probe_nodes(&strategy, &catalog).is_empty());
+}
+
+#[test]
 #[cfg(feature = "xray-channel")]
 fn xray_data_ignores_inherited_production_override() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
