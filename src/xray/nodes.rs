@@ -522,6 +522,18 @@ mod tests {
         patch_connection_address(&mut value, "203.0.113.7", "node.example");
         assert_eq!(value["settings"]["vnext"][0]["address"], "203.0.113.7");
         assert_eq!(value["streamSettings"]["tlsSettings"]["serverName"], "node.example");
+
+        let ws_node = Node {
+            name: "fixture-ws".into(),
+            subscription: "test".into(),
+            raw: serde_yaml::from_str(
+                "name: fixture-ws\ntype: vless\nserver: node.example\nport: 443\nuuid: 00000000-0000-4000-8000-000000000001\nnetwork: ws\ntls: true\nws-opts:\n  path: /proxy\n",
+            )
+            .unwrap(),
+        };
+        let mut ws_value = render(&ws_node, "stable-tag").unwrap();
+        patch_connection_address(&mut ws_value, "203.0.113.7", "node.example");
+        assert_eq!(ws_value["streamSettings"]["wsSettings"]["headers"]["Host"], "node.example");
     }
 
     #[test]
