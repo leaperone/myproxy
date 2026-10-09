@@ -5,6 +5,7 @@
 //! complete outbound or a diagnostic which lets the caller exclude that node.
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, ToSocketAddrs};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -44,6 +45,95 @@ pub fn render(node: &Node, tag: &str) -> Result<Value> {
     // query to the system nameserver times out. Resolve the server name first.
     use_configured_dns(&mut outbound);
     Ok(Value::Object(outbound))
+}
+
+/// Resolve a node's server name before the core starts. The original hostname
+/// remains in TLS SNI and WebSocket Host metadata; only the TCP connection
+/// address changes. This keeps Xray's endpoint bootstrap out of the DNS proxy
+/// loop while preserving certificate and HTTP routing semantics.
+pub fn resolve_node_address(node: &Node, outbound: &mut Value) -> Option<String> {
+    let raw = node.raw.as_mapping()?;
+    let server = raw
+        .get(YamlValue::String("server".into()))
+        .and_then(YamlValue::as_str)?
+        .trim();
+    let port = raw
+        .get(YamlValue::String("port".into()))
+        .and_then(|value| match value {
+            YamlValue::Number(number) => number.as_u64(),
+            YamlValue::String(value) => value.parse().ok(),
+            _ => None,
+        })
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|port| *port > 0)?;
+    let resolved = resolve_server_address(server, port)?;
+    if resolved == server { return Some(resolved); }
+    patch_connection_address(outbound, &resolved, server);
+    Some(resolved)
+}
+
+pub fn resolve_server_address(server: &str, port: u16) -> Option<String> {
+    if server.parse::<IpAddr>().is_ok() { return Some(server.to_string()); }
+    resolve_server_address_with(server, port, |host, port| {
+        (host, port).to_socket_addrs().map(|addresses| addresses.collect())
+    })
+}
+
+fn resolve_server_address_with<F>(
+    server: &str,
+    port: u16,
+    resolve: F,
+) -> Option<String>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<std::net::SocketAddr>>,
+{
+    let addresses = resolve(server, port).ok()?;
+    addresses
+        .iter()
+        .find_map(|address| match address.ip() {
+            IpAddr::V4(ip) => Some(ip.to_string()),
+            IpAddr::V6(_) => None,
+        })
+        .or_else(|| {
+            addresses.iter().find_map(|address| match address.ip() {
+                IpAddr::V4(_) => None,
+                IpAddr::V6(ip) => Some(ip.to_string()),
+            })
+        })
+}
+
+fn patch_connection_address(outbound: &mut Value, resolved: &str, original: &str) {
+    let Value::Object(root) = outbound else { return; };
+    let _ = patch_address_value(root.get_mut("settings"), resolved);
+    let Some(Value::Object(stream)) = root.get_mut("streamSettings") else { return; };
+    let security = stream.get("security").and_then(Value::as_str);
+    if matches!(security, Some("tls" | "reality")) {
+        let settings_key = if security == Some("reality") { "realitySettings" } else { "tlsSettings" };
+        if let Some(Value::Object(settings)) = stream.get_mut(settings_key) {
+            settings.entry("serverName").or_insert_with(|| Value::String(original.into()));
+        }
+    }
+    if let Some(Value::Object(ws)) = stream.get_mut("wsSettings") {
+        let headers = ws.entry("headers").or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(headers) = headers {
+            headers.entry("Host").or_insert_with(|| Value::String(original.into()));
+        }
+    }
+}
+
+fn patch_address_value(value: Option<&mut Value>, resolved: &str) -> bool {
+    let Some(value) = value else { return false; };
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::String(address)) = object.get_mut("address") {
+                *address = resolved.into();
+                return true;
+            }
+            object.values_mut().any(|value| patch_address_value(Some(value), resolved))
+        }
+        Value::Array(array) => array.iter_mut().any(|value| patch_address_value(Some(value), resolved)),
+        _ => false,
+    }
 }
 
 fn use_configured_dns(outbound: &mut Map<String, Value>) {
@@ -419,6 +509,39 @@ mod tests {
     fn dials_server_names_through_the_core_dns_client() {
         let value = render(&node("vless"), "stable-tag").unwrap();
         assert_eq!(value["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");
+    }
+
+    #[test]
+    fn resolves_server_address_without_losing_tls_or_websocket_names() {
+        let resolved = resolve_server_address_with("node.example", 443, |host, port| {
+            assert_eq!((host, port), ("node.example", 443));
+            Ok(vec!["203.0.113.7:443".parse().unwrap()])
+        });
+        assert_eq!(resolved.as_deref(), Some("203.0.113.7"));
+        let mut value = render(&node("vless"), "stable-tag").unwrap();
+        patch_connection_address(&mut value, "203.0.113.7", "node.example");
+        assert_eq!(value["settings"]["vnext"][0]["address"], "203.0.113.7");
+        assert_eq!(value["streamSettings"]["tlsSettings"]["serverName"], "node.example");
+
+        let ws_node = Node {
+            name: "fixture-ws".into(),
+            subscription: "test".into(),
+            raw: serde_yaml::from_str(
+                "name: fixture-ws\ntype: vless\nserver: node.example\nport: 443\nuuid: 00000000-0000-4000-8000-000000000001\nnetwork: ws\ntls: true\nws-opts:\n  path: /proxy\n",
+            )
+            .unwrap(),
+        };
+        let mut ws_value = render(&ws_node, "stable-tag").unwrap();
+        patch_connection_address(&mut ws_value, "203.0.113.7", "node.example");
+        assert_eq!(ws_value["streamSettings"]["wsSettings"]["headers"]["Host"], "node.example");
+    }
+
+    #[test]
+    fn literal_ip_needs_no_resolution_and_missing_dns_keeps_the_node_hostname() {
+        assert_eq!(resolve_server_address("203.0.113.7", 443).as_deref(), Some("203.0.113.7"));
+        assert_eq!(resolve_server_address_with("missing.example", 443, |_host, _port| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+        }), None);
     }
     #[test]
     fn renders_supported_protocols() {
