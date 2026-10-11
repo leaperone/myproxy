@@ -3,10 +3,10 @@ import Foundation
 import MyproxyNetworkShared
 
 /// Raises the extension's soft descriptor limit before accepting flows.
-/// For the default 4096 relays this asks for 8448 descriptors, covering two
-/// descriptors per relay plus 256 control descriptors. Failure is observable
-/// in the extension log; the relay registry still keeps its bounded admission
-/// guard when the launchd hard limit is lower.
+/// For the default 4096 relays this asks for 18,688 descriptors. That covers
+/// two descriptors per relay across TCP and UDP, two descriptors for each of
+/// the 1,024 UDP conversations, and 256 control descriptors. Failure is
+/// observable in the extension log; admission shrinks to the usable limit.
 enum RelayResourceLimits {
     private final class State: @unchecked Sendable {
         let lock = NSLock()
