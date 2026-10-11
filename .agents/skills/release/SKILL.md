@@ -63,11 +63,11 @@ description: 发布 myproxy 的 Prod 或 Nightly 版本，或把 Developer ID �
    gh workflow run release.yml --repo leaperone/myproxy --ref main -f channel=nightly
    ```
 
-3. 记录此次 dispatch 的 run ID，跟踪它生成的不可变版本 tag。Nightly release 必须是 prerelease；`nightly` 是固定 feed 指针，不能成为 latest Prod。产物源 SHA 从实际版本 tag 核对，不以 dispatch 时的本地 HEAD 代替。
+3. 记录此次 dispatch 的 run ID，立即派遣低成本 subagent（例如 GPT-6 Luna）执行 `gh run watch <run-id> -R leaperone/myproxy --exit-status`；主线程不轮询 `gh run list`、不阻塞。subagent 回报 workflow、run URL、head SHA、event、status、conclusion 和 jobs，并跟踪它生成的不可变版本 tag。Nightly release 必须是 prerelease；`nightly` 是固定 feed 指针，不能成为 latest Prod。产物源 SHA 从实际版本 tag 核对，不以 dispatch 时的本地 HEAD 代替。
 
 ## 核验与恢复
 
-- 跟踪本次 Release run 到结果，等待期间保持简短状态更新。失败先检查对应步骤与必要日志；工作流已成功只证明 CI 已公证并发布，不证明设备上的 System Extension 已换成这次构建。不启动 UI 手动测试。本地真机核验按「公证」第 6、7 步。
+- 由 subagent 执行 `gh run watch <run-id> -R leaperone/myproxy --exit-status` 直到终态并回报结果；失败先检查对应步骤与必要日志；工作流已成功只证明 CI 已公证并发布，不证明设备上的 System Extension 已换成这次构建。不启动 UI 手动测试。本地真机核验按「公证」第 6、7 步。
 - 核对 run success、版本 tag 的源 SHA、release 的 draft/prerelease/latest 状态和 zip/appcast 附件。下载本次公开 feed 与 archive 到临时目录，复用 `scripts/check-release-artifacts.py <channel> <version> <build_number> <tag> --dist <dir>`；它校验元数据和签名存在性，不代表密码学验签。
 - Prod 核对 `releases/latest/download/appcast.xml` 指向本次版本。Nightly 核对 `releases/download/nightly/appcast.xml` 指向本次不可变 tag，并确认 latest Prod 未变化。
 - 已有公开 release 时先核验是否已经完成，禁止覆盖资产或强推 tag。已有 tag/draft 时检查源 SHA、run 与资产；不能证明可安全续接就报告具体恢复条件，不删除或盲目重发。
