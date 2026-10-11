@@ -860,11 +860,12 @@ final class UDPFlowRelay: @unchecked Sendable {
 }
 
 final class UDPFlowRelayRegistry: @unchecked Sendable {
-    private static let maximumActiveRelays = 512
+    private static let maximumActiveRelays = NetworkRelayLimits.maximumActiveRelays
     private let lock = NSLock()
     private var mihomoRelays: [UUID: UDPFlowRelay] = [:]
     private var directRelays: [UUID: DirectUDPFlowRelay] = [:]
     private var generation = UUID()
+    private var capacityRejections = 0
 
     func startMihomo(
         flow: NEAppProxyUDPFlow,
@@ -893,7 +894,14 @@ final class UDPFlowRelayRegistry: @unchecked Sendable {
         lock.lock()
         guard generation == relayGeneration,
               mihomoRelays.count + directRelays.count < Self.maximumActiveRelays else {
+            let active = mihomoRelays.count + directRelays.count
+            capacityRejections += 1
+            let rejected = capacityRejections
             lock.unlock()
+            AppLog.warn(
+                "NetworkExtension.UDPRelay",
+                "capacity_rejected active=\(active) limit=\(Self.maximumActiveRelays) rejected=\(rejected)"
+            )
             relay.cancel()
             return
         }
@@ -971,7 +979,14 @@ final class UDPFlowRelayRegistry: @unchecked Sendable {
         lock.lock()
         guard generation == expectedGeneration,
               mihomoRelays.count + directRelays.count < Self.maximumActiveRelays else {
+            let active = mihomoRelays.count + directRelays.count
+            capacityRejections += 1
+            let rejected = capacityRejections
             lock.unlock()
+            AppLog.warn(
+                "NetworkExtension.UDPRelay",
+                "capacity_rejected active=\(active) limit=\(Self.maximumActiveRelays) rejected=\(rejected)"
+            )
             relay.cancel()
             return
         }

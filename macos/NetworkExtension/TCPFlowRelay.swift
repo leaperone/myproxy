@@ -7,6 +7,7 @@ enum TCPFlowRelayError: Error, LocalizedError, Sendable {
     case cancelled
     case capacityExceeded
     case handshakeTimedOut
+    case idleTimedOut
     case upstreamClosedDuringHandshake
     case upstreamFailed(String)
     case flowOpenFailed(String)
@@ -21,6 +22,8 @@ enum TCPFlowRelayError: Error, LocalizedError, Sendable {
             "myproxy reached the active TCP relay safety limit."
         case .handshakeTimedOut:
             "The local mihomo SOCKS5 handshake timed out."
+        case .idleTimedOut:
+            "The TCP relay exceeded its idle timeout."
         case .upstreamClosedDuringHandshake:
             "The local mihomo SOCKS5 listener closed during handshake."
         case let .upstreamFailed(message):
@@ -76,6 +79,8 @@ final class TCPFlowRelay: @unchecked Sendable {
 
     private var connection: NWConnection?
     private var handshakeTimeout: DispatchWorkItem?
+    private var idleTimeout: DispatchWorkItem?
+    private var idleGeneration: UInt64 = 0
     private var methodDecoder = SOCKS5MethodSelectionDecoder()
     private var authenticationDecoder = SOCKS5UsernamePasswordResponseDecoder()
     private var commandDecoder = SOCKS5CommandReplyDecoder()
@@ -304,6 +309,7 @@ final class TCPFlowRelay: @unchecked Sendable {
                 }
                 self.openedFlow = true
                 self.report(.ready)
+                self.resetIdleTimeout()
                 if initialUpstreamPayload.isEmpty {
                     self.startPumps()
                 } else {
@@ -341,6 +347,7 @@ final class TCPFlowRelay: @unchecked Sendable {
                 }
                 guard let data, !data.isEmpty else {
                     self.halfCloseState.markAppReadEnded()
+                    self.resetIdleTimeout()
                     guard let connection = self.connection else {
                         self.finish(error: TCPFlowRelayError.upstreamFailed(
                             "The connection disappeared before the upload half closed."
@@ -383,6 +390,7 @@ final class TCPFlowRelay: @unchecked Sendable {
                         } else {
                             self.backpressureState.end(.appToUpstream)
                             self.byteLedger.recordUpstreamAccepted(data.count)
+                            self.resetIdleTimeout()
                             self.failoverState.markApplicationPayloadForwarded()
                             self.report(.relaying)
                             self.readFromFlow()
@@ -442,6 +450,7 @@ final class TCPFlowRelay: @unchecked Sendable {
                         error.localizedDescription
                     ))
                 } else if !self.finished {
+                    self.resetIdleTimeout()
                     next()
                 }
             }
@@ -450,6 +459,7 @@ final class TCPFlowRelay: @unchecked Sendable {
 
     private func markUpstreamReadFinished() {
         halfCloseState.markUpstreamReadEnded()
+        resetIdleTimeout()
         flow.closeWriteWithError(nil)
         finishIfBothHalvesClosed()
     }
@@ -475,6 +485,8 @@ final class TCPFlowRelay: @unchecked Sendable {
         finished = true
         handshakeTimeout?.cancel()
         handshakeTimeout = nil
+        idleTimeout?.cancel()
+        idleTimeout = nil
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
@@ -497,10 +509,27 @@ final class TCPFlowRelay: @unchecked Sendable {
         finished = true
         handshakeTimeout?.cancel()
         handshakeTimeout = nil
+        idleTimeout?.cancel()
+        idleTimeout = nil
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
         completion(id, .directFallback(error.localizedDescription))
+    }
+
+    private func resetIdleTimeout() {
+        idleTimeout?.cancel()
+        idleGeneration &+= 1
+        let generation = idleGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.idleGeneration == generation else { return }
+            self.finish(error: TCPFlowRelayError.idleTimedOut)
+        }
+        idleTimeout = work
+        queue.asyncAfter(
+            deadline: .now() + NetworkRelayLimits.tcpIdleTimeout,
+            execute: work
+        )
     }
 
     private func report(_ state: AppRoutingRelayState, error: String? = nil) {
@@ -522,11 +551,12 @@ final class TCPFlowRelay: @unchecked Sendable {
 }
 
 final class TCPFlowRelayRegistry: @unchecked Sendable {
-    private static let maximumActiveRelays = 512
+    private static let maximumActiveRelays = NetworkRelayLimits.maximumActiveRelays
     private let lock = NSLock()
     private var mihomoRelays: [UUID: TCPFlowRelay] = [:]
     private var directRelays: [UUID: DirectTCPFlowRelay] = [:]
     private var generation = UUID()
+    private var capacityRejections = 0
 
     func startMihomo(
         flow: NEAppProxyTCPFlow,
@@ -549,7 +579,14 @@ final class TCPFlowRelayRegistry: @unchecked Sendable {
             return
         }
         guard mihomoRelays.count + directRelays.count < Self.maximumActiveRelays else {
+            let active = mihomoRelays.count + directRelays.count
+            capacityRejections += 1
+            let rejected = capacityRejections
             lock.unlock()
+            AppLog.warn(
+                "NetworkExtension.TCPRelay",
+                "capacity_rejected active=\(active) limit=\(Self.maximumActiveRelays) rejected=\(rejected)"
+            )
             rejectBeforeStart(
                 flow,
                 error: .capacityExceeded,
@@ -660,7 +697,14 @@ final class TCPFlowRelayRegistry: @unchecked Sendable {
             }
         } else {
             guard mihomoRelays.count + directRelays.count < Self.maximumActiveRelays else {
+                let active = mihomoRelays.count + directRelays.count
+                capacityRejections += 1
+                let rejected = capacityRejections
                 lock.unlock()
+                AppLog.warn(
+                    "NetworkExtension.TCPRelay",
+                    "capacity_rejected active=\(active) limit=\(Self.maximumActiveRelays) rejected=\(rejected)"
+                )
                 rejectBeforeStart(
                     flow,
                     error: .capacityExceeded,

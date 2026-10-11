@@ -707,6 +707,26 @@ struct NetworkSharedTests {
             )
         }
 
+        run.test("network_relay_limits_leave_capacity_above_previous_guard") {
+            try expect(
+                NetworkRelayLimits.defaultMaximumActiveRelays >= 4_096,
+                "default relay capacity must be at least 4096"
+            )
+            try expect(
+                NetworkRelayLimits.maximumActiveRelays > 0,
+                "configured relay capacity must be positive"
+            )
+            try expectEqual(
+                NetworkRelayLimits.estimatedFileDescriptorsPerRelay,
+                2,
+                "descriptor estimate"
+            )
+            try expect(
+                NetworkRelayLimits.tcpIdleTimeoutSeconds > NetworkRelayLimits.udpIdleTimeoutSeconds,
+                "TCP idle timeout keeps normal long-lived streams usable"
+            )
+        }
+
         let total = run.passed + run.failed
         print("\(run.passed) passed, \(run.failed) failed, \(total) total")
         if run.failed > 0 {
