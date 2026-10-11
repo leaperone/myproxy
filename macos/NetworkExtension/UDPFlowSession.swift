@@ -660,6 +660,7 @@ final class UDPFlowSession: @unchecked Sendable {
             record.admissionHeld = false
             releaseConversationAdmission()
         }
+        readFromFlowIfPossible()
     }
 
     private func finish(error: Error?) {
