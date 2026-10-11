@@ -5580,6 +5580,12 @@ fn node_health_text(node: &myproxy::xray::NodeHealthSnapshot) -> (String, String
     let age = |time: Option<u64>| time.map(|time| format!("{} 秒前", now.saturating_sub(time) / 1000))
         .unwrap_or_else(|| "尚无记录".into());
     let mut detail = format!("{state} · 最近探测 {} · 最近成功 {}", age(node.last_check_ms), age(node.last_success_ms));
+    if let Some(next) = node.next_probe_ms {
+        let seconds = next.saturating_sub(now) / 1000;
+        if seconds > 0 {
+            detail.push_str(&format!("\n下次复测约 {seconds} 秒后"));
+        }
+    }
     if let Some(error) = &node.last_error { detail.push_str(&format!("\n{error}")); }
     (state.to_string(), detail)
 }

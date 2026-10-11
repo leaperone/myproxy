@@ -5,6 +5,23 @@ use super::policy::{HealthState, NodeHealth};
 
 pub(super) const PRIMARY_TARGET: &str = "https://www.gstatic.com/generate_204";
 pub(super) const SECONDARY_TARGET: &str = "https://cp.cloudflare.com/generate_204";
+pub(super) const PROBE_INTERVAL_MS: u64 = 30_000;
+const FIRST_UNAVAILABLE_RETRY_MS: u64 = 60_000;
+const MAX_UNAVAILABLE_RETRY_MS: u64 = 10 * 60_000;
+
+pub(super) fn retry_delay_ms(failures: u32) -> u64 {
+    if failures < 2 {
+        return PROBE_INTERVAL_MS;
+    }
+    let exponent = failures.saturating_sub(2).min(4);
+    FIRST_UNAVAILABLE_RETRY_MS
+        .saturating_mul(1u64 << exponent)
+        .min(MAX_UNAVAILABLE_RETRY_MS)
+}
+
+pub(super) fn retry_at_ms(now_ms: u64, failures: u32) -> u64 {
+    now_ms.saturating_add(retry_delay_ms(failures))
+}
 
 /// Probe the primary target and use the independent provider only when it
 /// fails. The returned latency always belongs to the successful target.
@@ -58,6 +75,7 @@ pub(super) fn record_probe(item: &mut NodeHealth, result: Result<u32, String>, n
         Ok(delay) => {
             item.delay_ms = Some(delay);
             item.failures = 0;
+            item.next_probe_ms = None;
             item.last_success_ms = Some(now_ms);
             item.last_error = None;
             item.state = HealthState::Healthy;
@@ -65,6 +83,7 @@ pub(super) fn record_probe(item: &mut NodeHealth, result: Result<u32, String>, n
         Err(error) => {
             item.delay_ms = None;
             item.failures = item.failures.saturating_add(1);
+            item.next_probe_ms = Some(retry_at_ms(now_ms, item.failures));
             item.last_error = Some(sanitize(&error));
             item.state = if item.failures >= 2 { HealthState::Unavailable } else { HealthState::Degraded };
         }
@@ -133,5 +152,20 @@ mod tests {
         record_probe(&mut item, Ok(7), 20);
         assert_eq!(item.delay_ms, Some(7));
         assert_eq!(item.failures, 0);
+    }
+
+    #[test]
+    fn unavailable_probe_backoff_grows_and_success_clears_it() {
+        let mut item = health();
+        record_probe(&mut item, Err("first".into()), 100);
+        assert_eq!(item.next_probe_ms, Some(100 + PROBE_INTERVAL_MS));
+        record_probe(&mut item, Err("second".into()), 200);
+        assert_eq!(item.next_probe_ms, Some(200 + FIRST_UNAVAILABLE_RETRY_MS));
+        record_probe(&mut item, Err("third".into()), 300);
+        assert_eq!(item.next_probe_ms, Some(300 + 2 * FIRST_UNAVAILABLE_RETRY_MS));
+        record_probe(&mut item, Ok(42), 400);
+        assert_eq!(item.next_probe_ms, None);
+        assert_eq!(item.state, HealthState::Healthy);
+        assert_eq!(retry_delay_ms(6), MAX_UNAVAILABLE_RETRY_MS);
     }
 }

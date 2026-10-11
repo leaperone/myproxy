@@ -27,6 +27,7 @@ pub struct NodeHealth {
     pub state: HealthState,
     pub last_check_ms: Option<u64>,
     pub last_success_ms: Option<u64>,
+    pub next_probe_ms: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -572,7 +573,7 @@ pub fn groups(
                     .count();
                 let pending = leaf_names.len().saturating_sub(available + unavailable);
                 Some(format!(
-                    "健康探测：可用 {available} · 探测失败 {unavailable} · 待复测 {pending} · 每 30 秒重试"
+                    "健康探测：可用 {available} · 探测失败 {unavailable} · 待复测 {pending} · 失败节点按退避复测"
                 ))
             }
         };

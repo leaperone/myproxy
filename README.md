@@ -135,10 +135,12 @@ own Direct route; DNS requested through a proxy still follows the selected node.
 Health checks run about every 30 seconds with at most eight concurrent workers.
 They try the gstatic HTTPS 204 endpoint, then Cloudflare if the first check fails.
 Two consecutive rounds in which both checks fail exclude a node from automatic
-selection. Excluded nodes keep being checked and return after a successful check.
-A connection failure to an individual website does not mark the entire node down.
+selection. Excluded nodes are retried with an exponential backoff, up to ten
+minutes, and return after a successful check. A connection failure to an
+individual website does not mark the entire node down.
 The node cards show probe counts and states; member tooltips show the last check,
-last success, and failure reason. The CLI status includes the same node diagnostics.
+last success, failure reason, and next retry. The CLI status includes the same
+node diagnostics.
 
 Update metadata and archives use the current Mixed proxy first, then retry
 directly if that request or response body fails. Direct retries ignore proxy
