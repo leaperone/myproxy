@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +14,7 @@ use crate::paths;
 use crate::strategy::{Strategy, GLOBAL_GROUP};
 
 const FETCH_TIMEOUT: Duration = Duration::from_millis(800);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 pub const UI_CONNECTION_CAP: usize = 200;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -220,6 +221,8 @@ pub struct LiveSnapshot {
 }
 
 static LAST_GROUPS: Mutex<Vec<LiveGroup>> = Mutex::new(Vec::new());
+static LAST_GROUP_SELECTIONS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn last_probed_groups() -> Vec<LiveGroup> {
     LAST_GROUPS
@@ -425,6 +428,29 @@ pub fn probe(mixed_port: u16, group_name: &str) -> Result<String> {
     }
 }
 
+/// Probe the currently selected member through Mihomo's delay endpoint. This
+/// is intentionally separate from `probe`, which only verifies that the
+/// controller returned a non-empty group selection.
+pub fn probe_proxy_delay(mixed_port: u16, proxy_name: &str) -> Result<u32> {
+    if proxy_name.trim().is_empty() || proxy_name == "REJECT" {
+        bail!("proxy member is unavailable");
+    }
+    let encoded = encode_path_segment(proxy_name);
+    let target = encode_path_segment("https://www.gstatic.com/generate_204");
+    let url = format!(
+        "http://127.0.0.1:{}/proxies/{encoded}/delay?url={target}&timeout=3000",
+        controller_port(mixed_port)
+    );
+    let body = authorized_get(&url, PROBE_TIMEOUT)
+        .with_context(|| format!("probe proxy member {proxy_name}"))?;
+    let delays = parse_delay_map(&body).context("parse proxy delay response")?;
+    delays
+        .values()
+        .next()
+        .copied()
+        .context("proxy delay response did not include a delay")
+}
+
 pub fn ready(mixed_port: u16) -> Result<()> {
     let url = format!("http://127.0.0.1:{}/version", controller_port(mixed_port));
     let body = authorized_get(&url, FETCH_TIMEOUT).context("Mihomo controller unavailable")?;
@@ -447,8 +473,34 @@ pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
         .filter_map(|(name, raw)| LiveGroup::from_raw(name, raw, &parsed.proxies))
         .collect();
     groups.sort_by(|a, b| a.name.cmp(&b.name));
+    record_group_selection_changes(&groups);
     log::debug("controller", format!("proxies groups={}", groups.len()));
     Ok(groups)
+}
+
+fn record_group_selection_changes(groups: &[LiveGroup]) {
+    let mut previous = LAST_GROUP_SELECTIONS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    for group in groups {
+        let now = group.now.trim();
+        if now.is_empty() {
+            continue;
+        }
+        let current = now.to_string();
+        if let Some(before) = previous.get(&group.name).cloned() {
+            if before != current {
+                log::info(
+                    "proxy-group",
+                    format!(
+                        "group={} kind={} changed {} -> {}",
+                        group.name, group.kind, before, current
+                    ),
+                );
+            }
+        }
+        previous.insert(group.name.clone(), current);
+    }
 }
 
 pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Result<LiveSnapshot> {
