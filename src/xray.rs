@@ -152,6 +152,7 @@ pub struct NodeHealthSnapshot {
     pub delay_ms: Option<u32>,
     pub last_check_ms: Option<u64>,
     pub last_success_ms: Option<u64>,
+    pub next_probe_ms: Option<u64>,
     pub last_error: Option<String>,
     pub destination_failures: u32,
 }
@@ -710,6 +711,10 @@ impl Runtime {
                         let previous = {
                             let mut health = self.health.write().expect("health");
                             let item = health.entry((*name).clone()).or_default();
+                            let now = epoch_ms();
+                            if item.next_probe_ms.is_some_and(|next| next > now) {
+                                continue;
+                            }
                             let previous = item.state.clone();
                             item.state = HealthState::Checking;
                             previous
@@ -772,7 +777,7 @@ fn start_probes(runtime: &Arc<Runtime>) {
             }
             runtime.probe();
         }
-        while round_started.elapsed() < Duration::from_secs(30) {
+        while round_started.elapsed() < Duration::from_millis(health::PROBE_INTERVAL_MS) {
             std::thread::sleep(Duration::from_millis(250));
             if weak
                 .upgrade()
@@ -989,7 +994,7 @@ pub fn status() -> Result<XrayStatus> {
     let health = runtime.health.read().expect("health");
     let health_snapshot = runtime.catalog.nodes.iter().map(|node| {
         let item = health.get(&node.name).cloned().unwrap_or_default();
-        NodeHealthSnapshot { name: node.name.clone(), state: item.state, delay_ms: item.delay_ms, last_check_ms: item.last_check_ms, last_success_ms: item.last_success_ms, last_error: item.last_error, destination_failures: item.destination_failures }
+        NodeHealthSnapshot { name: node.name.clone(), state: item.state, delay_ms: item.delay_ms, last_check_ms: item.last_check_ms, last_success_ms: item.last_success_ms, next_probe_ms: item.next_probe_ms, last_error: item.last_error, destination_failures: item.destination_failures }
     }).collect();
     Ok(XrayStatus {
         wanted: true,
@@ -1020,7 +1025,7 @@ pub fn node_health() -> Result<Vec<NodeHealthSnapshot>> {
     let health = runtime.health.read().expect("health");
     Ok(runtime.catalog.nodes.iter().map(|node| {
         let item = health.get(&node.name).cloned().unwrap_or_default();
-        NodeHealthSnapshot { name: node.name.clone(), state: item.state, delay_ms: item.delay_ms, last_check_ms: item.last_check_ms, last_success_ms: item.last_success_ms, last_error: item.last_error, destination_failures: item.destination_failures }
+        NodeHealthSnapshot { name: node.name.clone(), state: item.state, delay_ms: item.delay_ms, last_check_ms: item.last_check_ms, last_success_ms: item.last_success_ms, next_probe_ms: item.next_probe_ms, last_error: item.last_error, destination_failures: item.destination_failures }
     }).collect())
 }
 pub fn traffic() -> Result<controller::TrafficSnapshot> {
