@@ -31,16 +31,16 @@ enum RelayResourceLimits {
         let requested = NetworkRelayLimits.maximumActiveRelays
             * NetworkRelayLimits.estimatedFileDescriptorsPerRelay
             * NetworkRelayLimits.estimatedRelayKinds
+            + NetworkRelayLimits.maximumActiveUDPConversations
+                * NetworkRelayLimits.estimatedFileDescriptorsPerUDPConversation
             + NetworkRelayLimits.reservedFileDescriptors
         let target = min(rlim_t(requested), current.rlim_max)
-        let effective = maximumRelaysAllowedByHardLimit(current.rlim_max)
-        state.lock.lock()
-        state.effectiveMaximumActiveRelays = effective
-        state.lock.unlock()
+        let hardLimitEffective = maximumRelaysAllowedByFileLimit(current.rlim_max)
         guard current.rlim_cur < target else {
+            setEffectiveMaximumActiveRelays(hardLimitEffective)
             AppLog.info(
                 "NetworkExtension.Resources",
-                "relay_capacity=\(effective) configured=\(NetworkRelayLimits.maximumActiveRelays) nofile_soft=\(current.rlim_cur) nofile_hard=\(current.rlim_max)"
+                "relay_capacity=\(hardLimitEffective) configured=\(NetworkRelayLimits.maximumActiveRelays) nofile_soft=\(current.rlim_cur) nofile_hard=\(current.rlim_max)"
             )
             return
         }
@@ -48,30 +48,43 @@ enum RelayResourceLimits {
         var raised = current
         raised.rlim_cur = target
         guard setrlimit(RLIMIT_NOFILE, &raised) == 0 else {
+            let softLimitEffective = maximumRelaysAllowedByFileLimit(current.rlim_cur)
+            setEffectiveMaximumActiveRelays(softLimitEffective)
             AppLog.warn(
                 "NetworkExtension.Resources",
-                "setrlimit(RLIMIT_NOFILE) failed requested=\(target) relay_capacity=\(effective) current=\(current.rlim_cur) hard=\(current.rlim_max) errno=\(errno)"
+                "setrlimit(RLIMIT_NOFILE) failed requested=\(target) relay_capacity=\(softLimitEffective) current=\(current.rlim_cur) hard=\(current.rlim_max) errno=\(errno)"
             )
             return
         }
+        setEffectiveMaximumActiveRelays(hardLimitEffective)
         AppLog.info(
             "NetworkExtension.Resources",
-            "relay_capacity=\(effective) configured=\(NetworkRelayLimits.maximumActiveRelays) nofile_soft=\(target) nofile_hard=\(current.rlim_max)"
+            "relay_capacity=\(hardLimitEffective) configured=\(NetworkRelayLimits.maximumActiveRelays) nofile_soft=\(target) nofile_hard=\(current.rlim_max)"
         )
     }
 
-    private static func maximumRelaysAllowedByHardLimit(_ hardLimit: rlim_t) -> Int {
+    private static func setEffectiveMaximumActiveRelays(_ value: Int) {
+        state.lock.lock()
+        state.effectiveMaximumActiveRelays = value
+        state.lock.unlock()
+    }
+
+    private static func maximumRelaysAllowedByFileLimit(_ fileLimit: rlim_t) -> Int {
         // Darwin exposes RLIM_INFINITY as an unavailable C macro in Swift.
-        guard hardLimit != (rlim_t.max >> 1) else {
+        guard fileLimit != (rlim_t.max >> 1) else {
             return NetworkRelayLimits.maximumActiveRelays
         }
         let perRelay = rlim_t(
             NetworkRelayLimits.estimatedFileDescriptorsPerRelay
                 * NetworkRelayLimits.estimatedRelayKinds
         )
-        let reserved = rlim_t(NetworkRelayLimits.reservedFileDescriptors)
-        guard hardLimit > reserved, perRelay > 0 else { return 1 }
-        let available = (hardLimit - reserved) / perRelay
+        let reserved = rlim_t(
+            NetworkRelayLimits.reservedFileDescriptors
+                + NetworkRelayLimits.maximumActiveUDPConversations
+                    * NetworkRelayLimits.estimatedFileDescriptorsPerUDPConversation
+        )
+        guard fileLimit > reserved, perRelay > 0 else { return 1 }
+        let available = (fileLimit - reserved) / perRelay
         return min(
             NetworkRelayLimits.maximumActiveRelays,
             max(1, Int(min(available, rlim_t(Int.max))))

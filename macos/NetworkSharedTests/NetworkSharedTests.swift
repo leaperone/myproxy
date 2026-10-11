@@ -726,6 +726,16 @@ struct NetworkSharedTests {
                 2,
                 "TCP and UDP relay kinds share the descriptor budget"
             )
+            try expectEqual(
+                NetworkRelayLimits.maximumActiveUDPConversations,
+                1_024,
+                "UDP conversation limit"
+            )
+            try expectEqual(
+                NetworkRelayLimits.estimatedFileDescriptorsPerUDPConversation,
+                2,
+                "UDP conversation descriptor estimate"
+            )
             try expect(
                 NetworkRelayLimits.tcpIdleTimeoutSeconds > NetworkRelayLimits.udpIdleTimeoutSeconds,
                 "TCP idle timeout keeps normal long-lived streams usable"

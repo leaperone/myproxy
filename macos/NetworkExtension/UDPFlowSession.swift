@@ -274,6 +274,7 @@ final class UDPFlowSession: @unchecked Sendable {
             drain(record)
         } catch {
             outboundBudget.release(bytes: datagram.payload.count)
+            readFromFlowIfPossible()
             throw error
         }
     }
@@ -1399,7 +1400,7 @@ private final class MihomoUDPConversation: UDPConversation, @unchecked Sendable 
 }
 
 final class UDPFlowSessionRegistry: @unchecked Sendable {
-    static let maximumActiveConversations = 1_024
+    static let maximumActiveConversations = NetworkRelayLimits.maximumActiveUDPConversations
     private static let maximumActiveSessions = 256
 
     private let lock = NSLock()
