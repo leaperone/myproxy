@@ -5,6 +5,7 @@ import MyproxyNetworkShared
 
 enum UDPFlowSessionError: Error, LocalizedError, Sendable {
     case cancelled
+    case idleTimedOut
     case flowOpenFailed(String)
     case flowReadFailed(String)
     case flowWriteFailed(String)
@@ -24,6 +25,8 @@ enum UDPFlowSessionError: Error, LocalizedError, Sendable {
         switch self {
         case .cancelled:
             "The UDP flow stopped because App Routing stopped, slept, or changed generation."
+        case .idleTimedOut:
+            "The UDP conversation exceeded its idle timeout."
         case let .flowOpenFailed(message):
             "The intercepted UDP flow could not be opened: \(message)"
         case let .flowReadFailed(message):
@@ -100,6 +103,8 @@ final class UDPFlowSession: @unchecked Sendable {
         let key: ConversationKey
         let plan: UDPFlowInterceptionPlan
         var conversation: (any UDPConversation)?
+        var idleTimeout: DispatchWorkItem?
+        var idleGeneration: UInt64 = 0
         var pendingPayloads: ArraySlice<Data?> = []
         var ready = false
         var sendInFlight = false
@@ -113,6 +118,7 @@ final class UDPFlowSession: @unchecked Sendable {
     }
 
     private struct PendingResponse: Sendable {
+        let id = UUID()
         let conversationIdentifier: UUID
         let datagram: UDPFlowDatagram
     }
@@ -324,6 +330,7 @@ final class UDPFlowSession: @unchecked Sendable {
         records[key] = record
         do {
             try configure(record)
+            resetIdleTimeout(for: record)
             return record
         } catch {
             remove(record)
@@ -473,7 +480,8 @@ final class UDPFlowSession: @unchecked Sendable {
         conversation.send(payload) { [weak self] error in
             guard let self else { return }
             self.queue.async {
-                guard !self.finished else { return }
+                guard !self.finished,
+                      self.records[record.key] === record else { return }
                 record.sendInFlight = false
                 if let error {
                     self.finish(error: error)
@@ -485,6 +493,7 @@ final class UDPFlowSession: @unchecked Sendable {
                 record.pendingPayloads[record.pendingPayloads.startIndex] = nil
                 record.pendingPayloads.removeFirst()
                 self.outboundBudget.release(bytes: payload.count)
+                self.resetIdleTimeout(for: record)
                 self.drain(record)
                 self.readFromFlowIfPossible()
             }
@@ -514,6 +523,11 @@ final class UDPFlowSession: @unchecked Sendable {
             self.queue.async {
                 guard !self.finished else { return }
                 self.writeInFlight = false
+                guard let pending = self.pendingResponses.first ?? nil,
+                      pending.id == response.id else {
+                    self.writeNextResponseIfNeeded()
+                    return
+                }
                 if let error {
                     self.finish(error: UDPFlowSessionError.flowWriteFailed(
                         error.localizedDescription
@@ -526,6 +540,7 @@ final class UDPFlowSession: @unchecked Sendable {
                 if let record = self.record(forConversation: response.conversationIdentifier),
                    let conversation = record.conversation {
                     conversation.responseDelivered(bytes: response.datagram.payload.count)
+                    self.resetIdleTimeout(for: record)
                     conversation.resumeReceiving()
                 }
                 self.writeNextResponseIfNeeded()
@@ -548,10 +563,13 @@ final class UDPFlowSession: @unchecked Sendable {
             record.conversation = nil
             record.ready = false
             record.sendInFlight = false
+            record.idleTimeout?.cancel()
+            record.idleTimeout = nil
             configureDirect(
                 record,
                 note: "Mihomo SOCKS5 UDP setup failed before payload forwarding; this destination used the rule's Direct fallback. \(error.localizedDescription)"
             )
+            resetIdleTimeout(for: record)
             return
         }
         finish(error: error)
@@ -582,11 +600,61 @@ final class UDPFlowSession: @unchecked Sendable {
         return records[key]
     }
 
-    private func remove(_ record: ConversationRecord) {
-        if let conversation = record.conversation {
-            recordKeyByConversationID.removeValue(forKey: conversation.id)
-            conversation.stop(error: nil, reportTerminal: false)
+    private func resetIdleTimeout(for record: ConversationRecord) {
+        record.idleTimeout?.cancel()
+        record.idleGeneration &+= 1
+        let generation = record.idleGeneration
+        let key = record.key
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  let current = self.records[key],
+                  current.idleGeneration == generation
+            else { return }
+            self.expire(record: current)
         }
+        record.idleTimeout = work
+        queue.asyncAfter(deadline: .now() + NetworkRelayLimits.udpIdleTimeout, execute: work)
+    }
+
+    private func expire(record: ConversationRecord) {
+        guard !finished,
+              records[record.key] === record else { return }
+        remove(
+            record,
+            error: UDPFlowSessionError.idleTimedOut,
+            reportTerminal: true
+        )
+    }
+
+    private func remove(
+        _ record: ConversationRecord,
+        error: Error? = nil,
+        reportTerminal: Bool = false
+    ) {
+        record.idleTimeout?.cancel()
+        record.idleTimeout = nil
+        if let conversation = record.conversation {
+            let conversationIdentifier = conversation.id
+            recordKeyByConversationID.removeValue(forKey: conversationIdentifier)
+            pendingResponses.removeAll { response in
+                guard let response,
+                      response.conversationIdentifier == conversationIdentifier else {
+                    return false
+                }
+                responseBudget.release(bytes: response.datagram.payload.count)
+                return true
+            }
+            conversation.stop(error: error, reportTerminal: reportTerminal)
+        }
+        record.conversation = nil
+        record.ready = false
+        record.sendInFlight = false
+        for payload in record.pendingPayloads {
+            if let payload {
+                outboundBudget.release(bytes: payload.count)
+            }
+        }
+        record.pendingPayloads.removeAll()
         records.removeValue(forKey: record.key)
         if record.admissionHeld {
             record.admissionHeld = false
@@ -597,7 +665,13 @@ final class UDPFlowSession: @unchecked Sendable {
     private func finish(error: Error?) {
         guard !finished else { return }
         finished = true
+        let parentFlowIdentifier = initialPlan.activity.flowIdentifier
+        let parentIsReportedByConversation = records.values.contains {
+            $0.plan.activity.flowIdentifier == parentFlowIdentifier
+        }
         for record in records.values {
+            record.idleTimeout?.cancel()
+            record.idleTimeout = nil
             record.conversation?.stop(error: error, reportTerminal: true)
             if record.admissionHeld {
                 record.admissionHeld = false
@@ -607,6 +681,17 @@ final class UDPFlowSession: @unchecked Sendable {
         records.removeAll(keepingCapacity: false)
         recordKeyByConversationID.removeAll(keepingCapacity: false)
         pendingResponses.removeAll(keepingCapacity: false)
+        if !parentIsReportedByConversation {
+            observerFactory(parentFlowIdentifier)(
+                AppRoutingRelaySnapshot(
+                    state: error == nil ? .completed : .failed,
+                    uploadBytes: 0,
+                    downloadBytes: 0,
+                    error: error?.localizedDescription,
+                    localPort: nil
+                )
+            )
+        }
         if let error {
             flow.closeReadWithError(error)
             flow.closeWriteWithError(error)
@@ -1320,6 +1405,8 @@ final class UDPFlowSessionRegistry: @unchecked Sendable {
     private var generation = UUID()
     private var sessions: [UUID: UDPFlowSession] = [:]
     private var activeConversations = 0
+    private var sessionCapacityRejections = 0
+    private var conversationCapacityRejections = 0
 
     @discardableResult
     func start(
@@ -1335,7 +1422,14 @@ final class UDPFlowSessionRegistry: @unchecked Sendable {
     ) -> Bool {
         lock.lock()
         guard sessions.count < Self.maximumActiveSessions else {
+            sessionCapacityRejections += 1
+            let rejected = sessionCapacityRejections
+            let active = sessions.count
             lock.unlock()
+            AppLog.warn(
+                "NetworkExtension.UDPSession",
+                "session_capacity_rejected active=\(active) limit=\(Self.maximumActiveSessions) rejected=\(rejected)"
+            )
             return false
         }
         let expectedGeneration = generation
@@ -1375,9 +1469,19 @@ final class UDPFlowSessionRegistry: @unchecked Sendable {
 
     private func acquireConversation() -> Bool {
         lock.lock()
-        defer { lock.unlock() }
-        guard activeConversations < Self.maximumActiveConversations else { return false }
+        guard activeConversations < Self.maximumActiveConversations else {
+            let active = activeConversations
+            conversationCapacityRejections += 1
+            let rejected = conversationCapacityRejections
+            lock.unlock()
+            AppLog.warn(
+                "NetworkExtension.UDPSession",
+                "conversation_capacity_rejected active=\(active) limit=\(Self.maximumActiveConversations) rejected=\(rejected)"
+            )
+            return false
+        }
         activeConversations += 1
+        lock.unlock()
         return true
     }
 

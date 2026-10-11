@@ -72,6 +72,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         options: [String: Any]? = nil,
         completionHandler: @escaping (Error?) -> Void
     ) {
+        RelayResourceLimits.prepare()
         let startCompletion = DNSProxyLifecycleCompletion(completionHandler)
         backendProbeLock.lock()
         let staleConfirmationTimer = takeBackendProbeConfirmationTimerLocked()

@@ -26,6 +26,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         options: [String: Any]? = nil,
         completionHandler: @escaping (Error?) -> Void
     ) {
+        RelayResourceLimits.prepare()
         let providerConfiguration =
             (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
         let configuration = providerConfiguration ?? options
@@ -72,6 +73,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             let plan = flowDecisionCoordinator.planTCPFlow(tcpFlow)
             let activity = Self.annotatedActivity(plan.activity)
             activities.upsert(activity)
+            if activity.isLiveManagedFlow {
+                Self.logRelayMetrics(activities, lifecycle: activity.relayState)
+            }
             Self.logDecision(activity)
             decision = plan.decision
             guard InitialFlowOwnershipPolicy.owns(decision.disposition) else {
@@ -151,6 +155,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     ) -> Bool {
         let activity = Self.annotatedActivity(plan.activity)
         activities.upsert(activity)
+        if activity.isLiveManagedFlow {
+            Self.logRelayMetrics(activities, lifecycle: activity.relayState)
+        }
         Self.logDecision(activity)
         // A Direct initial UDP decision stays on the original macOS path.
         // Per-destination Direct fallback remains available only inside a flow
@@ -662,7 +669,27 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 activity.endedAt = nil
             }
             activities.upsert(activity)
+            switch snapshot.state {
+            case .connecting, .ready, .completed, .failed:
+                Self.logRelayMetrics(activities, lifecycle: snapshot.state)
+            case .notApplicable, .pending, .relaying:
+                break
+            }
         }
+    }
+
+    private static func logRelayMetrics(
+        _ activities: AppRoutingActivityRing,
+        lifecycle: AppRoutingRelayState
+    ) {
+        let distribution = activities.activeSourceCounts()
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: ",")
+        AppLog.info(
+            "NetworkExtension.Relays",
+            "lifecycle=\(lifecycle.rawValue) active=\(activities.activeCount) by_app=\(distribution.isEmpty ? "none" : distribution)"
+        )
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
