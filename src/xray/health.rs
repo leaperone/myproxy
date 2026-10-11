@@ -13,7 +13,7 @@ pub(super) fn retry_delay_ms(failures: u32) -> u64 {
     if failures < 2 {
         return PROBE_INTERVAL_MS;
     }
-    let exponent = failures.saturating_sub(2).min(3);
+    let exponent = failures.saturating_sub(2).min(4);
     FIRST_UNAVAILABLE_RETRY_MS
         .saturating_mul(1u64 << exponent)
         .min(MAX_UNAVAILABLE_RETRY_MS)
@@ -166,5 +166,6 @@ mod tests {
         record_probe(&mut item, Ok(42), 400);
         assert_eq!(item.next_probe_ms, None);
         assert_eq!(item.state, HealthState::Healthy);
+        assert_eq!(retry_delay_ms(6), MAX_UNAVAILABLE_RETRY_MS);
     }
 }
