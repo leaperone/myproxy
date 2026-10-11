@@ -31,5 +31,8 @@ public enum NetworkRelayLimits {
     /// overhead. The budget includes a small allowance for control, logging,
     /// and DNS sockets. A launchd hard limit remains authoritative.
     public static let estimatedFileDescriptorsPerRelay = 2
+    public static let estimatedRelayKinds = 2
+    public static let maximumActiveUDPConversations = 1_024
+    public static let estimatedFileDescriptorsPerUDPConversation = 2
     public static let reservedFileDescriptors = 256
 }

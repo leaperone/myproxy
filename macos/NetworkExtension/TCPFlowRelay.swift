@@ -551,7 +551,7 @@ final class TCPFlowRelay: @unchecked Sendable {
 }
 
 final class TCPFlowRelayRegistry: @unchecked Sendable {
-    private static let maximumActiveRelays = NetworkRelayLimits.maximumActiveRelays
+    private static var maximumActiveRelays: Int { RelayResourceLimits.maximumActiveRelays }
     private let lock = NSLock()
     private var mihomoRelays: [UUID: TCPFlowRelay] = [:]
     private var directRelays: [UUID: DirectTCPFlowRelay] = [:]
