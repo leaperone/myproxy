@@ -49,6 +49,7 @@ jobs:
       - run: python3 scripts/test-xray-resource-limits.py
       - run: python3 scripts/test-xray-release-metadata.py
       - run: python3 scripts/test-xray-release-artifacts.py
+      - run: python3 scripts/test-stapler-validate.py
       - run: scripts/fetch-xray.sh
       - run: rustfmt --edition 2021 src/xray.rs src/backend.rs
       - uses: actions/upload-artifact@v4

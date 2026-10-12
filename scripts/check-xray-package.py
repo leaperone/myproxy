@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 import datetime
 import fnmatch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stapler_validate import run_stapler_validate
 from xray_release_metadata import validate_release
 archive_path = Path(sys.argv[1])
 with zipfile.ZipFile(sys.argv[1]) as archive:
@@ -65,7 +66,7 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
         core_details = subprocess.run(["codesign", "-d", "--verbose=4", str(app / "Contents/MacOS/xray")], check=True, capture_output=True, text=True).stderr
         assert "Identifier=local.harry.myproxy.xray" in core_details
         assert "TeamIdentifier=5UAHRS482C" in core_details
-        subprocess.run(["xcrun", "stapler", "validate", str(app)], check=True, capture_output=True)
+        run_stapler_validate(app)
         subprocess.run(["spctl", "--assess", "--type", "execute", str(app)], check=True, capture_output=True)
 if len(sys.argv) == 3:
     root_element = ET.parse(sys.argv[2]).getroot()
