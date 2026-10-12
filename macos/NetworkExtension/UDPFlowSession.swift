@@ -1,5 +1,6 @@
 import Foundation
 import MyproxyNetworkShared
+import OSLog
 @preconcurrency import Network
 @preconcurrency import NetworkExtension
 
@@ -81,6 +82,14 @@ private protocol UDPConversation: AnyObject, Sendable {
 /// first packet's IP/port decision for later destinations.
 final class UDPFlowSession: @unchecked Sendable {
     let id: UUID
+
+    private let dnsLogger = Logger(subsystem: "local.harry.myproxy.network-extension", category: "DNSPacketTrace")
+
+    private func traceDNS(_ stage: String, payload: Data? = nil, note: String = "") {
+        guard initialPlan.activity.captureOrigin == .dnsProxy else { return }
+        let header = payload.map { $0.prefix(12).map { String(format: "%02x", $0) }.joined() } ?? ""
+        dnsLogger.debug("flow=\(self.id.uuidString, privacy: .public) stage=\(stage, privacy: .public) bytes=\(payload?.count ?? 0) header=\(header, privacy: .public) \(note, privacy: .public)")
+    }
 
     private enum Limits {
         static let maximumConversations = 64
@@ -226,6 +235,7 @@ final class UDPFlowSession: @unchecked Sendable {
                     return
                 }
                 guard let datagrams, !datagrams.isEmpty else {
+                    self.traceDNS("application-eof", note: "conversations=\(self.records.count) responses=\(self.pendingResponses.count)")
                     self.finish(error: nil)
                     return
                 }
@@ -257,6 +267,7 @@ final class UDPFlowSession: @unchecked Sendable {
 
         do {
             let record = try conversationRecord(for: datagram.endpoint)
+            traceDNS("query", payload: datagram.payload, note: "route=\(record.plan.decision.disposition) target=\(String(describing: record.plan.directDestination))")
             record.pendingPayloads.append(datagram.payload)
             drain(record)
         } catch {
@@ -412,6 +423,7 @@ final class UDPFlowSession: @unchecked Sendable {
             guard let self else { return }
             self.queue.async {
                 guard let record = self.record(forConversation: identifier) else { return }
+                self.traceDNS("response", payload: datagram.payload, note: "source=\(datagram.endpoint) return=\(record.key.destination)")
                 self.enqueueResponse(
                     PendingResponse(
                         conversationIdentifier: identifier,
@@ -491,6 +503,7 @@ final class UDPFlowSession: @unchecked Sendable {
         UDPAppProxyFlowCompatibility.write(response.datagram, to: flow) { [weak self] error in
             guard let self else { return }
             self.queue.async {
+                self.traceDNS("write-complete", payload: response.datagram.payload, note: error?.localizedDescription ?? "ok")
                 guard !self.finished else { return }
                 self.writeInFlight = false
                 if let error {
@@ -575,6 +588,7 @@ final class UDPFlowSession: @unchecked Sendable {
 
     private func finish(error: Error?) {
         guard !finished else { return }
+        traceDNS("finished", note: error?.localizedDescription ?? "ok")
         finished = true
         for record in records.values {
             record.conversation?.stop(error: error, reportTerminal: true)

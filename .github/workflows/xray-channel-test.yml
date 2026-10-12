@@ -66,13 +66,13 @@ jobs:
       - run: cargo build --locked --bins --features sparkle,xray-channel
       - name: Set Xray release metadata
         id: metadata
-        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[xray-package]')
         run: |
           python3 scripts/xray_release_metadata.py \
             --run "$GITHUB_RUN_NUMBER" --attempt "$GITHUB_RUN_ATTEMPT" \
             --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
       - name: Import Developer ID certificate
-        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[xray-package]')
         run: |
           set -euo pipefail
           certificate_path="${RUNNER_TEMP}/myproxy-xray-developer-id.p12"
@@ -93,7 +93,7 @@ jobs:
           echo "MYPROXY_XRAY_KEYCHAIN_PATH=${keychain_path}" >> "${GITHUB_ENV}"
           echo "MYPROXY_XRAY_CERTIFICATE_PATH=${certificate_path}" >> "${GITHUB_ENV}"
       - name: Decode Developer ID profiles
-        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[xray-package]')
         run: |
           set -euo pipefail
           [[ -n "${MYPROXY_HOST_DEVID_PROFILE}" && -n "${MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE}" ]] || { echo "Developer ID profiles are required" >&2; exit 1; }
@@ -103,15 +103,15 @@ jobs:
           echo "MYPROXY_HOST_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/host.provisionprofile" >> "${GITHUB_ENV}"
           echo "MYPROXY_NETWORK_EXTENSION_DEVID_PROFILE_PATH=${RUNNER_TEMP}/myproxy-xray-profiles/network-extension.provisionprofile" >> "${GITHUB_ENV}"
       - run: scripts/package-xray-test.sh
-        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[xray-package]')
       - uses: actions/upload-artifact@v4
-        if: github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]')
+        if: github.ref == 'refs/heads/xray' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[xray-package]')
         with:
           name: myproxy-xray-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/xray-channel/*
           if-no-files-found: error
       - name: Preserve package diagnostics
-        if: failure() && (github.ref == 'refs/heads/xray' || contains(github.event.head_commit.message, '[xray-package]'))
+        if: failure() && (github.ref == 'refs/heads/xray' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[xray-package]'))
         uses: actions/upload-artifact@v4
         with:
           name: xray-package-diagnostics-${{ github.sha }}
