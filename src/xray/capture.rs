@@ -162,11 +162,7 @@ impl admission::Routing for ApplicationRouting {
         } else {
             policy::decide_application(&strategy, &runtime.catalog, &runtime.health.read().expect("health"), &context)
         };
-        let host = if request.kind == "dns" {
-            self.direct_dns.target(&request.host, &decision.route)
-        } else {
-            request.hostname.as_ref().filter(|name| !name.is_empty()).unwrap_or(&request.host).clone()
-        };
+        let host = self.direct_dns.admitted_host(request, &decision.route);
         Ok(admission::AdmittedRoute { generation, decision, host, port: request.port })
     }
 
@@ -196,6 +192,16 @@ impl admission::Routing for ApplicationRouting {
 }
 
 impl DirectDns {
+    fn admitted_host(&self, request: &admission::FlowRequest, route: &policy::Route) -> String {
+        // Transparent capture also receives DNS packets as ordinary traffic.
+        // Their hostname is the question, never the resolver to connect to.
+        if request.kind == "dns" || request.port == 53 {
+            self.target(&request.host, route)
+        } else {
+            request.hostname.as_ref().filter(|name| !name.is_empty()).unwrap_or(&request.host).clone()
+        }
+    }
+
     fn target(&self, original: &str, route: &policy::Route) -> String {
         if *route != policy::Route::Direct {
             return crate::compile::DNS_NAMESERVERS[0].to_string();
@@ -212,6 +218,35 @@ impl DirectDns {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transparent_dns_keeps_resolver_separate_from_query_hostname() {
+        use super::{admission, DirectDns, policy::Route};
+        let dns = DirectDns {
+            selected: "223.5.5.5".into(),
+            system_resolvers: vec!["119.29.29.29".parse().unwrap()],
+        };
+        let mut request = admission::FlowRequest {
+            version: 1, activation: "test".into(), nonce: "test".into(), flow_id: "test".into(),
+            kind: "traffic".into(), network: "udp".into(), host: "119.29.29.29".into(),
+            hostname: Some("api2.cursor.sh".into()), port: 53,
+            source: admission::FlowSource {
+                process_id: None, user_id: None, process_start: None, executable_path: None,
+                bundle_id: None, signing_id: None, team_id: None,
+            },
+        };
+        assert_eq!(dns.admitted_host(&request, &Route::Direct), "223.5.5.5");
+        assert_eq!(dns.admitted_host(&request, &Route::Node("US".into())), "1.1.1.1");
+        request.network = "tcp".into();
+        assert_eq!(dns.admitted_host(&request, &Route::Direct), "223.5.5.5");
+        request.host = "8.8.4.4".into();
+        assert_eq!(dns.admitted_host(&request, &Route::Direct), "8.8.4.4");
+        request.port = 443;
+        assert_eq!(dns.admitted_host(&request, &Route::Direct), "api2.cursor.sh");
+        request.kind = "dns".into();
+        request.port = 53;
+        assert_eq!(dns.admitted_host(&request, &Route::Node("US".into())), "1.1.1.1");
+    }
+
     #[test]
     fn direct_dns_keeps_the_first_system_resolver_when_none_answer() {
         let resolvers = vec![
