@@ -97,7 +97,7 @@ for name in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID SPARKLE_ED_PRIVAT
     [[ -n "${!name:-}" ]] || { echo "${name} is required" >&2; exit 1; }
 done
 scripts/notarize-macos-app.sh "$app" "$dist/notarization.json"
-xcrun stapler validate "$app"
+python3 scripts/stapler_validate.py "$app"
 spctl --assess --type execute --verbose=2 "$app"
 archive="$dist/myproxy-${version}.sparkle.zip"
 ditto -c -k --keepParent "$app" "$archive"
