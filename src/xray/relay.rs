@@ -10,9 +10,80 @@ use std::time::{Duration, Instant};
 
 use crate::xray::udp;
 
-const MAX_ACTIVE: usize = 128;
+/// Bounded concurrent relay flows (TCP CONNECT, UDP associate, and in-flight
+/// handshakes on the legacy mixed inlet). Sized to stay below the System
+/// Extension transparent-proxy TCP conversation budget without starving DNS
+/// readiness probes on the dynamic admission inlet.
+const MAX_ACTIVE_FLOWS: usize = 512;
+const PROBE_RESERVED_SLOTS: usize = 16;
+/// Pre-authentication SOCKS workers on the dynamic inlet (one thread each).
+const MAX_CONCURRENT_HANDSHAKES: usize = MAX_ACTIVE_FLOWS;
+const CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const HEADER_LIMIT: usize = 32 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn flow_capacity_cap(probe: bool) -> usize {
+    if probe {
+        MAX_ACTIVE_FLOWS
+    } else {
+        MAX_ACTIVE_FLOWS - PROBE_RESERVED_SLOTS
+    }
+}
+
+fn try_acquire_flow(state: &State, probe: bool) -> bool {
+    let cap = flow_capacity_cap(probe);
+    state
+        .active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| (active < cap).then_some(active + 1))
+        .is_ok()
+}
+
+struct HandshakeGuard {
+    state: Arc<State>,
+}
+
+impl Drop for HandshakeGuard {
+    fn drop(&mut self) {
+        self.state.handshake_active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_handshake(state: &Arc<State>) -> Option<HandshakeGuard> {
+    state
+        .handshake_active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_CONCURRENT_HANDSHAKES).then_some(active + 1)
+        })
+        .ok()
+        .map(|_| HandshakeGuard { state: state.clone() })
+}
+
+fn log_capacity_rejection(state: &State) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = state.capacity_log_epoch_secs.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < CAPACITY_LOG_INTERVAL.as_secs() {
+        return;
+    }
+    if state
+        .capacity_log_epoch_secs
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::log::warn(
+        "xray-relay",
+        format!(
+            "relay flow capacity reached (active={} cap={})",
+            state.active.load(Ordering::Relaxed),
+            MAX_ACTIVE_FLOWS
+        ),
+    );
+}
 
 fn is_resource_exhaustion(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
@@ -80,9 +151,11 @@ impl Entry {
 struct State {
     stop: AtomicBool,
     active: AtomicUsize,
+    handshake_active: AtomicUsize,
     serial: AtomicU64,
     up: AtomicU64,
     down: AtomicU64,
+    capacity_log_epoch_secs: AtomicU64,
     rows: Mutex<VecDeque<Arc<Entry>>>,
 }
 struct FlowGuard {
@@ -126,8 +199,14 @@ impl MixedServer {
         if !listener.local_addr()?.ip().is_loopback() { bail!("动态入口必须绑定本机地址"); }
         listener.set_nonblocking(true)?;
         let state = Arc::new(State {
-            stop: AtomicBool::new(false), active: AtomicUsize::new(0), serial: AtomicU64::new(1),
-            up: AtomicU64::new(0), down: AtomicU64::new(0), rows: Mutex::new(VecDeque::new()),
+            stop: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            handshake_active: AtomicUsize::new(0),
+            serial: AtomicU64::new(1),
+            up: AtomicU64::new(0),
+            down: AtomicU64::new(0),
+            capacity_log_epoch_secs: AtomicU64::new(0),
+            rows: Mutex::new(VecDeque::new()),
         });
         let shared = state.clone();
         let acceptor = thread::Builder::new().name("myproxy-admission-relay".into()).spawn(move || {
@@ -144,34 +223,30 @@ impl MixedServer {
                     }
                     Err(_) => break,
                 };
-                if client.set_nonblocking(false).is_err() { continue; }
-                if shared.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_ACTIVE).then_some(n + 1)).is_err() {
-                    let _ = client.shutdown(Shutdown::Both); continue;
+                if client.set_nonblocking(false).is_err() {
+                    continue;
                 }
-                let entry = Arc::new(Entry {
-                    id: format!("flow-{}", shared.serial.fetch_add(1, Ordering::Relaxed)), started: Instant::now(),
-                    source_port: client.peer_addr().map(|p| p.port()).unwrap_or(0), udp: AtomicBool::new(false), visible: AtomicBool::new(false),
-                    label: Mutex::new(("等待请求".into(), "待路由".into())), process: Mutex::new(String::new()), app_matcher: Mutex::new(String::new()), sockets: Mutex::new(vec![]), closed: AtomicBool::new(false),
-                    finished: AtomicBool::new(false), up: AtomicU64::new(0), down: AtomicU64::new(0), last_activity: AtomicU64::new(0),
-                });
-                let guard = FlowGuard { state: shared.clone(), entry: entry.clone() };
-                if entry.track(&client).is_err() { drop(guard); continue; }
-                {
-                    let mut rows = shared.rows.lock().expect("flow rows");
-                    while rows.len() >= UI_CONNECTION_CAP {
-                        if let Some(index) = rows.iter().position(|row| row.finished.load(Ordering::Acquire)) { rows.remove(index); } else { break; }
+                let handshake = match try_acquire_handshake(&shared) {
+                    Some(guard) => guard,
+                    None => {
+                        log_capacity_rejection(&shared);
+                        let _ = client.shutdown(Shutdown::Both);
+                        continue;
                     }
-                    rows.push_back(entry.clone());
-                }
+                };
                 let worker_state = shared.clone();
                 let worker_authenticator = authenticator.clone();
                 let worker_dialer = dialer.clone();
                 let worker_udp_router = udp_router.clone();
                 let _ = thread::Builder::new().name("myproxy-admission-flow".into()).spawn(move || {
-                    let _guard = guard;
-                    if let Err(error) = serve_dynamic(client, &entry, &worker_state, &worker_authenticator, &worker_dialer, &worker_udp_router) {
-                        *entry.label.lock().expect("flow label") = ("失败".into(), format!("失败：{error}"));
-                    }
+                    let _ = serve_dynamic_admission(
+                        client,
+                        &worker_state,
+                        &worker_authenticator,
+                        &worker_dialer,
+                        &worker_udp_router,
+                        handshake,
+                    );
                 });
             }
         })?;
@@ -186,9 +261,11 @@ impl MixedServer {
         let state = Arc::new(State {
             stop: AtomicBool::new(false),
             active: AtomicUsize::new(0),
+            handshake_active: AtomicUsize::new(0),
             serial: AtomicU64::new(1),
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
+            capacity_log_epoch_secs: AtomicU64::new(0),
             rows: Mutex::new(VecDeque::new()),
         });
         let shared = state.clone();
@@ -201,13 +278,8 @@ impl MixedServer {
                             if client.set_nonblocking(false).is_err() {
                                 continue;
                             }
-                            if shared
-                                .active
-                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                                    (n < MAX_ACTIVE).then_some(n + 1)
-                                })
-                                .is_err()
-                            {
+                            if !try_acquire_flow(&shared, false) {
+                                log_capacity_rejection(&shared);
                                 let _ = client.shutdown(Shutdown::Both);
                                 continue;
                             }
@@ -375,17 +447,89 @@ struct Request {
     udp_associate: bool,
 }
 
-fn serve_dynamic(
+fn serve_dynamic_admission(
     mut client: TcpStream,
-    entry: &Arc<Entry>,
     state: &Arc<State>,
     authenticator: &DynamicAuthenticator,
     dialer: &DynamicDialer,
     udp_router: &DynamicUdpRouter,
+    handshake: HandshakeGuard,
 ) -> Result<()> {
     client.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     client.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let (request, authorization) = socks_request_dynamic(&mut client, authenticator)?;
+    if state.stop.load(Ordering::Acquire) {
+        bail!("relay stopped during handshake");
+    }
+    if !try_acquire_flow(state, authorization.probe) {
+        log_capacity_rejection(state);
+        let _ = client.shutdown(Shutdown::Both);
+        bail!("relay at capacity");
+    }
+    drop(handshake);
+    let entry = Arc::new(Entry {
+        id: format!("flow-{}", state.serial.fetch_add(1, Ordering::Relaxed)),
+        started: Instant::now(),
+        source_port: client.peer_addr().map(|peer| peer.port()).unwrap_or(0),
+        udp: AtomicBool::new(false),
+        visible: AtomicBool::new(false),
+        label: Mutex::new(("等待请求".into(), "待路由".into())),
+        process: Mutex::new(String::new()),
+        app_matcher: Mutex::new(String::new()),
+        sockets: Mutex::new(vec![]),
+        closed: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+        up: AtomicU64::new(0),
+        down: AtomicU64::new(0),
+        last_activity: AtomicU64::new(0),
+    });
+    let guard = FlowGuard {
+        state: state.clone(),
+        entry: entry.clone(),
+    };
+    if entry.track(&client).is_err() {
+        drop(guard);
+        bail!("连接已关闭");
+    }
+    {
+        let mut rows = state.rows.lock().expect("flow rows");
+        while rows.len() >= UI_CONNECTION_CAP {
+            if let Some(index) = rows
+                .iter()
+                .position(|row| row.finished.load(Ordering::Acquire))
+            {
+                rows.remove(index);
+            } else {
+                break;
+            }
+        }
+        rows.push_back(entry.clone());
+    }
+    let _guard = guard;
+    if let Err(error) = serve_dynamic_authorized(
+        client,
+        &entry,
+        state,
+        request,
+        authorization,
+        dialer,
+        udp_router,
+    ) {
+        *entry.label.lock().expect("flow label") = ("失败".into(), format!("失败：{error}"));
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn serve_dynamic_authorized(
+    mut client: TcpStream,
+    entry: &Arc<Entry>,
+    state: &Arc<State>,
+    request: Request,
+    authorization: DynamicAuthorization,
+    dialer: &DynamicDialer,
+    udp_router: &DynamicUdpRouter,
+) -> Result<()> {
     if authorization.probe {
         if request.udp_associate {
             return udp::serve_association(client, 0, Arc::new(|_, _| bail!("readiness probe cannot forward payload")), |_,_,_,_,_| {});
@@ -984,8 +1128,14 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         let state = Arc::new(State {
-            stop: AtomicBool::new(false), active: AtomicUsize::new(1), serial: AtomicU64::new(1),
-            up: AtomicU64::new(0), down: AtomicU64::new(0), rows: Mutex::new(VecDeque::new()),
+            stop: AtomicBool::new(false),
+            active: AtomicUsize::new(1),
+            handshake_active: AtomicUsize::new(0),
+            serial: AtomicU64::new(1),
+            up: AtomicU64::new(0),
+            down: AtomicU64::new(0),
+            capacity_log_epoch_secs: AtomicU64::new(0),
+            rows: Mutex::new(VecDeque::new()),
         });
         let entry = Arc::new(Entry {
             id: "cleanup".into(), started: Instant::now(), source_port: 0, udp: AtomicBool::new(false),
@@ -1178,5 +1328,190 @@ mod tests {
         assert!(request.starts_with("POST / HTTP/1.1"));
         assert!(request.ends_with('a'));
         assert!(!request.contains("other.invalid"));
+    }
+
+    #[test]
+    fn probe_reservation_allows_readiness_when_ordinary_capacity_is_full() {
+        let ordinary_cap = flow_capacity_cap(false);
+        let state = Arc::new(State {
+            stop: AtomicBool::new(false),
+            active: AtomicUsize::new(ordinary_cap),
+            handshake_active: AtomicUsize::new(0),
+            serial: AtomicU64::new(1),
+            up: AtomicU64::new(0),
+            down: AtomicU64::new(0),
+            capacity_log_epoch_secs: AtomicU64::new(0),
+            rows: Mutex::new(VecDeque::new()),
+        });
+        assert!(!try_acquire_flow(&state, false));
+        assert!(try_acquire_flow(&state, true));
+        state.active.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn read_http_connect_ok(client: &mut TcpStream) {
+        let mut head = vec![];
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+    }
+
+    fn echo_payload(client: &mut TcpStream, payload: &[u8]) {
+        client.write_all(payload).unwrap();
+        let mut echoed = vec![0; payload.len()];
+        client.read_exact(&mut echoed).unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    fn wait_for_live_connections(server: &MixedServer, expected: usize, deadline: Instant) {
+        while Instant::now() < deadline {
+            if server.snapshot().connection_count == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            server.snapshot().connection_count,
+            expected,
+            "timed out waiting for live connection count"
+        );
+    }
+
+    fn spawn_upstream_echo_holders(upstream: TcpListener, count: usize) -> JoinHandle<()> {
+        thread::spawn(move || {
+            for _ in 0..count {
+                let (mut socket, _) = upstream.accept().unwrap();
+                thread::spawn(move || {
+                    let mut buf = [0; 256];
+                    while let Ok(n) = socket.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = socket.write_all(&buf[..n]);
+                    }
+                });
+            }
+        })
+    }
+
+    fn open_mixed_hold(address: SocketAddr) -> TcpStream {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        client
+            .write_all(b"CONNECT hold.invalid:443 HTTP/1.1\r\nHost: hold.invalid:443\r\n\r\n")
+            .unwrap();
+        read_http_connect_ok(&mut client);
+        client
+    }
+
+    #[test]
+    fn mixed_relay_supports_more_than_legacy_128_concurrent_flows() {
+        crate::xray::raise_process_fd_limit();
+        const FLOW_COUNT: usize = 130;
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target = upstream.local_addr().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mixed = MixedServer::start(
+            listener,
+            Arc::new(move |_, _| {
+                Ok(Dialed {
+                    stream: TcpStream::connect(target)?,
+                    chain: "fixture".into(),
+                    rule: "capacity".into(),
+                })
+            }),
+        )
+        .unwrap();
+        let upstream_worker = spawn_upstream_echo_holders(upstream, FLOW_COUNT);
+        let mut clients: Vec<TcpStream> = (0..FLOW_COUNT)
+            .map(|_| thread::spawn(move || open_mixed_hold(address)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        wait_for_live_connections(&mixed, FLOW_COUNT, Instant::now() + Duration::from_secs(30));
+        echo_payload(&mut clients[0], b"first");
+        echo_payload(&mut clients[FLOW_COUNT - 1], b"last!");
+        for client in clients {
+            let _ = client.shutdown(Shutdown::Both);
+        }
+        wait_for_live_connections(&mixed, 0, Instant::now() + Duration::from_secs(15));
+        upstream_worker.join().unwrap();
+        drop(mixed);
+    }
+
+    #[test]
+    fn dynamic_relay_supports_many_concurrent_authenticated_flows() {
+        use crate::xray::{admission, policy};
+
+        crate::xray::raise_process_fd_limit();
+        const FLOW_COUNT: usize = 130;
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target = upstream.local_addr().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let route = Arc::new(admission::AdmittedRoute {
+            generation: 1,
+            decision: policy::Decision {
+                allow_direct_fallback: false,
+                route: policy::Route::Direct,
+                chain: vec!["fixture".into()],
+                rule: "capacity".into(),
+            },
+            host: "127.0.0.1".into(),
+            port: target.port(),
+        });
+        let authenticator: DynamicAuthenticator = Arc::new({
+            let route = route.clone();
+            move |user, _pass| {
+                Ok(DynamicAuthorization {
+                    lease: user.into(),
+                    host: route.host.clone(),
+                    port: route.port,
+                    label: "fixture".into(),
+                    process: "fixture".into(),
+                    app_matcher: String::new(),
+                    network: "tcp".into(),
+                    route: route.clone(),
+                    probe: false,
+                })
+            }
+        });
+        let dialer: DynamicDialer = Arc::new(move |_| {
+            Ok(Dialed {
+                stream: TcpStream::connect(target)?,
+                chain: "fixture".into(),
+                rule: "capacity".into(),
+            })
+        });
+        let udp_router: DynamicUdpRouter =
+            Arc::new(|_, _, _| bail!("udp not used in capacity fixture"));
+        let relay = MixedServer::start_dynamic(listener, authenticator, dialer, udp_router).unwrap();
+        let upstream_worker = spawn_upstream_echo_holders(upstream, FLOW_COUNT);
+        let target_port = target.port();
+        let mut clients: Vec<TcpStream> = (0..FLOW_COUNT)
+            .map(|index| {
+                thread::spawn(move || {
+                    let user = format!("lease-{index}");
+                    dial_socks(relay_addr, &user, "secret", "127.0.0.1", target_port).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        wait_for_live_connections(&relay, FLOW_COUNT, Instant::now() + Duration::from_secs(30));
+        echo_payload(&mut clients[0], b"first");
+        echo_payload(&mut clients[FLOW_COUNT - 1], b"last!");
+        for client in clients {
+            let _ = client.shutdown(Shutdown::Both);
+        }
+        wait_for_live_connections(&relay, 0, Instant::now() + Duration::from_secs(15));
+        upstream_worker.join().unwrap();
+        drop(relay);
     }
 }
