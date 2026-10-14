@@ -27,6 +27,8 @@ The bundled macOS CLI delegates `status`, `apply`, `subscription refresh`, `conn
 
 ## Reference sources
 
+Mobile Xray dependencies, pinned sources, licensing and platform references are indexed in `mobile/THIRD_PARTY.md` and `mobile/README.md`. Mobile builds run through `.github/workflows/mobile-xray.yml`; device acceptance is a separate phase from compilation.
+
 All reference sources used for mihomo integration and comparable macOS clients are indexed here. Local snapshots were retrieved on **2026-09-15** under `~/project/myproxy-references/` (on this machine `/Users/harry/project/myproxy-references/`), outside this repository. They are reading material, not bundled dependencies. Preserve the recorded revision when checking a claim; record any additional reference source here. Check `scripts/fetch-mihomo.sh` for the actual bundled version before relying on upstream behavior.
 
 | Source | Official source and local directory | Recorded revision | Purpose / license |
