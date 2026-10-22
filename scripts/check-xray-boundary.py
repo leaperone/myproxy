@@ -112,7 +112,7 @@ def verify_version_metadata(original_lock, current_lock, original_plists, curren
 
 
 def main():
-    base = os.environ.get("MYPROXY_BOUNDARY_BASE", "67dd4c196d4f0e3408e3efdd426e6baafbfbf79102")
+    base = os.environ.get("MYPROXY_BOUNDARY_BASE", "67dd4c196d4f0e3408e3efdd426e6baafbf79102")
     protected = (
         ".github/workflows/release.yml", ".github/workflows/ci.yml",
         "scripts/release-macos.sh", "scripts/package-macos-app.sh",

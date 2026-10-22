@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.util
 import plistlib
+import os
+import sys
 import subprocess
 import unittest
 from pathlib import Path
@@ -79,6 +81,15 @@ class ApprovedCaLockTests(unittest.TestCase):
             self.current_plists,
             self.version,
         )
+
+    def test_full_boundary_command_accepts_reviewed_ca_update(self):
+        env = os.environ.copy()
+        env.pop("MYPROXY_BOUNDARY_BASE", None)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/check-xray-boundary.py")],
+            cwd=ROOT, env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_original_xray_lock_is_allowed(self):
         self.verify_lock(self.baseline_lock, self.baseline_lock)
