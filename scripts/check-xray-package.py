@@ -35,11 +35,19 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     assert extension + "MacOS/MyproxyNetworkExtension" in names
     assert root + "embedded.provisionprofile" in names
     assert archive.read(root + "Resources/ThirdParty/xray/LICENSE").startswith(b"Mozilla Public License Version 2.0")
-    assert b"v26.9.9" in archive.read(root + "Resources/ThirdParty/xray/NOTICE.md")
+    notice = archive.read(root + "Resources/ThirdParty/xray/NOTICE.md")
+    assert b"v26.10.21" in notice
     assert not any(name.endswith("/mihomo") for name in names)
     with tempfile.TemporaryDirectory() as directory:
         app = Path(directory) / "MyProxy.app"
         subprocess.run(["ditto", "-x", "-k", str(archive_path), directory], check=True)
+        version_out = subprocess.run(
+            [str(app / "Contents/MacOS/xray"), "version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "26.10.21" in version_out, "bundled xray binary missing 26.10.21 version marker"
         subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
         extension_app = app / "Contents/Library/SystemExtensions/local.harry.myproxy.network-extension.systemextension"
         subprocess.run(["codesign", "--verify", "--deep", "--strict", str(extension_app)], check=True)
