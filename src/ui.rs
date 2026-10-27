@@ -11,11 +11,12 @@ use gpui_kit::component::button::{
 use gpui_kit::component::dialog::{Cancel, Confirm, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, StyledExt,
-    Theme, TitleBar, WindowExt,
+    h_flex, v_flex, ActiveTheme, Colorize, Disableable, Icon, IconName, Root, Selectable, Sizable,
+    StyledExt, Theme, TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::KeyDownEvent;
@@ -2154,15 +2155,24 @@ impl AppView {
     fn nav_item(
         &self,
         cx: &mut Context<Self>,
+        theme: &Theme,
         page: Page,
         label: &'static str,
         icon: IconName,
     ) -> Button {
         let compact = self.sidebar_compact;
-        Button::new(SharedString::from(format!("nav-{label}")))
-            .ghost()
+        let selected = self.page == page;
+        let button = Button::new(SharedString::from(format!("nav-{label}")))
             .w_full()
-            .selected(self.page == page)
+            .small()
+            .compact();
+        let button = if selected {
+            button.secondary()
+        } else {
+            button.ghost()
+        };
+        button
+            .selected(selected)
             .accessibility_label(label)
             .tooltip(label)
             .child(
@@ -2173,6 +2183,19 @@ impl AppView {
                     .gap_2()
                     .when(compact, |this| this.justify_center())
                     .when(!compact, |this| this.justify_start())
+                    .when(!compact, |this| {
+                        this.child(
+                            div()
+                                .w(px(3.))
+                                .h(px(20.))
+                                .rounded_full()
+                                .bg(if selected {
+                                    brand_accent(theme)
+                                } else {
+                                    theme.sidebar.opacity(0.)
+                                }),
+                        )
+                    })
                     .child(Icon::new(icon).size_4().flex_shrink_0())
                     .when(!compact, |this| {
                         this.child(
@@ -3193,60 +3216,66 @@ impl AppView {
         } else {
             theme.accent
         };
-        TitleBar::new().child(
-            h_flex()
-                .id("title-contents")
-                .w_full()
-                .items_center()
-                .justify_between()
-                .pr_3()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(div().text_sm().font_semibold().child("MyProxy"))
-                        .children(
-                            updates::build_badge().map(|label| pill(theme, label, theme.warning)),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(status_pill(theme, "核心", core_label, core_color))
-                        .child(status_pill(
-                            theme,
-                            "系统接管",
-                            extension_label,
-                            extension_color,
-                        ))
-                        .child(status_pill(theme, "DNS", dns_label, dns_color))
-                        .when(self.connected && self.traffic_has_rate, |this| {
-                            this.child(
-                                div().text_xs().text_color(theme.muted_foreground).child(format!(
-                                    "↑{} · ↓{}",
-                                    controller::format_rate(self.traffic_up),
-                                    controller::format_rate(self.traffic_down)
-                                )),
-                            )
-                        })
-                        .when(self.is_dirty() || self.external_change_pending, |this| {
-                            this.child(
-                                Button::new("apply")
-                                    .small()
-                                    .disabled(busy)
-                                    .label(if busy {
-                                        "处理中…"
-                                    } else if self.external_change_pending {
-                                        "覆盖并应用"
-                                    } else {
-                                        "应用"
-                                    })
-                                    .on_click(self.on_apply(cx)),
-                            )
-                        }),
-                ),
-        )
+        TitleBar::new()
+            .border_b_1()
+            .border_color(theme.border.opacity(0.62))
+            .bg(theme.background.opacity(0.96))
+            .child(
+                h_flex()
+                    .id("title-contents")
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .pr_3()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_sm().font_semibold().child("MyProxy"))
+                            .children(
+                                updates::build_badge().map(|label| pill(theme, label, theme.warning)),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(status_pill(theme, "核心", core_label, core_color))
+                            .child(status_pill(
+                                theme,
+                                "系统接管",
+                                extension_label,
+                                extension_color,
+                            ))
+                            .child(status_pill(theme, "DNS", dns_label, dns_color))
+                            .when(self.connected && self.traffic_has_rate, |this| {
+                                this.child(
+                                    div().text_xs().text_color(theme.muted_foreground).child(format!(
+                                        "↑{} · ↓{}",
+                                        controller::format_rate(self.traffic_up),
+                                        controller::format_rate(self.traffic_down)
+                                    )),
+                                )
+                            })
+                            .when(self.is_dirty() || self.external_change_pending, |this| {
+                                this.child(
+                                    Button::new("apply")
+                                        .small()
+                                        .disabled(busy)
+                                        .label(if busy {
+                                            "处理中…"
+                                        } else if self.external_change_pending {
+                                            "覆盖并应用"
+                                        } else {
+                                            "应用"
+                                        })
+                                        .on_click(self.on_apply(cx)),
+                                )
+                            }),
+                    ),
+            )
     }
 
     fn sidebar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -3255,21 +3284,53 @@ impl AppView {
             .flex_shrink_0()
             .h_full()
             .gap_2()
-            .p_2()
-            .w(px(if self.sidebar_compact { 56. } else { 216. }))
-            .bg(theme.sidebar)
+            .p_3()
+            .w(px(if self.sidebar_compact { 64. } else { 216. }))
+            .bg(theme.sidebar.opacity(0.94))
+            .border_r_1()
+            .border_color(theme.sidebar_border.opacity(0.72))
             .child(self.sidebar_header(cx, theme))
             .child(
                 v_flex()
                     .id("nav-items")
                     .w_full()
                     .gap_1()
-                    .child(self.nav_item(cx, Page::Overview, "总览", IconName::LayoutDashboard))
-                    .child(self.nav_item(cx, Page::Connections, "连接", IconName::Network))
-                    .child(self.nav_item(cx, Page::Subscriptions, "订阅", IconName::Inbox))
-                    .child(self.nav_item(cx, Page::Groups, "节点组", IconName::Folder))
-                    .child(self.nav_item(cx, Page::Rules, "规则", IconName::Map))
-                    .child(self.nav_item(cx, Page::Settings, "设置", IconName::Settings)),
+                    .child(self.nav_item(
+                        cx,
+                        theme,
+                        Page::Overview,
+                        "总览",
+                        IconName::LayoutDashboard,
+                    ))
+                    .child(self.nav_item(
+                        cx,
+                        theme,
+                        Page::Connections,
+                        "连接",
+                        IconName::Network,
+                    ))
+                    .child(self.nav_item(
+                        cx,
+                        theme,
+                        Page::Subscriptions,
+                        "订阅",
+                        IconName::Inbox,
+                    ))
+                    .child(self.nav_item(
+                        cx,
+                        theme,
+                        Page::Groups,
+                        "节点组",
+                        IconName::Folder,
+                    ))
+                    .child(self.nav_item(cx, theme, Page::Rules, "规则", IconName::Map))
+                    .child(self.nav_item(
+                        cx,
+                        theme,
+                        Page::Settings,
+                        "设置",
+                        IconName::Settings,
+                    )),
             )
     }
 
@@ -3306,7 +3367,7 @@ impl AppView {
                         .text_xs()
                         .font_medium()
                         .text_color(theme.muted_foreground)
-                        .child("导航"),
+                        .child("WORKSPACE"),
                 )
             })
             .child(toggle)
@@ -3319,12 +3380,20 @@ impl AppView {
             .min_w_0()
             .h_full()
             .overflow_hidden()
-            .p_6()
-            .gap_4()
+            .px_7()
+            .py_6()
+            .gap_3()
             .bg(theme.background)
             .child(
                 div()
                     .id("status")
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border.opacity(0.54))
+                    .bg(theme.muted.opacity(0.16))
                     .text_xs()
                     .text_color(
                         if self.status.contains("失败")
@@ -3392,6 +3461,7 @@ impl AppView {
         match next {
             SetupNext::AddSubscription => h_flex()
                 .gap_2()
+                .flex_wrap()
                 .items_center()
                 .child(
                     Button::new("hero-add-subscription")
@@ -3406,6 +3476,7 @@ impl AppView {
                 .into_any_element(),
             SetupNext::RefreshCatalog => h_flex()
                 .gap_2()
+                .flex_wrap()
                 .items_center()
                 .child(
                     Button::new("hero-refresh-subscriptions")
@@ -3441,21 +3512,26 @@ impl AppView {
         let has_nodes = !self.catalog.nodes.is_empty();
         let muted = theme.muted_foreground;
         let inbound = format!(
-            "规则只处理进入代理的流量。Mixed 把客户端代理设为 {}（HTTP + SOCKS5）。系统接管在设置里打开，并到 {} 允许 myproxy。TUN 与接管互斥，首次要管理员密码。",
+            "规则只处理进入代理的流量。\nMixed 把客户端代理设为 {}（HTTP + SOCKS5）。\n系统接管在设置里打开，并到 {} 允许 myproxy。\nTUN 与接管互斥，首次要管理员密码。",
             self.mixed_endpoint(),
             setup::login_items_path_label()
         );
-        v_flex()
-            .w_full()
-            .p_4()
-            .gap_2()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.group_box)
-            .child(div().text_sm().font_semibold().child("配置"))
+        surface(theme)
+            .flex_1()
+            .min_w(px(300.))
+            .p_5()
+            .gap_3()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().font_semibold().child("配置"))
+                    .child(pill(theme, "SETUP", brand_accent(theme))),
+            )
             .child(
                 div()
+                    .min_w_0()
                     .text_xs()
                     .text_color(muted)
                     .child(if has_sub {
@@ -3466,6 +3542,7 @@ impl AppView {
             )
             .child(
                 div()
+                    .min_w_0()
                     .text_xs()
                     .text_color(muted)
                     .child(if has_nodes {
@@ -3476,6 +3553,7 @@ impl AppView {
             )
             .child(
                 div()
+                    .min_w_0()
                     .text_xs()
                     .text_color(muted)
                     .child(if self.connected {
@@ -3484,12 +3562,18 @@ impl AppView {
                         "3. 连接核心 — 有节点后再连。空组出口不可用，不会直连。"
                     }),
             )
-            .child(div().text_xs().text_color(muted).child(inbound))
+            .child(
+                div()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(inbound),
+            )
             .when(next == SetupNext::AddSubscription, |this| {
                 this.child(
                     Button::new("setup-add-subscription")
                         .small()
-                        .primary()
+                        .secondary()
                         .label("添加订阅")
                         .on_click(self.select_page(cx, Page::Subscriptions)),
                 )
@@ -3521,29 +3605,52 @@ impl AppView {
             "—".into()
         };
         let now = self.overview_proxy_label();
+        let mixed = self.mixed_endpoint();
+        let runtime_status = if connected { "LIVE" } else { "IDLE" };
+        let runtime_color = if connected {
+            theme.success
+        } else {
+            theme.muted_foreground
+        };
         v_flex()
-            .gap_4()
+            .gap_5()
             .child(page_title(
                 theme,
                 "总览",
                 &self.inbound_modes_subtitle(),
             ))
-            .child(self.overview_setup_card(cx, theme))
             .child(
                 h_flex()
                     .w_full()
-                    .p_5()
                     .gap_4()
                     .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.group_box)
+                    .items_stretch()
                     .child(
                         v_flex()
-                            .gap(px(4.))
+                            .flex_1()
+                            .min_w(px(420.))
+                            .max_w_full()
+                            .p_6()
+                            .gap_4()
+                            .rounded(theme.radius_lg)
+                            .border_1()
+                            .border_color(brand_accent(theme).opacity(0.42))
+                            .bg(theme.background.mix_oklab(brand_accent(theme), 0.92))
+                            .shadow_md()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(brand_accent(theme))
+                                            .child("RUNTIME STATUS"),
+                                    )
+                                    .child(pill(theme, runtime_status, runtime_color)),
+                            )
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -3551,68 +3658,114 @@ impl AppView {
                                     .child(status_dot(theme, connected))
                                     .child(
                                         div()
-                                            .text_lg()
-                                            .font_semibold()
+                                            .text_2xl()
+                                            .font_bold()
                                             .child(self.connected_label()),
                                     ),
                             )
                             .child(
                                 div()
-                                    .text_xs()
+                                    .min_w_0()
+                                    .max_w(px(680.))
+                                    .text_sm()
                                     .text_color(theme.muted_foreground)
                                     .child(if connected {
-                                        format!("Mixed {} · 系统接管 {} · DNS {}{}", self.mixed_endpoint(),
-                                            self.extension_status.phase_label(), self.extension_status.dns_label(),
-                                            if self.applied.tun { " · TUN 按策略规则运行" } else { "" })
+                                        format!(
+                                            "Mixed {} · 系统接管 {} · DNS {}{}",
+                                            mixed,
+                                            self.extension_status.phase_label(),
+                                            self.extension_status.dns_label(),
+                                            if self.applied.tun {
+                                                " · TUN 按策略规则运行"
+                                            } else {
+                                                ""
+                                            }
+                                        )
                                     } else if wanted {
                                         "核心尚未就绪，请查看操作状态。".into()
                                     } else {
                                         format!(
                                             "连接后 Mixed {} 可供显式代理客户端使用。系统接管和 TUN 在设置里分别打开；规则只处理进入这三条入站的流量。",
-                                            self.mixed_endpoint()
+                                            mixed
                                         )
                                     }),
+                            )
+                            .child(self.overview_hero(cx))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .flex_wrap()
+                                    .child(pill(theme, &format!("MIXED {}", mixed), brand_accent(theme)))
+                                    .child(pill(
+                                        theme,
+                                        &format!("SYSTEM {}", self.extension_status.phase_label()),
+                                        if matches!(self.extension_status.phase, Phase::Running) {
+                                            theme.success
+                                        } else {
+                                            theme.muted_foreground
+                                        },
+                                    ))
+                                    .child(pill(
+                                        theme,
+                                        &format!("DNS {}", self.extension_status.dns_label()),
+                                        if matches!(
+                                            self.extension_status.dns_phase,
+                                            network_extension::DnsPhase::Running
+                                        ) {
+                                            theme.success
+                                        } else {
+                                            theme.muted_foreground
+                                        },
+                                    )),
                             ),
                     )
-                    .child(self.overview_hero(cx)),
+                    .child(self.overview_setup_card(cx, theme)),
             )
             .child(
-                h_flex()
-                    .gap_3()
-                    .flex_wrap()
-                    .child(metric(
-                        theme,
-                        "状态",
-                        self.connected_label(),
-                    ))
-                    .child(metric(theme, "上传", &up))
-                    .child(metric(theme, "下载", &down))
-                    .child(metric(theme, "连接数", &conns)),
+                v_flex()
+                    .gap_2()
+                    .child(section_heading(theme, "LIVE PULSE"))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .flex_wrap()
+                            .child(metric(theme, "状态", self.connected_label()))
+                            .child(metric(theme, "上传", &up))
+                            .child(metric(theme, "下载", &down))
+                            .child(metric(theme, "连接数", &conns)),
+                    ),
             )
             .child(
-                h_flex().gap_3().flex_wrap()
-                    .child(metric(theme, "PROXY", &now))
-                    .child(metric(theme, "GLOBAL", &global_selection_label(&self.global_now(), self.connected)))
-                    .child(metric(
-                        theme,
-                        "系统接管",
-                        self.extension_status.phase_label(),
-                    ))
-                    .child(metric(
-                        theme,
-                        "Mixed",
-                        &self.mixed_endpoint(),
-                    ))
-                    .child(metric(
-                        theme,
-                        "节点",
-                        &format!(
-                            "{} kept / 过滤 {} / 拉取失败 {}",
-                            self.catalog.nodes.len(),
-                            self.catalog.filter_excluded_count(),
-                            self.catalog.fetch_failure_count()
-                        ),
-                    )),
+                v_flex()
+                    .gap_2()
+                    .child(section_heading(theme, "ROUTING SNAPSHOT"))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .flex_wrap()
+                            .child(metric(theme, "PROXY", &now))
+                            .child(metric(
+                                theme,
+                                "GLOBAL",
+                                &global_selection_label(&self.global_now(), self.connected),
+                            ))
+                            .child(metric(
+                                theme,
+                                "系统接管",
+                                self.extension_status.phase_label(),
+                            ))
+                            .child(metric(theme, "Mixed", &mixed))
+                            .child(metric(
+                                theme,
+                                "节点",
+                                &format!(
+                                    "{} kept / 过滤 {} / 拉取失败 {}",
+                                    self.catalog.nodes.len(),
+                                    self.catalog.filter_excluded_count(),
+                                    self.catalog.fetch_failure_count()
+                                ),
+                            )),
+                    ),
             )
             .when(
                 self.traffic_error.is_some() || self.proxy_error.is_some(),
@@ -3679,7 +3832,8 @@ impl AppView {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .overflow_x_hidden()
             .gap_4()
             .child(page_title(
                 theme,
@@ -3694,15 +3848,16 @@ impl AppView {
                 h_flex()
                     .gap_3()
                     .flex_wrap()
-                    .child(metric(
-                        theme,
-                        "状态",
-                        self.connected_label(),
-                    ))
-                    .child(metric(theme, "Mixed 端口", &mixed))
-                    .child(metric(theme, "上传", &up))
-                    .child(metric(theme, "下载", &down))
-                    .child(metric(theme, "连接数", &count)),
+                    .items_stretch()
+                    .child(
+                        metric(theme, "状态", self.connected_label())
+                            .min_w(px(100.))
+                            .p_3(),
+                    )
+                    .child(metric(theme, "Mixed 端口", &mixed).min_w(px(100.)).p_3())
+                    .child(metric(theme, "上传", &up).min_w(px(100.)).p_3())
+                    .child(metric(theme, "下载", &down).min_w(px(100.)).p_3())
+                    .child(metric(theme, "连接数", &count).min_w(px(100.)).p_3()),
             )
             .when(
                 self.traffic_error.is_some() || (connected && !self.traffic.connections.is_empty()),
@@ -3737,6 +3892,7 @@ impl AppView {
                                                 .small()
                                                 .outline()
                                                 .label("显示直连")
+                                                .tooltip("显示直连")
                                                 .checked(self.connection_filters.show_direct)
                                                 .on_click(move |checked, _, app| {
                                                     let show = *checked;
@@ -3827,18 +3983,19 @@ impl AppView {
             .when(connected && !self.traffic.connections.is_empty(), |this| {
                 let row_count = filtered.len();
                 this.child(
-                    v_flex()
+                    h_flex()
                         .id("connection-list")
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
                         .w_full()
-                        .overflow_x_scroll()
+                        .overflow_x_scrollbar()
                         .child(
                             v_flex()
                                 .min_w(px(920.))
                                 .w_full()
                                 .flex_1()
+                                .flex_shrink_0()
                                 .min_h_0()
                                 .gap_1()
                                 .child(connection_header_row(
@@ -4089,7 +4246,7 @@ impl AppView {
 
     fn groups(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
-        let accent = theme.accent;
+        let accent = brand_accent(theme);
         let query = self.member_query.read(cx).value().trim().to_lowercase();
         v_flex()
             .gap_4()
@@ -4205,17 +4362,18 @@ impl AppView {
             .collect();
         let visible_len = visible.len();
         let muted_fg = theme.muted_foreground;
-        let accent = theme.accent;
+        let accent = brand_accent(theme);
         v_flex()
             .id("rules-page")
             .flex_1()
             .min_h_0()
-            .overflow_hidden()
-            .gap_4()
+            .overflow_y_scroll()
+            .overflow_x_hidden()
+            .gap_2()
             .child(page_title(
                 theme,
                 "规则",
-                "规则入口先绕过本机和私网，再按下表自上而下首条命中。同一规则内是任一条件命中；GFWList 预设独立装卸。",
+                "按下表自上而下首条命中；同一规则内任一条件命中，GFWList 预设独立装卸。",
             ))
             .child(self.routing_panel(cx, theme))
             .child(
@@ -4272,7 +4430,7 @@ impl AppView {
                 v_flex()
                     .id("rule-list")
                     .flex_1()
-                    .min_h_0()
+                    .min_h(px(160.))
                     .overflow_y_scroll()
                     .gap_3()
                     .children(visible.into_iter().map(|(index, set)| {
@@ -4947,12 +5105,12 @@ impl AppView {
             theme,
             "分流",
             v_flex()
-                .gap_3()
+                .gap_2()
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("规则入口先绕过本机与私网，再按用户规则、GFWList 或国内直连、未命中走向处理。GFWList 整包装卸。国内直连的 GEOIP 在 Mihomo 里求值，系统接管不做 IP 库。"),
+                        .child("入口绕过本机与私网；再按规则、GFWList、国内直连或未命中走向处理。"),
                 )
                 .child(
                     h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().map(
@@ -5029,6 +5187,8 @@ impl AppView {
                         }),
                 ),
         )
+        .p_3()
+        .gap_2()
     }
 
     fn set_routing_profile(&mut self, profile: RoutingProfile, cx: &mut Context<Self>) {
@@ -5144,17 +5304,6 @@ impl AppView {
                 )
                 .when_some(self.extension_status.message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(message)))
                 .when_some(self.extension_status.dns_message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(format!("DNS：{message}"))))
-                .child({
-                    Button::new("open-login-items")
-                        .small()
-                        .ghost()
-                        .label("打开登录项与扩展")
-                        .on_click(move |_, _, _| {
-                            let _ = std::process::Command::new("open")
-                                .arg("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
-                                .spawn();
-                        })
-                })
                 .child(
                     div()
                         .text_xs()
@@ -5455,16 +5604,19 @@ impl AppView {
                     .child(
                         Toggle::new("appearance-light")
                             .label("浅色")
+                            .tooltip("浅色")
                             .checked(self.appearance == Appearance::Light),
                     )
                     .child(
                         Toggle::new("appearance-dark")
                             .label("深色")
+                            .tooltip("深色")
                             .checked(self.appearance == Appearance::Dark),
                     )
                     .child(
                         Toggle::new("appearance-system")
                             .label("系统")
+                            .tooltip("系统")
                             .checked(self.appearance == Appearance::System),
                     )
                     .on_click(self.set_appearance(cx)),
@@ -5728,7 +5880,7 @@ fn render_member_row(
 ) -> impl IntoElement {
     let name_owned = name.to_string();
     let muted_fg = theme.muted_foreground;
-    let accent = theme.accent;
+    let accent = brand_accent(theme);
     h_flex()
         .id(SharedString::from(format!("member-{name}")))
         .w_full()
@@ -5888,14 +6040,15 @@ fn render_group_card(
     let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
-    v_flex()
+    surface(theme)
         .id(SharedString::from(format!("group-card-{id}")))
-        .p_4()
-        .gap_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(if selected { accent } else { theme.border })
-        .bg(theme.group_box)
+        .p_5()
+        .gap_3()
+        .border_color(if selected {
+            accent
+        } else {
+            theme.border.opacity(0.68)
+        })
         .cursor_pointer()
         .when(selected, |this| this.bg(accent.opacity(0.14)))
         .hover(move |style| style.bg(muted))
@@ -5912,16 +6065,27 @@ fn render_group_card(
         .child(
             h_flex()
                 .w_full()
+                .min_w_0()
                 .items_center()
                 .justify_between()
-                .child(div().text_sm().font_semibold().child(format!(
-                        "{}  ·  {}  ·  {}",
-                        group.name,
-                        group.kind_label(),
-                        count
-                            .map(|count| format!("{count} 个节点"))
-                            .unwrap_or_else(|| "等待核心状态".into())
-                    )))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_sm()
+                        .font_semibold()
+                        .child(format!(
+                            "{}  ·  {}  ·  {}",
+                            group.name,
+                            group.kind_label(),
+                            count
+                                .map(|count| format!("{count} 个节点"))
+                                .unwrap_or_else(|| "等待核心状态".into())
+                        )),
+                )
                 .child(
                     h_flex()
                         .gap_1()
@@ -6078,23 +6242,30 @@ fn render_global_card(
     let muted_fg = theme.muted_foreground;
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     let shown_empty = shown.is_empty();
-    v_flex()
+    surface(theme)
         .id("group-card-GLOBAL")
-        .p_4()
-        .gap_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
+        .p_5()
+        .gap_3()
+        .border_color(if inbound_global {
+            accent.opacity(0.72)
+        } else {
+            theme.border.opacity(0.68)
+        })
         .when(inbound_global, |this| this.bg(accent.opacity(0.10)))
         .hover(move |style| style.bg(muted))
         .child(
             h_flex()
                 .w_full()
+                .min_w_0()
                 .items_center()
                 .justify_between()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_sm()
                         .font_semibold()
                         .child(format!("GLOBAL  ·  内置选择  ·  {} 个成员", members.len())),
@@ -6193,11 +6364,7 @@ fn file_stamp(path: &Path) -> Option<SystemTime> {
 }
 
 fn empty_hint_box(theme: &Theme) -> Div {
-    div()
-        .p_4()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
+    surface(theme).p_5()
 }
 
 fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
@@ -6422,10 +6589,10 @@ fn render_connection_row(
         .px_3()
         .py_2()
         .gap_2()
-        .rounded(theme.radius)
+        .rounded(theme.radius_lg)
         .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
+        .border_color(theme.border.opacity(0.58))
+        .bg(theme.group_box.opacity(0.68))
         .hover(move |style| style.bg(muted))
         .context_menu({
             let entity = entity.clone();
@@ -6538,14 +6705,15 @@ fn render_rule_set_card(
     let muted_fg = theme.muted_foreground;
     const CHIP_LIMIT: usize = 10;
     let extra = set.matchers.len().saturating_sub(CHIP_LIMIT);
-    v_flex()
+    surface(theme)
         .id(SharedString::from(format!("rule-card-{id}")))
-        .p_4()
-        .gap_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
+        .p_5()
+        .gap_3()
+        .border_color(if selected {
+            accent
+        } else {
+            theme.border.opacity(0.68)
+        })
         .cursor_pointer()
         .when(selected, |this| this.bg(accent.opacity(0.14)))
         .hover(move |style| style.bg(muted))
@@ -6625,10 +6793,13 @@ fn render_rule_set_card(
         .child(
             h_flex()
                 .w_full()
+                .min_w_0()
                 .items_center()
                 .justify_between()
                 .child(
                     h_flex()
+                        .flex_1()
+                        .min_w_0()
                         .gap_2()
                         .items_center()
                         .child(
@@ -6637,7 +6808,16 @@ fn render_rule_set_card(
                                 .text_color(muted_fg)
                                 .child(format!("{}", index + 1)),
                         )
-                        .child(div().text_sm().font_semibold().child(set.name.clone()))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_sm()
+                                .font_semibold()
+                                .child(set.name.clone()),
+                        )
                         .child(pill(theme, &via_label(&via), accent)),
                 )
                 .child({
@@ -6680,45 +6860,91 @@ fn render_rule_set_card(
         )
 }
 
-fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
+fn surface(theme: &Theme) -> Div {
     v_flex()
-        .gap_1()
-        .child(div().text_lg().font_semibold().child(title.to_string()))
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(theme.border.opacity(0.68))
+        .bg(theme.group_box.opacity(0.78))
+}
+
+fn brand_accent(theme: &Theme) -> Hsla {
+    if theme.is_dark() {
+        theme.info
+    } else {
+        theme.info.darken(0.40)
+    }
+}
+
+fn section_heading(theme: &Theme, title: &str) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
         .child(
             div()
+                .text_xs()
+                .font_semibold()
+                .text_color(theme.muted_foreground)
+                .child(title.to_string()),
+        )
+        .child(div().h(px(1.)).flex_1().bg(theme.border.opacity(0.58)))
+}
+
+fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
+    v_flex()
+        .gap_2()
+        .pb_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(24.))
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(brand_accent(theme)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(brand_accent(theme))
+                        .child("MYPROXY / CONTROL"),
+                ),
+        )
+        .child(div().text_2xl().font_bold().child(title.to_string()))
+        .child(
+            div()
+                .max_w(px(780.))
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .child(subtitle.to_string()),
         )
 }
 
-fn metric(theme: &Theme, label: &str, value: &str) -> impl IntoElement {
-    v_flex()
+fn metric(theme: &Theme, label: &str, value: &str) -> Div {
+    surface(theme)
+        .min_h(px(88.))
         .flex_1()
-        .min_w(px(140.))
+        .min_w(px(132.))
         .p_4()
-        .gap_1()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
+        .gap_2()
         .child(
             div()
                 .text_xs()
+                .font_medium()
                 .text_color(theme.muted_foreground)
                 .child(label.to_string()),
         )
-        .child(div().text_sm().font_semibold().child(value.to_string()))
+        .child(div().text_lg().font_semibold().child(value.to_string()))
 }
 
-fn panel(theme: &Theme, title: &str, body: impl IntoElement) -> impl IntoElement {
-    v_flex()
-        .p_4()
-        .gap_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
+fn panel(theme: &Theme, title: &str, body: impl IntoElement) -> Div {
+    surface(theme)
+        .p_5()
+        .gap_3()
         .child(div().text_sm().font_semibold().child(title.to_string()))
         .child(body)
 }
@@ -6726,25 +6952,41 @@ fn panel(theme: &Theme, title: &str, body: impl IntoElement) -> impl IntoElement
 fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
     div()
         .px_2()
-        .py(px(2.))
+        .py(px(3.))
         .rounded(px(999.))
         .bg(color.opacity(0.16))
+        .border_1()
+        .border_color(color.opacity(0.24))
         .text_color(color)
         .text_xs()
+        .font_medium()
         .child(text.to_string())
 }
 
 fn status_pill(theme: &Theme, label: &str, value: &str, color: Hsla) -> impl IntoElement {
     h_flex()
-        .gap_1()
+        .gap_2()
         .items_center()
+        .px_2()
+        .py(px(3.))
+        .rounded(px(999.))
+        .bg(color.opacity(0.08))
+        .border_1()
+        .border_color(color.opacity(0.2))
+        .child(div().size_2().rounded_full().bg(color))
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(label.to_string()),
         )
-        .child(pill(theme, value, color))
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(color)
+                .child(value.to_string()),
+        )
 }
 
 fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
