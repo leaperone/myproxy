@@ -44,7 +44,11 @@ pub struct Snapshot {
     pub operation: OperationState,
     pub runtime: Option<RuntimeIdentity>,
     pub controller_ready: bool,
+    #[serde(default)]
+    pub core_health: crate::supervisor::CoreHealth,
     pub extension: RuntimeStatus,
+    #[serde(default)]
+    pub extension_warnings: Vec<String>,
     pub extension_required: bool,
     pub catalog: Option<AppliedCatalog>,
 }
@@ -64,7 +68,9 @@ pub fn request(request: Request) -> Result<Snapshot> {
                 .is_some_and(|strategy| strategy.system_extension);
         if uses_extension {
             if matches!(request, Request::Status) {
-                return Ok(snapshot(&Supervisor::shared(), host_unavailable()));
+                let supervisor = Supervisor::shared();
+                let health = supervisor.last_health();
+                return Ok(snapshot(&supervisor, health, host_unavailable()));
             }
             bail!("System Extension control requires the myproxyctl bundled with the signed app");
         }
@@ -146,7 +152,12 @@ fn execute(request: Request) -> Result<Snapshot> {
             std::thread::sleep(Duration::from_millis(100));
         }
     };
-    let mut snapshot = snapshot(&supervisor, extension);
+    let core_health = if matches!(request, Request::Status) {
+        supervisor.observe(&strategy)
+    } else {
+        supervisor.last_health()
+    };
+    let mut snapshot = snapshot(&supervisor, core_health, extension);
     snapshot.catalog = catalog;
     if !matches!(request, Request::Status)
         && (snapshot.operation.is_busy()
@@ -158,16 +169,23 @@ fn execute(request: Request) -> Result<Snapshot> {
     Ok(snapshot)
 }
 
-fn snapshot(supervisor: &Supervisor, extension: RuntimeStatus) -> Snapshot {
+fn snapshot(
+    supervisor: &Supervisor,
+    core_health: crate::supervisor::CoreHealth,
+    extension: RuntimeStatus,
+) -> Snapshot {
     let runtime = supervisor.runtime_identity();
+    let extension_required = runtime.is_some()
+        && supervisor
+            .applied_strategy()
+            .is_some_and(|strategy| strategy.system_extension);
     Snapshot {
         operation: supervisor.operation_state(),
         controller_ready: runtime
             .is_some_and(|identity| crate::controller::ready(identity.mixed_port).is_ok()),
-        extension_required: runtime.is_some()
-            && supervisor
-                .applied_strategy()
-                .is_some_and(|strategy| strategy.system_extension),
+        core_health,
+        extension_warnings: extension.consistency_warnings(extension_required),
+        extension_required,
         runtime,
         extension,
         catalog: None,
@@ -228,7 +246,9 @@ mod tests {
                 mixed_port: 7890,
             }),
             controller_ready: true,
+            core_health: crate::supervisor::CoreHealth::ready("Default"),
             extension_required: true,
+            extension_warnings: vec![],
             catalog: None,
             extension: RuntimeStatus {
                 phase: Phase::Running,
@@ -336,7 +356,9 @@ mod transport {
         let path = socket_path()?;
         let mut connection = UnixStream::connect(&path);
         if connection.is_err() && matches!(request, Request::Status) {
-            return Ok(snapshot(&Supervisor::shared(), host_unavailable()));
+            let supervisor = Supervisor::shared();
+            let health = supervisor.last_health();
+            return Ok(snapshot(&supervisor, health, host_unavailable()));
         }
         if connection.is_err() {
             let mut launch = std::process::Command::new("/usr/bin/open");

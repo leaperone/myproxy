@@ -25,6 +25,8 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
 const FAIL_BEFORE_RETRY: u32 = 3;
 const RECOVER_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_RECOVERIES: u32 = 5;
+const MIHOMO_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const EGRESS_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct CaptureStopUnconfirmed;
@@ -35,12 +37,36 @@ impl std::fmt::Display for CaptureStopUnconfirmed {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreHealth {
     pub wanted: bool,
     pub ready: bool,
     pub note: Option<String>,
     pub proxy_now: String,
+    /// Unix milliseconds of the last health observation or state transition.
+    #[serde(default)]
+    pub last_checked_at: Option<u64>,
+    /// Number of consecutive failed probes since the last successful probe.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Number of automatic core recovery attempts since the last connect.
+    #[serde(default)]
+    pub recoveries: u32,
+    /// Most recent probe or recovery error, retained after a later recovery.
+    #[serde(default)]
+    pub last_failure: Option<String>,
+    /// Unix milliseconds when the most recent automatic recovery started.
+    #[serde(default)]
+    pub last_recovery_at: Option<u64>,
+    /// Result of the last real outbound delay probe through `proxy_now`.
+    #[serde(default)]
+    pub egress_ok: Option<bool>,
+    #[serde(default)]
+    pub egress_delay_ms: Option<u32>,
+    #[serde(default)]
+    pub egress_checked_at: Option<u64>,
+    #[serde(default)]
+    pub egress_error: Option<String>,
 }
 
 impl CoreHealth {
@@ -50,10 +76,19 @@ impl CoreHealth {
             ready: false,
             note: None,
             proxy_now: String::new(),
+            last_checked_at: None,
+            consecutive_failures: 0,
+            recoveries: 0,
+            last_failure: None,
+            last_recovery_at: None,
+            egress_ok: None,
+            egress_delay_ms: None,
+            egress_checked_at: None,
+            egress_error: None,
         }
     }
 
-    fn ready(proxy_now: impl Into<String>) -> Self {
+    pub(crate) fn ready(proxy_now: impl Into<String>) -> Self {
         let proxy_now = proxy_now.into();
         Self {
             wanted: true,
@@ -61,6 +96,15 @@ impl CoreHealth {
             note: (proxy_now == "REJECT")
                 .then(|| "核心已就绪；当前节点组为空，代理出口不可用".into()),
             proxy_now,
+            last_checked_at: Some(now_millis()),
+            consecutive_failures: 0,
+            recoveries: 0,
+            last_failure: None,
+            last_recovery_at: None,
+            egress_ok: None,
+            egress_delay_ms: None,
+            egress_checked_at: None,
+            egress_error: None,
         }
     }
 
@@ -70,7 +114,22 @@ impl CoreHealth {
             ready: false,
             note: Some(note.into()),
             proxy_now: String::new(),
+            last_checked_at: Some(now_millis()),
+            consecutive_failures: 0,
+            recoveries: 0,
+            last_failure: Some(note.into()),
+            last_recovery_at: None,
+            egress_ok: None,
+            egress_delay_ms: None,
+            egress_checked_at: None,
+            egress_error: None,
         }
+    }
+}
+
+impl Default for CoreHealth {
+    fn default() -> Self {
+        Self::idle()
     }
 }
 
@@ -81,6 +140,13 @@ struct HealthWatch {
     fails: u32,
     recoveries: u32,
     released: Option<String>,
+    last_recovery_at: Option<u64>,
+    last_failure: Option<String>,
+    last_egress_check: Option<Instant>,
+    egress_ok: Option<bool>,
+    egress_delay_ms: Option<u32>,
+    egress_checked_at: Option<u64>,
+    egress_error: Option<String>,
 }
 
 impl Default for HealthWatch {
@@ -92,6 +158,13 @@ impl Default for HealthWatch {
             fails: 0,
             recoveries: 0,
             released: None,
+            last_recovery_at: None,
+            last_failure: None,
+            last_egress_check: None,
+            egress_ok: None,
+            egress_delay_ms: None,
+            egress_checked_at: None,
+            egress_error: None,
         }
     }
 }
@@ -375,6 +448,16 @@ impl Supervisor {
         }
         let mut health = watch.last.clone();
         health.wanted = true;
+        health.consecutive_failures = watch.fails;
+        health.recoveries = watch.recoveries;
+        health.last_recovery_at = watch.last_recovery_at;
+        if health.last_failure.is_none() {
+            health.last_failure = watch.last_failure.clone();
+        }
+        health.egress_ok = watch.egress_ok;
+        health.egress_delay_ms = watch.egress_delay_ms;
+        health.egress_checked_at = watch.egress_checked_at;
+        health.egress_error = watch.egress_error.clone();
         health
     }
 
@@ -606,7 +689,13 @@ impl Supervisor {
         reclaim_owned_mihomo(Some(strategy.mixed_port), None);
         wait_for_owned_ports_free(strategy.mixed_port);
         let bin = paths::bundled_mihomo();
-        let log_file = File::create(paths::mihomo_log_path()?).context("mihomo.log")?;
+        let mut log_file = open_mihomo_log(runtime.generation)?;
+        writeln!(
+            log_file,
+            "\n===== myproxy runtime generation={} mixed_port={} =====",
+            runtime.generation, strategy.mixed_port
+        )?;
+        log_file.flush().context("flush mihomo.log")?;
         let mut child = mihomo_command(&bin)?
             .arg("-f")
             .arg(paths::runtime_yaml_path()?)
@@ -921,18 +1010,70 @@ impl Supervisor {
         match probe {
             Ok(proxy_now) => {
                 self.mark_ready(proxy_now.clone());
-                CoreHealth::ready(proxy_now)
+                self.observe_egress(runtime.strategy.mixed_port, &proxy_now);
+                self.last_health()
             }
             Err(error) => self.note_failure(runtime, now, &format!("{error:#}")),
         }
+    }
+
+    fn observe_egress(&self, mixed_port: u16, proxy_now: &str) {
+        let now = Instant::now();
+        {
+            let mut watch = self.health.lock().expect("supervisor health lock");
+            if watch
+                .last_egress_check
+                .is_some_and(|last| now.duration_since(last) < EGRESS_PROBE_INTERVAL)
+            {
+                return;
+            }
+            watch.last_egress_check = Some(now);
+        }
+        let result = controller::probe_proxy_delay(mixed_port, proxy_now);
+        let mut watch = self.health.lock().expect("supervisor health lock");
+        watch.egress_checked_at = Some(now_millis());
+        match result {
+            Ok(delay) => {
+                watch.egress_ok = Some(true);
+                watch.egress_delay_ms = Some(delay);
+                watch.egress_error = None;
+                log::info(
+                    "supervisor",
+                    format!("egress probe ok proxy={} delay_ms={delay}", proxy_now),
+                );
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                watch.egress_ok = Some(false);
+                watch.egress_delay_ms = None;
+                watch.egress_error = Some(error.clone());
+                log::warn(
+                    "supervisor",
+                    format!("egress probe failed proxy={proxy_now}: {error}"),
+                );
+            }
+        }
+        let mut health = watch.last.clone();
+        health.egress_ok = watch.egress_ok;
+        health.egress_delay_ms = watch.egress_delay_ms;
+        health.egress_checked_at = watch.egress_checked_at;
+        health.egress_error = watch.egress_error.clone();
+        watch.last = health;
     }
 
     fn mark_ready(&self, proxy_now: String) {
         let mut watch = self.health.lock().expect("supervisor health lock");
         watch.last_check = Some(Instant::now());
         watch.fails = 0;
-        watch.recoveries = 0;
-        watch.last = CoreHealth::ready(proxy_now);
+        let mut health = CoreHealth::ready(proxy_now);
+        health.recoveries = watch.recoveries;
+        health.last_recovery_at = watch.last_recovery_at;
+        health.last_failure = watch.last_failure.clone();
+        health.egress_ok = watch.egress_ok;
+        health.egress_delay_ms = watch.egress_delay_ms;
+        health.egress_checked_at = watch.egress_checked_at;
+        health.egress_error = watch.egress_error.clone();
+        watch.last = health;
     }
 
     fn reset_health(&self) {
@@ -944,6 +1085,7 @@ impl Supervisor {
             let mut watch = self.health.lock().expect("supervisor health lock");
             watch.last_check = Some(now);
             watch.fails = watch.fails.saturating_add(1);
+            watch.last_failure = Some(reason.to_string());
             (watch.fails, watch.recoveries, watch.last_recover)
         };
         let note = match recovery_step(fails, recoveries, last_recover, now) {
@@ -953,7 +1095,24 @@ impl Supervisor {
             RecoveryStep::GiveUp => return self.give_up(runtime.generation, reason),
         };
         let health = CoreHealth::failing(&format!("{reason}；{note}"));
+        let mut health = health;
+        health.consecutive_failures = fails;
+        health.recoveries = recoveries;
+        health.last_recovery_at = self
+            .health
+            .lock()
+            .expect("supervisor health lock")
+            .last_recovery_at;
         self.store_health(health.clone());
+        if fails == 1 || fails == FAIL_BEFORE_RETRY {
+            log::warn(
+                "supervisor",
+                format!(
+                    "core probe failed generation={} consecutive_failures={fails} recoveries={recoveries}: {reason}",
+                    runtime.generation
+                ),
+            );
+        }
         health
     }
 
@@ -999,6 +1158,7 @@ impl Supervisor {
                     CoreHealth::failing(&format!("核心多次恢复失败，自动断开未完成，将重试：{error:#}"));
                 let mut watch = self.health.lock().expect("supervisor health lock");
                 watch.last_recover = Some(Instant::now());
+                watch.last_failure = health.last_failure.clone();
                 watch.last = health.clone();
                 health
             }
@@ -1029,7 +1189,19 @@ impl Supervisor {
             watch.last_recover = Some(now);
             watch.recoveries = watch.recoveries.saturating_add(1);
             watch.fails = 0;
+            watch.last_recovery_at = Some(now_millis());
         }
+        log::warn(
+            "supervisor",
+            format!(
+                "core recovery attempt={} generation={}",
+                self.health
+                    .lock()
+                    .expect("supervisor health lock")
+                    .recoveries,
+                runtime.generation
+            ),
+        );
         let result = (|| -> Result<CoreHealth> {
             runtime.validate_extension_snapshot()?;
             paths::atomic_write(&paths::runtime_yaml_path()?, runtime.yaml.as_bytes())?;
@@ -1051,7 +1223,15 @@ impl Supervisor {
             }
             Err(error) => {
                 OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
-                CoreHealth::failing(&format!("核心恢复失败：{error:#}"))
+                let reason = format!("核心恢复失败：{error:#}");
+                let mut watch = self.health.lock().expect("supervisor health lock");
+                watch.last_failure = Some(reason.clone());
+                watch.fails = 1;
+                let mut health = CoreHealth::failing(&reason);
+                health.consecutive_failures = watch.fails;
+                health.recoveries = watch.recoveries;
+                health.last_recovery_at = watch.last_recovery_at;
+                health
             }
         };
         self.store_health(health.clone());
@@ -1081,13 +1261,49 @@ impl Supervisor {
             OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
             let mut health = self.last_health();
             health.note = Some(format!("{error:#}"));
+            health.last_failure = health.note.clone();
             self.store_health(health);
         }
     }
 
     fn store_health(&self, health: CoreHealth) {
-        self.health.lock().expect("supervisor health lock").last = health;
+        let mut watch = self.health.lock().expect("supervisor health lock");
+        let mut health = health;
+        health.consecutive_failures = watch.fails;
+        health.recoveries = watch.recoveries;
+        health.last_recovery_at = watch.last_recovery_at;
+        if health.last_failure.is_none() {
+            health.last_failure = watch.last_failure.clone();
+        }
+        health.egress_ok = watch.egress_ok;
+        health.egress_delay_ms = watch.egress_delay_ms;
+        health.egress_checked_at = watch.egress_checked_at;
+        health.egress_error = watch.egress_error.clone();
+        if health.last_checked_at.is_none() {
+            health.last_checked_at = Some(now_millis());
+        }
+        watch.last = health;
     }
+}
+
+fn open_mihomo_log(generation: u64) -> Result<File> {
+    let path = paths::mihomo_log_path()?;
+    if fs::metadata(&path)
+        .map(|meta| meta.len() >= MIHOMO_LOG_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let backup = path.with_extension("log.1");
+        let _ = fs::rename(&path, backup);
+        log::info(
+            "supervisor",
+            format!("rotated mihomo log before runtime generation={generation}"),
+        );
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .context("mihomo.log")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1121,6 +1337,14 @@ fn next_generation(previous: u64) -> u64 {
         .unwrap_or_default()
         .as_nanos();
     (now.min(u64::MAX as u128) as u64).max(previous.saturating_add(1))
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn saved_selection(group: &str) -> Result<String> {
