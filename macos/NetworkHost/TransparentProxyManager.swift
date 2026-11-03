@@ -22,14 +22,27 @@ actor AppleTransparentProxyManager {
     func configure(_ configuration: [String: NSObject]) async throws {
         let manager: NETransparentProxyManager
         do {
-            manager = try await loadOwnedManager() ?? NETransparentProxyManager()
+            manager = try await loadOwnedManager() ?? self.manager ?? NETransparentProxyManager()
         } catch let failure as NetworkExtensionControlFailure
             where failure.message.contains("loadAllFromPreferences") {
             // nehelper can leave loadAllFromPreferences without a callback
             // while the old preference is wedged. A fresh manager can still
-            // replace that preference; failing here prevents recovery.
-            AppLog.warn("ne-host", "loadAllFromPreferences timed out; creating a fresh manager")
-            manager = NETransparentProxyManager()
+            // replace that preference when nothing is already owned. Replacing
+            // a live owned manager here makes later stop() miss the running
+            // tunnel and can leave capture/DNS up after a failed live update.
+            if let existing = self.manager {
+                AppLog.warn(
+                    "ne-host",
+                    "loadAllFromPreferences timed out; keeping the owned manager"
+                )
+                manager = existing
+            } else {
+                AppLog.warn(
+                    "ne-host",
+                    "loadAllFromPreferences timed out; creating a fresh manager"
+                )
+                manager = NETransparentProxyManager()
+            }
         }
         try Task.checkCancellation()
         let providerProtocol = NETunnelProviderProtocol()
