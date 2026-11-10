@@ -80,6 +80,7 @@ struct HealthWatch {
     last: CoreHealth,
     fails: u32,
     recoveries: u32,
+    recovery_generation: Option<u64>,
     released: Option<String>,
 }
 
@@ -91,6 +92,7 @@ impl Default for HealthWatch {
             last: CoreHealth::idle(),
             fails: 0,
             recoveries: 0,
+            recovery_generation: None,
             released: None,
         }
     }
@@ -918,14 +920,19 @@ impl Supervisor {
         {
             return self.last_health();
         }
+        let recoveries = {
+            let mut watch = self.health.lock().expect("supervisor health lock");
+            if watch
+                .recovery_generation
+                .is_some_and(|generation| generation != runtime.generation)
+            {
+                *watch = HealthWatch::default();
+            }
+            watch.recoveries
+        };
         match probe {
             Ok(proxy_now) => {
                 // A retained core cannot complete a failed startup or snapshot commit.
-                let recoveries = self
-                    .health
-                    .lock()
-                    .expect("supervisor health lock")
-                    .recoveries;
                 if recoveries > 0 {
                     return self.note_failure(runtime, now, "上次核心恢复未完成");
                 }
@@ -941,6 +948,7 @@ impl Supervisor {
         watch.last_check = Some(Instant::now());
         watch.fails = 0;
         watch.recoveries = 0;
+        watch.recovery_generation = None;
         watch.last = CoreHealth::ready(proxy_now);
     }
 
@@ -1037,6 +1045,7 @@ impl Supervisor {
             let mut watch = self.health.lock().expect("supervisor health lock");
             watch.last_recover = Some(now);
             watch.recoveries = watch.recoveries.saturating_add(1);
+            watch.recovery_generation = Some(runtime.generation);
             watch.fails = 0;
         }
         let mut core_changed = false;
