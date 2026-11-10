@@ -80,6 +80,7 @@ struct HealthWatch {
     last: CoreHealth,
     fails: u32,
     recoveries: u32,
+    recovery_generation: Option<u64>,
     released: Option<String>,
 }
 
@@ -91,6 +92,7 @@ impl Default for HealthWatch {
             last: CoreHealth::idle(),
             fails: 0,
             recoveries: 0,
+            recovery_generation: None,
             released: None,
         }
     }
@@ -130,6 +132,8 @@ struct RuntimeConfig {
     #[serde(default)]
     extension_request: Option<crate::network_extension::EnableRequest>,
     generation: u64,
+    #[serde(default)]
+    activation_generation: u64,
 }
 
 impl RuntimeConfig {
@@ -470,6 +474,7 @@ impl Supervisor {
             yaml,
             extension_request,
             generation: next_generation(0),
+            activation_generation: 0,
         })
     }
 
@@ -522,6 +527,7 @@ impl Supervisor {
             if should_run && !is_wanted() {
                 bail!("连接操作已取消");
             }
+            candidate.activation_generation = candidate.generation;
             candidate.save()?;
             if should_run {
                 if let Err(err) = crate::system_proxy::sync(
@@ -559,6 +565,7 @@ impl Supervisor {
                         self.disconnect_inner(None)?;
                         let health = self.start_runtime(&mut previous)?;
                         previous.generation = next_generation(candidate.generation);
+                        previous.activation_generation = previous.generation;
                         previous.save()?;
                         self.mark_ready(health.proxy_now.clone());
                         self.store_health(health);
@@ -918,8 +925,22 @@ impl Supervisor {
         {
             return self.last_health();
         }
+        let recoveries = {
+            let mut watch = self.health.lock().expect("supervisor health lock");
+            if watch
+                .recovery_generation
+                .is_some_and(|generation| generation != runtime.activation_generation)
+            {
+                *watch = HealthWatch::default();
+            }
+            watch.recoveries
+        };
         match probe {
             Ok(proxy_now) => {
+                // A retained core cannot complete a failed startup or snapshot commit.
+                if recoveries > 0 {
+                    return self.note_failure(runtime, now, "上次核心恢复未完成");
+                }
                 self.mark_ready(proxy_now.clone());
                 CoreHealth::ready(proxy_now)
             }
@@ -932,6 +953,7 @@ impl Supervisor {
         watch.last_check = Some(Instant::now());
         watch.fails = 0;
         watch.recoveries = 0;
+        watch.recovery_generation = None;
         watch.last = CoreHealth::ready(proxy_now);
     }
 
@@ -1028,17 +1050,28 @@ impl Supervisor {
             let mut watch = self.health.lock().expect("supervisor health lock");
             watch.last_recover = Some(now);
             watch.recoveries = watch.recoveries.saturating_add(1);
+            watch.recovery_generation = Some(runtime.activation_generation);
             watch.fails = 0;
         }
+        let mut core_changed = false;
         let result = (|| -> Result<CoreHealth> {
             runtime.validate_extension_snapshot()?;
             paths::atomic_write(&paths::runtime_yaml_path()?, runtime.yaml.as_bytes())?;
             self.disconnect_inner(None)?;
+            core_changed = true;
             let health = self.start_runtime(&mut runtime)?;
             runtime.generation = next_generation(runtime.generation);
+            runtime.activation_generation = runtime.generation;
             runtime.save()?;
             Ok(health)
         })();
+        let result = result.or_else(|error| {
+            if core_changed {
+                self.disconnect_inner(None)
+                    .context(format!("恢复失败后清理未完成；原错误：{error:#}"))?;
+            }
+            Err(error)
+        });
         let result = self.finish_cancelled(result);
         let health = match result {
             Ok(mut health) => {
@@ -1548,6 +1581,27 @@ fn pid_file_alive(port: Option<u16>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_snapshot_activation_identity_is_backward_compatible() {
+        for activation_generation in [None, Some(17_u64)] {
+            let mut snapshot = serde_json::json!({
+                "strategy": Strategy::default(),
+                "catalog": Catalog::default(),
+                "yaml": "",
+                "generation": 41,
+            });
+            if let Some(generation) = activation_generation {
+                snapshot["activation_generation"] = generation.into();
+            }
+            let runtime: RuntimeConfig = serde_json::from_value(snapshot).unwrap();
+            let persisted = serde_json::to_value(&runtime).unwrap();
+            assert_eq!(
+                persisted["activation_generation"],
+                activation_generation.unwrap_or(0)
+            );
+        }
+    }
 
     #[test]
     fn queued_apply_observes_shutdown() {

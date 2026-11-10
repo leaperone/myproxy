@@ -96,8 +96,10 @@ Default Mixed port is **7890**.
 
 `strategy.json` stores the saved configuration. Saving, applying, Mihomo readiness,
 System Extension activation, and DNS readiness are separate states. Apply validates
-the candidate before replacing a running configuration; a failed activation reports
-the failure and attempts to restore the previous working configuration.
+the candidate before replacing a running configuration. Synchronous activation
+failures are reported and trigger an attempt to restore the previous configuration.
+Once the Host accepts an asynchronous System Extension request, later capture or
+DNS failures are reported separately and do not trigger that rollback.
 
 The protected `runtime-state.json` keeps the applied YAML and matching System
 Extension request together. An older running core without this snapshot requires
