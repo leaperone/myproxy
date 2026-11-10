@@ -1577,6 +1577,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_snapshot_activation_identity_is_backward_compatible() {
+        for activation_generation in [None, Some(17_u64)] {
+            let mut snapshot = serde_json::json!({
+                "strategy": Strategy::default(),
+                "catalog": Catalog::default(),
+                "yaml": "",
+                "generation": 41,
+            });
+            if let Some(generation) = activation_generation {
+                snapshot["activation_generation"] = generation.into();
+            }
+            let runtime: RuntimeConfig = serde_json::from_value(snapshot).unwrap();
+            let persisted = serde_json::to_value(&runtime).unwrap();
+            assert_eq!(
+                persisted["activation_generation"],
+                activation_generation.unwrap_or(0)
+            );
+        }
+    }
+
+    #[test]
     fn queued_apply_observes_shutdown() {
         *OPERATION.lock().unwrap() = true;
         let (ready, started) = std::sync::mpsc::channel();
