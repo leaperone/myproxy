@@ -920,6 +920,15 @@ impl Supervisor {
         }
         match probe {
             Ok(proxy_now) => {
+                // A retained core cannot complete a failed startup or snapshot commit.
+                let recoveries = self
+                    .health
+                    .lock()
+                    .expect("supervisor health lock")
+                    .recoveries;
+                if recoveries > 0 {
+                    return self.note_failure(runtime, now, "上次核心恢复未完成");
+                }
                 self.mark_ready(proxy_now.clone());
                 CoreHealth::ready(proxy_now)
             }
@@ -1030,15 +1039,24 @@ impl Supervisor {
             watch.recoveries = watch.recoveries.saturating_add(1);
             watch.fails = 0;
         }
+        let mut core_changed = false;
         let result = (|| -> Result<CoreHealth> {
             runtime.validate_extension_snapshot()?;
             paths::atomic_write(&paths::runtime_yaml_path()?, runtime.yaml.as_bytes())?;
             self.disconnect_inner(None)?;
+            core_changed = true;
             let health = self.start_runtime(&mut runtime)?;
             runtime.generation = next_generation(runtime.generation);
             runtime.save()?;
             Ok(health)
         })();
+        let result = result.or_else(|error| {
+            if core_changed {
+                self.disconnect_inner(None)
+                    .context(format!("恢复失败后清理未完成；原错误：{error:#}"))?;
+            }
+            Err(error)
+        });
         let result = self.finish_cancelled(result);
         let health = match result {
             Ok(mut health) => {
