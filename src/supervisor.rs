@@ -132,6 +132,8 @@ struct RuntimeConfig {
     #[serde(default)]
     extension_request: Option<crate::network_extension::EnableRequest>,
     generation: u64,
+    #[serde(default)]
+    activation_generation: u64,
 }
 
 impl RuntimeConfig {
@@ -472,6 +474,7 @@ impl Supervisor {
             yaml,
             extension_request,
             generation: next_generation(0),
+            activation_generation: 0,
         })
     }
 
@@ -524,6 +527,7 @@ impl Supervisor {
             if should_run && !is_wanted() {
                 bail!("连接操作已取消");
             }
+            candidate.activation_generation = candidate.generation;
             candidate.save()?;
             if should_run {
                 if let Err(err) = crate::system_proxy::sync(
@@ -561,6 +565,7 @@ impl Supervisor {
                         self.disconnect_inner(None)?;
                         let health = self.start_runtime(&mut previous)?;
                         previous.generation = next_generation(candidate.generation);
+                        previous.activation_generation = previous.generation;
                         previous.save()?;
                         self.mark_ready(health.proxy_now.clone());
                         self.store_health(health);
@@ -924,7 +929,7 @@ impl Supervisor {
             let mut watch = self.health.lock().expect("supervisor health lock");
             if watch
                 .recovery_generation
-                .is_some_and(|generation| generation != runtime.generation)
+                .is_some_and(|generation| generation != runtime.activation_generation)
             {
                 *watch = HealthWatch::default();
             }
@@ -1045,7 +1050,7 @@ impl Supervisor {
             let mut watch = self.health.lock().expect("supervisor health lock");
             watch.last_recover = Some(now);
             watch.recoveries = watch.recoveries.saturating_add(1);
-            watch.recovery_generation = Some(runtime.generation);
+            watch.recovery_generation = Some(runtime.activation_generation);
             watch.fails = 0;
         }
         let mut core_changed = false;
@@ -1056,6 +1061,7 @@ impl Supervisor {
             core_changed = true;
             let health = self.start_runtime(&mut runtime)?;
             runtime.generation = next_generation(runtime.generation);
+            runtime.activation_generation = runtime.generation;
             runtime.save()?;
             Ok(health)
         })();
