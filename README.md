@@ -100,6 +100,8 @@ the candidate before replacing a running configuration. Synchronous activation
 failures are reported and trigger an attempt to restore the previous configuration.
 Once the Host accepts an asynchronous System Extension request, later capture or
 DNS failures are reported separately and do not trigger that rollback.
+A working Mixed listener does not prove automatic capture is active. Explicit proxy
+clients can keep working while System Extension capture or DNS interception is down.
 
 The protected `runtime-state.json` keeps the applied YAML and matching System
 Extension request together. An older running core without this snapshot requires
