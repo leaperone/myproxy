@@ -1123,6 +1123,14 @@ impl Supervisor {
             runtime.generation = next_generation(runtime.generation);
             runtime.activation_generation = runtime.generation;
             runtime.save()?;
+            if !is_wanted() {
+                bail!("连接操作已取消");
+            }
+            if let Err(err) =
+                crate::system_proxy::sync(runtime.strategy.system_proxy, runtime.strategy.mixed_port)
+            {
+                log::warn("system-proxy", format!("sync failed: {err:#}"));
+            }
             self.health
                 .lock()
                 .expect("supervisor health lock")
