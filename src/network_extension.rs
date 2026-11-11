@@ -175,6 +175,15 @@ impl RuntimeStatus {
     pub fn is_pending(&self) -> bool {
         matches!(self.phase, Phase::Requesting | Phase::Stopping)
     }
+
+    pub fn is_running_for(&self, revision: u64) -> bool {
+        self.observed
+            && self.phase == Phase::Running
+            && self.dns_phase == DnsPhase::Running
+            && self.capture_enabled
+            && self.desired_revision == revision
+            && self.applied_revision == Some(revision)
+    }
 }
 
 fn unavailable_status() -> RuntimeStatus {
@@ -672,12 +681,7 @@ fn capture_is_current(
     request: &EnableRequest,
     status: &RuntimeStatus,
 ) -> bool {
-    previous == Some(request)
-        && status.observed
-        && status.phase == Phase::Running
-        && status.dns_phase == DnsPhase::Running
-        && status.capture_enabled
-        && status.applied_revision == Some(request.revision)
+    previous == Some(request) && status.is_running_for(request.revision)
 }
 
 pub fn disable_async() -> Result<()> {
@@ -999,6 +1003,7 @@ mod tests {
         status.phase = Phase::Running;
         status.dns_phase = DnsPhase::Running;
         status.capture_enabled = true;
+        status.desired_revision = request.revision;
         status.applied_revision = Some(request.revision);
         assert!(capture_is_current(Some(&request), &request, &status));
         assert!(!capture_is_current(None, &request, &status));
@@ -1014,6 +1019,12 @@ mod tests {
         assert!(!capture_is_current(Some(&request), &request, &status));
         status.dns_phase = DnsPhase::Running;
         status.applied_revision = None;
+        assert!(!capture_is_current(Some(&request), &request, &status));
+        status.applied_revision = Some(request.revision);
+        status.desired_revision = request.revision + 1;
+        assert!(!capture_is_current(Some(&request), &request, &status));
+        status.desired_revision = request.revision;
+        status.observed = false;
         assert!(!capture_is_current(Some(&request), &request, &status));
     }
 }
