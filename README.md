@@ -21,7 +21,7 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 
 Nightly builds are GitHub prereleases with immutable build tags. The `nightly` prerelease points to the latest Nightly feed. Both channels generate Sparkle deltas from recent same-channel archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow. While the core is connected, Check for Updates and archive/delta downloads use Mixed as an HTTP proxy.
 
-`Cargo.toml` holds the next target release version. Since `v0.0.3` is already released, `main` now targets `0.0.4`: Prod uses `v0.0.4`, while Nightly uses `v0.0.4-nightly.20260905.42.1` (UTC date, Release run number, attempt). The app displays the same version without the `v` prefix; the source commit is recorded in release notes. When a Prod release is ready, tag its matching commit, then advance `main` to the next target version. Nightly tags do not trigger the Prod workflow.
+`Cargo.toml` holds the next target release version. Prod uses `v<version>`. Nightly uses `v<version>-nightly.<YYYYMMDD>.<run_number>.<attempt>`, with the UTC date and Release workflow run number and attempt. The app displays the same version without the `v` prefix. Release notes record the source commit. When a Prod release is ready, tag its matching commit, then advance `main` to the next target version. Nightly tags do not trigger the Prod workflow.
 
 Both channels use the Release workflow's run number and attempt as `CFBundleVersion`, so Sparkle can compare builds across channels. The display version, build number, feed, and channel are validated against the packaged app before publication. A manually dispatched Prod release checks out the requested tag; its version must match `Cargo.toml` at that commit.
 
@@ -62,9 +62,9 @@ Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy
 
 ## CLI
 
-`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. A first launch that does not yet have the PATH link opens a one-screen prompt to create `~/.cargo/bin/myproxyctl` and copy the official Agent skill. Skipping or installing writes `onboard.json` next to `strategy.json`, so the prompt does not return. The MacBook Air install script creates the same link automatically.
+`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. Open **设置 → 命令行工具** to create or update the `~/.cargo/bin/myproxyctl` PATH link. **复制 Agent skill** copies the official instructions from `.agents/skills/agent/SKILL.md`. **安装说明** opens the optional installation dialog. The MacBook Air install script creates the same PATH link automatically.
 
-The app's **设置 → 命令行工具** panel can create or update that link later, and copies the official Agent skill from `.agents/skills/agent/SKILL.md`. It refuses to replace an existing regular file. If a terminal cannot find `myproxyctl`, add `~/.cargo/bin` to `PATH`. You can still invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly.
+The in-app installer refuses to replace an existing regular file. If a terminal cannot find `myproxyctl`, add `~/.cargo/bin` to `PATH`. You can still invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly.
 
 All commands accept `--json` for one machine-readable success result on stdout. Runtime errors return a JSON `error` on stderr and a non-zero exit. The official [Agent CLI skill](.agents/skills/agent/SKILL.md) explains how to inspect and configure myproxy.
 
