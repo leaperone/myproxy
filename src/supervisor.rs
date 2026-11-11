@@ -915,7 +915,13 @@ impl Supervisor {
             }
             watch.last_check = Some(now);
         }
-        let probe = self.probe_strategy(&runtime.strategy);
+        let extension = runtime
+            .strategy
+            .system_extension
+            .then(crate::network_extension::status);
+        let probe = self
+            .probe_strategy(&runtime.strategy)
+            .and_then(|proxy_now| runtime_health(&runtime, proxy_now, extension.as_ref()));
         if self.is_busy()
             || RuntimeConfig::load()
                 .ok()
@@ -936,13 +942,13 @@ impl Supervisor {
             watch.recoveries
         };
         match probe {
-            Ok(proxy_now) => {
+            Ok(health) => {
                 // A retained core cannot complete a failed startup or snapshot commit.
                 if recoveries > 0 {
                     return self.note_failure(runtime, now, "上次核心恢复未完成");
                 }
-                self.mark_ready(proxy_now.clone());
-                CoreHealth::ready(proxy_now)
+                self.mark_ready(health.proxy_now.clone());
+                health
             }
             Err(error) => self.note_failure(runtime, now, &format!("{error:#}")),
         }
@@ -1121,6 +1127,14 @@ impl Supervisor {
     fn store_health(&self, health: CoreHealth) {
         self.health.lock().expect("supervisor health lock").last = health;
     }
+}
+
+fn runtime_health(
+    _runtime: &RuntimeConfig,
+    proxy_now: String,
+    _extension: Option<&crate::network_extension::RuntimeStatus>,
+) -> Result<CoreHealth> {
+    Ok(CoreHealth::ready(proxy_now))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1581,6 +1595,50 @@ fn pid_file_alive(port: Option<u16>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network_extension::{DnsPhase, Phase, RuntimeStatus};
+
+    fn extension_runtime() -> (RuntimeConfig, RuntimeStatus) {
+        let strategy = Strategy {
+            system_extension: true,
+            ..Strategy::default()
+        };
+        let request = crate::network_extension::inbound_plan(&strategy);
+        let status = RuntimeStatus {
+            phase: Phase::Running,
+            dns_phase: DnsPhase::Running,
+            observed: true,
+            desired_revision: request.revision,
+            applied_revision: Some(request.revision),
+            capture_enabled: true,
+            fail_open: true,
+            message: None,
+            dns_message: None,
+        };
+        let runtime = RuntimeConfig {
+            strategy,
+            catalog: Catalog::default(),
+            yaml: String::new(),
+            extension_request: Some(request),
+            generation: 41,
+            activation_generation: 17,
+        };
+        (runtime, status)
+    }
+
+    #[test]
+    fn healthy_core_does_not_hide_failed_capture_or_dns() {
+        let (runtime, mut status) = extension_runtime();
+        assert!(runtime_health(&runtime, "node".into(), Some(&status))
+            .unwrap()
+            .ready);
+        status.phase = Phase::Failed;
+        status.message = Some("capture disconnected".into());
+        assert!(runtime_health(&runtime, "node".into(), Some(&status)).is_err());
+        status.phase = Phase::Running;
+        status.dns_phase = DnsPhase::Failed;
+        status.dns_message = Some("DNS startup failed".into());
+        assert!(runtime_health(&runtime, "node".into(), Some(&status)).is_err());
+    }
 
     #[test]
     fn runtime_snapshot_activation_identity_is_backward_compatible() {
