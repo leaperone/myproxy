@@ -100,6 +100,18 @@ the candidate before replacing a running configuration. Synchronous activation
 failures are reported and trigger an attempt to restore the previous configuration.
 Once the Host accepts an asynchronous System Extension request, later capture or
 DNS failures are reported separately and do not trigger that rollback.
+A working Mixed listener does not prove automatic capture is active. Explicit proxy
+clients can keep working while System Extension capture or DNS interception is down.
+
+The Supervisor monitors the applied configuration, including capture and DNS when
+System Extension is required. An accepted enable request stays pending until the
+Host confirms capture, DNS, and the matching request revision. Startup or unknown
+status has a 120-second grace period; waiting for approval or a system reboot stays
+pending without automatic resubmission. Confirmed failures and startup timeouts use
+the existing bounded recovery loop with the same applied request and credentials.
+Attempts are cleared only after all required components are ready. After five
+failed recoveries, myproxy releases capture, DNS, and the system proxy as on
+disconnect. If release cannot be confirmed, it keeps the core and retries cleanup.
 
 The protected `runtime-state.json` keeps the applied YAML and matching System
 Extension request together. An older running core without this snapshot requires

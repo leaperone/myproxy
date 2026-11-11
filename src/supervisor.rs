@@ -25,6 +25,7 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
 const FAIL_BEFORE_RETRY: u32 = 3;
 const RECOVER_INTERVAL: Duration = Duration::from_secs(8);
 const MAX_RECOVERIES: u32 = 5;
+const EXTENSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 struct CaptureStopUnconfirmed;
@@ -81,6 +82,8 @@ struct HealthWatch {
     fails: u32,
     recoveries: u32,
     recovery_generation: Option<u64>,
+    recovery_committed: bool,
+    pending_since: Option<Instant>,
     released: Option<String>,
 }
 
@@ -93,8 +96,67 @@ impl Default for HealthWatch {
             fails: 0,
             recoveries: 0,
             recovery_generation: None,
+            recovery_committed: false,
+            pending_since: None,
             released: None,
         }
+    }
+}
+
+impl HealthWatch {
+    fn recovery_submitted(&mut self, activation_generation: u64, now: Instant) {
+        self.recovery_generation = Some(activation_generation);
+        self.recovery_committed = true;
+        self.pending_since = Some(now);
+    }
+
+    fn observe_runtime(
+        &mut self,
+        runtime: &RuntimeConfig,
+        probe: Result<CoreHealth>,
+        extension: Option<&crate::network_extension::RuntimeStatus>,
+        now: Instant,
+    ) -> Result<CoreHealth> {
+        if self
+            .recovery_generation
+            .is_some_and(|generation| generation != runtime.activation_generation)
+        {
+            *self = Self::default();
+        }
+        self.last_check = Some(now);
+        let health = probe?;
+        // A retained core cannot complete a failed startup or snapshot commit.
+        if self.recoveries > 0 && !self.recovery_committed {
+            bail!("上次运行恢复未完成");
+        }
+        if health.ready {
+            self.fails = 0;
+            self.recoveries = 0;
+            self.recovery_generation = None;
+            self.recovery_committed = false;
+            self.pending_since = None;
+        } else if extension.is_some_and(|status| {
+            status.observed
+                && matches!(
+                    status.phase,
+                    crate::network_extension::Phase::WaitingApproval
+                        | crate::network_extension::Phase::RequiresReboot
+                )
+        }) {
+            self.fails = 0;
+            self.pending_since = None;
+        } else {
+            let since = *self.pending_since.get_or_insert(now);
+            if now.duration_since(since) >= EXTENSION_STARTUP_TIMEOUT {
+                bail!(
+                    "等待系统接管和 DNS 就绪超时；{}",
+                    health.note.as_deref().unwrap_or("运行状态未知")
+                );
+            }
+            self.fails = 0;
+        }
+        self.last = health.clone();
+        Ok(health)
     }
 }
 
@@ -538,7 +600,7 @@ impl Supervisor {
                 }
             }
             if let Some(health) = health {
-                self.mark_ready(health.proxy_now.clone());
+                self.reset_health();
                 self.store_health(health);
             }
             Ok(())
@@ -567,7 +629,7 @@ impl Supervisor {
                         previous.generation = next_generation(candidate.generation);
                         previous.activation_generation = previous.generation;
                         previous.save()?;
-                        self.mark_ready(health.proxy_now.clone());
+                        self.reset_health();
                         self.store_health(health);
                     } else if should_run {
                         self.disconnect_inner(None)?;
@@ -699,19 +761,27 @@ impl Supervisor {
                 .clone();
         }
         let now = self.probe_strategy(strategy)?;
-        if strategy.system_extension {
+        let extension = if strategy.system_extension {
             let request = runtime
                 .extension_request
                 .as_ref()
                 .context("missing applied Network Extension request")?;
             crate::network_extension::enable_request_async(request)?;
-        }
+            Some(crate::network_extension::status())
+        } else {
+            None
+        };
         if !is_wanted() {
             bail!("连接操作已取消");
         }
-        let mut health = CoreHealth::ready(now);
+        let mut health = runtime_health(runtime, now, extension.as_ref())
+            .unwrap_or_else(|error| CoreHealth::failing(&format!("{error:#}")));
         if !notes.is_empty() {
-            health.note = Some(notes.join("；"));
+            let notes = notes.join("；");
+            health.note = Some(match health.note {
+                Some(note) => format!("{note}；{notes}"),
+                None => notes,
+            });
         }
         Ok(health)
     }
@@ -915,7 +985,13 @@ impl Supervisor {
             }
             watch.last_check = Some(now);
         }
-        let probe = self.probe_strategy(&runtime.strategy);
+        let extension = runtime
+            .strategy
+            .system_extension
+            .then(crate::network_extension::status);
+        let probe = self
+            .probe_strategy(&runtime.strategy)
+            .and_then(|proxy_now| runtime_health(&runtime, proxy_now, extension.as_ref()));
         if self.is_busy()
             || RuntimeConfig::load()
                 .ok()
@@ -925,36 +1001,14 @@ impl Supervisor {
         {
             return self.last_health();
         }
-        let recoveries = {
+        let probe = {
             let mut watch = self.health.lock().expect("supervisor health lock");
-            if watch
-                .recovery_generation
-                .is_some_and(|generation| generation != runtime.activation_generation)
-            {
-                *watch = HealthWatch::default();
-            }
-            watch.recoveries
+            watch.observe_runtime(&runtime, probe, extension.as_ref(), now)
         };
         match probe {
-            Ok(proxy_now) => {
-                // A retained core cannot complete a failed startup or snapshot commit.
-                if recoveries > 0 {
-                    return self.note_failure(runtime, now, "上次核心恢复未完成");
-                }
-                self.mark_ready(proxy_now.clone());
-                CoreHealth::ready(proxy_now)
-            }
+            Ok(health) => health,
             Err(error) => self.note_failure(runtime, now, &format!("{error:#}")),
         }
-    }
-
-    fn mark_ready(&self, proxy_now: String) {
-        let mut watch = self.health.lock().expect("supervisor health lock");
-        watch.last_check = Some(Instant::now());
-        watch.fails = 0;
-        watch.recoveries = 0;
-        watch.recovery_generation = None;
-        watch.last = CoreHealth::ready(proxy_now);
     }
 
     fn reset_health(&self) {
@@ -997,12 +1051,15 @@ impl Supervisor {
         {
             return self.last_health();
         }
-        log::error("supervisor", format!("core recovery exhausted: {reason}"));
+        log::error(
+            "supervisor",
+            format!("runtime recovery exhausted: {reason}"),
+        );
         let _ = operation.show(OperationState::Disconnecting);
         let result = self.disconnect_inner(None).and_then(|()| set_wanted(false));
         match result {
             Ok(()) => {
-                let note = format!("核心多次恢复失败，已自动断开并恢复系统网络设置：{reason}");
+                let note = format!("运行状态多次恢复失败，已自动断开并恢复系统网络设置：{reason}");
                 let mut watch = self.health.lock().expect("supervisor health lock");
                 *watch = HealthWatch::default();
                 watch.released = Some(note.clone());
@@ -1017,8 +1074,9 @@ impl Supervisor {
                     format!("give-up disconnect failed: {error:#}"),
                 );
                 OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
-                let health =
-                    CoreHealth::failing(&format!("核心多次恢复失败，自动断开未完成，将重试：{error:#}"));
+                let health = CoreHealth::failing(&format!(
+                    "运行状态多次恢复失败，自动断开未完成，将重试：{error:#}"
+                ));
                 let mut watch = self.health.lock().expect("supervisor health lock");
                 watch.last_recover = Some(Instant::now());
                 watch.last = health.clone();
@@ -1051,6 +1109,8 @@ impl Supervisor {
             watch.last_recover = Some(now);
             watch.recoveries = watch.recoveries.saturating_add(1);
             watch.recovery_generation = Some(runtime.activation_generation);
+            watch.recovery_committed = false;
+            watch.pending_since = None;
             watch.fails = 0;
         }
         let mut core_changed = false;
@@ -1063,6 +1123,18 @@ impl Supervisor {
             runtime.generation = next_generation(runtime.generation);
             runtime.activation_generation = runtime.generation;
             runtime.save()?;
+            if !is_wanted() {
+                bail!("连接操作已取消");
+            }
+            if let Err(err) =
+                crate::system_proxy::sync(runtime.strategy.system_proxy, runtime.strategy.mixed_port)
+            {
+                log::warn("system-proxy", format!("sync failed: {err:#}"));
+            }
+            self.health
+                .lock()
+                .expect("supervisor health lock")
+                .recovery_submitted(runtime.activation_generation, Instant::now());
             Ok(health)
         })();
         let result = result.or_else(|error| {
@@ -1075,16 +1147,23 @@ impl Supervisor {
         let result = self.finish_cancelled(result);
         let health = match result {
             Ok(mut health) => {
-                self.mark_ready(health.proxy_now.clone());
+                if health.ready {
+                    self.reset_health();
+                }
+                let note = if health.ready {
+                    "已使用上次有效配置恢复运行"
+                } else {
+                    "恢复请求已提交"
+                };
                 health.note = Some(match health.note {
-                    Some(note) => format!("已使用上次有效配置恢复核心；{note}"),
-                    None => "已使用上次有效配置恢复核心".into(),
+                    Some(detail) => format!("{note}；{detail}"),
+                    None => note.into(),
                 });
                 health
             }
             Err(error) => {
                 OPERATION_STATE.store(OperationState::Error as u8, Ordering::Release);
-                CoreHealth::failing(&format!("核心恢复失败：{error:#}"))
+                CoreHealth::failing(&format!("运行恢复失败：{error:#}"))
             }
         };
         self.store_health(health.clone());
@@ -1121,6 +1200,55 @@ impl Supervisor {
     fn store_health(&self, health: CoreHealth) {
         self.health.lock().expect("supervisor health lock").last = health;
     }
+}
+
+fn runtime_health(
+    runtime: &RuntimeConfig,
+    proxy_now: String,
+    extension: Option<&crate::network_extension::RuntimeStatus>,
+) -> Result<CoreHealth> {
+    use crate::network_extension::{DnsPhase, Phase};
+
+    if !runtime.strategy.system_extension {
+        return Ok(CoreHealth::ready(proxy_now));
+    }
+    let request = runtime
+        .extension_request
+        .as_ref()
+        .context("运行快照缺少系统接管凭据，请先断开再连接")?;
+    let status = extension.context("无法读取系统接管状态")?;
+    if status.is_running_for(request.revision) {
+        return Ok(CoreHealth::ready(proxy_now));
+    }
+    let capture = status.message.as_deref().unwrap_or(status.phase_label());
+    let dns = status.dns_message.as_deref().unwrap_or(status.dns_label());
+    let note = format!("系统接管：{capture}；DNS：{dns}");
+    if status.observed {
+        if status.desired_revision != request.revision {
+            bail!("系统接管配置修订不匹配；{note}");
+        }
+        if status.dns_phase == DnsPhase::Failed {
+            bail!("{note}");
+        }
+        let pending = status.is_pending()
+            || matches!(status.phase, Phase::WaitingApproval | Phase::RequiresReboot)
+            || (status.phase == Phase::Running
+                && status.capture_enabled
+                && status.applied_revision == Some(request.revision)
+                && matches!(
+                    status.dns_phase,
+                    DnsPhase::Waiting | DnsPhase::Unknown | DnsPhase::Stopping
+                ));
+        if !pending {
+            bail!("{note}");
+        }
+    }
+    Ok(CoreHealth {
+        wanted: true,
+        ready: false,
+        note: Some(format!("核心已就绪；{note}")),
+        proxy_now,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1581,6 +1709,266 @@ fn pid_file_alive(port: Option<u16>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network_extension::{DnsPhase, Phase, RuntimeStatus};
+
+    fn extension_runtime() -> (RuntimeConfig, RuntimeStatus) {
+        let strategy = Strategy {
+            system_extension: true,
+            ..Strategy::default()
+        };
+        let request = crate::network_extension::inbound_plan(&strategy);
+        let status = RuntimeStatus {
+            phase: Phase::Running,
+            dns_phase: DnsPhase::Running,
+            observed: true,
+            desired_revision: request.revision,
+            applied_revision: Some(request.revision),
+            capture_enabled: true,
+            fail_open: true,
+            message: None,
+            dns_message: None,
+        };
+        let runtime = RuntimeConfig {
+            strategy,
+            catalog: Catalog::default(),
+            yaml: String::new(),
+            extension_request: Some(request),
+            generation: 41,
+            activation_generation: 17,
+        };
+        (runtime, status)
+    }
+
+    #[test]
+    fn healthy_core_does_not_hide_failed_capture_or_dns() {
+        let (runtime, mut status) = extension_runtime();
+        assert!(
+            runtime_health(&runtime, "node".into(), Some(&status))
+                .unwrap()
+                .ready
+        );
+        status.phase = Phase::Failed;
+        status.message = Some("capture disconnected".into());
+        assert!(runtime_health(&runtime, "node".into(), Some(&status)).is_err());
+        status.phase = Phase::Running;
+        status.dns_phase = DnsPhase::Failed;
+        status.dns_message = Some("DNS startup failed".into());
+        assert!(runtime_health(&runtime, "node".into(), Some(&status)).is_err());
+    }
+
+    #[test]
+    fn applied_extension_health_requires_capture_and_matching_revisions() {
+        let (mut runtime, status) = extension_runtime();
+        let mut disabled = status.clone();
+        disabled.capture_enabled = false;
+        assert!(runtime_health(&runtime, "node".into(), Some(&disabled)).is_err());
+        let mut stale = status.clone();
+        stale.applied_revision = Some(status.desired_revision + 1);
+        assert!(runtime_health(&runtime, "node".into(), Some(&stale)).is_err());
+        stale = status.clone();
+        stale.desired_revision += 1;
+        assert!(runtime_health(&runtime, "node".into(), Some(&stale)).is_err());
+
+        // Only the applied strategy decides whether capture is required.
+        runtime.strategy.system_extension = false;
+        assert!(
+            runtime_health(&runtime, "node".into(), Some(&disabled))
+                .unwrap()
+                .ready
+        );
+        runtime.extension_request = None;
+        assert!(runtime_health(&runtime, "node".into(), None).unwrap().ready);
+        runtime.strategy.system_extension = true;
+        assert!(runtime_health(&runtime, "node".into(), Some(&status)).is_err());
+    }
+
+    #[test]
+    fn extension_startup_and_unknown_status_have_a_bounded_wait() {
+        let (runtime, status) = extension_runtime();
+        let now = Instant::now();
+        for (phase, dns_phase, observed) in [
+            (Phase::Requesting, DnsPhase::Waiting, true),
+            (Phase::Stopping, DnsPhase::Stopping, true),
+            (Phase::Running, DnsPhase::Waiting, true),
+            (Phase::Running, DnsPhase::Unknown, true),
+            (Phase::Running, DnsPhase::Running, false),
+        ] {
+            let pending = RuntimeStatus {
+                phase,
+                dns_phase,
+                observed,
+                ..status.clone()
+            };
+            let mut watch = HealthWatch::default();
+            for at in [now, now + EXTENSION_STARTUP_TIMEOUT - HEALTH_INTERVAL] {
+                let health = watch
+                    .observe_runtime(
+                        &runtime,
+                        runtime_health(&runtime, "node".into(), Some(&pending)),
+                        Some(&pending),
+                        at,
+                    )
+                    .unwrap();
+                assert!(!health.ready);
+                assert_eq!(watch.fails, 0);
+            }
+            watch.fails = FAIL_BEFORE_RETRY - 1;
+            let error = watch
+                .observe_runtime(
+                    &runtime,
+                    runtime_health(&runtime, "node".into(), Some(&pending)),
+                    Some(&pending),
+                    now + EXTENSION_STARTUP_TIMEOUT,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("就绪超时"));
+            assert_eq!(watch.fails, FAIL_BEFORE_RETRY - 1);
+            assert_eq!(
+                recovery_step(watch.fails + 1, watch.recoveries, None, now),
+                RecoveryStep::Recover
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_and_reboot_waits_do_not_restart_a_healthy_core() {
+        let (runtime, status) = extension_runtime();
+        let now = Instant::now();
+        for phase in [Phase::WaitingApproval, Phase::RequiresReboot] {
+            let pending = RuntimeStatus {
+                phase,
+                dns_phase: DnsPhase::Unknown,
+                ..status.clone()
+            };
+            let mut watch = HealthWatch {
+                recoveries: 2,
+                ..HealthWatch::default()
+            };
+            watch.recovery_submitted(runtime.activation_generation, now);
+            for at in [now, now + EXTENSION_STARTUP_TIMEOUT * 10] {
+                assert!(
+                    !watch
+                        .observe_runtime(
+                            &runtime,
+                            runtime_health(&runtime, "node".into(), Some(&pending)),
+                            Some(&pending),
+                            at,
+                        )
+                        .unwrap()
+                        .ready
+                );
+                assert_eq!(watch.recoveries, 2);
+                assert_eq!(watch.fails, 0);
+                assert!(watch.pending_since.is_none());
+            }
+            assert!(watch
+                .observe_runtime(
+                    &runtime,
+                    Err(anyhow::anyhow!("core exited")),
+                    Some(&pending),
+                    now,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn async_recovery_keeps_attempts_until_capture_and_dns_are_current() {
+        let (mut runtime, status) = extension_runtime();
+        let now = Instant::now();
+        let mut watch = HealthWatch {
+            recoveries: MAX_RECOVERIES,
+            recovery_generation: Some(runtime.activation_generation),
+            ..HealthWatch::default()
+        };
+        assert!(watch
+            .observe_runtime(
+                &runtime,
+                runtime_health(&runtime, "node".into(), Some(&status)),
+                Some(&status),
+                now,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("恢复未完成"));
+
+        runtime.generation += 1;
+        runtime.activation_generation = runtime.generation;
+        watch.recovery_submitted(runtime.activation_generation, now);
+        let mut pending = RuntimeStatus {
+            phase: Phase::Requesting,
+            dns_phase: DnsPhase::Waiting,
+            ..status.clone()
+        };
+        for selection in 0..2 {
+            runtime.generation += selection;
+            assert!(
+                !watch
+                    .observe_runtime(
+                        &runtime,
+                        runtime_health(&runtime, "node".into(), Some(&pending)),
+                        Some(&pending),
+                        now,
+                    )
+                    .unwrap()
+                    .ready
+            );
+            assert_eq!(watch.recoveries, MAX_RECOVERIES);
+            assert_eq!(
+                watch.recovery_generation,
+                Some(runtime.activation_generation)
+            );
+        }
+        pending.phase = Phase::Running;
+        pending.dns_phase = DnsPhase::Failed;
+        assert!(watch
+            .observe_runtime(
+                &runtime,
+                runtime_health(&runtime, "node".into(), Some(&pending)),
+                Some(&pending),
+                now,
+            )
+            .is_err());
+        assert_eq!(
+            recovery_step(FAIL_BEFORE_RETRY, watch.recoveries, None, now),
+            RecoveryStep::GiveUp
+        );
+        assert!(
+            watch
+                .observe_runtime(
+                    &runtime,
+                    runtime_health(&runtime, "node".into(), Some(&status)),
+                    Some(&status),
+                    now,
+                )
+                .unwrap()
+                .ready
+        );
+        assert_eq!(watch.recoveries, 0);
+        assert!(watch.recovery_generation.is_none());
+    }
+
+    #[test]
+    fn a_new_user_activation_resets_previous_recovery_attempts() {
+        let (runtime, status) = extension_runtime();
+        let mut watch = HealthWatch {
+            recoveries: MAX_RECOVERIES,
+            recovery_generation: Some(runtime.activation_generation - 1),
+            ..HealthWatch::default()
+        };
+        assert!(
+            watch
+                .observe_runtime(
+                    &runtime,
+                    runtime_health(&runtime, "node".into(), Some(&status)),
+                    Some(&status),
+                    Instant::now(),
+                )
+                .unwrap()
+                .ready
+        );
+        assert_eq!(watch.recoveries, 0);
+    }
 
     #[test]
     fn runtime_snapshot_activation_identity_is_backward_compatible() {
