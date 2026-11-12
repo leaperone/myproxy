@@ -11,6 +11,7 @@ name = "Network Extension"
 prefix = "macos/"
 check = "scripts/test-network-shared.sh"
 build = "scripts/build-network-extension.sh"
+ci_check = "build"
 
 [[scope]]
 name = "Preflight configuration"
