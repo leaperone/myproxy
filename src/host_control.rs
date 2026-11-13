@@ -226,6 +226,7 @@ mod tests {
             runtime: Some(RuntimeIdentity {
                 generation: 1,
                 mixed_port: 7890,
+                mixed_lan: false,
             }),
             controller_ready: true,
             extension_required: true,

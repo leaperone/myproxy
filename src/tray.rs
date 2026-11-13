@@ -177,7 +177,16 @@ fn menu_face() -> MenuFace {
                 network_extension::Phase::Failed => "自动代理需要处理",
                 _ => "自动代理未开启",
             };
-            format!("已连接 · 手动代理可用 · {automatic}")
+            let scope = runtime
+                .map(|identity| {
+                    if identity.mixed_lan {
+                        "局域网可用"
+                    } else {
+                        "仅本机可用"
+                    }
+                })
+                .unwrap_or("仅本机可用");
+            format!("已连接 · 手动代理可用 · {automatic} · {scope}")
         }
         _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "代理正在恢复".into()),
         _ => health.note.clone().unwrap_or_else(|| "未连接".into()),

@@ -29,6 +29,10 @@ enum Commands {
     Port {
         port: u16,
     },
+    /// Bind Mixed on every interface. Controller, DNS, and extension listeners stay local.
+    MixedLan {
+        state: String,
+    },
     Tun {
         state: String,
     },
@@ -208,6 +212,7 @@ fn run(cli: Cli) -> Result<()> {
                 "connect",
                 "disconnect",
                 "port",
+                "mixed-lan",
                 "tun",
                 "extension",
                 "mixed-mode",
@@ -269,6 +274,7 @@ fn run(cli: Cli) -> Result<()> {
             let unmatched = myproxy::compile::unmatched_target(&strategy);
             emit(json, serde_json::json!({
                 "mixed_port": strategy.mixed_port,
+                "mixed_lan": strategy.mixed_lan,
                 "mixed_mode": strategy.mixed_mode.as_str(),
                 "global": strategy.global_selected,
                 "tun": strategy.tun,
@@ -287,16 +293,18 @@ fn run(cli: Cli) -> Result<()> {
                 "runtime": runtime.as_ref().map(|identity| serde_json::json!({
                     "generation": identity.generation,
                     "mixed_port": identity.mixed_port,
+                    "mixed_lan": identity.mixed_lan,
                     "controller_ready": controller_ready,
                 })),
                 "extension_runtime": extension,
                 "strategy": paths::strategy_path()?.display().to_string(),
             }), format!(
-                "saved mixed-port {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
-                strategy.mixed_port, strategy.mixed_mode.as_str(), strategy.tun,
+                "saved mixed-port {}  mixed-lan {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  mixed-lan {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
+                strategy.mixed_port, strategy.mixed_lan, strategy.mixed_mode.as_str(), strategy.tun,
                 strategy.system_extension, strategy.routing_profile.as_str(), unmatched,
                 runtime.as_ref().map(|identity| format!("mixed-port {} (generation {})", identity.mixed_port, identity.generation))
                     .unwrap_or_else(|| "disconnected / unverified".into()),
+                runtime.as_ref().map(|identity| identity.mixed_lan).unwrap_or(false),
                 if controller_ready { "ready" } else { "unavailable" },
                 if extension.observed { extension.phase_label() } else { "unknown" },
                 if extension.observed { extension.dns_label() } else { "unknown" },
@@ -373,6 +381,24 @@ fn run(cli: Cli) -> Result<()> {
                 json,
                 serde_json::json!({"mixed_port": port, "status": "saved", "applied": false}),
                 format!("saved mixed-port {port}; apply/connect to activate"),
+            );
+        }
+        Commands::MixedLan { state } => {
+            let on = match state.as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                _ => bail!("mixed-lan on|off"),
+            };
+            let mut strategy = Strategy::load()?;
+            strategy.mixed_lan = on;
+            strategy.save()?;
+            emit(
+                json,
+                serde_json::json!({"mixed_lan": on, "mixed_port": strategy.mixed_port, "status": "saved", "applied": false}),
+                format!(
+                    "saved mixed-lan {}; apply/connect to activate",
+                    if on { "on" } else { "off" }
+                ),
             );
         }
         Commands::Tun { state } => {

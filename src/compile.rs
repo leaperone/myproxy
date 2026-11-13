@@ -114,7 +114,7 @@ fn try_compile_root(
     request: Option<&crate::network_extension::EnableRequest>,
 ) -> Result<serde_yaml::Mapping> {
     let mut root = serde_yaml::Mapping::new();
-    root.insert("allow-lan".into(), false.into());
+    root.insert("allow-lan".into(), strategy.mixed_lan.into());
     root.insert("bind-address".into(), "127.0.0.1".into());
     root.insert("mode".into(), "rule".into());
     root.insert("log-level".into(), "info".into());
@@ -545,10 +545,16 @@ fn insert_inbound_listeners(
 }
 
 fn push_mixed_listener(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strategy) {
+    // Mihomo's Go listener makes :: dual-stack; two wildcard sockets collide on macOS and Linux.
+    let host = if strategy.mixed_lan {
+        "::"
+    } else {
+        "127.0.0.1"
+    };
     let mut item = serde_yaml::Mapping::new();
     item.insert("name".into(), "myproxy-mixed".into());
     item.insert("type".into(), "mixed".into());
-    item.insert("listen".into(), "127.0.0.1".into());
+    item.insert("listen".into(), host.into());
     item.insert("port".into(), strategy.mixed_port.into());
     if let Some(proxy) = inbound_proxy(strategy.mixed_mode, strategy) {
         item.insert("proxy".into(), proxy.into());
@@ -1057,6 +1063,76 @@ mod tests {
             Some(u64::from(strategy.mixed_port))
         );
         assert_eq!(proxy_field(mixed), None);
+        assert_eq!(
+            root.get("allow-lan").and_then(serde_yaml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            listeners(&root)
+                .into_iter()
+                .filter(|item| {
+                    item.get("type").and_then(serde_yaml::Value::as_str) == Some("mixed")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mixed_lan_opens_mixed_only() {
+        let mut strategy = Strategy::default();
+        strategy.mixed_lan = true;
+        strategy.system_extension = true;
+        let root = compiled(&strategy);
+        assert_eq!(
+            root.get("allow-lan").and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            root.get("bind-address").and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            root.get("external-controller")
+                .and_then(serde_yaml::Value::as_str)
+                .and_then(|value| value.split(':').next()),
+            Some("127.0.0.1")
+        );
+        let mixed = mixed_listener(&root);
+        assert_eq!(
+            mixed.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("::")
+        );
+        assert_eq!(
+            listeners(&root)
+                .into_iter()
+                .filter(|item| {
+                    item.get("type").and_then(serde_yaml::Value::as_str) == Some("mixed")
+                })
+                .count(),
+            1
+        );
+        assert!(listeners(&root)
+            .into_iter()
+            .all(|item| listener_name(item) != "myproxy-mixed-ipv6"));
+        assert_eq!(proxy_field(mixed), None);
+        for listener in listeners(&root) {
+            if listener_name(listener) == "myproxy-mixed" {
+                continue;
+            }
+            assert!(matches!(
+                listener.get("listen").and_then(serde_yaml::Value::as_str),
+                Some("127.0.0.1") | Some("::1")
+            ));
+        }
+        let dns = root
+            .get("dns")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("dns");
+        assert_eq!(
+            dns.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1:1053")
+        );
     }
 
     #[test]
