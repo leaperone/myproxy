@@ -9,12 +9,13 @@
 //! The tests below pin every pair that carries content against the shipped
 //! Default Light and Default Dark palettes.
 
-use gpui_kit::gpui::{hsla, Hsla};
 use gpui_kit::component::Theme;
+use gpui_kit::gpui::{hsla, Hsla};
 
 /// WCAG contrast for text that carries content.
 const BODY_CONTRAST: f32 = 4.5;
 /// WCAG contrast for a non-text indicator such as a selected border.
+#[cfg(test)]
 const INDICATOR_CONTRAST: f32 = 3.0;
 /// Steps used when a role has to be darkened or lightened into range.
 const LEGIBLE_STEPS: u8 = 10;
@@ -141,10 +142,7 @@ mod tests {
 
     #[test]
     fn warning_text_reaches_body_contrast_in_both_appearances() {
-        for (warning, surface) in [
-            (LIGHT_WARNING, LIGHT_SURFACE),
-            (DARK_WARNING, DARK_SURFACE),
-        ] {
+        for (warning, surface) in [(LIGHT_WARNING, LIGHT_SURFACE), (DARK_WARNING, DARK_SURFACE)] {
             let text = legible_on(hex(warning), hex(surface));
             let ratio = contrast_ratio(text, hex(surface));
             assert!(
@@ -160,7 +158,10 @@ mod tests {
         // Guards the two measured failures the role exists to prevent.
         assert!(contrast_ratio(hex(LIGHT_WARNING), hex(LIGHT_SURFACE)) < BODY_CONTRAST);
         assert!(contrast_ratio(hex(DARK_WARNING), hex(DARK_SURFACE)) >= BODY_CONTRAST);
-        assert_eq!(legible_on(hex(DARK_WARNING), hex(DARK_SURFACE)), hex(DARK_WARNING));
+        assert_eq!(
+            legible_on(hex(DARK_WARNING), hex(DARK_SURFACE)),
+            hex(DARK_WARNING)
+        );
     }
 
     #[test]
@@ -177,7 +178,10 @@ mod tests {
             (DARK_FOREGROUND, DARK_SURFACE),
         ] {
             let ratio = contrast_ratio(hex(border), hex(surface));
-            assert!(ratio >= INDICATOR_CONTRAST, "selection {ratio} on #{surface:06x}");
+            assert!(
+                ratio >= INDICATOR_CONTRAST,
+                "selection {ratio} on #{surface:06x}"
+            );
         }
     }
 

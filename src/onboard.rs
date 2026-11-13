@@ -110,7 +110,7 @@ impl Render for OnboardView {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("之后若打开「系统接管」，请到系统设置 › 通用 › 登录项与扩展 允许 myproxy。"),
+                    .child("之后若打开「自动代理」，请到系统设置 › 通用 › 登录项与扩展允许 myproxy。"),
             )
             .child(
                 div()

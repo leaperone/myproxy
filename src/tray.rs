@@ -170,15 +170,16 @@ fn menu_face() -> MenuFace {
         OperationState::Applying => "正在应用策略…".into(),
         OperationState::Disconnecting => "正在断开…".into(),
         _ if busy => "正在处理操作…".into(),
-        _ if health.ready && runtime.is_some() => format!(
-            "Mixed 已就绪 · {} · 系统接管 {} · DNS {}",
-            runtime
-                .map(|identity| format!("127.0.0.1:{}", identity.mixed_port))
-                .unwrap_or_default(),
-            extension.phase_label(),
-            extension.dns_label()
-        ),
-        _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "核心尚未就绪".into()),
+        _ if health.ready && runtime.is_some() => {
+            let automatic = match extension.phase {
+                network_extension::Phase::Running => "自动代理已开启",
+                network_extension::Phase::WaitingApproval => "自动代理等待授权",
+                network_extension::Phase::Failed => "自动代理需要处理",
+                _ => "自动代理未开启",
+            };
+            format!("已连接 · 手动代理可用 · {automatic}")
+        }
+        _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "代理正在恢复".into()),
         _ => health.note.clone().unwrap_or_else(|| "未连接".into()),
     };
     if !busy && operation == OperationState::Error {
