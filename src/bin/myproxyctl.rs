@@ -897,6 +897,7 @@ fn run(cli: Cli) -> Result<()> {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     via: via.trim().to_string(),
+                    dns_ipv4_only: false,
                     matchers,
                 });
                 let value = serde_json::json!({"status": "added", "id": set.id, "name": set.name, "via": set.via, "matchers": set.matchers.len(), "applied": false});

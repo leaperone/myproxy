@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 
 use crate::catalog::{self, Catalog};
 use crate::gfw;
@@ -44,54 +45,11 @@ pub const DNS_LISTEN_PORT: u16 = 1053;
 /// provider dials this list instead of the endpoint it sees.
 pub const DNS_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
 
-/// Bilibili live/CDN names use real IPv4 answers. The resolver fragment keeps
-/// AAAA out of both the query and response while leaving global IPv6 enabled.
-const BILIBILI_IPV4_ONLY_NAMESERVERS: [&str; 2] = [
+/// The resolver fragment keeps AAAA, SVCB, and HTTPS IPv6 hints out while
+/// leaving global IPv6 enabled for domains without the user rule toggle.
+const DNS_IPV4_ONLY_NAMESERVERS: [&str; 2] = [
     "udp://1.1.1.1#disable-ipv6=true&disable-qtype-64=true&disable-qtype-65=true",
     "udp://8.8.8.8#disable-ipv6=true&disable-qtype-64=true&disable-qtype-65=true",
-];
-const BILIBILI_REAL_IP_RULES: &[&str] = &[
-    "DOMAIN-SUFFIX,bilibili.com,real-ip",
-    "DOMAIN-SUFFIX,bilibili.tv,real-ip",
-    "DOMAIN-SUFFIX,hdslb.com,real-ip",
-    "DOMAIN-SUFFIX,hdslb.net,real-ip",
-    "DOMAIN-SUFFIX,hdslb.org,real-ip",
-    "DOMAIN-SUFFIX,bilivideo.com,real-ip",
-    "DOMAIN-SUFFIX,bilivideo.cn,real-ip",
-    "DOMAIN-SUFFIX,bilivideo.net,real-ip",
-    "DOMAIN-SUFFIX,biliapi.net,real-ip",
-    "DOMAIN-SUFFIX,biliapi.com,real-ip",
-    "DOMAIN-SUFFIX,biliimg.com,real-ip",
-    "DOMAIN-SUFFIX,bilicdn1.com,real-ip",
-    "DOMAIN-SUFFIX,bilicdn2.com,real-ip",
-    "DOMAIN-SUFFIX,bilicdn3.com,real-ip",
-    "DOMAIN-SUFFIX,bilicdn4.com,real-ip",
-    "DOMAIN-SUFFIX,bilicdn5.com,real-ip",
-    "DOMAIN-SUFFIX,szbdyd.com,real-ip",
-    "DOMAIN-SUFFIX,acgvideo.com,real-ip",
-];
-const BILIBILI_IPV4_ONLY_POLICY_DOMAINS: &[&str] = &[
-    "+.bilibili.com",
-    "+.bilibili.tv",
-    "+.hdslb.com",
-    "+.hdslb.net",
-    "+.hdslb.org",
-    "+.bilivideo.com",
-    "+.bilivideo.cn",
-    "+.bilivideo.net",
-    "+.biliapi.net",
-    "+.biliapi.com",
-    "+.biliimg.com",
-    "+.bilicdn1.com",
-    "+.bilicdn2.com",
-    "+.bilicdn3.com",
-    "+.bilicdn4.com",
-    "+.bilicdn5.com",
-    "+.bilicdn.com",
-    "+.bilicdn.cn",
-    "+.bilicdn.net",
-    "+.szbdyd.com",
-    "+.acgvideo.com",
 ];
 
 /// Health-check URL for fallback / url-test groups.
@@ -184,9 +142,9 @@ fn try_compile_root(
         // for those relays (and for proxy-server name resolution), but leave
         // packet-level hijacking to the DNS provider; `dns-hijack` only makes
         // sense on the TUN/utun path.
-        insert_dns(&mut root, false);
+        insert_dns(&mut root, false, strategy);
     } else if strategy.tun {
-        insert_tun_intercept(&mut root);
+        insert_tun_intercept(&mut root, strategy);
     }
 
     let proxies: Vec<serde_yaml::Value> = catalog.nodes.iter().map(|n| n.raw.clone()).collect();
@@ -481,7 +439,67 @@ fn yaml_strings(items: &[&str]) -> serde_yaml::Value {
 /// packets sent to arbitrary resolvers; the Network Extension DNS provider
 /// performs that interception on the system resolver path, so SE omits the
 /// `dns-hijack` option while sharing the resolver configuration.
-fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
+fn dns_ipv4_only_domains(strategy: &Strategy) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut domains = Vec::new();
+    for set in &strategy.rule_sets {
+        if !set.dns_ipv4_only {
+            continue;
+        }
+        for matcher in &set.matchers {
+            let (rule_kind, policy_domain, value) = match matcher.kind.as_str() {
+                "suffix" => (
+                    "DOMAIN-SUFFIX",
+                    format!(
+                        "+.{}",
+                        matcher
+                            .value
+                            .trim_start_matches("*.")
+                            .trim_start_matches('.')
+                    ),
+                    matcher
+                        .value
+                        .trim_start_matches("*.")
+                        .trim_start_matches('.')
+                        .to_string(),
+                ),
+                "domain" if matcher.value.starts_with("*.") => (
+                    "DOMAIN-SUFFIX",
+                    format!(
+                        "+.{}",
+                        matcher
+                            .value
+                            .trim_start_matches("*.")
+                            .trim_start_matches('.')
+                    ),
+                    matcher
+                        .value
+                        .trim_start_matches("*.")
+                        .trim_start_matches('.')
+                        .to_string(),
+                ),
+                "domain" => (
+                    "DOMAIN",
+                    matcher.value.clone(),
+                    matcher.value.clone(),
+                ),
+                _ => continue,
+            };
+            let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+            let policy_domain = policy_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            if value.is_empty() || policy_domain.is_empty() {
+                continue;
+            }
+            let rule = format!("{rule_kind},{value},real-ip");
+            if seen.insert((rule.clone(), policy_domain.clone())) {
+                domains.push((rule, policy_domain));
+            }
+        }
+    }
+    domains
+}
+
+fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool, strategy: &Strategy) {
     let mut dns = serde_yaml::Mapping::new();
     dns.insert("enable".into(), true.into());
     dns.insert(
@@ -498,7 +516,8 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
         "DOMAIN-SUFFIX,local,real-ip",
         "DOMAIN,localhost,real-ip",
     ];
-    fake_ip_filter.extend_from_slice(BILIBILI_REAL_IP_RULES);
+    let ipv4_domains = dns_ipv4_only_domains(strategy);
+    fake_ip_filter.extend(ipv4_domains.iter().map(|(rule, _)| rule.as_str()));
     dns.insert(
         "fake-ip-filter".into(),
         serde_yaml::Value::Sequence(
@@ -514,16 +533,18 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     );
     dns.insert("nameserver".into(), yaml_strings(&DNS_NAMESERVERS));
     let mut nameserver_policy = serde_yaml::Mapping::new();
-    for domain in BILIBILI_IPV4_ONLY_POLICY_DOMAINS {
+    for (_, domain) in &ipv4_domains {
         nameserver_policy.insert(
-            (*domain).into(),
-            yaml_strings(&BILIBILI_IPV4_ONLY_NAMESERVERS),
+            domain.clone().into(),
+            yaml_strings(&DNS_IPV4_ONLY_NAMESERVERS),
         );
     }
-    dns.insert(
-        "nameserver-policy".into(),
-        serde_yaml::Value::Mapping(nameserver_policy),
-    );
+    if !nameserver_policy.is_empty() {
+        dns.insert(
+            "nameserver-policy".into(),
+            serde_yaml::Value::Mapping(nameserver_policy),
+        );
+    }
     dns.insert(
         "proxy-server-nameserver".into(),
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
@@ -541,7 +562,7 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     }
 }
 
-fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
+fn insert_tun_intercept(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
     let mut tun = serde_yaml::Mapping::new();
     tun.insert("enable".into(), true.into());
     tun.insert("stack".into(), "system".into());
@@ -550,7 +571,7 @@ fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
     tun.insert("auto-detect-interface".into(), true.into());
     root.insert("tun".into(), serde_yaml::Value::Mapping(tun));
 
-    insert_dns(root, true);
+    insert_dns(root, true, strategy);
 
     let mut http = serde_yaml::Mapping::new();
     http.insert(
@@ -1000,7 +1021,7 @@ mod tests {
     #[test]
     fn system_extension_dns_engine_has_no_packet_hijack() {
         let mut root = serde_yaml::Mapping::new();
-        insert_dns(&mut root, false);
+        insert_dns(&mut root, false, &Strategy::default());
 
         let dns = root
             .get("dns")
@@ -1014,13 +1035,25 @@ mod tests {
             )))
         );
         assert!(!dns.contains_key("dns-hijack"));
+        assert!(!dns.contains_key("nameserver-policy"));
         assert!(!root.contains_key("tun"));
     }
 
     #[test]
-    fn dns_engine_uses_real_ipv4_answers_for_bilibili_only() {
+    fn dns_engine_uses_real_ipv4_answers_for_enabled_rule_domains() {
+        let mut strategy = Strategy::default();
+        strategy.rule_sets.push(crate::strategy::RuleSet {
+            id: "bilibili".into(),
+            name: "Bilibili".into(),
+            via: "DIRECT".into(),
+            dns_ipv4_only: true,
+            matchers: vec![crate::strategy::Matcher {
+                kind: "suffix".into(),
+                value: "bilivideo.com".into(),
+            }],
+        });
         let mut root = serde_yaml::Mapping::new();
-        insert_dns(&mut root, false);
+        insert_dns(&mut root, false, &strategy);
 
         let dns = root
             .get("dns")
@@ -1039,37 +1072,32 @@ mod tests {
             .iter()
             .map(|value| value.as_str().expect("filter entry"))
             .collect::<Vec<_>>();
-        let mut expected_filters = vec![
-            "DOMAIN-SUFFIX,lan,real-ip",
-            "DOMAIN-SUFFIX,local,real-ip",
-            "DOMAIN,localhost,real-ip",
-        ];
-        expected_filters.extend_from_slice(BILIBILI_REAL_IP_RULES);
-        assert_eq!(filters, expected_filters);
+        assert!(filters.contains(&"DOMAIN-SUFFIX,lan,real-ip"));
+        assert!(filters.contains(&"DOMAIN-SUFFIX,local,real-ip"));
+        assert!(filters.contains(&"DOMAIN,localhost,real-ip"));
+        assert!(filters.contains(&"DOMAIN-SUFFIX,bilivideo.com,real-ip"));
 
         let policy = dns
             .get("nameserver-policy")
             .and_then(serde_yaml::Value::as_mapping)
             .expect("nameserver policy");
-        for domain in BILIBILI_IPV4_ONLY_POLICY_DOMAINS {
-            let servers = policy
-                .get(*domain)
-                .and_then(serde_yaml::Value::as_sequence)
-                .expect("Bilibili policy servers");
-            assert_eq!(
-                servers,
-                &BILIBILI_IPV4_ONLY_NAMESERVERS
-                    .iter()
-                    .map(|server| serde_yaml::Value::String((*server).into()))
-                    .collect::<Vec<_>>()
-            );
-        }
+        let servers = policy
+            .get("+.bilivideo.com")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("IPv4-only policy servers");
+        assert_eq!(
+            servers,
+            &DNS_IPV4_ONLY_NAMESERVERS
+                .iter()
+                .map(|server| serde_yaml::Value::String((*server).into()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn dns_engine_nameservers_match_the_provider_fallback_list() {
         let mut root = serde_yaml::Mapping::new();
-        insert_dns(&mut root, false);
+        insert_dns(&mut root, false, &Strategy::default());
 
         let nameservers = root
             .get("dns")
@@ -1093,7 +1121,7 @@ mod tests {
     #[test]
     fn tun_dns_engine_hijacks_udp_and_tcp_port_53() {
         let mut root = serde_yaml::Mapping::new();
-        insert_tun_intercept(&mut root);
+        insert_tun_intercept(&mut root, &Strategy::default());
 
         let tun = root
             .get("tun")
@@ -1266,6 +1294,7 @@ mod tests {
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
+            dns_ipv4_only: false,
             matchers: vec![crate::strategy::Matcher {
                 kind: "suffix".into(),
                 value: "example.com".into(),
@@ -1351,6 +1380,7 @@ mod tests {
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
+            dns_ipv4_only: false,
             matchers: vec![crate::strategy::Matcher {
                 kind: "suffix".into(),
                 value: "example.com".into(),

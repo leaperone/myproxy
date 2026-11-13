@@ -157,6 +157,7 @@ fn telegram_rule_set() -> RuleSet {
         id: Uuid::new_v4().to_string(),
         name: TELEGRAM_GROUP.into(),
         via: TELEGRAM_GROUP.into(),
+        dns_ipv4_only: false,
         matchers: telegram_matchers(),
     }
 }
@@ -410,6 +411,9 @@ pub struct RuleSet {
     pub id: String,
     pub name: String,
     pub via: String,
+    /// When true, domain/suffix matchers use real IPv4-only DNS answers.
+    #[serde(default)]
+    pub dns_ipv4_only: bool,
     #[serde(default)]
     pub matchers: Vec<Matcher>,
 }
@@ -685,6 +689,17 @@ impl Strategy {
             }
             if set.matchers.is_empty() {
                 anyhow::bail!("rule {} needs at least one matcher", set.name);
+            }
+            if set.dns_ipv4_only
+                && !set
+                    .matchers
+                    .iter()
+                    .any(|matcher| matches!(matcher.kind.as_str(), "domain" | "suffix"))
+            {
+                anyhow::bail!(
+                    "rule {}: DNS IPv4-only requires a domain or suffix matcher",
+                    set.name
+                );
             }
             self.validate_target(&set.via, None)
                 .with_context(|| format!("rule {} target", set.name))?;
@@ -1087,6 +1102,7 @@ impl Strategy {
             id: Uuid::new_v4().to_string(),
             name,
             via,
+            dns_ipv4_only: false,
             matchers: vec![matcher],
         }))
     }
@@ -1588,6 +1604,7 @@ impl RuleSet {
             id: rule.id,
             name,
             via: rule.via,
+            dns_ipv4_only: false,
             matchers: vec![matcher],
         }
     }
@@ -2027,24 +2044,28 @@ mod tests {
             id: "r1".into(),
             name: "r1".into(),
             via: "node:Old · via".into(),
+            dns_ipv4_only: false,
             matchers: vec![],
         }];
         strategy.rule_sets.push(RuleSet {
             id: "r2".into(),
             name: "r2".into(),
             via: "gfw:PROXY".into(),
+            dns_ipv4_only: false,
             matchers: vec![],
         });
         strategy.rule_sets.push(RuleSet {
             id: "r3".into(),
             name: "r3".into(),
             via: "DIRECT".into(),
+            dns_ipv4_only: false,
             matchers: vec![],
         });
         strategy.rule_sets.push(RuleSet {
             id: "r4".into(),
             name: "r4".into(),
             via: "group:PROXY".into(),
+            dns_ipv4_only: false,
             matchers: vec![],
         });
 
@@ -2113,6 +2134,7 @@ mod tests {
             id: "r1".into(),
             name: "r1".into(),
             via: "Old · x".into(),
+            dns_ipv4_only: false,
             matchers: vec![],
         }];
         strategy
@@ -2149,5 +2171,19 @@ mod tests {
         assert!(!second.changed());
         assert_eq!(second.refs_rewritten, 0);
         assert_eq!(strategy.groups[0].sources, vec!["New".to_string()]);
+    }
+
+    #[test]
+    fn dns_ipv4_only_requires_a_domain_or_suffix_matcher() {
+        let mut strategy = Strategy::default();
+        strategy.rule_sets = vec![RuleSet {
+            id: "app-only".into(),
+            name: "App only".into(),
+            via: "DIRECT".into(),
+            dns_ipv4_only: true,
+            matchers: vec![Matcher::app("Safari".into())],
+        }];
+        let error = strategy.validate().expect_err("app-only DNS rule must fail");
+        assert!(error.to_string().contains("domain or suffix"));
     }
 }
