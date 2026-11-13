@@ -4545,7 +4545,7 @@ impl AppView {
                             .gap_2()
                             .items_center()
                             .flex_wrap()
-                            .child(div().text_sm().child(if self.strategy.mixed_lan {
+                            .child(div().text_sm().child(if self.applied.mixed_lan {
                                 "所有网络接口"
                             } else {
                                 "127.0.0.1"

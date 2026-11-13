@@ -293,16 +293,18 @@ fn run(cli: Cli) -> Result<()> {
                 "runtime": runtime.as_ref().map(|identity| serde_json::json!({
                     "generation": identity.generation,
                     "mixed_port": identity.mixed_port,
+                    "mixed_lan": identity.mixed_lan,
                     "controller_ready": controller_ready,
                 })),
                 "extension_runtime": extension,
                 "strategy": paths::strategy_path()?.display().to_string(),
             }), format!(
-                "saved mixed-port {}  mixed-lan {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
+                "saved mixed-port {}  mixed-lan {}  mixed-mode {}  tun {}  extension {}  routing {}  unmatched {}\nruntime {}  mixed-lan {}  controller {}  extension {}  DNS {}\nsubs {}  nodes {}  excluded {}  groups {}  rules {}",
                 strategy.mixed_port, strategy.mixed_lan, strategy.mixed_mode.as_str(), strategy.tun,
                 strategy.system_extension, strategy.routing_profile.as_str(), unmatched,
                 runtime.as_ref().map(|identity| format!("mixed-port {} (generation {})", identity.mixed_port, identity.generation))
                     .unwrap_or_else(|| "disconnected / unverified".into()),
+                runtime.as_ref().map(|identity| identity.mixed_lan).unwrap_or(false),
                 if controller_ready { "ready" } else { "unavailable" },
                 if extension.observed { extension.phase_label() } else { "unknown" },
                 if extension.observed { extension.dns_label() } else { "unknown" },
