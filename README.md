@@ -126,9 +126,9 @@ application support directory.
   order, after built-in local-network bypasses, and only after traffic enters Mixed,
   System Extension, or TUN. Mixed and System Extension each have their own mode; TUN
   follows the profile rules and is mutually exclusive with System Extension.
-- Each domain or suffix rule can enable `DNS 仅 IPv4`. The strategy stores this as
-  `dns_ipv4_only`; the toggle changes DNS answers for that rule without changing its
-  traffic route. Process, keyword, and CIDR matchers do not provide DNS policies.
+- Each DIRECT domain or suffix rule can enable `DNS 仅 IPv4`. The strategy stores this as
+  `dns_ipv4_only`; proxy and reject rules keep fake-IP hostname matching. Process,
+  keyword, and CIDR matchers do not provide DNS policies.
 - `gfw:<group>` is evaluated by mihomo (`RULE-SET,gfw` then DIRECT on a miss).
   System Extension still captures the user's own process and domain/suffix/keyword/cidr
   matchers, including pins whose via is `gfw:<group>`. It does not embed the GFW

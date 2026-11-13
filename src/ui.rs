@@ -778,6 +778,7 @@ impl Render for RuleSetEditor {
             .matchers
             .iter()
             .any(|matcher| matches!(matcher.kind.as_str(), "domain" | "suffix"));
+        let dns_ipv4_available = dns_matcher_available && self.via.eq_ignore_ascii_case("DIRECT");
 
         v_flex()
             .gap_3()
@@ -822,11 +823,11 @@ impl Render for RuleSetEditor {
                     .label(if self.dns_ipv4_only {
                         "DNS 仅 IPv4"
                     } else {
-                        "DNS 双栈"
+                        "DNS 双栈（仅直连规则）"
                     })
                     .checked(self.dns_ipv4_only)
-                    .disabled(!dns_matcher_available)
-                    .accessibility_label("该规则的 DNS 仅使用 IPv4")
+                    .disabled(!dns_ipv4_available)
+                    .accessibility_label("直连规则的 DNS 仅使用 IPv4")
                     .on_click(move |_, _, app| {
                         entity.update(app, |this, cx| {
                             this.dns_ipv4_only = !this.dns_ipv4_only;
@@ -838,7 +839,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("只影响域名或后缀的 DNS 地址族，不改变这条规则的走向。"),
+                    .child("仅对直连规则的域名或后缀生效，不改变规则走向。"),
             )
             .child(
                 h_flex()

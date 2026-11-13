@@ -14,7 +14,7 @@ pub const DEFAULT_EXCLUDE: &str = r"(?i)(流量|剩余|到期|官网|重置|过�
 
 pub const DEFAULT_MIXED_PORT: u16 = 7890;
 
-pub const STRATEGY_SCHEMA: u32 = 7;
+pub const STRATEGY_SCHEMA: u32 = 8;
 
 pub const TELEGRAM_GROUP: &str = "Telegram";
 
@@ -701,6 +701,12 @@ impl Strategy {
                     set.name
                 );
             }
+            if set.dns_ipv4_only && !set.via.eq_ignore_ascii_case("DIRECT") {
+                anyhow::bail!(
+                    "rule {}: DNS IPv4-only is available only for DIRECT rules",
+                    set.name
+                );
+            }
             self.validate_target(&set.via, None)
                 .with_context(|| format!("rule {} target", set.name))?;
             for matcher in &set.matchers {
@@ -858,6 +864,10 @@ impl Strategy {
         }
         if self.schema < 7 {
             self.migrate_routing_profile();
+        }
+        if self.schema < 8 {
+            // `dns_ipv4_only` defaults to false through serde. Bump the schema
+            // so older writers do not silently round-trip the new option.
         }
         self.schema = STRATEGY_SCHEMA;
         true
@@ -1797,6 +1807,27 @@ mod tests {
     }
 
     #[test]
+    fn schema_seven_defaults_dns_ipv4_only_and_migrates_to_eight() {
+        let json = r#"{
+            "schema": 7,
+            "exclude_filter": "",
+            "subscriptions": [],
+            "groups": [],
+            "rule_sets": [{
+                "id": "bili",
+                "name": "Bilibili",
+                "via": "DIRECT",
+                "matchers": [{"kind": "suffix", "value": "bilivideo.com"}]
+            }]
+        }"#;
+        let mut strategy: Strategy = serde_json::from_str(json).expect("parse schema 7");
+        assert!(!strategy.rule_sets[0].dns_ipv4_only);
+        assert!(strategy.migrate());
+        assert_eq!(strategy.schema, STRATEGY_SCHEMA);
+        assert!(!strategy.rule_sets[0].dns_ipv4_only);
+    }
+
+    #[test]
     fn unmatched_group_migrates_to_group_profile() {
         let json = r#"{
             "schema": 6,
@@ -2185,5 +2216,19 @@ mod tests {
         }];
         let error = strategy.validate().expect_err("app-only DNS rule must fail");
         assert!(error.to_string().contains("domain or suffix"));
+    }
+
+    #[test]
+    fn dns_ipv4_only_requires_a_direct_rule() {
+        let mut strategy = Strategy::default();
+        strategy.rule_sets = vec![RuleSet {
+            id: "proxy-domain".into(),
+            name: "Proxy domain".into(),
+            via: "PROXY".into(),
+            dns_ipv4_only: true,
+            matchers: vec![Matcher::suffix("example.com".into())],
+        }];
+        let error = strategy.validate().expect_err("proxy DNS rule must fail");
+        assert!(error.to_string().contains("DIRECT"));
     }
 }
