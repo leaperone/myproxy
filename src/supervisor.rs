@@ -164,6 +164,8 @@ impl HealthWatch {
 pub struct RuntimeIdentity {
     pub generation: u64,
     pub mixed_port: u16,
+    #[serde(default)]
+    pub mixed_lan: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +227,7 @@ impl RuntimeConfig {
         RuntimeIdentity {
             generation: self.generation,
             mixed_port: self.strategy.mixed_port,
+            mixed_lan: self.strategy.mixed_lan,
         }
     }
 }
@@ -1710,6 +1713,25 @@ fn pid_file_alive(port: Option<u16>) -> bool {
 mod tests {
     use super::*;
     use crate::network_extension::{DnsPhase, Phase, RuntimeStatus};
+
+    #[test]
+    fn runtime_identity_keeps_mixed_lan_compatible_with_old_snapshots() {
+        let old: RuntimeIdentity =
+            serde_json::from_str(r#"{"generation":1,"mixed_port":7890}"#).expect("old identity");
+        assert!(!old.mixed_lan);
+        let current = RuntimeIdentity {
+            generation: 2,
+            mixed_port: 7890,
+            mixed_lan: true,
+        };
+        assert_eq!(
+            serde_json::to_value(current)
+                .expect("identity")
+                .get("mixed_lan")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
 
     fn extension_runtime() -> (RuntimeConfig, RuntimeStatus) {
         let strategy = Strategy {

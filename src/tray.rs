@@ -173,7 +173,13 @@ fn menu_face() -> MenuFace {
         _ if health.ready && runtime.is_some() => format!(
             "Mixed 已就绪 · {} · 系统接管 {} · DNS {}",
             runtime
-                .map(|identity| format!("127.0.0.1:{}", identity.mixed_port))
+                .map(|identity| {
+                    if identity.mixed_lan {
+                        format!("所有网络接口:{}", identity.mixed_port)
+                    } else {
+                        format!("127.0.0.1:{}", identity.mixed_port)
+                    }
+                })
                 .unwrap_or_default(),
             extension.phase_label(),
             extension.dns_label()
