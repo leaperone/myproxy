@@ -62,6 +62,14 @@ const BILIBILI_REAL_IP_RULES: &[&str] = &[
     "DOMAIN-SUFFIX,bilivideo.net,real-ip",
     "DOMAIN-SUFFIX,biliapi.net,real-ip",
     "DOMAIN-SUFFIX,biliapi.com,real-ip",
+    "DOMAIN-SUFFIX,biliimg.com,real-ip",
+    "DOMAIN-SUFFIX,bilicdn1.com,real-ip",
+    "DOMAIN-SUFFIX,bilicdn2.com,real-ip",
+    "DOMAIN-SUFFIX,bilicdn3.com,real-ip",
+    "DOMAIN-SUFFIX,bilicdn4.com,real-ip",
+    "DOMAIN-SUFFIX,bilicdn5.com,real-ip",
+    "DOMAIN-SUFFIX,szbdyd.com,real-ip",
+    "DOMAIN-SUFFIX,acgvideo.com,real-ip",
     "DOMAIN-KEYWORD,bilicdn,real-ip",
 ];
 const BILIBILI_IPV4_ONLY_POLICY_DOMAINS: &[&str] = &[
@@ -75,9 +83,17 @@ const BILIBILI_IPV4_ONLY_POLICY_DOMAINS: &[&str] = &[
     "+.bilivideo.net",
     "+.biliapi.net",
     "+.biliapi.com",
+    "+.biliimg.com",
+    "+.bilicdn1.com",
+    "+.bilicdn2.com",
+    "+.bilicdn3.com",
+    "+.bilicdn4.com",
+    "+.bilicdn5.com",
     "+.bilicdn.com",
     "+.bilicdn.cn",
     "+.bilicdn.net",
+    "+.szbdyd.com",
+    "+.acgvideo.com",
 ];
 
 /// Health-check URL for fallback / url-test groups.
