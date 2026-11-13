@@ -94,7 +94,7 @@ Default Mixed port is **7890**.
 
 To let devices on the same LAN use this Mac as a proxy, enable **设置 → 显式代理（Mixed）→ 对局域网开放** or run `myproxyctl mixed-lan on`. Configure the other device with this Mac's LAN IP and the Mixed port.
 
-Mixed has no inbound password. Leave the switch off on untrusted networks. The controller, DNS, and System Extension listeners stay on loopback. Run `myproxyctl mixed-lan off` to close the LAN listener. Apply or reconnect after changing the setting.
+Mixed has no inbound password and listens on all network interfaces when enabled. Leave the switch off on untrusted networks. VPN, hotspot, and firewall rules can make the port reachable from other networks. The controller, DNS, and System Extension listeners stay on loopback. Run `myproxyctl mixed-lan off` to close the LAN listener. Apply or reconnect after changing the setting.
 
 ## Routing and runtime state
 

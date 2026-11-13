@@ -1541,11 +1541,8 @@ impl AppView {
     fn mixed_endpoint(&self) -> String {
         self.runtime
             .map(|runtime| {
-                if self.strategy.mixed_lan {
-                    format!(
-                        "127.0.0.1:{}；局域网设备使用本机 IP:{}",
-                        runtime.mixed_port, runtime.mixed_port
-                    )
+                if self.applied.mixed_lan {
+                    format!("所有网络接口:{}", runtime.mixed_port)
                 } else {
                     format!("127.0.0.1:{}", runtime.mixed_port)
                 }
@@ -4503,7 +4500,19 @@ impl AppView {
                                         div()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
-                                            .child("同一局域网的设备可以用这台电脑的 IP 和 Mixed 端口连接。没有密码。控制器、DNS 和系统接管入口仍只在本机。"),
+                                            .child("同一局域网的设备使用本机 IP 和 Mixed 端口连接；IP 可在系统设置 → 网络查看。"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.warning)
+                                            .child("Mixed 无入站密码，并监听所有网络接口。VPN、热点或防火墙规则可能让其他网络也能访问。"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("控制器、DNS 和系统接管入口仍只在本机。"),
                                     ),
                             )
                             .child({
@@ -4513,7 +4522,7 @@ impl AppView {
                                     .small()
                                     .label(if lan_on { "开启" } else { "关闭" })
                                     .checked(lan_on)
-                                    .accessibility_label("对局域网开放")
+                                    .accessibility_label("对局域网开放（所有网络接口）")
                                     .disabled(self.is_busy())
                                     .on_click(move |_, _, app| {
                                         entity.update(app, |this, cx| {
@@ -4521,7 +4530,7 @@ impl AppView {
                                             this.persist_inbound_mode(
                                                 cx,
                                                 if this.strategy.mixed_lan {
-                                                    "Mixed 将对局域网开放。".into()
+                                                    "Mixed 将对局域网开放（所有网络接口）。".into()
                                                 } else {
                                                     "Mixed 将只监听本机。".into()
                                                 },
@@ -4537,7 +4546,7 @@ impl AppView {
                             .items_center()
                             .flex_wrap()
                             .child(div().text_sm().child(if self.strategy.mixed_lan {
-                                "本机局域网 IP"
+                                "所有网络接口"
                             } else {
                                 "127.0.0.1"
                             }))
