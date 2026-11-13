@@ -1543,7 +1543,7 @@ impl AppView {
             .map(|runtime| {
                 if self.strategy.mixed_lan {
                     format!(
-                        "127.0.0.1:{}，局域网 :{}",
+                        "127.0.0.1:{}；局域网设备使用本机 IP:{}",
                         runtime.mixed_port, runtime.mixed_port
                     )
                 } else {
@@ -4537,7 +4537,7 @@ impl AppView {
                             .items_center()
                             .flex_wrap()
                             .child(div().text_sm().child(if self.strategy.mixed_lan {
-                                "0.0.0.0"
+                                "本机局域网 IP"
                             } else {
                                 "127.0.0.1"
                             }))
