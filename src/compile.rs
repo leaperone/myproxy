@@ -545,22 +545,21 @@ fn insert_inbound_listeners(
 }
 
 fn push_mixed_listener(listeners: &mut Vec<serde_yaml::Value>, strategy: &Strategy) {
-    let hosts: &[(&str, &str)] = if strategy.mixed_lan {
-        &[("myproxy-mixed", "0.0.0.0"), ("myproxy-mixed-ipv6", "::")]
+    // Mihomo's Go listener makes :: dual-stack; two wildcard sockets collide on macOS and Linux.
+    let host = if strategy.mixed_lan {
+        "::"
     } else {
-        &[("myproxy-mixed", "127.0.0.1")]
+        "127.0.0.1"
     };
-    for (name, host) in hosts {
-        let mut item = serde_yaml::Mapping::new();
-        item.insert("name".into(), (*name).into());
-        item.insert("type".into(), "mixed".into());
-        item.insert("listen".into(), (*host).into());
-        item.insert("port".into(), strategy.mixed_port.into());
-        if let Some(proxy) = inbound_proxy(strategy.mixed_mode, strategy) {
-            item.insert("proxy".into(), proxy.into());
-        }
-        listeners.push(serde_yaml::Value::Mapping(item));
+    let mut item = serde_yaml::Mapping::new();
+    item.insert("name".into(), "myproxy-mixed".into());
+    item.insert("type".into(), "mixed".into());
+    item.insert("listen".into(), host.into());
+    item.insert("port".into(), strategy.mixed_port.into());
+    if let Some(proxy) = inbound_proxy(strategy.mixed_mode, strategy) {
+        item.insert("proxy".into(), proxy.into());
     }
+    listeners.push(serde_yaml::Value::Mapping(item));
 }
 
 fn append_network_extension_listeners(
@@ -1068,9 +1067,15 @@ mod tests {
             root.get("allow-lan").and_then(serde_yaml::Value::as_bool),
             Some(false)
         );
-        assert!(listeners(&root)
-            .into_iter()
-            .all(|item| listener_name(item) != "myproxy-mixed-ipv6"));
+        assert_eq!(
+            listeners(&root)
+                .into_iter()
+                .filter(|item| {
+                    item.get("type").and_then(serde_yaml::Value::as_str) == Some("mixed")
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1096,24 +1101,37 @@ mod tests {
         let mixed = mixed_listener(&root);
         assert_eq!(
             mixed.get("listen").and_then(serde_yaml::Value::as_str),
-            Some("0.0.0.0")
-        );
-        let ipv6 = listeners(&root)
-            .into_iter()
-            .find(|item| listener_name(item) == "myproxy-mixed-ipv6")
-            .expect("ipv6 mixed");
-        assert_eq!(
-            ipv6.get("listen").and_then(serde_yaml::Value::as_str),
             Some("::")
         );
-        assert_eq!(proxy_field(ipv6), None);
-        let socks = listeners(&root)
-            .into_iter()
-            .find(|item| listener_name(item) == "myproxy-network-extension-socks-ipv4")
-            .expect("extension socks");
         assert_eq!(
-            socks.get("listen").and_then(serde_yaml::Value::as_str),
-            Some("127.0.0.1")
+            listeners(&root)
+                .into_iter()
+                .filter(|item| {
+                    item.get("type").and_then(serde_yaml::Value::as_str) == Some("mixed")
+                })
+                .count(),
+            1
+        );
+        assert!(listeners(&root)
+            .into_iter()
+            .all(|item| listener_name(item) != "myproxy-mixed-ipv6"));
+        assert_eq!(proxy_field(mixed), None);
+        for listener in listeners(&root) {
+            if listener_name(listener) == "myproxy-mixed" {
+                continue;
+            }
+            assert!(matches!(
+                listener.get("listen").and_then(serde_yaml::Value::as_str),
+                Some("127.0.0.1") | Some("::1")
+            ));
+        }
+        let dns = root
+            .get("dns")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("dns");
+        assert_eq!(
+            dns.get("listen").and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1:1053")
         );
     }
 
