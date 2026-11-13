@@ -1,0 +1,53 @@
+:root {
+  color-scheme: light dark;
+  font: -apple-system-body, system-ui, sans-serif;
+  background: #f5f5f7;
+  color: #1d1d1f;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; width: 360px; }
+
+main { padding: 16px; }
+
+header, .rules-head, footer, .endpoint-row, .add-rule, .rule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+header { justify-content: space-between; margin-bottom: 16px; }
+h1 { font-size: 18px; margin: 0; }
+p { margin: 3px 0 0; color: #6e6e73; font-size: 12px; }
+.state { color: #248a3d; font-size: 12px; }
+
+label { display: block; font-size: 12px; font-weight: 600; margin: 12px 0 6px; }
+select, input, button { font: inherit; }
+select, input { min-height: 32px; border: 1px solid #c7c7cc; border-radius: 7px; padding: 5px 8px; background: white; color: inherit; }
+select { width: 100%; }
+.endpoint-row input:first-child { flex: 1; }
+.endpoint-row input:last-child { width: 88px; }
+.rules-head { justify-content: space-between; margin-top: 8px; }
+.rules-head label { margin-bottom: 0; }
+button { border: 0; border-radius: 7px; padding: 6px 10px; cursor: pointer; }
+button.primary { background: #007aff; color: white; }
+button.secondary { background: #e5e5ea; color: inherit; }
+button:not(.primary):not(.secondary) { background: #e5e5ea; color: inherit; font-size: 12px; }
+.add-rule { margin-top: 6px; }
+.add-rule input { min-width: 0; flex: 1; }
+.add-rule select { width: 70px; }
+.rules { list-style: none; margin: 8px 0 0; padding: 0; max-height: 180px; overflow: auto; }
+.rule { border-bottom: 1px solid #d2d2d7; padding: 7px 0; }
+.rule span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.rule em { color: #6e6e73; font-size: 11px; font-style: normal; }
+.rule button { padding: 2px 6px; background: transparent; color: #ff3b30; }
+footer { justify-content: flex-end; margin-top: 14px; }
+.hint { line-height: 1.4; }
+
+@media (prefers-color-scheme: dark) {
+  :root { background: #1c1c1e; color: #f2f2f7; }
+  select, input { background: #2c2c2e; border-color: #545458; }
+  button.secondary, button:not(.primary):not(.secondary) { background: #3a3a3c; }
+  .rule { border-color: #38383a; }
+}

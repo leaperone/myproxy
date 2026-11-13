@@ -21,7 +21,7 @@ Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更�
 
 Nightly builds are GitHub prereleases with immutable build tags. The `nightly` prerelease points to the latest Nightly feed. Both channels generate Sparkle deltas from recent same-channel archives; Nightly never replaces GitHub's latest stable release. Existing published Prod tags cannot be overwritten by the workflow. While the core is connected, Check for Updates and archive/delta downloads use Mixed as an HTTP proxy.
 
-`Cargo.toml` holds the next target release version. Since `v0.0.3` is already released, `main` now targets `0.0.4`: Prod uses `v0.0.4`, while Nightly uses `v0.0.4-nightly.20260905.42.1` (UTC date, Release run number, attempt). The app displays the same version without the `v` prefix; the source commit is recorded in release notes. When a Prod release is ready, tag its matching commit, then advance `main` to the next target version. Nightly tags do not trigger the Prod workflow.
+`Cargo.toml` holds the next target release version. Prod uses `v<version>`. Nightly uses `v<version>-nightly.<YYYYMMDD>.<run_number>.<attempt>`, with the UTC date and Release workflow run number and attempt. The app displays the same version without the `v` prefix. Release notes record the source commit. When a Prod release is ready, tag its matching commit, then advance `main` to the next target version. Nightly tags do not trigger the Prod workflow.
 
 Both channels use the Release workflow's run number and attempt as `CFBundleVersion`, so Sparkle can compare builds across channels. The display version, build number, feed, and channel are validated against the packaged app before publication. A manually dispatched Prod release checks out the requested tag; its version must match `Cargo.toml` at that commit.
 
@@ -41,13 +41,30 @@ scripts/release-macos.sh          # zip + appcast into dist/
 cargo run --bin myproxyctl -- capabilities
 ```
 
+### Browser extension
+
+The browser extension lives under [`browser-extension/`](browser-extension/). It
+keeps only browser-scoped website rules and sends matching requests to the
+existing Mixed listener; nodes, subscriptions, DNS, and routing remain owned by
+myproxy.
+
+```sh
+scripts/package-browser-extension.sh chromium
+scripts/package-browser-extension.sh firefox
+scripts/package-browser-extension.sh safari
+```
+
+Chrome/Edge use a PAC script and Firefox uses the WebExtension proxy listener.
+Safari has no WebExtension proxy API, so its packaged resources use the native
+messaging protocol documented in [`browser-extension/safari/native-bridge.md`](browser-extension/safari/native-bridge.md).
+
 Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy.log`; 设置 → 日志 shows the tail. Subscription URLs are never written.
 
 ## CLI
 
-`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. A first launch that does not yet have the PATH link opens a one-screen prompt to create `~/.cargo/bin/myproxyctl` and copy the official Agent skill. Skipping or installing writes `onboard.json` next to `strategy.json`, so the prompt does not return. The MacBook Air install script creates the same link automatically.
+`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. Open **设置 → 命令行工具** to create or update the `~/.cargo/bin/myproxyctl` PATH link. **复制 Agent skill** copies the official instructions from `.agents/skills/agent/SKILL.md`. **安装说明** opens the optional installation dialog. The MacBook Air install script creates the same PATH link automatically.
 
-The app's **设置 → 命令行工具** panel can create or update that link later, and copies the official Agent skill from `.agents/skills/agent/SKILL.md`. It refuses to replace an existing regular file. If a terminal cannot find `myproxyctl`, add `~/.cargo/bin` to `PATH`. You can still invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly.
+The in-app installer refuses to replace an existing regular file. If a terminal cannot find `myproxyctl`, add `~/.cargo/bin` to `PATH`. You can still invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly.
 
 All commands accept `--json` for one machine-readable success result on stdout. Runtime errors return a JSON `error` on stderr and a non-zero exit. The official [Agent CLI skill](.agents/skills/agent/SKILL.md) explains how to inspect and configure myproxy.
 
@@ -65,6 +82,7 @@ myproxyctl --json import ~/Downloads/myproxy-strategy-2026-09-10.json
 
 ```sh
 cargo run --bin myproxyctl -- subscription add 'https://…' --name Example
+cargo run --bin myproxyctl -- subscription set Example --name HK
 cargo run --bin myproxyctl -- filter --set '(?i)(流量|剩余|到期|官网)'
 cargo run --bin myproxyctl -- group add PROXY --all
 cargo run --bin myproxyctl -- rule add --name GitHub --keyword github --via PROXY
@@ -78,8 +96,22 @@ Default Mixed port is **7890**.
 
 `strategy.json` stores the saved configuration. Saving, applying, Mihomo readiness,
 System Extension activation, and DNS readiness are separate states. Apply validates
-the candidate before replacing a running configuration; a failed activation reports
-the failure and attempts to restore the previous working configuration.
+the candidate before replacing a running configuration. Synchronous activation
+failures are reported and trigger an attempt to restore the previous configuration.
+Once the Host accepts an asynchronous System Extension request, later capture or
+DNS failures are reported separately and do not trigger that rollback.
+A working Mixed listener does not prove automatic capture is active. Explicit proxy
+clients can keep working while System Extension capture or DNS interception is down.
+
+The Supervisor monitors the applied configuration, including capture and DNS when
+System Extension is required. An accepted enable request stays pending until the
+Host confirms capture, DNS, and the matching request revision. Startup or unknown
+status has a 120-second grace period; waiting for approval or a system reboot stays
+pending without automatic resubmission. Confirmed failures and startup timeouts use
+the existing bounded recovery loop with the same applied request and credentials.
+Attempts are cleared only after all required components are ready. After five
+failed recoveries, myproxy releases capture, DNS, and the system proxy as on
+disconnect. If release cannot be confirmed, it keeps the core and retries cleanup.
 
 The protected `runtime-state.json` keeps the applied YAML and matching System
 Extension request together. An older running core without this snapshot requires
@@ -103,12 +135,17 @@ application support directory.
   **显示直连** reveals only DIRECT connections recorded by the core.
 - System Extension DNS interception stays coupled to the core: disconnect waits
   until capture and DNS are down before stopping Mihomo. If NEDNSProxy cannot be
-  disabled, the core is kept so system resolution is not blackholed. When the
-  private SOCKS backend is down, the DNS provider relays queries directly.
-- macOS hands the DNS provider the queried name as the flow endpoint, not the
-  resolver address, so the provider answers those queries through the resolver list
-  the strategy already uses (`dns.nameserver`). DNS readiness reported in the app
-  proves the private SOCKS relay is reachable, not that every lookup resolves.
+  disabled, the core is kept so system resolution is not blackholed.
+- With System Extension on, public lookups (including public names asked of the
+  router) are answered by Mihomo's fake-ip DNS, so apps see `198.18.x` addresses
+  and Mihomo applies domain rules when they connect. Apps that an app rule sends
+  DIRECT get real addresses. If Mihomo's DNS stops answering, lookups fall back
+  to a real resolver within about ten seconds and return to fake-ip when it
+  recovers. LAN names such as `.lan`, `.local`, and single-label
+  hosts still go to the LAN resolver. When a lookup goes direct and macOS
+  reports the queried name instead of a resolver address, the provider uses the
+  strategy's `dns.nameserver` list. DNS readiness reported in the app proves the
+  private SOCKS listener is reachable, not that every lookup resolves.
 
 Source checks and builds do not verify macOS approval, DNS forwarding, or actual
 traffic. Those require acceptance on the signed installed application.

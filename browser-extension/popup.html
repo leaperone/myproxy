@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MyProxy</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>MyProxy</h1>
+        <p>浏览器按网站代理</p>
+      </div>
+      <span id="state" class="state">加载中</span>
+    </header>
+
+    <label for="mode">代理模式</label>
+    <select id="mode">
+      <option value="smart">自动切换</option>
+      <option value="always">始终代理</option>
+      <option value="direct">直连</option>
+      <option value="system">系统代理</option>
+    </select>
+
+    <section class="endpoint">
+      <label for="host">myproxy Mixed</label>
+      <div class="endpoint-row">
+        <input id="host" type="text" value="127.0.0.1" aria-label="代理地址">
+        <input id="port" type="number" min="1" max="65535" value="7891" aria-label="代理端口">
+      </div>
+    </section>
+
+    <section class="rules-head">
+      <label>网站规则</label>
+      <button id="add-current" type="button">添加当前网站</button>
+    </section>
+    <form id="add-rule" class="add-rule">
+      <input id="pattern" type="text" placeholder="例如 *.github.com" autocomplete="off">
+      <select id="action" aria-label="规则动作">
+        <option value="proxy">代理</option>
+        <option value="direct">直连</option>
+      </select>
+      <button type="submit">添加</button>
+    </form>
+    <ul id="rules" class="rules"></ul>
+
+    <footer>
+      <button id="reset" class="secondary" type="button">恢复默认</button>
+      <button id="apply" class="primary" type="button">应用</button>
+    </footer>
+    <p class="hint">代理请求进入本机 myproxy；节点和分流策略由 myproxy 管理。</p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

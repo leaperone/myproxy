@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "MyProxy Browser Rules",
+  "version": "0.1.0",
+  "description": "按网站规则把浏览器请求送入本机 myproxy。",
+  "author": "leaperone",
+  "action": {
+    "default_title": "MyProxy",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "activeTab",
+    "proxy",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "minimum_chrome_version": "100"
+}

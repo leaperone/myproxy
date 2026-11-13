@@ -72,6 +72,23 @@ pub fn request(request: Request) -> Result<Snapshot> {
     execute(request)
 }
 
+/// Only the signed app can realize a System Extension intent, so an unbundled
+/// macOS CLI may edit strategy but not turn System Extension on.
+pub fn refuse_unbundled_extension_enable(next_enables: bool) -> Result<()> {
+    if !cfg!(target_os = "macos") || crate::login_item::is_bundled() {
+        return Ok(());
+    }
+    let saved = Strategy::load().is_ok_and(|strategy| strategy.system_extension);
+    if turns_on_extension(saved, next_enables) {
+        bail!("Turning on System Extension requires the myproxyctl bundled with the signed app");
+    }
+    Ok(())
+}
+
+fn turns_on_extension(saved: bool, next: bool) -> bool {
+    next && !saved
+}
+
 #[cfg(target_os = "macos")]
 fn host_unavailable() -> RuntimeStatus {
     RuntimeStatus {
@@ -193,6 +210,14 @@ pub fn start() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbundled_cli_may_edit_but_not_enable_extension() {
+        assert!(turns_on_extension(false, true));
+        assert!(!turns_on_extension(true, true));
+        assert!(!turns_on_extension(true, false));
+        assert!(!turns_on_extension(false, false));
+    }
 
     #[test]
     fn core_ready_does_not_hide_unconfirmed_capture_or_dns() {

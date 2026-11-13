@@ -32,14 +32,16 @@ const DEFAULT_DIRECT_RULES: &[&str] = &[
     "IP-CIDR6,ff00::/8,DIRECT,no-resolve",
 ];
 
+/// Mirrored by `DNSProxyUpstreamResolver.mihomoDNS`, where the Network
+/// Extension DNS provider relays public system lookups.
 pub const DNS_LISTEN_PORT: u16 = 1053;
 
-/// Resolvers Mihomo uses for system lookups.
+/// Resolvers Mihomo uses for its own lookups.
 ///
 /// macOS hands the Network Extension DNS provider the *queried name* as the
-/// flow endpoint instead of the resolver address, so the provider cannot dial
-/// the endpoint it sees. It relays those queries to this list instead, which
-/// keeps system answers on the same resolvers as the core.
+/// flow endpoint instead of the resolver address. When a LAN name, or any
+/// name while Mihomo is unavailable, has to be answered directly, the
+/// provider dials this list instead of the endpoint it sees.
 pub const DNS_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
 
 /// Health-check URL for fallback / url-test groups.
@@ -438,6 +440,7 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     );
     dns.insert("ipv6".into(), true.into());
     dns.insert("enhanced-mode".into(), "fake-ip".into());
+    // Mirrored by `DNSProxyUpstreamResolver.mihomoFakeIPNetwork`.
     dns.insert("fake-ip-range".into(), "198.18.0.1/16".into());
     dns.insert(
         "fake-ip-filter".into(),

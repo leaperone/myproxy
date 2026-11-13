@@ -7,6 +7,7 @@ enum DirectTCPFlowRelayError: Error, LocalizedError, Sendable {
     case cancelled
     case invalidDestination
     case connectionTimedOut
+    case idleTimedOut
     case upstreamFailed(String)
     case flowOpenFailed(String)
     case flowReadFailed(String)
@@ -20,6 +21,8 @@ enum DirectTCPFlowRelayError: Error, LocalizedError, Sendable {
             "The direct TCP destination is invalid."
         case .connectionTimedOut:
             "The direct TCP connection timed out."
+        case .idleTimedOut:
+            "The direct TCP relay exceeded its idle timeout."
         case let .upstreamFailed(message):
             "The direct TCP connection failed: \(message)"
         case let .flowOpenFailed(message):
@@ -49,6 +52,8 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
 
     private var connection: NWConnection?
     private var connectionTimeout: DispatchWorkItem?
+    private var idleTimeout: DispatchWorkItem?
+    private var idleGeneration: UInt64 = 0
     private var openedFlow = false
     private var openingFlow = false
     private var halfCloseState = TCPRelayHalfCloseState()
@@ -154,6 +159,7 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
                 }
                 self.openedFlow = true
                 self.report(.ready)
+                self.resetIdleTimeout()
                 self.readFromFlow()
                 self.readFromUpstream()
             }
@@ -176,6 +182,7 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
                 }
                 guard let data, !data.isEmpty else {
                     self.halfCloseState.markAppReadEnded()
+                    self.resetIdleTimeout()
                     self.sendUpstreamEOF()
                     return
                 }
@@ -198,6 +205,7 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
                         } else if !self.finished {
                             self.backpressureState.end(.appToUpstream)
                             self.byteLedger.recordUpstreamAccepted(data.count)
+                            self.resetIdleTimeout()
                             self.report(.relaying)
                             self.readFromFlow()
                         }
@@ -281,6 +289,7 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
                         error.localizedDescription
                     ))
                 } else if !self.finished {
+                    self.resetIdleTimeout()
                     next()
                 }
             }
@@ -289,6 +298,7 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
 
     private func markUpstreamReadFinished() {
         halfCloseState.markUpstreamReadEnded()
+        resetIdleTimeout()
         flow.closeWriteWithError(nil)
         finishIfBothHalvesClosed()
     }
@@ -304,6 +314,8 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
         finished = true
         connectionTimeout?.cancel()
         connectionTimeout = nil
+        idleTimeout?.cancel()
+        idleTimeout = nil
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
@@ -320,6 +332,21 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
             error: error?.localizedDescription
         )
         completion(id)
+    }
+
+    private func resetIdleTimeout() {
+        idleTimeout?.cancel()
+        idleGeneration &+= 1
+        let generation = idleGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.idleGeneration == generation else { return }
+            self.finish(error: DirectTCPFlowRelayError.idleTimedOut)
+        }
+        idleTimeout = work
+        queue.asyncAfter(
+            deadline: .now() + NetworkRelayLimits.tcpIdleTimeout,
+            execute: work
+        )
     }
 
     private func report(_ state: AppRoutingRelayState, error: String? = nil) {

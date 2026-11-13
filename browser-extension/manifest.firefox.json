@@ -1,0 +1,28 @@
+{
+  "manifest_version": 2,
+  "name": "MyProxy Browser Rules",
+  "version": "0.1.0",
+  "description": "按网站规则把浏览器请求送入本机 myproxy。",
+  "author": "leaperone",
+  "browser_action": {
+    "browser_style": true,
+    "default_title": "MyProxy",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "permissions": [
+    "<all_urls>",
+    "activeTab",
+    "proxy",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "applications": {
+    "gecko": {
+      "id": "browser-extension@myproxy.local"
+    }
+  }
+}

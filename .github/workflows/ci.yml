@@ -19,5 +19,7 @@ jobs:
         run: scripts/fetch-sparkle.sh
       - name: Build Network Extension
         run: scripts/build-network-extension.sh
+      - name: Test NetworkShared
+        run: scripts/test-network-shared.sh
       - name: Build
         run: cargo build --bins --features sparkle
