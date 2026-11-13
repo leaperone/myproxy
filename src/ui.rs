@@ -835,6 +835,12 @@ impl Render for RuleSetEditor {
                     })
             })
             .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child("只影响域名或后缀的 DNS 地址族，不改变这条规则的走向。"),
+            )
+            .child(
                 h_flex()
                     .gap_2()
                     .items_center()
