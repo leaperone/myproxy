@@ -826,7 +826,7 @@ impl Render for RuleSetEditor {
                         "DNS 双栈（仅直连规则）"
                     })
                     .checked(self.dns_ipv4_only)
-                    .disabled(!dns_ipv4_available)
+                    .disabled(!dns_ipv4_available && !self.dns_ipv4_only)
                     .accessibility_label("直连规则的 DNS 仅使用 IPv4")
                     .on_click(move |_, _, app| {
                         entity.update(app, |this, cx| {
