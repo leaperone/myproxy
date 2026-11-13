@@ -51,7 +51,6 @@ const BILIBILI_IPV4_ONLY_NAMESERVERS: [&str; 2] = [
     "udp://8.8.8.8#disable-ipv6=true&disable-qtype-64=true&disable-qtype-65=true",
 ];
 const BILIBILI_REAL_IP_RULES: &[&str] = &[
-    "DOMAIN-KEYWORD,bilibili,real-ip",
     "DOMAIN-SUFFIX,bilibili.com,real-ip",
     "DOMAIN-SUFFIX,bilibili.tv,real-ip",
     "DOMAIN-SUFFIX,hdslb.com,real-ip",
@@ -70,7 +69,6 @@ const BILIBILI_REAL_IP_RULES: &[&str] = &[
     "DOMAIN-SUFFIX,bilicdn5.com,real-ip",
     "DOMAIN-SUFFIX,szbdyd.com,real-ip",
     "DOMAIN-SUFFIX,acgvideo.com,real-ip",
-    "DOMAIN-KEYWORD,bilicdn,real-ip",
 ];
 const BILIBILI_IPV4_ONLY_POLICY_DOMAINS: &[&str] = &[
     "+.bilibili.com",
