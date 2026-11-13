@@ -44,6 +44,42 @@ pub const DNS_LISTEN_PORT: u16 = 1053;
 /// provider dials this list instead of the endpoint it sees.
 pub const DNS_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
 
+/// Bilibili live/CDN names use real IPv4 answers. The resolver fragment keeps
+/// AAAA out of both the query and response while leaving global IPv6 enabled.
+const BILIBILI_IPV4_ONLY_NAMESERVERS: [&str; 2] = [
+    "udp://1.1.1.1#disable-ipv6=true&disable-qtype-64=true&disable-qtype-65=true",
+    "udp://8.8.8.8#disable-ipv6=true&disable-qtype-64=true&disable-qtype-65=true",
+];
+const BILIBILI_REAL_IP_RULES: &[&str] = &[
+    "DOMAIN-KEYWORD,bilibili,real-ip",
+    "DOMAIN-SUFFIX,bilibili.com,real-ip",
+    "DOMAIN-SUFFIX,bilibili.tv,real-ip",
+    "DOMAIN-SUFFIX,hdslb.com,real-ip",
+    "DOMAIN-SUFFIX,hdslb.net,real-ip",
+    "DOMAIN-SUFFIX,hdslb.org,real-ip",
+    "DOMAIN-SUFFIX,bilivideo.com,real-ip",
+    "DOMAIN-SUFFIX,bilivideo.cn,real-ip",
+    "DOMAIN-SUFFIX,bilivideo.net,real-ip",
+    "DOMAIN-SUFFIX,biliapi.net,real-ip",
+    "DOMAIN-SUFFIX,biliapi.com,real-ip",
+    "DOMAIN-KEYWORD,bilicdn,real-ip",
+];
+const BILIBILI_IPV4_ONLY_POLICY_DOMAINS: &[&str] = &[
+    "+.bilibili.com",
+    "+.bilibili.tv",
+    "+.hdslb.com",
+    "+.hdslb.net",
+    "+.hdslb.org",
+    "+.bilivideo.com",
+    "+.bilivideo.cn",
+    "+.bilivideo.net",
+    "+.biliapi.net",
+    "+.biliapi.com",
+    "+.bilicdn.com",
+    "+.bilicdn.cn",
+    "+.bilicdn.net",
+];
+
 /// Health-check URL for fallback / url-test groups.
 const AUTO_GROUP_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// Seconds between member probes. 300 left a dead `now` selected for minutes.
@@ -442,15 +478,38 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     dns.insert("enhanced-mode".into(), "fake-ip".into());
     // Mirrored by `DNSProxyUpstreamResolver.mihomoFakeIPNetwork`.
     dns.insert("fake-ip-range".into(), "198.18.0.1/16".into());
+    dns.insert("fake-ip-filter-mode".into(), "rule".into());
+    let mut fake_ip_filter = vec![
+        "DOMAIN-SUFFIX,lan,real-ip",
+        "DOMAIN-SUFFIX,local,real-ip",
+        "DOMAIN,localhost,real-ip",
+    ];
+    fake_ip_filter.extend_from_slice(BILIBILI_REAL_IP_RULES);
     dns.insert(
         "fake-ip-filter".into(),
-        yaml_strings(&["*.lan", "*.local", "localhost"]),
+        serde_yaml::Value::Sequence(
+            fake_ip_filter
+                .into_iter()
+                .map(|value| serde_yaml::Value::String(value.into()))
+                .collect(),
+        ),
     );
     dns.insert(
         "default-nameserver".into(),
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
     );
     dns.insert("nameserver".into(), yaml_strings(&DNS_NAMESERVERS));
+    let mut nameserver_policy = serde_yaml::Mapping::new();
+    for domain in BILIBILI_IPV4_ONLY_POLICY_DOMAINS {
+        nameserver_policy.insert(
+            (*domain).into(),
+            yaml_strings(&BILIBILI_IPV4_ONLY_NAMESERVERS),
+        );
+    }
+    dns.insert(
+        "nameserver-policy".into(),
+        serde_yaml::Value::Mapping(nameserver_policy),
+    );
     dns.insert(
         "proxy-server-nameserver".into(),
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
@@ -942,6 +1001,55 @@ mod tests {
         );
         assert!(!dns.contains_key("dns-hijack"));
         assert!(!root.contains_key("tun"));
+    }
+
+    #[test]
+    fn dns_engine_uses_real_ipv4_answers_for_bilibili_only() {
+        let mut root = serde_yaml::Mapping::new();
+        insert_dns(&mut root, false);
+
+        let dns = root
+            .get("dns")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("DNS mapping");
+        assert_eq!(dns.get("ipv6"), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(
+            dns.get("fake-ip-filter-mode"),
+            Some(&serde_yaml::Value::String("rule".into()))
+        );
+
+        let filters = dns
+            .get("fake-ip-filter")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("fake-ip filter")
+            .iter()
+            .map(|value| value.as_str().expect("filter entry"))
+            .collect::<Vec<_>>();
+        let mut expected_filters = vec![
+            "DOMAIN-SUFFIX,lan,real-ip",
+            "DOMAIN-SUFFIX,local,real-ip",
+            "DOMAIN,localhost,real-ip",
+        ];
+        expected_filters.extend_from_slice(BILIBILI_REAL_IP_RULES);
+        assert_eq!(filters, expected_filters);
+
+        let policy = dns
+            .get("nameserver-policy")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("nameserver policy");
+        for domain in BILIBILI_IPV4_ONLY_POLICY_DOMAINS {
+            let servers = policy
+                .get(*domain)
+                .and_then(serde_yaml::Value::as_sequence)
+                .expect("Bilibili policy servers");
+            assert_eq!(
+                servers,
+                &BILIBILI_IPV4_ONLY_NAMESERVERS
+                    .iter()
+                    .map(|server| serde_yaml::Value::String((*server).into()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
