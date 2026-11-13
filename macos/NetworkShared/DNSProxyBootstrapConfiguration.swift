@@ -7,17 +7,22 @@ import Foundation
 /// single `Data` value avoids independently bridging heterogeneous NSNumber,
 /// NSString, and NSData fields in the provider entry point.
 public struct DNSProxyBootstrapConfiguration: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
     // The capture snapshot itself may be 8 MiB. JSON represents Data as
     // base64, so the atomic DNS bootstrap needs headroom for that expansion,
     // the route catalog, and schema metadata.
     public static let maximumEncodedSize = 12 * 1_024 * 1_024
+    public static let maximumUpstreamResolvers = 8
 
     public let schemaVersion: Int
     public let revision: UInt64
     public let activationIdentifier: UUID
     public let profileRulesProxy: MihomoRouteProxyEndpoint
     public let routeProxyEndpoints: [MihomoRouteProxyEndpoint]?
+    /// Resolvers for queries macOS hands over as a *name* endpoint. The system
+    /// resolver path reports the queried name instead of the resolver address,
+    /// so those flows can only be answered by an upstream the provider knows.
+    public let upstreamResolvers: [String]?
     public let encodedCaptureSnapshot: Data?
 
     public init(
@@ -25,6 +30,7 @@ public struct DNSProxyBootstrapConfiguration: Codable, Equatable, Sendable {
         activationIdentifier: UUID,
         profileRulesProxy: MihomoRouteProxyEndpoint,
         routeProxyEndpoints: [MihomoRouteProxyEndpoint]? = nil,
+        upstreamResolvers: [String]? = nil,
         encodedCaptureSnapshot: Data? = nil
     ) throws {
         schemaVersion = Self.currentSchemaVersion
@@ -32,12 +38,17 @@ public struct DNSProxyBootstrapConfiguration: Codable, Equatable, Sendable {
         self.activationIdentifier = activationIdentifier
         self.profileRulesProxy = profileRulesProxy
         self.routeProxyEndpoints = routeProxyEndpoints
+        self.upstreamResolvers = upstreamResolvers
         self.encodedCaptureSnapshot = encodedCaptureSnapshot
         try validate()
     }
 
     public func validate() throws {
-        guard schemaVersion == 1 || schemaVersion == Self.currentSchemaVersion else {
+        // Schema 1 and 2 bootstrap payloads carry no resolver list; they stay
+        // accepted so an extension update can read a configuration written by an
+        // older host.
+        let supportedSchemas = [1, 2, Self.currentSchemaVersion]
+        guard supportedSchemas.contains(schemaVersion) else {
             throw DNSProxyBootstrapConfigurationError.unsupportedSchemaVersion(
                 schemaVersion
             )
@@ -47,6 +58,13 @@ public struct DNSProxyBootstrapConfiguration: Codable, Equatable, Sendable {
         }
         guard profileRulesProxy.route == .profileRules else {
             throw DNSProxyBootstrapConfigurationError.invalidProfileRulesRoute
+        }
+        if let upstreamResolvers {
+            guard upstreamResolvers.count <= Self.maximumUpstreamResolvers,
+                  upstreamResolvers.allSatisfy(DNSProxyUpstreamResolver.isValid)
+            else {
+                throw DNSProxyBootstrapConfigurationError.invalidUpstreamResolvers
+            }
         }
         do {
             try MihomoRouteProxyCatalog.validate(
@@ -113,6 +131,7 @@ public enum DNSProxyBootstrapConfigurationError: Error, Equatable, Sendable {
     case invalidRevision(UInt64)
     case invalidProfileRulesRoute
     case invalidProfileRulesProxy
+    case invalidUpstreamResolvers
     case encodedPayloadTooLarge(actual: Int, maximum: Int)
 }
 
@@ -127,8 +146,183 @@ extension DNSProxyBootstrapConfigurationError: LocalizedError {
             "DNS proxy bootstrap must use the profile-rules Mihomo route."
         case .invalidProfileRulesProxy:
             "DNS proxy bootstrap contains an invalid private Mihomo SOCKS5 endpoint."
+        case .invalidUpstreamResolvers:
+            "DNS proxy bootstrap contains invalid upstream resolvers."
         case let .encodedPayloadTooLarge(actual, maximum):
             "DNS proxy bootstrap is \(actual) bytes; the maximum is \(maximum)."
         }
+    }
+}
+
+/// One upstream resolver the DNS provider relays name-endpoint queries to.
+public enum DNSProxyUpstreamResolver {
+    public static let defaultPort: UInt16 = 53
+    /// Same addresses as `compile::DNS_NAMESERVERS`. Used when a schema 1/2
+    /// bootstrap or an empty host list would otherwise leave name-endpoint
+    /// flows pointing at the queried hostname.
+    public static let defaults = ["1.1.1.1", "8.8.8.8"]
+
+    public static func isValid(_ spec: String) -> Bool {
+        endpoint(for: spec) != nil
+    }
+
+    /// Address specs the provider can dial. An empty or hostname-only list
+    /// becomes `defaults` so a name-endpoint flow always has a resolver.
+    public static func resolved(_ specs: [String]?) -> [String] {
+        let usable = (specs ?? []).filter(isValid)
+        return usable.isEmpty ? Array(defaults) : usable
+    }
+
+    /// Parses `1.1.1.1`, `1.1.1.1:53`, `[2606:4700:4700::1111]:53`, or a bare
+    /// IPv6 address. Hostnames are rejected: a name endpoint must not become
+    /// another name lookup the provider cannot complete.
+    public static func endpoint(for spec: String) -> SOCKS5Endpoint? {
+        let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var host = trimmed
+        var port = defaultPort
+        if trimmed.hasPrefix("[") {
+            guard let closing = trimmed.firstIndex(of: "]") else { return nil }
+            host = String(trimmed[trimmed.index(after: trimmed.startIndex) ..< closing])
+            let remainder = trimmed[trimmed.index(after: closing)...]
+            if !remainder.isEmpty {
+                guard remainder.hasPrefix(":"),
+                      let parsed = UInt16(remainder.dropFirst())
+                else { return nil }
+                port = parsed
+            }
+        } else if trimmed.filter({ $0 == ":" }).count == 1,
+                  let separator = trimmed.firstIndex(of: ":") {
+            host = String(trimmed[..<separator])
+            guard let parsed = UInt16(trimmed[trimmed.index(after: separator)...]) else {
+                return nil
+            }
+            port = parsed
+        }
+        guard port > 0, let address = try? IPAddress(host) else { return nil }
+        return SOCKS5Endpoint(address: SOCKS5Address(ipAddress: address), port: port)
+    }
+
+    /// SOCKS dest for one DNS UDP datagram. A hostname on port 53 is the
+    /// queried name, not a resolver. Dial a resolver IP instead. The original
+    /// endpoint stays the conversation key and the write-back target.
+    public static func relayDestination(
+        for destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint] = []
+    ) -> SOCKS5Endpoint {
+        if destination.address.ipAddress != nil {
+            return destination
+        }
+        guard destination.port == defaultPort else {
+            return destination
+        }
+        if let resolver = resolvers.first(where: { $0.address.ipAddress != nil }) {
+            return resolver
+        }
+        return endpoint(for: defaults[0])!
+    }
+
+    /// Mihomo's fake-ip DNS listener, `127.0.0.1:compile::DNS_LISTEN_PORT`.
+    /// Queries relayed through Mihomo are answered here rather than by a
+    /// public resolver, whose answers are poisoned on direct paths; the fake
+    /// address lets Mihomo restore the domain when the app connects.
+    public static let mihomoDNS = SOCKS5Endpoint(
+        address: SOCKS5Address(ipAddress: try! IPAddress("127.0.0.1")),
+        port: 1053
+    )
+
+    /// Mihomo's `fake-ip-range` (`198.18.0.1/16` in `compile::insert_dns`).
+    public static let mihomoFakeIPNetwork = try! IPNetwork("198.18.0.0/16")
+}
+
+/// Whether a DNS query must stay with the LAN resolver that received it.
+public enum DNSQueryScope: Hashable, Sendable {
+    case local
+    case remote
+    /// A public name the app's connection would reach unrelayed (a DIRECT
+    /// rule), so a fake-ip answer would be unusable.
+    case native
+
+    public init(name: String) {
+        let normalized = name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let isLocal = !normalized.contains(".")
+            || normalized == "localdomain"
+            || normalized.hasSuffix(".local")
+            || normalized.hasSuffix(".lan")
+            || normalized.hasSuffix(".localdomain")
+            || normalized.hasSuffix(".home.arpa")
+            || normalized.hasSuffix(".in-addr.arpa")
+            || normalized.hasSuffix(".ip6.arpa")
+        self = isLocal ? .local : .remote
+    }
+
+    /// First question name of a DNS message; `nil` when the payload is not a
+    /// parseable query.
+    public static func questionName(in message: Data) -> String? {
+        let bytes = [UInt8](message)
+        guard bytes.count > 12, bytes[4] != 0 || bytes[5] != 0 else { return nil }
+        var labels: [String] = []
+        var index = 12
+        while index < bytes.count {
+            let length = Int(bytes[index])
+            if length == 0 { return labels.joined(separator: ".") }
+            guard length < 64, index + 1 + length <= bytes.count else { return nil }
+            labels.append(String(decoding: bytes[(index + 1)...(index + length)], as: UTF8.self))
+            index += 1 + length
+        }
+        return nil
+    }
+}
+
+public enum DNSRelayRoute: Equatable, Sendable {
+    case directTrustedComponent
+    case directLocalResolver
+    case directNativeFlow
+    /// Mihomo's backend probe keeps failing; answer from a real resolver
+    /// until it recovers rather than leaving system lookups unanswered.
+    case directMihomoUnavailable
+    case mihomo
+
+    /// Every route is dialed from the provider's own socket, which DNS
+    /// interception does not see. Mihomo's DNS is reached directly rather than
+    /// through a SOCKS listener, whose `proxy:` in proxy/global mode would carry
+    /// the loopback query to the remote node.
+    public func target(
+        for destination: SOCKS5Endpoint,
+        resolvers: [SOCKS5Endpoint]
+    ) -> SOCKS5Endpoint {
+        switch self {
+        case .directTrustedComponent, .directLocalResolver, .directNativeFlow,
+             .directMihomoUnavailable:
+            DNSProxyUpstreamResolver.relayDestination(for: destination, resolvers: resolvers)
+        case .mihomo:
+            DNSProxyUpstreamResolver.mihomoDNS
+        }
+    }
+}
+
+public enum DNSRelayRoutingPolicy {
+    public static func route(
+        destination: SOCKS5Endpoint,
+        isTrustedMyproxyComponent: Bool,
+        queryScope: DNSQueryScope?,
+        mihomoAvailable: Bool
+    ) -> DNSRelayRoute {
+        if isTrustedMyproxyComponent {
+            return .directTrustedComponent
+        }
+        if queryScope == .native {
+            return .directNativeFlow
+        }
+        if let domain = destination.address.domain, DNSQueryScope(name: domain) == .local {
+            return .directLocalResolver
+        }
+        if destination.address.ipAddress?.isLocalNetwork == true, queryScope != .remote {
+            return .directLocalResolver
+        }
+        return mihomoAvailable ? .mihomo : .directMihomoUnavailable
     }
 }

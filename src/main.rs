@@ -15,9 +15,10 @@ use myproxy::supervisor::Supervisor;
 
 use ui::AppView;
 
-gpui_kit::actions!(app, [About, CheckForUpdates, Quit]);
+gpui_kit::actions!(app, [About, CheckForUpdates, CloseWindow, Quit]);
 
 fn main() {
+    let host_control_launch = std::env::args().any(|arg| arg == "--host-control");
     myproxy::log::init();
     let _instance_guard = match myproxy::instance::InstanceGuard::acquire() {
         Ok(Some(guard)) => guard,
@@ -56,7 +57,7 @@ fn main() {
         strategy.mixed_port,
     );
     Supervisor::shared().sync_wanted_on_launch();
-    let show_window = !lite && !strategy.silent_launch;
+    let show_window = !host_control_launch && !lite && !strategy.silent_launch;
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.on_reopen(show_main_window);
     app.run(move |cx| {
@@ -72,7 +73,10 @@ fn main() {
         }
         sparkle::set_channel(strategy.update_channel.unwrap_or_default());
         sparkle::init();
-        if strategy.connect_on_launch {
+        if let Err(err) = myproxy::host_control::start() {
+            myproxy::log::error("host-control", format!("start failed: {err:#}"));
+        }
+        if strategy.connect_on_launch && !host_control_launch {
             let strategy = strategy.clone();
             cx.background_executor()
                 .spawn(async move {
@@ -115,12 +119,16 @@ fn open_main_window(cx: &mut App) {
 fn install_app_menu(cx: &mut App) {
     cx.on_action(|_: &About, _cx| show_about());
     cx.on_action(|_: &CheckForUpdates, _cx| sparkle::check());
+    cx.on_action(|_: &CloseWindow, cx| close_window(cx));
     cx.on_action(|_: &Quit, cx| quit_app(cx));
+    cx.bind_keys([KeyBinding::new("cmd-w", CloseWindow, None)]);
     cx.set_menus([Menu::new("MyProxy").items([
         MenuItem::action("About MyProxy", About),
         MenuItem::action("Check for Updates…", CheckForUpdates).disabled(!sparkle::available()),
         MenuItem::separator(),
         MenuItem::action("Quit MyProxy", Quit),
+    ]), Menu::new("Window").items([
+        MenuItem::action("Close Window", CloseWindow),
     ])]);
 }
 
@@ -166,6 +174,12 @@ pub(crate) fn quit_app(cx: &mut App) {
         });
     })
     .detach();
+}
+
+fn close_window(cx: &mut App) {
+    if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
 }
 
 pub(crate) fn show_main_window(cx: &mut App) {

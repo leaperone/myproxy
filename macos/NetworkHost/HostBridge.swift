@@ -31,6 +31,8 @@ private struct HostEnableRequest: Decodable, Sendable {
     let gfwDomains: [String]
     let groupPorts: [GroupPort]
     let gfwPorts: [GroupPort]
+    /// Upstream resolvers for system lookups macOS reports as a name endpoint.
+    let dnsResolvers: [String]?
     let capturePrivateNetworks: Bool?
 }
 
@@ -85,7 +87,9 @@ private final class HostSideEffectLock: @unchecked Sendable {
     private init(descriptor: Int32) { self.descriptor = descriptor }
 
     static func acquire(for intent: HostSharedIntent) async throws -> HostSideEffectLock {
-        let path = try HostSharedIntent.stateURL("network-extension-operation.lock").path
+        // A process stuck in `myproxy_ne_wait` can remain UE-exiting and keep
+        // the old flock forever. A new file lets a recovered host proceed.
+        let path = try HostSharedIntent.stateURL("network-extension-side-effects.lock").path
         let descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else {
             throw NetworkExtensionControlFailure(
@@ -93,6 +97,8 @@ private final class HostSideEffectLock: @unchecked Sendable {
             )
         }
         do {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(45))
             while true {
                 try intent.check()
                 if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
@@ -102,6 +108,12 @@ private final class HostSideEffectLock: @unchecked Sendable {
                 guard errno == EWOULDBLOCK || errno == EINTR else {
                     throw NetworkExtensionControlFailure(
                         operation: .configureTransparentProxy, message: "无法取得系统接管操作锁"
+                    )
+                }
+                if clock.now >= deadline {
+                    throw NetworkExtensionControlFailure(
+                        operation: .configureTransparentProxy,
+                        message: "等待系统接管操作锁超时"
                     )
                 }
                 try await Task.sleep(for: .milliseconds(100))
@@ -237,7 +249,7 @@ private final class HostOperations: @unchecked Sendable {
         previous?.cancel()
         HostRuntime.shared.begin(operation: revision, desired: desired, phase: phase)
         task = Task {
-            await previous?.value
+            await Self.awaitSuperseded(previous)
             do {
                 try intent.check()
                 try await operation(intent)
@@ -261,6 +273,43 @@ private final class HostOperations: @unchecked Sendable {
         task?.cancel()
         self.intent = nil
         HostRuntime.shared.invalidate(operation: latestRevision)
+    }
+
+    /// Wait for a cancelled predecessor, but do not inherit its hang.
+    /// `TaskGroup.cancelAll` cannot interrupt `await previous.value`, so this
+    /// uses a once-resolve race: predecessor completion or the supersede
+    /// deadline, whichever finishes first.
+    private static func awaitSuperseded(_ previous: Task<Void, Never>?) async {
+        guard let previous else { return }
+        let reply = OnceReply<Void>()
+        do {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                reply.attach(continuation)
+                Task {
+                    await previous.value
+                    reply.finish(.success(()))
+                }
+                let parts = OnceReplyTimeout.supersededOperation.components
+                let seconds = TimeInterval(parts.seconds)
+                    + TimeInterval(parts.attoseconds) / 1_000_000_000_000_000_000
+                DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+                    reply.finish(
+                        .failure(
+                            NetworkExtensionControlFailure(
+                                operation: .configureTransparentProxy,
+                                message: "superseded host operation deadline"
+                            )
+                        )
+                    )
+                }
+            }
+        } catch {
+            AppLog.warn(
+                "ne-host",
+                "superseded host operation still running after cancel; continuing"
+            )
+        }
     }
 }
 
@@ -327,7 +376,7 @@ private actor HostController {
         if !applied {
             try await disableDNSProxyAllowingDenied(intent: intent)
             try intent.check()
-            try await transparentProxy.stop()
+            try await transparentProxy.stop(dropWedgedConfiguration: true)
             try intent.check()
             try await transparentProxy.configure(configurations.transparent)
             try intent.check()
@@ -352,7 +401,19 @@ private actor HostController {
             try intent.check()
             try await dnsProxy.configureAndEnable(configurations.dnsBootstrap)
             try intent.check()
-            // Saving DNS preferences is not a runtime acknowledgement.
+            // Preferences and the SOCKS backend can both look ready while
+            // getaddrinfo is still hung on a name-endpoint flow.
+            let probe = await dnsProxy.proveSystemResolver()
+            AppLog.info("ne-host", "system resolver probe=\(probe)")
+            switch probe {
+            case .intercepted, .clear:
+                break
+            case .unproven:
+                throw NetworkExtensionControlFailure(
+                    operation: .configureDNSProxy,
+                    message: "system resolver did not return after NEDNSProxy enable"
+                )
+            }
         } catch {
             try intent.check()
             HostRuntime.shared.update(operation: operation) {
@@ -471,14 +532,27 @@ private actor HostController {
                 }
             }
         } catch {
+            let detail = describeProviderStatusError(error)
+            AppLog.error("ne-host", "refreshStatus failed: \(detail)")
             HostRuntime.shared.update(operation: operation, observation: observation) {
                 guard ["running", "disabled", "failed"].contains($0.phase) else { return }
                 $0.phase = "failed"
-                $0.message = "无法读取系统接管 Provider 状态"
+                $0.message = "无法读取系统接管 Provider 状态：\(detail)"
                 $0.dnsPhase = "unknown"
             }
         }
     }
+}
+
+private func describeProviderStatusError(_ error: Error) -> String {
+    if let failure = error as? NetworkExtensionControlFailure {
+        return failure.message
+    }
+    let nsError = error as NSError
+    if nsError.domain == NSCocoaErrorDomain {
+        return error.localizedDescription
+    }
+    return "\(nsError.domain) \(nsError.code) — \(error.localizedDescription)"
 }
 
 private func isRecoverableDNSProxyDisableError(_ error: Error) -> Bool {
@@ -501,6 +575,21 @@ private extension HostController {
             )
         }
     }
+}
+
+/// Resolvers the DNS provider may relay name-endpoint queries to. Entries the
+/// provider cannot dial as a plain address (a hostname or a DoH URL) are
+/// dropped rather than failing activation, because they never reach a resolver.
+/// An empty remainder uses the same defaults as the provider data plane.
+private func usableResolvers(from specs: [String]?) -> [String] {
+    let usable = (specs ?? []).filter(DNSProxyUpstreamResolver.isValid)
+    if let specs, usable.count != specs.count {
+        AppLog.warn(
+            "ne-host",
+            "dns resolvers dropped=\(specs.count - usable.count) because they are not plain addresses"
+        )
+    }
+    return DNSProxyUpstreamResolver.resolved(usable.isEmpty ? nil : usable)
 }
 
 private func preservesRouteEndpoints(
@@ -536,6 +625,7 @@ private func providerConfigurations(
         activationIdentifier: activationIdentifier,
         profileRulesProxy: endpoints[0],
         routeProxyEndpoints: endpoints,
+        upstreamResolvers: usableResolvers(from: request.dnsResolvers),
         encodedCaptureSnapshot: encodedSnapshot
     ).encoded()
     let transparent: [String: NSObject] = [
@@ -988,12 +1078,11 @@ public func myproxy_ne_status() -> UnsafeMutablePointer<CChar>? {
     return duplicateString(json)
 }
 
-/// CLI waits service the native run loop so preference/authorization callbacks
-/// can complete before the command exits. GUI reads use myproxy_ne_status only.
+/// Residual FFI wait used by older callers. One source or the deadline, never
+/// `run(until:)`, which can sit inside a blocked NE XPC source and starve the
+/// Rust disable deadline. Host status polling no longer calls this.
 @_cdecl("myproxy_ne_wait")
 public func myproxy_ne_wait(_ milliseconds: UInt32) {
-    let deadline = Date().addingTimeInterval(Double(min(milliseconds, 100)) / 1000)
-    RunLoop.current.run(until: deadline)
-    let remaining = deadline.timeIntervalSinceNow
-    if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+    let timeout = TimeInterval(min(max(milliseconds, 1), 100)) / 1000
+    _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(timeout))
 }

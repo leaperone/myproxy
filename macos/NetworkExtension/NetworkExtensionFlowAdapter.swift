@@ -66,25 +66,6 @@ enum MihomoRouteAvailabilityPolicy {
     }
 }
 
-enum DNSProfileRoutingRulePolicy {
-    /// A DNS proxy flow exposes the resolver endpoint, not the hostname the
-    /// source application is resolving. Only a source-scoped rule with no
-    /// destination or port constraint may select an explicit Profile here.
-    /// Filtering before evaluation prevents a higher-priority resolver-IP or
-    /// port-53 rule from shadowing a later application rule.
-    static func eligible(_ rule: CaptureRule) -> Bool {
-        guard rule.enabled,
-              !rule.sources.isEmpty,
-              rule.destinations.isEmpty,
-              rule.portRanges.isEmpty,
-              case let .mihomo(route) = rule.action,
-              route.routingProfileID != nil else {
-            return false
-        }
-        return true
-    }
-}
-
 final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
     private struct State: Sendable {
         var revision: UInt64 = 0
@@ -92,13 +73,9 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         var preparedConfiguration = PreparedCaptureConfiguration(
             .failOpen(.missingEncodedSnapshot)
         )
-        var dnsPreparedConfiguration = PreparedCaptureConfiguration(
-            .failOpen(.missingEncodedSnapshot)
-        )
         var mihomoSOCKSConfigurations: [MihomoRoute: ProviderSOCKSConfiguration] = [:]
         var availableMihomoRoutes: Set<MihomoRoute> = []
         var rulesByIdentifier: [String: CaptureRule] = [:]
-        var dnsRulesByIdentifier: [String: CaptureRule] = [:]
     }
 
     private let lock = NSLock()
@@ -120,30 +97,11 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         // Compile destination indexes once per provider configuration load,
         // never once per intercepted connection.
         let preparedConfiguration = PreparedCaptureConfiguration(loadResult)
-        let dnsRules = loadResult.snapshot?.rules.filter(
-            DNSProfileRoutingRulePolicy.eligible
-        ) ?? []
-        let dnsLoadResult: CaptureConfigurationLoadResult
-        if let snapshot = loadResult.snapshot,
-           let filteredSnapshot = try? CaptureConfigurationSnapshot(
-               revision: snapshot.revision,
-               generationID: snapshot.generationID,
-               createdAt: snapshot.createdAt,
-               rules: dnsRules,
-               capturePrivateNetworks: snapshot.capturePrivateNetworks
-           ) {
-            dnsLoadResult = .loaded(filteredSnapshot)
-        } else {
-            dnsLoadResult = loadResult
-        }
 
         lock.lock()
         state.revision = Self.uint64(configuration?[ProviderConfigurationKey.revision]) ?? 0
         state.captureEnabled = captureEnabled
         state.preparedConfiguration = preparedConfiguration
-        state.dnsPreparedConfiguration = PreparedCaptureConfiguration(
-            dnsLoadResult
-        )
         let routeCatalog = ProviderSOCKSConfiguration.routeCatalog(
             providerConfiguration: configuration
         ) ?? [:]
@@ -151,9 +109,6 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         state.availableMihomoRoutes = Set(routeCatalog.keys)
         state.rulesByIdentifier = Dictionary(
             uniqueKeysWithValues: loadResult.snapshot?.rules.map { ($0.id, $0) } ?? []
-        )
-        state.dnsRulesByIdentifier = Dictionary(
-            uniqueKeysWithValues: dnsRules.map { ($0.id, $0) }
         )
         lock.unlock()
     }
@@ -231,7 +186,12 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         return TCPFlowInterceptionPlan(
             decision: outcome.decision,
             destination: routePlan?.destinations.original,
-            mihomoDestination: routePlan?.destinations.mihomo,
+            mihomoDestination: routePlan.map {
+                DNSProxyUpstreamResolver.relayDestination(
+                    for: $0.destinations.mihomo,
+                    resolvers: [$0.destinations.original]
+                )
+            },
             proxy: routePlan?.proxy,
             unavailableFallback: unavailableFallbackRequested(
                 by: outcome.decision,
@@ -260,31 +220,29 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         )
     }
 
-    /// Reuses application identity matching for a DNS proxy flow. The remote
-    /// endpoint is the resolver rather than the queried hostname, so this is
-    /// intentionally used only to select an application-scoped Profile route;
-    /// unmatched and destination-only rules remain on the default DNS route.
-    func decideDNSFlow(
-        _ flow: NEAppProxyFlow,
-        destination: SOCKS5Endpoint,
-        transportProtocol: TransportProtocol
-    ) -> FlowTrafficDecision {
-        let host = destination.address.ipAddress?.presentation
-            ?? destination.address.domain
-            ?? ""
-        var dnsState = snapshotState()
-        dnsState.preparedConfiguration = dnsState.dnsPreparedConfiguration
-        dnsState.rulesByIdentifier = dnsState.dnsRulesByIdentifier
-        return decide(
+    /// Whether this app's connections to `hostname` pass to macOS unrelayed by
+    /// an app-only rule, so its lookup must return a real address rather than a
+    /// Mihomo fake-ip. A hostname DIRECT rule does not count: an app that
+    /// connects by address would lose the hostname, while a fake-ip lets Mihomo
+    /// restore it and apply the same rule. The port is unknown at lookup time;
+    /// host capture rules carry no port ranges.
+    func passesNatively(_ flow: NEAppProxyFlow, hostname: String) -> Bool {
+        let currentState = snapshotState()
+        let decision = decide(
             flow: flow,
-            endpoint: FlowRemoteEndpoint(
-                host: host,
-                port: String(destination.port)
-            ),
-            transportProtocol: transportProtocol,
-            state: dnsState,
-            remoteHostname: destination.address.domain
+            endpoint: FlowRemoteEndpoint(host: hostname, port: "443"),
+            transportProtocol: .tcp,
+            state: currentState,
+            remoteHostname: hostname
         ).decision
+        switch (decision.disposition, decision.reason) {
+        case (.failOpen, _):
+            return true
+        case let (.direct, .rule(.matchedRule(identifier))):
+            return currentState.rulesByIdentifier[identifier]?.destinations.isEmpty == true
+        default:
+            return false
+        }
     }
 
     @available(macOS 15.0, *)
@@ -502,7 +460,12 @@ final class NetworkExtensionFlowDecisionCoordinator: @unchecked Sendable {
         return UDPFlowInterceptionPlan(
             decision: outcome.decision,
             initialDestination: routePlan?.destinations.original,
-            mihomoDestination: routePlan?.destinations.mihomo,
+            mihomoDestination: routePlan.map {
+                DNSProxyUpstreamResolver.relayDestination(
+                    for: $0.destinations.mihomo,
+                    resolvers: [$0.destinations.original]
+                )
+            },
             proxy: routePlan?.proxy,
             unavailableFallback: unavailableFallbackRequested(
                 by: outcome.decision,
@@ -728,6 +691,10 @@ struct UDPFlowInterceptionPlan: Sendable {
     let initialDestination: SOCKS5Endpoint?
     /// Hostname-preserving SOCKS target used only for Mihomo relay.
     let mihomoDestination: SOCKS5Endpoint?
+    /// Target a Direct or unavailable-fallback relay dials when it differs from
+    /// the original endpoint. The DNS provider sets this when macOS reports the
+    /// queried name instead of the resolver the flow actually addresses.
+    let directDestination: SOCKS5Endpoint?
     let proxy: ProviderSOCKSConfiguration?
     let unavailableFallback: UnavailableFallback
     let activity: AppRoutingActivity
@@ -737,6 +704,7 @@ struct UDPFlowInterceptionPlan: Sendable {
         decision: FlowTrafficDecision,
         initialDestination: SOCKS5Endpoint?,
         mihomoDestination: SOCKS5Endpoint?,
+        directDestination: SOCKS5Endpoint? = nil,
         proxy: ProviderSOCKSConfiguration?,
         unavailableFallback: UnavailableFallback,
         activity: AppRoutingActivity,
@@ -745,6 +713,7 @@ struct UDPFlowInterceptionPlan: Sendable {
         self.decision = decision
         self.initialDestination = initialDestination
         self.mihomoDestination = mihomoDestination
+        self.directDestination = directDestination
         self.proxy = proxy
         self.unavailableFallback = unavailableFallback
         self.activity = activity

@@ -519,6 +519,26 @@ pub fn select_proxy(mixed_port: u16, group: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Clear Mihomo's persisted manual pin for an automatic group. Mihomo stores
+/// SelectAble state for fallback/url-test groups in its profile cache; after a
+/// config reload that stale pin can keep a dead member selected indefinitely.
+pub fn clear_auto_selection(mixed_port: u16, group: &str) -> Result<()> {
+    if group.is_empty() {
+        bail!("proxy group is required");
+    }
+    let url = format!(
+        "http://127.0.0.1:{}/proxies/{}",
+        controller_port(mixed_port),
+        encode_path_segment(group)
+    );
+    ureq::delete(&url)
+        .timeout(FETCH_TIMEOUT)
+        .set("Authorization", &format!("Bearer {CONTROLLER_SECRET}"))
+        .call()
+        .with_context(|| format!("clear automatic proxy selection {group}"))?;
+    Ok(())
+}
+
 pub fn test_group_delay(mixed_port: u16, group: &str) -> Result<HashMap<String, u32>> {
     let port = controller_port(mixed_port);
     let encoded = encode_path_segment(group);

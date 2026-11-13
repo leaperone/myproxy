@@ -13,7 +13,7 @@ use crate::log;
 use crate::login_item;
 use crate::strategy::{InboundMode, Strategy};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnableRequest {
     pub revision: u64,
@@ -27,6 +27,8 @@ pub struct EnableRequest {
     pub group_ports: Vec<GroupPort>,
     #[serde(default)]
     pub gfw_ports: Vec<GroupPort>,
+    #[serde(default)]
+    pub dns_resolvers: Vec<String>,
     #[serde(default)]
     pub capture_private_networks: bool,
 }
@@ -76,6 +78,7 @@ struct Session {
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static OPERATION_REVISION: AtomicU64 = AtomicU64::new(0);
+static LAST_SUBMITTED: Mutex<Option<EnableRequest>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +174,15 @@ impl RuntimeStatus {
 
     pub fn is_pending(&self) -> bool {
         matches!(self.phase, Phase::Requesting | Phase::Stopping)
+    }
+
+    pub fn is_running_for(&self, revision: u64) -> bool {
+        self.observed
+            && self.phase == Phase::Running
+            && self.dns_phase == DnsPhase::Running
+            && self.capture_enabled
+            && self.desired_revision == revision
+            && self.applied_revision == Some(revision)
     }
 }
 
@@ -283,16 +295,14 @@ pub fn wait_for_settle(timeout: Duration) -> RuntimeStatus {
         if (!status.is_pending() && status.observed) || Instant::now() >= deadline {
             return status;
         }
-        wait_for_callbacks();
+        wait_poll_interval();
     }
 }
 
-fn wait_for_callbacks() {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        ffi::myproxy_ne_wait(100)
-    };
-    #[cfg(not(target_os = "macos"))]
+/// Deadline loops must not pump the process run loop. `RunLoop.run(until:)`
+/// can sit inside a blocked Network Extension source and never return, which
+/// is how a 30s `wait_disabled` became a multi-hour apply.
+fn wait_poll_interval() {
     std::thread::sleep(Duration::from_millis(100));
 }
 
@@ -327,7 +337,7 @@ pub fn wait_disabled(timeout: Duration) -> Result<()> {
                 current.dns_phase.label()
             );
         }
-        wait_for_callbacks();
+        wait_poll_interval();
     }
 }
 
@@ -523,6 +533,10 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         gfw_domains: Vec::new(),
         group_ports,
         gfw_ports,
+        dns_resolvers: compile::DNS_NAMESERVERS
+            .iter()
+            .map(|resolver| (*resolver).to_string())
+            .collect(),
         capture_private_networks: strategy.lan_capture,
     })
 }
@@ -633,6 +647,14 @@ pub fn enable_request_async(request: &EnableRequest) -> Result<()> {
         if !login_item::is_bundled() {
             bail!("系统接管需要包含 Network Extension 的已签名 .app");
         }
+        if capture_is_current(
+            LAST_SUBMITTED.lock().expect("ne last request").as_ref(),
+            request,
+            &status(),
+        ) {
+            return Ok(());
+        }
+        let submitted = request.clone();
         let mut request = request.clone();
         request.operation_revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
         let json = serde_json::to_string(&request)?;
@@ -645,6 +667,7 @@ pub fn enable_request_async(request: &EnableRequest) -> Result<()> {
                 message.unwrap_or_else(|| "系统接管请求提交失败".into())
             );
         }
+        *LAST_SUBMITTED.lock().expect("ne last request") = Some(submitted);
         log::info(
             "ne",
             format!("submitted capture revision={}", request.revision),
@@ -653,7 +676,16 @@ pub fn enable_request_async(request: &EnableRequest) -> Result<()> {
     }
 }
 
+fn capture_is_current(
+    previous: Option<&EnableRequest>,
+    request: &EnableRequest,
+    status: &RuntimeStatus,
+) -> bool {
+    previous == Some(request) && status.is_running_for(request.revision)
+}
+
 pub fn disable_async() -> Result<()> {
+    *LAST_SUBMITTED.lock().expect("ne last request") = None;
     let revision = OPERATION_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
     #[cfg(not(target_os = "macos"))]
     {
@@ -707,6 +739,7 @@ mod ffi {
         pub fn myproxy_ne_disable(operation_revision: u64, error_out: *mut *mut c_char) -> i32;
         pub fn myproxy_ne_status() -> *mut c_char;
         pub fn myproxy_ne_activity_batch(cursor: u64, limit: u32) -> *mut c_char;
+        #[allow(dead_code)]
         pub fn myproxy_ne_wait(milliseconds: u32);
         pub fn myproxy_ne_free_string(value: *mut c_char);
     }
@@ -892,6 +925,44 @@ mod tests {
     }
 
     #[test]
+    fn enable_request_carries_the_configured_dns_resolvers() {
+        let mut strategy = Strategy::default();
+        strategy.system_extension = true;
+        let plan = inbound_plan(&strategy);
+        assert_eq!(
+            plan.dns_resolvers,
+            compile::DNS_NAMESERVERS
+                .iter()
+                .map(|resolver| resolver.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn enable_request_json_uses_dns_resolvers_camel_case() {
+        let request = EnableRequest {
+            revision: 1,
+            operation_revision: 1,
+            socks_port: 1080,
+            username: "u".into(),
+            password: "p".into(),
+            process_rules: vec![],
+            dest_rules: vec![],
+            gfw_domains: vec![],
+            group_ports: vec![],
+            gfw_ports: vec![],
+            dns_resolvers: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+            capture_private_networks: false,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["dnsResolvers"],
+            serde_json::json!(["1.1.1.1", "8.8.8.8"])
+        );
+        assert!(value.get("dns_resolvers").is_none());
+    }
+
+    #[test]
     fn non_rule_mode_clears_process_pins() {
         let mut strategy = Strategy::default();
         strategy.system_extension = true;
@@ -923,5 +994,37 @@ mod tests {
         down.phase = Phase::Disabled;
         down.dns_phase = DnsPhase::Disabled;
         assert!(capture_released_for_core_stop(&down));
+    }
+
+    #[test]
+    fn reuse_capture_requires_the_same_plan_and_confirmed_dns() {
+        let request = inbound_plan(&Strategy::default());
+        let mut status = unavailable_status();
+        status.phase = Phase::Running;
+        status.dns_phase = DnsPhase::Running;
+        status.capture_enabled = true;
+        status.desired_revision = request.revision;
+        status.applied_revision = Some(request.revision);
+        assert!(capture_is_current(Some(&request), &request, &status));
+        assert!(!capture_is_current(None, &request, &status));
+
+        let mut changed = request.clone();
+        changed.capture_private_networks = !changed.capture_private_networks;
+        assert!(!capture_is_current(Some(&request), &changed, &status));
+        changed = request.clone();
+        changed.password.push('x');
+        assert!(!capture_is_current(Some(&request), &changed, &status));
+
+        status.dns_phase = DnsPhase::Unknown;
+        assert!(!capture_is_current(Some(&request), &request, &status));
+        status.dns_phase = DnsPhase::Running;
+        status.applied_revision = None;
+        assert!(!capture_is_current(Some(&request), &request, &status));
+        status.applied_revision = Some(request.revision);
+        status.desired_revision = request.revision + 1;
+        assert!(!capture_is_current(Some(&request), &request, &status));
+        status.desired_revision = request.revision;
+        status.observed = false;
+        assert!(!capture_is_current(Some(&request), &request, &status));
     }
 }

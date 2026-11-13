@@ -78,7 +78,7 @@ chmod +x "$app/Contents/MacOS/"* "$system_extension/Contents/MacOS/MyproxyNetwor
 identity="${CODESIGN_IDENTITY:-}"
 if [[ -z "$identity" && "${CODESIGN_ADHOC:-}" != "1" ]]; then
   identity=$(security find-identity -v -p codesigning 2>/dev/null \
-    | awk -F'"' '/Developer ID Application:/ {print $2; exit}')
+    | python3 scripts/select_developer_id_identity.py)
 fi
 
 sign_nested() {
