@@ -165,17 +165,45 @@ fn menu_face() -> MenuFace {
     let health = supervisor.last_health();
     let runtime = supervisor.runtime_identity();
     let extension = network_extension::status();
+    let automatic_enabled = supervisor
+        .applied_strategy()
+        .is_some_and(|strategy| strategy.system_extension);
     let mut status = match operation {
         OperationState::Connecting => "正在连接…".into(),
         OperationState::Applying => "正在应用策略…".into(),
         OperationState::Disconnecting => "正在断开…".into(),
         _ if busy => "正在处理操作…".into(),
         _ if health.ready && runtime.is_some() => {
-            let automatic = match extension.phase {
-                network_extension::Phase::Running => "自动代理已开启",
-                network_extension::Phase::WaitingApproval => "自动代理等待授权",
-                network_extension::Phase::Failed => "自动代理需要处理",
-                _ => "自动代理未开启",
+            let automatic = if !automatic_enabled {
+                "自动代理未开启"
+            } else if extension.observed
+                && extension.desired_revision > 0
+                && extension.is_running_for(extension.desired_revision)
+            {
+                "自动代理已开启"
+            } else {
+                match extension.phase {
+                    network_extension::Phase::Running
+                        if matches!(extension.dns_phase, network_extension::DnsPhase::Failed)
+                            || !extension.capture_enabled =>
+                    {
+                        "自动代理需要处理"
+                    }
+                    network_extension::Phase::Running
+                        if matches!(
+                            extension.dns_phase,
+                            network_extension::DnsPhase::Unknown
+                                | network_extension::DnsPhase::Waiting
+                                | network_extension::DnsPhase::Stopping
+                        ) =>
+                    {
+                        "自动代理等待确认"
+                    }
+                    network_extension::Phase::Running => "自动代理配置未生效",
+                    network_extension::Phase::WaitingApproval => "自动代理等待授权",
+                    network_extension::Phase::Failed => "自动代理需要处理",
+                    _ => "自动代理未开启",
+                }
             };
             let scope = runtime
                 .map(|identity| {

@@ -1096,8 +1096,19 @@ fn automatic_proxy_status(status: &RuntimeStatus, enabled: bool) -> &'static str
     if !status.observed {
         return "等待确认";
     }
+    if status.desired_revision > 0 && status.is_running_for(status.desired_revision) {
+        return "已开启";
+    }
     match status.phase {
-        Phase::Running => "已开启",
+        Phase::Running => match status.dns_phase {
+            network_extension::DnsPhase::Waiting
+            | network_extension::DnsPhase::Unknown
+            | network_extension::DnsPhase::Stopping => "等待确认",
+            network_extension::DnsPhase::Failed => "需要处理",
+            network_extension::DnsPhase::Running if !status.capture_enabled => "需要处理",
+            network_extension::DnsPhase::Running => "配置未生效",
+            network_extension::DnsPhase::Disabled => "需要处理",
+        },
         Phase::WaitingApproval => "需要允许",
         Phase::Requesting => "正在开启",
         Phase::Stopping => "正在关闭",
@@ -3254,7 +3265,7 @@ impl AppView {
             theme.muted_foreground
         };
         let automatic_label =
-            automatic_proxy_status(&self.extension_status, self.strategy.system_extension);
+            automatic_proxy_status(&self.extension_status, self.applied.system_extension);
         let automatic_color = match automatic_label {
             "已开启" => theme.success,
             "未开启" => theme.muted_foreground,
@@ -3654,11 +3665,22 @@ impl AppView {
         } else {
             "未连接"
         };
+        let automatic_label = automatic_proxy_status(
+            &self.extension_status,
+            self.applied.system_extension,
+        );
+        let automatic_color = if automatic_label == "已开启" {
+            theme.success
+        } else if automatic_label == "未开启" {
+            theme.muted_foreground
+        } else {
+            theme_ext::warning_text(theme)
+        };
         let status_detail = if connected {
             format!(
                 "手动代理 {} · 自动代理 {}{}",
                 self.mixed_endpoint(),
-                automatic_proxy_status(&self.extension_status, self.applied.system_extension),
+                automatic_label,
                 if self.applied.tun {
                     " · 全局网络接管已开启"
                 } else {
@@ -3722,11 +3744,8 @@ impl AppView {
                                     .child(pill(theme, "手动代理", brand_accent(theme)))
                                     .child(pill(
                                         theme,
-                                        automatic_proxy_status(
-                                            &self.extension_status,
-                                            self.applied.system_extension,
-                                        ),
-                                        theme.success,
+                                        automatic_label,
+                                        automatic_color,
                                     )),
                             ),
                     )
@@ -4458,6 +4477,25 @@ impl AppView {
 
     fn settings(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
+        let endpoint_note = if self.runtime.is_some() {
+            let pending = self.strategy.mixed_port != self.applied.mixed_port
+                || self.strategy.mixed_lan != self.applied.mixed_lan;
+            if pending {
+                format!(
+                    "当前运行地址：{}。保存的端口或局域网设置尚未应用。",
+                    self.mixed_endpoint()
+                )
+            } else {
+                format!("当前手动代理地址：{}。", self.mixed_endpoint())
+            }
+        } else {
+            let endpoint = if self.strategy.mixed_lan {
+                format!("本机或局域网地址:{}", self.strategy.mixed_port)
+            } else {
+                format!("127.0.0.1:{}", self.strategy.mixed_port)
+            };
+            format!("连接后手动代理地址：{}。", endpoint)
+        };
         v_flex()
             .gap_4()
             .child(page_title(
@@ -4478,15 +4516,7 @@ impl AppView {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "{}:{} 可供手动填写代理。普通应用可在上方开启自动代理。",
-                                if self.strategy.mixed_lan {
-                                    "本机或局域网地址"
-                                } else {
-                                    "127.0.0.1"
-                                },
-                                self.strategy.mixed_port
-                            )),
+                            .child(endpoint_note),
                     )
                     .child(
                         h_flex()
@@ -5379,8 +5409,9 @@ impl AppView {
         let entity = cx.entity();
         let on = self.strategy.system_extension;
         let tun_on = self.strategy.tun;
-        let automatic_label = automatic_proxy_status(&self.extension_status, on);
-        let dns_label = dns_status_label(&self.extension_status, on);
+        let automatic_label =
+            automatic_proxy_status(&self.extension_status, self.applied.system_extension);
+        let dns_label = dns_status_label(&self.extension_status, self.applied.system_extension);
         let waiting = matches!(
             self.extension_status.phase,
             Phase::WaitingApproval | Phase::Requesting
@@ -7351,4 +7382,40 @@ fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
     } else {
         theme.muted_foreground
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{automatic_proxy_status, network_extension, Phase, RuntimeStatus};
+
+    fn running_status() -> RuntimeStatus {
+        RuntimeStatus {
+            phase: Phase::Running,
+            dns_phase: network_extension::DnsPhase::Running,
+            observed: true,
+            desired_revision: 7,
+            applied_revision: Some(7),
+            message: None,
+            dns_message: None,
+            capture_enabled: true,
+            fail_open: true,
+        }
+    }
+
+    #[test]
+    fn automatic_proxy_label_requires_capture_dns_and_revision() {
+        let mut status = running_status();
+        assert_eq!(automatic_proxy_status(&status, true), "已开启");
+
+        status.capture_enabled = false;
+        assert_eq!(automatic_proxy_status(&status, true), "需要处理");
+
+        status.capture_enabled = true;
+        status.dns_phase = network_extension::DnsPhase::Failed;
+        assert_eq!(automatic_proxy_status(&status, true), "需要处理");
+
+        status.dns_phase = network_extension::DnsPhase::Running;
+        status.applied_revision = None;
+        assert_eq!(automatic_proxy_status(&status, true), "配置未生效");
+    }
 }
