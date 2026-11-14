@@ -6022,7 +6022,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("打开后，Debug / Trace 也会写入上方日志。MYPROXY_DEV=1 同样生效。"),
+                        .child("打开后会记录更详细的诊断日志。MYPROXY_DEV=1 同样生效。"),
                 )
                 .child({
                     let entity = entity.clone();

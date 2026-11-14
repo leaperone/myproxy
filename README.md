@@ -130,7 +130,7 @@ application support directory.
   order, after built-in local-network bypasses, and only after traffic enters Mixed,
   System Extension, or TUN. Mixed and System Extension each have their own mode; TUN
   follows the profile rules and is mutually exclusive with System Extension.
-- Each DIRECT domain or suffix rule can enable `DNS 仅 IPv4`. The strategy stores this as
+- Each DIRECT domain or suffix rule can enable `网站解析仅用 IPv4`. The strategy stores this as
   `dns_ipv4_only`; proxy and reject rules keep fake-IP hostname matching. Process,
   keyword, and CIDR matchers do not provide DNS policies.
 - `gfw:<group>` is evaluated by mihomo (`RULE-SET,gfw` then DIRECT on a miss).
