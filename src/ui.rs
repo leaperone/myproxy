@@ -1167,6 +1167,26 @@ fn dns_status_label(status: &RuntimeStatus, enabled: bool) -> &'static str {
     }
 }
 
+fn runtime_dns_label(
+    status: &RuntimeStatus,
+    extension_enabled: bool,
+    tun_enabled: bool,
+    pending: bool,
+    connected: bool,
+) -> &'static str {
+    if pending {
+        "待应用"
+    } else if tun_enabled {
+        if connected {
+            "由 TUN 提供"
+        } else {
+            "等待连接"
+        }
+    } else {
+        dns_status_label(status, extension_enabled)
+    }
+}
+
 fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> Vec<ViaChoice> {
     let mut out = vec![
         ViaChoice {
@@ -1706,6 +1726,29 @@ impl AppView {
                 }
             })
             .unwrap_or_else(|| "未监听".into())
+    }
+
+    fn dns_display_label(&self) -> &'static str {
+        runtime_dns_label(
+            &self.extension_status,
+            self.applied.system_extension,
+            self.applied.tun,
+            self.strategy.tun != self.applied.tun
+                || self.strategy.system_extension != self.applied.system_extension,
+            self.connected,
+        )
+    }
+
+    fn tun_display_label(&self) -> &'static str {
+        if self.strategy.tun != self.applied.tun {
+            "待应用"
+        } else if self.applied.tun && self.connected {
+            "已开启"
+        } else if self.applied.tun {
+            "等待连接"
+        } else {
+            "未开启"
+        }
     }
 
     fn sync_runtime(&mut self) -> bool {
@@ -3473,36 +3516,60 @@ impl AppView {
             .gap_3()
             .bg(theme.background)
             .when(self.show_status(), |this| {
+                let status_is_alert = self.status.contains("失败")
+                    || self.status.contains("错误")
+                    || self.status.contains("异常")
+                    || self.status.contains("无响应")
+                    || self.status.contains("无法")
+                    || self.status.contains("未保存")
+                    || self.status.contains("未生效")
+                    || self.status.contains("不支持")
+                    || self.status.contains("需要处理")
+                    || self.status.contains("需要允许")
+                    || self.status.contains("需要重启")
+                    || self.status.contains("等待授权");
+                let status_color = if status_is_alert {
+                    theme_ext::warning_text(theme)
+                } else if self.is_busy() {
+                    theme.accent
+                } else {
+                    theme.muted_foreground
+                };
                 this.child(
-                div()
-                    .id("status")
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border.opacity(0.54))
-                    .bg(theme.muted.opacity(0.16))
-                    .text_xs()
+                    div()
+                        .id("status")
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(status_color.opacity(0.28))
+                        .bg(status_color.opacity(0.08))
                         .role(
-                            if self.status.contains("失败") || self.status.contains("错误") {
+                            if status_is_alert {
                                 Role::Alert
                             } else {
                                 Role::Status
                             },
                         )
-                    .text_color(
-                        if self.status.contains("失败")
-                            || self.status.contains("异常")
-                            || self.status.contains("无响应")
-                        {
-                                theme_ext::warning_text(theme)
-                        } else {
-                            theme.muted_foreground
-                        },
-                    )
-                    .child(self.status.clone()),
-            )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().size_2().rounded_full().bg(status_color))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(if status_is_alert {
+                                            status_color
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(self.status.clone()),
+                                ),
+                        ),
+                )
             })
             .child(match self.page {
                 Page::Rules => self.rules(cx, theme).into_any_element(),
@@ -3702,21 +3769,47 @@ impl AppView {
             &self.extension_status,
             self.applied.system_extension,
         );
+        let automatic_pending = self.strategy.system_extension != self.applied.system_extension;
+        let tun_pending = self.strategy.tun != self.applied.tun;
+        let automatic_problem = self.connected
+            && (automatic_pending
+                || tun_pending
+                || (self.applied.system_extension && automatic_label != "已开启"));
+        let overview_automatic_label = if automatic_pending {
+            "待应用"
+        } else {
+            automatic_label
+        };
+        let dns_label = self.dns_display_label();
+        let tun_label = self.tun_display_label();
+        let tun_detail = if self.strategy.tun || self.applied.tun {
+            format!(" · 全局接管 {}", tun_label)
+        } else {
+            String::new()
+        };
         let status_detail = if connected {
             format!(
-                "手动代理 {} · 自动代理 {}{}",
+                "手动代理 {} · 自动代理 {} · DNS {}{}",
                 self.mixed_endpoint(),
-                automatic_label,
-                if self.applied.tun {
-                    " · 全局网络接管已开启"
-                } else {
-                    ""
-                }
+                overview_automatic_label,
+                dns_label,
+                tun_detail
             )
         } else if wanted {
-            "代理正在启动或恢复，请查看上方状态和操作提示。".into()
+            format!(
+                "代理正在启动或恢复。自动代理 {} · DNS {}{}。请查看上方状态和操作提示。",
+                overview_automatic_label, dns_label, tun_detail
+            )
         } else {
-            "连接后即可使用已配置的出口。需要让其他应用自动使用代理时，请在设置开启「自动代理」。".into()
+            format!(
+                "连接后即可使用已配置的出口。自动代理 {} · DNS {}{}。需要让其他应用自动使用代理时，请在设置开启「自动代理」。",
+                overview_automatic_label, dns_label, tun_detail
+            )
+        };
+        let status_label = if automatic_problem {
+            "部分可用"
+        } else {
+            self.connected_label()
         };
         v_flex()
             .gap_4()
@@ -3742,15 +3835,27 @@ impl AppView {
                                     .items_center()
                                     .justify_between()
                                     .child(div().text_sm().font_semibold().child("当前状态"))
-                                    .child(pill(theme, status_badge, brand_accent(theme))),
+                                    .child(pill(
+                                        theme,
+                                        if automatic_problem {
+                                            "部分就绪"
+                                        } else {
+                                            status_badge
+                                        },
+                                        if automatic_problem {
+                                            theme.warning
+                                        } else {
+                                            brand_accent(theme)
+                                        },
+                                    )),
                             )
                             .child(
                                 h_flex()
                                     .gap_2()
                                     .items_center()
-                                    .child(status_dot(theme, connected))
+                                    .child(status_dot(theme, connected && !automatic_problem))
                                     .child(
-                                        div().text_2xl().font_bold().child(self.connected_label()),
+                                        div().text_2xl().font_bold().child(status_label),
                                     ),
                             )
                             .child(
@@ -3826,6 +3931,13 @@ impl AppView {
             "—".into()
         };
         let total_count = self.traffic.connection_count;
+        let reported_count = if !connected {
+            "—".to_string()
+        } else if self.traffic_error.is_some() {
+            "读不到".to_string()
+        } else {
+            total_count.to_string()
+        };
         let loaded_count = self.traffic.connections.len();
         let filtered =
             controller::filter_connections(&self.traffic.connections, &self.connection_filters);
@@ -3838,8 +3950,8 @@ impl AppView {
             "当前没有活动连接。只有进入手动代理或自动代理的流量会出现在这里。".into()
         } else {
             format!(
-                "已载入 {} 条 · 当前显示 {} 条",
-                loaded_count, filtered_count
+                "核心报告 {} 条 · 已载入 {} 条 · 当前显示 {} 条",
+                total_count, loaded_count, filtered_count
             )
         };
         v_flex()
@@ -3866,7 +3978,7 @@ impl AppView {
                     ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
-                    .child(metric(theme, "活动连接", &total_count.to_string())),
+                    .child(metric(theme, "代理连接", &reported_count)),
             )
             .when(connected, |this| {
                     this.child(
@@ -4304,11 +4416,12 @@ impl AppView {
                     self.is_busy(),
                 )
             })
+            .child(section_heading(theme, "已配置节点组"))
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_xs().child("搜索所有节点"))
-                    .child(Input::new(&self.member_query)),
+                    .child(div().text_xs().child("筛选各组成员"))
+                    .child(Input::new(&self.member_query).aria_label("筛选各组成员")),
             )
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint_action(
@@ -4414,7 +4527,11 @@ impl AppView {
                                 });
                             })
                     })
-                    .child(div().flex_1().child(Input::new(&self.rule_query)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.rule_query).aria_label("筛选规则")),
+                    )
                     .when(!query.trim().is_empty(), |this| {
                         let entity = entity.clone();
                         this.child(
@@ -4440,7 +4557,6 @@ impl AppView {
                         },
                     )),
             )
-            .when(visible_len > 0, |this| this.child(rule_table_header(theme)))
             .when(self.strategy.rule_sets.is_empty(), |this| {
                 this.child(empty_hint_action(
                     theme,
@@ -5427,7 +5543,7 @@ impl AppView {
         let tun_on = self.strategy.tun;
         let automatic_label =
             automatic_proxy_status(&self.extension_status, self.applied.system_extension);
-        let dns_label = dns_status_label(&self.extension_status, self.applied.system_extension);
+        let dns_label = self.dns_display_label();
         let waiting = matches!(
             self.extension_status.phase,
             Phase::WaitingApproval | Phase::Requesting
@@ -5540,9 +5656,9 @@ impl AppView {
                                 .small()
                                 .secondary()
                                 .label(if self.system_options_expanded {
-                                    "收起设置"
+                                    "收起接管设置"
                                             } else {
-                                    "显示设置"
+                                    "展开接管设置"
                                 })
                                 .on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
@@ -6309,19 +6425,8 @@ fn render_group_card(
         } else {
             theme.border
         })
-        .cursor_pointer()
         .when(selected, |this| this.bg(selected_border.opacity(0.10)))
         .hover(move |style| style.bg(hover))
-        .on_click({
-            let entity = entity.clone();
-            let id = id.clone();
-            move |_, window, app| {
-                entity.update(app, |this, cx| {
-                    this.open_group_dialog(Some(&id), window, cx);
-                    cx.notify();
-                });
-            }
-        })
         .child(
             h_flex()
                 .w_full()
@@ -6525,7 +6630,7 @@ fn render_global_card(
                         .min_w_0()
                         .gap_2()
                         .items_center()
-                        .child(div().text_sm().font_semibold().child("全局出口")),
+                        .child(div().text_sm().font_semibold().child("内置全局出口")),
                 )
                 .child(
                     h_flex()
@@ -6583,7 +6688,11 @@ fn render_global_card(
             )
         })
         .when(expanded, |this| {
-            this.child(div().w_full().child(Input::new(query)))
+            this.child(
+                div()
+                    .w_full()
+                    .child(Input::new(query).aria_label("搜索全局出口")),
+            )
                 .when(!shown_empty, |this| {
                     this.child(h_flex().w_full().flex_wrap().gap_1().children(
                         shown.into_iter().map(|(name, delay)| {
@@ -7023,20 +7132,6 @@ fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn rule_table_header(theme: &Theme) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(div().w(px(28.)).child("#"))
-        .child(div().flex_1().min_w_0().child("匹配条件"))
-        .child(div().w(px(150.)).child("出口"))
-        .child(div().w(px(260.)).child("操作"))
-}
-
 fn render_rule_set_card(
     entity: Entity<AppView>,
     theme: &Theme,
@@ -7066,19 +7161,8 @@ fn render_rule_set_card(
         } else {
             theme.border
         })
-        .cursor_pointer()
         .when(selected, |this| this.bg(selected_border.opacity(0.10)))
         .hover(move |style| style.bg(hover))
-        .on_click({
-            let entity = entity.clone();
-            let id = id.clone();
-            move |_, window, app| {
-                entity.update(app, |this, cx| {
-                    this.open_rule_dialog(Some(&id), window, cx);
-                    cx.notify();
-                });
-            }
-        })
         .context_menu({
             let entity = entity.clone();
             let id = id.clone();
@@ -7178,22 +7262,7 @@ fn render_rule_set_card(
                         .when(set.dns_ipv4_only, |this| {
                             this.child(pill(theme, "解析仅用 IPv4", theme.info))
                         }),
-                )
-                .child({
-                    let entity = entity.clone();
-                    let del_id = id.clone();
-                    Button::new(SharedString::from(format!("del-rule-{del_id}")))
-                        .small()
-                        .danger()
-                        .label("删除")
-                        .on_click(move |_, window, app| {
-                            app.stop_propagation();
-                            entity.update(app, |this, cx| {
-                                this.confirm_remove_selected_rule(&del_id, window, cx);
-                                cx.notify();
-                            });
-                        })
-                }),
+                ),
         )
         .child(
             h_flex()
@@ -7206,11 +7275,22 @@ fn render_rule_set_card(
                     )
                 }))
                 .when(extra > 0, |this| {
+                    let entity = entity.clone();
+                    let edit_id = id.clone();
+                    let name = set.name.clone();
                     this.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(format!("+{extra}")),
+                        Button::new(SharedString::from(format!("more-matchers-{edit_id}")))
+                            .small()
+                            .ghost()
+                            .label(format!("+{extra} 条"))
+                            .accessibility_label(format!("查看规则 {name} 的全部匹配条件"))
+                            .on_click(move |_, window, app| {
+                                app.stop_propagation();
+                                entity.update(app, |this, cx| {
+                                    this.open_rule_dialog(Some(&edit_id), window, cx);
+                                    cx.notify();
+                                });
+                            }),
                     )
                 })
                 .when(set.matchers.is_empty(), |this| {
@@ -7274,11 +7354,13 @@ fn render_rule_set_card(
                 .child({
                     let entity = entity.clone();
                     let via_id = id.clone();
+                    let name = set.name.clone();
                     let via_current = via.clone();
                     let choices = via_choices.clone();
                     Button::new(SharedString::from(format!("via-rule-{via_id}")))
                         .small()
                         .label("改走向")
+                        .accessibility_label(format!("修改规则 {name} 的走向"))
                         .dropdown_menu(move |menu, _, _| {
                             let entity = entity.clone();
                             let via_id = via_id.clone();
@@ -7288,6 +7370,23 @@ fn render_rule_set_card(
                                     cx.notify();
                                 });
                             })
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    let del_id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("del-rule-{del_id}")))
+                        .small()
+                        .danger()
+                        .label("删除")
+                        .accessibility_label(format!("删除规则 {name}"))
+                        .on_click(move |_, window, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.confirm_remove_selected_rule(&del_id, window, cx);
+                                cx.notify();
+                            });
                         })
                 }),
         )
@@ -7433,7 +7532,8 @@ fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        automatic_proxy_status, network_extension, subscription_display_url, Phase, RuntimeStatus,
+        automatic_proxy_status, network_extension, runtime_dns_label, subscription_display_url,
+        Phase, RuntimeStatus,
     };
 
     fn running_status() -> RuntimeStatus {
@@ -7477,5 +7577,13 @@ mod tests {
             subscription_display_url("https://example.invalid/path#secret"),
             "example.invalid"
         );
+    }
+
+    #[test]
+    fn runtime_dns_label_distinguishes_tun_and_pending_capture() {
+        let status = running_status();
+        assert_eq!(runtime_dns_label(&status, false, true, false, true), "由 TUN 提供");
+        assert_eq!(runtime_dns_label(&status, false, true, false, false), "等待连接");
+        assert_eq!(runtime_dns_label(&status, false, true, true, true), "待应用");
     }
 }
