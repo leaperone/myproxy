@@ -632,6 +632,7 @@ struct RuleSetEditor {
     notice: String,
     name: Entity<InputState>,
     via: String,
+    dns_ipv4_only: bool,
     matchers: Vec<Matcher>,
     draft_kind: RuleDraftKind,
     match_input: Entity<InputState>,
@@ -650,6 +651,9 @@ impl RuleSetEditor {
             .as_ref()
             .map(|s| s.via.clone())
             .unwrap_or(fallback_via);
+        let dns_ipv4_only = existing
+            .as_ref()
+            .is_some_and(|s| s.dns_ipv4_only);
         let name = existing
             .as_ref()
             .map(|s| s.name.clone())
@@ -677,6 +681,7 @@ impl RuleSetEditor {
             notice: String::new(),
             name,
             via,
+            dns_ipv4_only,
             matchers,
             draft_kind,
             match_input,
@@ -689,6 +694,7 @@ impl RuleSetEditor {
             id: self.edit_id.clone().unwrap_or_default(),
             name: self.name.read(cx).value().trim().to_string(),
             via: self.via.trim().to_string(),
+            dns_ipv4_only: self.dns_ipv4_only,
             matchers: self.matchers.clone(),
         }
     }
@@ -807,6 +813,11 @@ impl Render for RuleSetEditor {
                     || choice.value.to_lowercase().contains(&via_query)
             })
             .collect();
+        let dns_matcher_available = self
+            .matchers
+            .iter()
+            .any(|matcher| matches!(matcher.kind.as_str(), "domain" | "suffix"));
+        let dns_ipv4_available = dns_matcher_available && self.via.eq_ignore_ascii_case("DIRECT");
 
         v_flex()
             .gap_3()
@@ -855,6 +866,29 @@ impl Render for RuleSetEditor {
                             ),
                     ),
             )
+            .when(dns_ipv4_available || self.dns_ipv4_only, |this| {
+                this.child({
+                let entity = entity.clone();
+                Switch::new("rule-dns-ipv4-only")
+                    .small()
+                    .label("网站解析仅用 IPv4")
+                    .checked(self.dns_ipv4_only)
+                    .disabled(!dns_ipv4_available && !self.dns_ipv4_only)
+                    .accessibility_label("这条直连规则的网站解析仅用 IPv4")
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.dns_ipv4_only = !this.dns_ipv4_only;
+                            cx.notify();
+                        });
+                    })
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child("仅对这条直连规则中的域名生效；其他规则不受影响。"),
+            )
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -2452,6 +2486,7 @@ impl AppView {
                 id: String::new(),
                 name: process.trim().to_string(),
                 via: default_via(&self.strategy),
+                dns_ipv4_only: false,
                 matchers: vec![Matcher::app(matcher.to_string())],
             }),
             window,
@@ -2485,6 +2520,7 @@ impl AppView {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: process.trim().to_string(),
                 via: via.to_string(),
+                dns_ipv4_only: false,
                 matchers: vec![Matcher::app(matcher.to_string())],
             });
         }
@@ -7155,7 +7191,10 @@ fn render_rule_set_card(
                             theme,
                             &via_label(&via),
                             accent,
-                        ))),
+                        )))
+                        .when(set.dns_ipv4_only, |this| {
+                            this.child(pill(theme, "解析仅用 IPv4", theme.info))
+                        }),
                 )
                 .child({
                     let entity = entity.clone();

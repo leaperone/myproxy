@@ -808,6 +808,7 @@ mod tests {
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
+            dns_ipv4_only: false,
             matchers: vec![crate::strategy::Matcher {
                 kind: "suffix".into(),
                 value: "example.com".into(),
@@ -849,6 +850,7 @@ mod tests {
             id: "cpa".into(),
             name: "CPA".into(),
             via: "AI Proxy".into(),
+            dns_ipv4_only: false,
             matchers: vec![crate::strategy::Matcher {
                 kind: "suffix".into(),
                 value: "cpa.leaper.one".into(),
