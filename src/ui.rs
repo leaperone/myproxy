@@ -4557,7 +4557,6 @@ impl AppView {
                         },
                     )),
             )
-            .when(visible_len > 0, |this| this.child(rule_table_header(theme)))
             .when(self.strategy.rule_sets.is_empty(), |this| {
                 this.child(empty_hint_action(
                     theme,
@@ -7131,20 +7130,6 @@ fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {
         .text_xs()
         .text_color(theme.muted_foreground)
         .child(text.to_string())
-}
-
-fn rule_table_header(theme: &Theme) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(div().w(px(28.)).child("#"))
-        .child(div().flex_1().min_w_0().child("匹配条件"))
-        .child(div().w(px(150.)).child("出口"))
-        .child(div().w(px(260.)).child("操作"))
 }
 
 fn render_rule_set_card(
