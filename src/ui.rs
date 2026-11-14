@@ -3523,7 +3523,11 @@ impl AppView {
                     || self.status.contains("无法")
                     || self.status.contains("未保存")
                     || self.status.contains("未生效")
-                    || self.status.contains("不支持");
+                    || self.status.contains("不支持")
+                    || self.status.contains("需要处理")
+                    || self.status.contains("需要允许")
+                    || self.status.contains("需要重启")
+                    || self.status.contains("等待授权");
                 let status_color = if status_is_alert {
                     theme_ext::warning_text(theme)
                 } else if self.is_busy() {
