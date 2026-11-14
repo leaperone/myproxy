@@ -1167,6 +1167,26 @@ fn dns_status_label(status: &RuntimeStatus, enabled: bool) -> &'static str {
     }
 }
 
+fn runtime_dns_label(
+    status: &RuntimeStatus,
+    extension_enabled: bool,
+    tun_enabled: bool,
+    pending: bool,
+    connected: bool,
+) -> &'static str {
+    if pending {
+        "待应用"
+    } else if tun_enabled {
+        if connected {
+            "由 TUN 提供"
+        } else {
+            "等待连接"
+        }
+    } else {
+        dns_status_label(status, extension_enabled)
+    }
+}
+
 fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> Vec<ViaChoice> {
     let mut out = vec![
         ViaChoice {
@@ -1706,6 +1726,29 @@ impl AppView {
                 }
             })
             .unwrap_or_else(|| "未监听".into())
+    }
+
+    fn dns_display_label(&self) -> &'static str {
+        runtime_dns_label(
+            &self.extension_status,
+            self.applied.system_extension,
+            self.applied.tun,
+            self.strategy.tun != self.applied.tun
+                || self.strategy.system_extension != self.applied.system_extension,
+            self.connected,
+        )
+    }
+
+    fn tun_display_label(&self) -> &'static str {
+        if self.strategy.tun != self.applied.tun {
+            "待应用"
+        } else if self.applied.tun && self.connected {
+            "已开启"
+        } else if self.applied.tun {
+            "等待连接"
+        } else {
+            "未开启"
+        }
     }
 
     fn sync_runtime(&mut self) -> bool {
@@ -3476,13 +3519,17 @@ impl AppView {
                 let status_is_alert = self.status.contains("失败")
                     || self.status.contains("错误")
                     || self.status.contains("异常")
-                    || self.status.contains("无响应");
+                    || self.status.contains("无响应")
+                    || self.status.contains("无法")
+                    || self.status.contains("未保存")
+                    || self.status.contains("未生效")
+                    || self.status.contains("不支持");
                 let status_color = if status_is_alert {
                     theme_ext::warning_text(theme)
                 } else if self.is_busy() {
                     theme.accent
                 } else {
-                    theme.success
+                    theme.muted_foreground
                 };
                 this.child(
                     div()
@@ -3718,15 +3765,23 @@ impl AppView {
             &self.extension_status,
             self.applied.system_extension,
         );
-        let dns_label = dns_status_label(&self.extension_status, self.applied.system_extension);
         let automatic_pending = self.strategy.system_extension != self.applied.system_extension;
+        let tun_pending = self.strategy.tun != self.applied.tun;
         let automatic_problem = self.connected
             && (automatic_pending
+                || tun_pending
                 || (self.applied.system_extension && automatic_label != "已开启"));
         let overview_automatic_label = if automatic_pending {
             "待应用"
         } else {
             automatic_label
+        };
+        let dns_label = self.dns_display_label();
+        let tun_label = self.tun_display_label();
+        let tun_detail = if self.strategy.tun || self.applied.tun {
+            format!(" · 全局接管 {}", tun_label)
+        } else {
+            String::new()
         };
         let status_detail = if connected {
             format!(
@@ -3734,21 +3789,17 @@ impl AppView {
                 self.mixed_endpoint(),
                 overview_automatic_label,
                 dns_label,
-                if self.applied.tun {
-                    " · 全局网络接管已开启"
-                } else {
-                    ""
-                }
+                tun_detail
             )
         } else if wanted {
             format!(
-                "代理正在启动或恢复。自动代理 {} · DNS {}。请查看上方状态和操作提示。",
-                overview_automatic_label, dns_label
+                "代理正在启动或恢复。自动代理 {} · DNS {}{}。请查看上方状态和操作提示。",
+                overview_automatic_label, dns_label, tun_detail
             )
         } else {
             format!(
-                "连接后即可使用已配置的出口。自动代理 {} · DNS {}。需要让其他应用自动使用代理时，请在设置开启「自动代理」。",
-                overview_automatic_label, dns_label
+                "连接后即可使用已配置的出口。自动代理 {} · DNS {}{}。需要让其他应用自动使用代理时，请在设置开启「自动代理」。",
+                overview_automatic_label, dns_label, tun_detail
             )
         };
         let status_label = if automatic_problem {
@@ -5489,7 +5540,7 @@ impl AppView {
         let tun_on = self.strategy.tun;
         let automatic_label =
             automatic_proxy_status(&self.extension_status, self.applied.system_extension);
-        let dns_label = dns_status_label(&self.extension_status, self.applied.system_extension);
+        let dns_label = self.dns_display_label();
         let waiting = matches!(
             self.extension_status.phase,
             Phase::WaitingApproval | Phase::Requesting
@@ -7492,7 +7543,8 @@ fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        automatic_proxy_status, network_extension, subscription_display_url, Phase, RuntimeStatus,
+        automatic_proxy_status, network_extension, runtime_dns_label, subscription_display_url,
+        Phase, RuntimeStatus,
     };
 
     fn running_status() -> RuntimeStatus {
@@ -7536,5 +7588,13 @@ mod tests {
             subscription_display_url("https://example.invalid/path#secret"),
             "example.invalid"
         );
+    }
+
+    #[test]
+    fn runtime_dns_label_distinguishes_tun_and_pending_capture() {
+        let status = running_status();
+        assert_eq!(runtime_dns_label(&status, false, true, false, true), "由 TUN 提供");
+        assert_eq!(runtime_dns_label(&status, false, true, false, false), "等待连接");
+        assert_eq!(runtime_dns_label(&status, false, true, true, true), "待应用");
     }
 }
