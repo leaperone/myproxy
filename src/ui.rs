@@ -2519,7 +2519,7 @@ impl AppView {
         let editing = self.rule_edit_id.is_some();
         let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
         window.open_dialog(cx, move |dialog, window, _| {
-            let ok_label = if editing { "保存" } else { "添加" };
+            let ok_label = if editing { "保存并应用" } else { "添加并应用" };
             dialog
                 .title(if editing {
                     "编辑规则"
@@ -2603,7 +2603,7 @@ impl AppView {
         let editing = id.is_some();
         let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
         window.open_dialog(cx, move |dialog, window, _| {
-            let ok_label = if editing { "保存" } else { "添加" };
+            let ok_label = if editing { "保存并应用" } else { "添加并应用" };
             dialog
                 .title(if editing {
                     "编辑节点组"
@@ -3981,7 +3981,7 @@ impl AppView {
                         .overflow_x_scrollbar()
                         .child(
                             v_flex()
-                                .min_w(px(860.))
+                                .min_w(px(560.))
                                 .w_full()
                                 .flex_1()
                                 .min_h_0()
@@ -4003,37 +4003,33 @@ impl AppView {
                                     )
                                 })
                                 .when(filtered_count > 0, |this| {
-                                    this.child(uniform_list(
+                                    this.child(
+                                        uniform_list(
                                             "connection-rows",
-                                        filtered_count,
+                                            filtered_count,
                                             cx.processor(|this, range: Range<usize>, _window, cx| {
                                                 let filtered = controller::filter_connections(
                                                     &this.traffic.connections,
                                                     &this.connection_filters,
                                                 );
                                                 let theme = cx.theme().clone();
-                                                let choices =
-                                                    via_choices(&this.strategy, &this.catalog, None);
+                                                let choices = via_choices(&this.strategy, &this.catalog, None);
                                                 let busy = this.is_busy();
                                                 let entity = cx.entity();
-                                                range
-                                                    .filter_map(|ix| {
-                                                        filtered.get(ix).map(|conn| {
-                                                            render_connection_row(
-                                                                entity.clone(),
-                                                                &theme,
-                                                                conn,
-                                                                choices.clone(),
-                                                                busy,
-                                                            )
-                                                        })
+                                                range.filter_map(|ix| {
+                                                    filtered.get(ix).map(|conn| {
+                                                        render_connection_row(
+                                                            entity.clone(), &theme, conn,
+                                                            choices.clone(), busy,
+                                                        )
                                                     })
-                                                    .collect::<Vec<_>>()
+                                                }).collect::<Vec<_>>()
                                             }),
-                                    ))
-                                    .flex_1()
-                                    .min_h(px(160.))
-                                    .w_full()
+                                        )
+                                        .flex_1()
+                                        .min_h(px(160.))
+                                        .w_full(),
+                                    )
                                 })
                                 .when(total_count > loaded_count, |this| {
                                         this.child(
@@ -4716,9 +4712,9 @@ impl AppView {
             .child(self.cli_install_panel(cx, theme))
             .child(self.strategy_backup_panel(cx, theme))
             .child(self.developer_panel(cx, theme))
+            .child(self.logs_panel(theme))
                     }),
             )
-            .child(self.logs_panel(theme))
     }
 
     fn strategy_backup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -4881,8 +4877,14 @@ impl AppView {
             .and_then(|name| name.to_str())
             .unwrap_or("配置")
             .to_string();
+        let apply_note = if self.wanted {
+            "导入后立即应用。"
+        } else {
+            "下次连接或应用时生效。"
+        };
+        let import_label = if self.wanted { "导入并应用" } else { "导入" };
         let message = format!(
-            "将用「{file_name}」整份替换当前策略（{} 个订阅、{} 个节点组、{} 条规则）。导入前会留下备份。",
+            "将用「{file_name}」整份替换当前策略（{} 个订阅、{} 个节点组、{} 条规则）。导入前会留下备份。{apply_note}",
             preview.subscriptions.len(),
             preview.groups.len(),
             preview.rule_sets.len()
@@ -4917,7 +4919,7 @@ impl AppView {
                         .child(
                             Button::new("import-strategy-ok")
                                 .primary()
-                                .label("导入")
+                                .label(import_label)
                                 .on_click(|_, window, cx| {
                                     window
                                         .dispatch_action(Box::new(Confirm { secondary: false }), cx)
@@ -5930,7 +5932,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("Info、Warning、Error 始终写入同一文件。Debug / Trace 仅开发者模式或 MYPROXY_DEV=1。不记录订阅地址。"),
+                        .child("查看运行记录，订阅链接不会写入日志。开启开发者模式可记录更多诊断细节。"),
                 )
                 .child(
                     h_flex()
@@ -6660,7 +6662,6 @@ fn connection_header_row(
     connections: &[controller::LiveConnection],
     filters: &ConnectionFilters,
 ) -> impl IntoElement {
-    let muted_fg = theme.muted_foreground;
     h_flex()
         .w_full()
         .items_center()
@@ -6711,7 +6712,6 @@ fn connection_header_row(
             controller::connection_column_values(connections, filters, ConnectionColumn::Chain),
             filters.chain.clone(),
         ))
-        .child(connection_col(px(192.), "流量与操作", muted_fg, None))
 }
 
 fn connection_filter_header(
@@ -6907,7 +6907,7 @@ fn render_connection_row(
     v_flex()
         .id(SharedString::from(format!("conn-{id}")))
         .w_full()
-        .min_w(px(860.))
+        .min_w(px(560.))
         .px_3()
         .py_2()
         .gap_1()

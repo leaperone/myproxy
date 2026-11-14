@@ -12,7 +12,7 @@ If the build is not Developer ID–notarized, macOS Gatekeeper may require a rig
 
 ## Updates
 
-Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更新通道**, then use **检查更新** or the menu-bar extra. The choice is saved in `strategy.json`; older configurations default to the installed build's channel. Switching back to Prod receives the next newer Prod build and does not downgrade the installed app.
+Choose **正式版（Prod）** or **Nightly** under **设置 → 高级设置 → 更新 → 更新通道**, then use **检查更新** or the menu-bar extra. The choice is saved in `strategy.json`; older configurations default to the installed build's channel. Switching back to Prod receives the next newer Prod build and does not downgrade the installed app.
 
 | Channel | Sparkle feed | CI/CD |
 | --- | --- | --- |
@@ -78,7 +78,7 @@ myproxyctl --json export
 myproxyctl --json import ~/Downloads/myproxy-strategy-2026-09-10.json
 ```
 
-`export` writes the current `strategy.json` (default `~/Downloads/myproxy-strategy-YYYY-MM-DD.json`). `import` replaces the live file after writing `strategy.json.bak-import-*` and does not apply; run `apply` if the core should pick it up. The **设置 → 配置** panel does the same with a file dialog.
+`export` writes the current `strategy.json` (default `~/Downloads/myproxy-strategy-YYYY-MM-DD.json`). `import` replaces the live file after writing `strategy.json.bak-import-*` and does not apply; run `apply` if the core should pick it up. The **设置 → 高级设置 → 配置** panel uses file dialogs and also creates a backup. In the app, importing while a connection is requested applies the configuration immediately; otherwise it takes effect on the next connection or apply.
 
 ```sh
 cargo run --bin myproxyctl -- subscription add 'https://…' --name Example
