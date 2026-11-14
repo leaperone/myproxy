@@ -3473,36 +3473,52 @@ impl AppView {
             .gap_3()
             .bg(theme.background)
             .when(self.show_status(), |this| {
+                let status_is_alert = self.status.contains("失败")
+                    || self.status.contains("错误")
+                    || self.status.contains("异常")
+                    || self.status.contains("无响应");
+                let status_color = if status_is_alert {
+                    theme_ext::warning_text(theme)
+                } else if self.is_busy() {
+                    theme.accent
+                } else {
+                    theme.success
+                };
                 this.child(
-                div()
-                    .id("status")
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border.opacity(0.54))
-                    .bg(theme.muted.opacity(0.16))
-                    .text_xs()
+                    div()
+                        .id("status")
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(status_color.opacity(0.28))
+                        .bg(status_color.opacity(0.08))
                         .role(
-                            if self.status.contains("失败") || self.status.contains("错误") {
+                            if status_is_alert {
                                 Role::Alert
                             } else {
                                 Role::Status
                             },
                         )
-                    .text_color(
-                        if self.status.contains("失败")
-                            || self.status.contains("异常")
-                            || self.status.contains("无响应")
-                        {
-                                theme_ext::warning_text(theme)
-                        } else {
-                            theme.muted_foreground
-                        },
-                    )
-                    .child(self.status.clone()),
-            )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().size_2().rounded_full().bg(status_color))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(if status_is_alert {
+                                            status_color
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(self.status.clone()),
+                                ),
+                        ),
+                )
             })
             .child(match self.page {
                 Page::Rules => self.rules(cx, theme).into_any_element(),
@@ -3702,6 +3718,9 @@ impl AppView {
             &self.extension_status,
             self.applied.system_extension,
         );
+        let automatic_problem = self.connected
+            && self.applied.system_extension
+            && automatic_label != "已开启";
         let status_detail = if connected {
             format!(
                 "手动代理 {} · 自动代理 {}{}",
@@ -3717,6 +3736,11 @@ impl AppView {
             "代理正在启动或恢复，请查看上方状态和操作提示。".into()
         } else {
             "连接后即可使用已配置的出口。需要让其他应用自动使用代理时，请在设置开启「自动代理」。".into()
+        };
+        let status_label = if automatic_problem {
+            "部分可用"
+        } else {
+            self.connected_label()
         };
         v_flex()
             .gap_4()
@@ -3742,15 +3766,27 @@ impl AppView {
                                     .items_center()
                                     .justify_between()
                                     .child(div().text_sm().font_semibold().child("当前状态"))
-                                    .child(pill(theme, status_badge, brand_accent(theme))),
+                                    .child(pill(
+                                        theme,
+                                        if automatic_problem {
+                                            "部分就绪"
+                                        } else {
+                                            status_badge
+                                        },
+                                        if automatic_problem {
+                                            theme.warning
+                                        } else {
+                                            brand_accent(theme)
+                                        },
+                                    )),
                             )
                             .child(
                                 h_flex()
                                     .gap_2()
                                     .items_center()
-                                    .child(status_dot(theme, connected))
+                                    .child(status_dot(theme, connected && !automatic_problem))
                                     .child(
-                                        div().text_2xl().font_bold().child(self.connected_label()),
+                                        div().text_2xl().font_bold().child(status_label),
                                     ),
                             )
                             .child(
@@ -3838,8 +3874,8 @@ impl AppView {
             "当前没有活动连接。只有进入手动代理或自动代理的流量会出现在这里。".into()
         } else {
             format!(
-                "已载入 {} 条 · 当前显示 {} 条",
-                loaded_count, filtered_count
+                "核心报告 {} 条 · 已载入 {} 条 · 当前显示 {} 条",
+                total_count, loaded_count, filtered_count
             )
         };
         v_flex()
@@ -3866,7 +3902,7 @@ impl AppView {
                     ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
-                    .child(metric(theme, "活动连接", &total_count.to_string())),
+                    .child(metric(theme, "核心报告", &total_count.to_string())),
             )
             .when(connected, |this| {
                     this.child(
@@ -4304,11 +4340,12 @@ impl AppView {
                     self.is_busy(),
                 )
             })
+            .child(section_heading(theme, "节点组"))
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_xs().child("搜索所有节点"))
-                    .child(Input::new(&self.member_query)),
+                    .child(div().text_xs().child("筛选节点预览"))
+                    .child(Input::new(&self.member_query).aria_label("筛选节点预览")),
             )
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint_action(
@@ -4414,7 +4451,11 @@ impl AppView {
                                 });
                             })
                     })
-                    .child(div().flex_1().child(Input::new(&self.rule_query)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.rule_query).aria_label("筛选规则")),
+                    )
                     .when(!query.trim().is_empty(), |this| {
                         let entity = entity.clone();
                         this.child(
@@ -5540,9 +5581,9 @@ impl AppView {
                                 .small()
                                 .secondary()
                                 .label(if self.system_options_expanded {
-                                    "收起设置"
+                                    "收起接管设置"
                                             } else {
-                                    "显示设置"
+                                    "展开接管设置"
                                 })
                                 .on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
@@ -6300,6 +6341,16 @@ fn render_group_card(
     let selected_border = theme_ext::selection_border(theme);
     let muted_fg = theme.muted_foreground;
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
+    let card_label = format!(
+        "编辑节点组 {}，{}，{}",
+        group.name,
+        group.kind_label(),
+        if connected {
+            format!("当前选择 {}", now)
+        } else {
+            format!("已保存选择 {}", now)
+        }
+    );
     surface(theme)
         .id(SharedString::from(format!("group-card-{id}")))
         .p_5()
@@ -6310,6 +6361,24 @@ fn render_group_card(
             theme.border
         })
         .cursor_pointer()
+        .role(Role::Button)
+        .aria_label(card_label)
+        .tab_index(0)
+        .focus_visible(|style| style.border_color(selected_border))
+        .on_key_down({
+            let entity = entity.clone();
+            let id = id.clone();
+            move |event, window, app| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    window.prevent_default();
+                    app.stop_propagation();
+                    entity.update(app, |this, cx| {
+                        this.open_group_dialog(Some(&id), window, cx);
+                        cx.notify();
+                    });
+                }
+            }
+        })
         .when(selected, |this| this.bg(selected_border.opacity(0.10)))
         .hover(move |style| style.bg(hover))
         .on_click({
@@ -6583,7 +6652,11 @@ fn render_global_card(
             )
         })
         .when(expanded, |this| {
-            this.child(div().w_full().child(Input::new(query)))
+            this.child(
+                div()
+                    .w_full()
+                    .child(Input::new(query).aria_label("搜索全局出口")),
+            )
                 .when(!shown_empty, |this| {
                     this.child(h_flex().w_full().flex_wrap().gap_1().children(
                         shown.into_iter().map(|(name, delay)| {
@@ -7055,6 +7128,7 @@ fn render_rule_set_card(
     let selected_border = theme_ext::selection_border(theme);
     let muted_fg = theme.muted_foreground;
     let context_choices = via_choices.clone();
+    let card_label = format!("编辑规则 {}，走向 {}", set.name, via_label(&via));
     const CHIP_LIMIT: usize = 10;
     let extra = set.matchers.len().saturating_sub(CHIP_LIMIT);
     surface(theme)
@@ -7067,6 +7141,24 @@ fn render_rule_set_card(
             theme.border
         })
         .cursor_pointer()
+        .role(Role::Button)
+        .aria_label(card_label)
+        .tab_index(0)
+        .focus_visible(|style| style.border_color(selected_border))
+        .on_key_down({
+            let entity = entity.clone();
+            let id = id.clone();
+            move |event, window, app| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    window.prevent_default();
+                    app.stop_propagation();
+                    entity.update(app, |this, cx| {
+                        this.open_rule_dialog(Some(&id), window, cx);
+                        cx.notify();
+                    });
+                }
+            }
+        })
         .when(selected, |this| this.bg(selected_border.opacity(0.10)))
         .hover(move |style| style.bg(hover))
         .on_click({
@@ -7179,21 +7271,7 @@ fn render_rule_set_card(
                             this.child(pill(theme, "解析仅用 IPv4", theme.info))
                         }),
                 )
-                .child({
-                    let entity = entity.clone();
-                    let del_id = id.clone();
-                    Button::new(SharedString::from(format!("del-rule-{del_id}")))
-                        .small()
-                        .danger()
-                        .label("删除")
-                        .on_click(move |_, window, app| {
-                            app.stop_propagation();
-                            entity.update(app, |this, cx| {
-                                this.confirm_remove_selected_rule(&del_id, window, cx);
-                                cx.notify();
-                            });
-                        })
-                }),
+                .child(div().w(px(12.))),
         )
         .child(
             h_flex()
@@ -7206,11 +7284,22 @@ fn render_rule_set_card(
                     )
                 }))
                 .when(extra > 0, |this| {
+                    let entity = entity.clone();
+                    let edit_id = id.clone();
+                    let name = set.name.clone();
                     this.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(format!("+{extra}")),
+                        Button::new(SharedString::from(format!("more-matchers-{edit_id}")))
+                            .small()
+                            .ghost()
+                            .label(format!("+{extra} 条"))
+                            .accessibility_label(format!("查看规则 {name} 的全部匹配条件"))
+                            .on_click(move |_, window, app| {
+                                app.stop_propagation();
+                                entity.update(app, |this, cx| {
+                                    this.open_rule_dialog(Some(&edit_id), window, cx);
+                                    cx.notify();
+                                });
+                            }),
                     )
                 })
                 .when(set.matchers.is_empty(), |this| {
@@ -7288,6 +7377,23 @@ fn render_rule_set_card(
                                     cx.notify();
                                 });
                             })
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    let del_id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("del-rule-{del_id}")))
+                        .small()
+                        .danger()
+                        .label("删除")
+                        .accessibility_label(format!("删除规则 {name}"))
+                        .on_click(move |_, window, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.confirm_remove_selected_rule(&del_id, window, cx);
+                                cx.notify();
+                            });
                         })
                 }),
         )
