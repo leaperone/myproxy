@@ -3910,6 +3910,7 @@ impl AppView {
                                                 .small()
                                                 .outline()
                                                 .label("显示直连")
+                                                .tooltip("显示直连")
                                                 .checked(self.connection_filters.show_direct)
                                                 .on_click(move |checked, _, app| {
                                                     let show = *checked;
