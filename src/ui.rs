@@ -3702,13 +3702,6 @@ impl AppView {
             &self.extension_status,
             self.applied.system_extension,
         );
-        let automatic_color = if automatic_label == "已开启" {
-            theme.success
-        } else if automatic_label == "未开启" {
-            theme.muted_foreground
-        } else {
-            theme_ext::warning_text(theme)
-        };
         let status_detail = if connected {
             format!(
                 "手动代理 {} · 自动代理 {}{}",
@@ -3766,18 +3759,7 @@ impl AppView {
                                     .text_color(theme.muted_foreground)
                                     .child(status_detail),
                             )
-                            .child(self.overview_hero(cx))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .child(pill(theme, "手动代理", brand_accent(theme)))
-                                    .child(pill(
-                                        theme,
-                                        automatic_label,
-                                        automatic_color,
-                                    )),
-                            ),
+                            .child(self.overview_hero(cx)),
                     )
                     .child(self.overview_setup_card(cx, theme)),
             )
