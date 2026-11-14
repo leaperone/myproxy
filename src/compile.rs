@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 
 use crate::catalog::{self, Catalog};
 use crate::gfw;
@@ -43,6 +44,13 @@ pub const DNS_LISTEN_PORT: u16 = 1053;
 /// name while Mihomo is unavailable, has to be answered directly, the
 /// provider dials this list instead of the endpoint it sees.
 pub const DNS_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
+
+/// The resolver fragment keeps AAAA, SVCB, and HTTPS IPv6 hints out while
+/// leaving global IPv6 enabled for domains without the user rule toggle.
+const DNS_IPV4_ONLY_NAMESERVERS: [&str; 2] = [
+    "udp://1.1.1.1#disable-ipv6=true&disable-qtype-64=true&disable-qtype-65=true",
+    "udp://8.8.8.8#disable-ipv6=true&disable-qtype-64=true&disable-qtype-65=true",
+];
 
 /// Health-check URL for fallback / url-test groups.
 const AUTO_GROUP_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
@@ -134,9 +142,9 @@ fn try_compile_root(
         // for those relays (and for proxy-server name resolution), but leave
         // packet-level hijacking to the DNS provider; `dns-hijack` only makes
         // sense on the TUN/utun path.
-        insert_dns(&mut root, false);
+        insert_dns(&mut root, false, strategy);
     } else if strategy.tun {
-        insert_tun_intercept(&mut root);
+        insert_tun_intercept(&mut root, strategy);
     }
 
     let proxies: Vec<serde_yaml::Value> = catalog.nodes.iter().map(|n| n.raw.clone()).collect();
@@ -431,7 +439,67 @@ fn yaml_strings(items: &[&str]) -> serde_yaml::Value {
 /// packets sent to arbitrary resolvers; the Network Extension DNS provider
 /// performs that interception on the system resolver path, so SE omits the
 /// `dns-hijack` option while sharing the resolver configuration.
-fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
+fn dns_ipv4_only_domains(strategy: &Strategy) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut domains = Vec::new();
+    for set in &strategy.rule_sets {
+        if !set.dns_ipv4_only {
+            continue;
+        }
+        for matcher in &set.matchers {
+            let (rule_kind, policy_domain, value) = match matcher.kind.as_str() {
+                "suffix" => (
+                    "DOMAIN-SUFFIX",
+                    format!(
+                        "+.{}",
+                        matcher
+                            .value
+                            .trim_start_matches("*.")
+                            .trim_start_matches('.')
+                    ),
+                    matcher
+                        .value
+                        .trim_start_matches("*.")
+                        .trim_start_matches('.')
+                        .to_string(),
+                ),
+                "domain" if matcher.value.starts_with("*.") => (
+                    "DOMAIN-SUFFIX",
+                    format!(
+                        "+.{}",
+                        matcher
+                            .value
+                            .trim_start_matches("*.")
+                            .trim_start_matches('.')
+                    ),
+                    matcher
+                        .value
+                        .trim_start_matches("*.")
+                        .trim_start_matches('.')
+                        .to_string(),
+                ),
+                "domain" => (
+                    "DOMAIN",
+                    matcher.value.clone(),
+                    matcher.value.clone(),
+                ),
+                _ => continue,
+            };
+            let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+            let policy_domain = policy_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            if value.is_empty() || policy_domain.is_empty() {
+                continue;
+            }
+            let rule = format!("{rule_kind},{value},real-ip");
+            if seen.insert((rule.clone(), policy_domain.clone())) {
+                domains.push((rule, policy_domain));
+            }
+        }
+    }
+    domains
+}
+
+fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool, strategy: &Strategy) {
     let mut dns = serde_yaml::Mapping::new();
     dns.insert("enable".into(), true.into());
     dns.insert(
@@ -442,15 +510,41 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     dns.insert("enhanced-mode".into(), "fake-ip".into());
     // Mirrored by `DNSProxyUpstreamResolver.mihomoFakeIPNetwork`.
     dns.insert("fake-ip-range".into(), "198.18.0.1/16".into());
+    dns.insert("fake-ip-filter-mode".into(), "rule".into());
+    let mut fake_ip_filter = vec![
+        "DOMAIN-SUFFIX,lan,real-ip",
+        "DOMAIN-SUFFIX,local,real-ip",
+        "DOMAIN,localhost,real-ip",
+    ];
+    let ipv4_domains = dns_ipv4_only_domains(strategy);
+    fake_ip_filter.extend(ipv4_domains.iter().map(|(rule, _)| rule.as_str()));
     dns.insert(
         "fake-ip-filter".into(),
-        yaml_strings(&["*.lan", "*.local", "localhost"]),
+        serde_yaml::Value::Sequence(
+            fake_ip_filter
+                .into_iter()
+                .map(|value| serde_yaml::Value::String(value.into()))
+                .collect(),
+        ),
     );
     dns.insert(
         "default-nameserver".into(),
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
     );
     dns.insert("nameserver".into(), yaml_strings(&DNS_NAMESERVERS));
+    let mut nameserver_policy = serde_yaml::Mapping::new();
+    for (_, domain) in &ipv4_domains {
+        nameserver_policy.insert(
+            domain.clone().into(),
+            yaml_strings(&DNS_IPV4_ONLY_NAMESERVERS),
+        );
+    }
+    if !nameserver_policy.is_empty() {
+        dns.insert(
+            "nameserver-policy".into(),
+            serde_yaml::Value::Mapping(nameserver_policy),
+        );
+    }
     dns.insert(
         "proxy-server-nameserver".into(),
         yaml_strings(&["8.8.8.8", "1.1.1.1"]),
@@ -468,7 +562,7 @@ fn insert_dns(root: &mut serde_yaml::Mapping, hijack: bool) {
     }
 }
 
-fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
+fn insert_tun_intercept(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
     let mut tun = serde_yaml::Mapping::new();
     tun.insert("enable".into(), true.into());
     tun.insert("stack".into(), "system".into());
@@ -477,7 +571,7 @@ fn insert_tun_intercept(root: &mut serde_yaml::Mapping) {
     tun.insert("auto-detect-interface".into(), true.into());
     root.insert("tun".into(), serde_yaml::Value::Mapping(tun));
 
-    insert_dns(root, true);
+    insert_dns(root, true, strategy);
 
     let mut http = serde_yaml::Mapping::new();
     http.insert(
@@ -933,7 +1027,7 @@ mod tests {
     #[test]
     fn system_extension_dns_engine_has_no_packet_hijack() {
         let mut root = serde_yaml::Mapping::new();
-        insert_dns(&mut root, false);
+        insert_dns(&mut root, false, &Strategy::default());
 
         let dns = root
             .get("dns")
@@ -947,13 +1041,69 @@ mod tests {
             )))
         );
         assert!(!dns.contains_key("dns-hijack"));
+        assert!(!dns.contains_key("nameserver-policy"));
         assert!(!root.contains_key("tun"));
+    }
+
+    #[test]
+    fn dns_engine_uses_real_ipv4_answers_for_enabled_rule_domains() {
+        let mut strategy = Strategy::default();
+        strategy.rule_sets.push(crate::strategy::RuleSet {
+            id: "bilibili".into(),
+            name: "Bilibili".into(),
+            via: "DIRECT".into(),
+            dns_ipv4_only: true,
+            matchers: vec![crate::strategy::Matcher {
+                kind: "suffix".into(),
+                value: "bilivideo.com".into(),
+            }],
+        });
+        let mut root = serde_yaml::Mapping::new();
+        insert_dns(&mut root, false, &strategy);
+
+        let dns = root
+            .get("dns")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("DNS mapping");
+        assert_eq!(dns.get("ipv6"), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(
+            dns.get("fake-ip-filter-mode"),
+            Some(&serde_yaml::Value::String("rule".into()))
+        );
+
+        let filters = dns
+            .get("fake-ip-filter")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("fake-ip filter")
+            .iter()
+            .map(|value| value.as_str().expect("filter entry"))
+            .collect::<Vec<_>>();
+        assert!(filters.contains(&"DOMAIN-SUFFIX,lan,real-ip"));
+        assert!(filters.contains(&"DOMAIN-SUFFIX,local,real-ip"));
+        assert!(filters.contains(&"DOMAIN,localhost,real-ip"));
+        assert!(filters.contains(&"DOMAIN-SUFFIX,bilivideo.com,real-ip"));
+
+        let policy = dns
+            .get("nameserver-policy")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("nameserver policy");
+        let servers = policy
+            .get("+.bilivideo.com")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("IPv4-only policy servers");
+        assert_eq!(
+            servers,
+            &DNS_IPV4_ONLY_NAMESERVERS
+                .iter()
+                .map(|server| serde_yaml::Value::String((*server).into()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn dns_engine_nameservers_match_the_provider_fallback_list() {
         let mut root = serde_yaml::Mapping::new();
-        insert_dns(&mut root, false);
+        insert_dns(&mut root, false, &Strategy::default());
 
         let nameservers = root
             .get("dns")
@@ -977,7 +1127,7 @@ mod tests {
     #[test]
     fn tun_dns_engine_hijacks_udp_and_tcp_port_53() {
         let mut root = serde_yaml::Mapping::new();
-        insert_tun_intercept(&mut root);
+        insert_tun_intercept(&mut root, &Strategy::default());
 
         let tun = root
             .get("tun")
@@ -1220,6 +1370,7 @@ mod tests {
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
+            dns_ipv4_only: false,
             matchers: vec![crate::strategy::Matcher {
                 kind: "suffix".into(),
                 value: "example.com".into(),
@@ -1305,6 +1456,7 @@ mod tests {
             id: "safari".into(),
             name: "Safari".into(),
             via: "gfw:Default".into(),
+            dns_ipv4_only: false,
             matchers: vec![crate::strategy::Matcher {
                 kind: "suffix".into(),
                 value: "example.com".into(),
