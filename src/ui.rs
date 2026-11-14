@@ -3741,9 +3741,15 @@ impl AppView {
                 }
             )
         } else if wanted {
-            "代理正在启动或恢复，请查看上方状态和操作提示。".into()
+            format!(
+                "代理正在启动或恢复。自动代理 {} · DNS {}。请查看上方状态和操作提示。",
+                overview_automatic_label, dns_label
+            )
         } else {
-            "连接后即可使用已配置的出口。需要让其他应用自动使用代理时，请在设置开启「自动代理」。".into()
+            format!(
+                "连接后即可使用已配置的出口。自动代理 {} · DNS {}。需要让其他应用自动使用代理时，请在设置开启「自动代理」。",
+                overview_automatic_label, dns_label
+            )
         };
         let status_label = if automatic_problem {
             "部分可用"
@@ -3917,7 +3923,7 @@ impl AppView {
                     ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
-                    .child(metric(theme, "核心报告", &reported_count)),
+                    .child(metric(theme, "代理连接", &reported_count)),
             )
             .when(connected, |this| {
                     this.child(
@@ -6570,7 +6576,7 @@ fn render_global_card(
                         .min_w_0()
                         .gap_2()
                         .items_center()
-                        .child(div().text_sm().font_semibold().child("全局出口")),
+                        .child(div().text_sm().font_semibold().child("内置全局出口")),
                 )
                 .child(
                     h_flex()
