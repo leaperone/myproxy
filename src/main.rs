@@ -110,6 +110,7 @@ fn window_options() -> WindowOptions {
 
 fn open_main_window(cx: &mut App) {
     cx.open_window(window_options(), |window, cx| {
+        window.set_window_title("MyProxy");
         let view = cx.new(|cx| AppView::new(window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     })

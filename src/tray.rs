@@ -116,7 +116,7 @@ fn build_tray() -> anyhow::Result<TrayKeepAlive> {
     let status = MenuItem::with_id("status", "未连接", false, None);
     let toggle = MenuItem::with_id("toggle", "连接", true, None);
     let open = MenuItem::with_id("open", "打开窗口", true, None);
-    let apply = MenuItem::with_id("apply", "更新配置", true, None);
+    let apply = MenuItem::with_id("apply", "应用", true, None);
     let about = MenuItem::with_id("about", "关于 MyProxy", true, None);
     let updates = MenuItem::with_id("updates", "检查更新", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
@@ -165,26 +165,28 @@ fn menu_face() -> MenuFace {
     let health = supervisor.last_health();
     let runtime = supervisor.runtime_identity();
     let extension = network_extension::status();
+    let automatic_enabled = supervisor
+        .applied_strategy()
+        .is_some_and(|strategy| strategy.system_extension);
     let mut status = match operation {
         OperationState::Connecting => "正在连接…".into(),
         OperationState::Applying => "正在应用策略…".into(),
         OperationState::Disconnecting => "正在断开…".into(),
         _ if busy => "正在处理操作…".into(),
-        _ if health.ready && runtime.is_some() => format!(
-            "Mixed 已就绪 · {} · 系统接管 {} · DNS {}",
-            runtime
+        _ if health.ready && runtime.is_some() => {
+            let automatic = crate::ui::automatic_proxy_status(&extension, automatic_enabled);
+            let scope = runtime
                 .map(|identity| {
                     if identity.mixed_lan {
-                        format!("所有网络接口:{}", identity.mixed_port)
+                        "局域网可用"
                     } else {
-                        format!("127.0.0.1:{}", identity.mixed_port)
+                        "仅本机可用"
                     }
                 })
-                .unwrap_or_default(),
-            extension.phase_label(),
-            extension.dns_label()
-        ),
-        _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "核心尚未就绪".into()),
+                .unwrap_or("仅本机可用");
+            format!("已连接 · 手动代理可用 · 自动代理{automatic} · {scope}")
+        }
+        _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "代理正在恢复".into()),
         _ => health.note.clone().unwrap_or_else(|| "未连接".into()),
     };
     if !busy && operation == OperationState::Error {

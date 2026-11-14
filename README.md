@@ -12,7 +12,7 @@ If the build is not Developer ID–notarized, macOS Gatekeeper may require a rig
 
 ## Updates
 
-Choose **正式版（Prod）** or **Nightly** under **设置 → 更新 → 更新通道**, then use **检查更新** or the menu-bar extra. The choice is saved in `strategy.json`; older configurations default to the installed build's channel. Switching back to Prod receives the next newer Prod build and does not downgrade the installed app.
+Choose **正式版（Prod）** or **Nightly** under **设置 → 高级设置 → 更新 → 更新通道**, then use **检查更新** or the menu-bar extra. The choice is saved in `strategy.json`; older configurations default to the installed build's channel. Switching back to Prod receives the next newer Prod build and does not downgrade the installed app.
 
 | Channel | Sparkle feed | CI/CD |
 | --- | --- | --- |
@@ -58,11 +58,11 @@ Chrome/Edge use a PAC script and Firefox uses the WebExtension proxy listener.
 Safari has no WebExtension proxy API, so its packaged resources use the native
 messaging protocol documented in [`browser-extension/safari/native-bridge.md`](browser-extension/safari/native-bridge.md).
 
-Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy.log`; 设置 → 日志 shows the tail. Subscription URLs are never written.
+Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy.log`; 设置 → 高级设置 → 日志 shows the tail. Subscription URLs are never written.
 
 ## CLI
 
-`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. Open **设置 → 命令行工具** to create or update the `~/.cargo/bin/myproxyctl` PATH link. **复制 Agent skill** copies the official instructions from `.agents/skills/agent/SKILL.md`. **安装说明** opens the optional installation dialog. The MacBook Air install script creates the same PATH link automatically.
+`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. Open **设置 → 高级设置 → 命令行工具** to create or update the `~/.cargo/bin/myproxyctl` PATH link. **复制 Agent skill** copies the official instructions from `.agents/skills/agent/SKILL.md`. **安装说明** opens the optional installation dialog. The MacBook Air install script creates the same PATH link automatically.
 
 The in-app installer refuses to replace an existing regular file. If a terminal cannot find `myproxyctl`, add `~/.cargo/bin` to `PATH`. You can still invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly.
 
@@ -78,7 +78,7 @@ myproxyctl --json export
 myproxyctl --json import ~/Downloads/myproxy-strategy-2026-09-10.json
 ```
 
-`export` writes the current `strategy.json` (default `~/Downloads/myproxy-strategy-YYYY-MM-DD.json`). `import` replaces the live file after writing `strategy.json.bak-import-*` and does not apply; run `apply` if the core should pick it up. The **设置 → 配置** panel does the same with a file dialog.
+`export` writes the current `strategy.json` (default `~/Downloads/myproxy-strategy-YYYY-MM-DD.json`). `import` replaces the live file after writing `strategy.json.bak-import-*` and does not apply; run `apply` if the core should pick it up. The **设置 → 高级设置 → 配置** panel uses file dialogs and also creates a backup. In the app, importing while a connection is requested applies the configuration immediately; otherwise it takes effect on the next connection or apply.
 
 ```sh
 cargo run --bin myproxyctl -- subscription add 'https://…' --name Example
@@ -92,7 +92,7 @@ cargo run --bin myproxyctl -- connect
 
 Default Mixed port is **7890**.
 
-To let devices on the same LAN use this Mac as a proxy, enable **设置 → 显式代理（Mixed）→ 对局域网开放** or run `myproxyctl mixed-lan on`. Configure the other device with this Mac's LAN IP and the Mixed port.
+To let devices on the same LAN use this Mac as a proxy, enable **设置 → 手动代理 → 允许局域网设备使用** or run `myproxyctl mixed-lan on`. Configure the other device with this Mac's LAN IP and the manual proxy port.
 
 Mixed has no inbound password and listens on all network interfaces when enabled. Leave the switch off on untrusted networks. VPN, hotspot, and firewall rules can make the port reachable from other networks. The controller, DNS, and System Extension listeners stay on loopback. Run `myproxyctl mixed-lan off` to close the LAN listener. Apply or reconnect after changing the setting.
 
@@ -130,7 +130,7 @@ application support directory.
   order, after built-in local-network bypasses, and only after traffic enters Mixed,
   System Extension, or TUN. Mixed and System Extension each have their own mode; TUN
   follows the profile rules and is mutually exclusive with System Extension.
-- Each DIRECT domain or suffix rule can enable `DNS 仅 IPv4`. The strategy stores this as
+- Each DIRECT domain or suffix rule can enable `网站解析仅用 IPv4`. The strategy stores this as
   `dns_ipv4_only`; proxy and reject rules keep fake-IP hostname matching. Process,
   keyword, and CIDR matchers do not provide DNS policies.
 - `gfw:<group>` is evaluated by mihomo (`RULE-SET,gfw` then DIRECT on a miss).

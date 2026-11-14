@@ -5,6 +5,7 @@ name = "Rust"
 prefix = "src/"
 check = "cargo check --quiet"
 build = "cargo build --quiet --bins --features sparkle"
+ci_check = "build"
 
 [[scope]]
 name = "Network Extension"

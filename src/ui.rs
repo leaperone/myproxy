@@ -33,6 +33,7 @@ use myproxy::strategy::{
     Subscription as StrategySubscription, SubscriptionPatch, GLOBAL_GROUP,
 };
 use myproxy::supervisor::{CoreHealth, OperationState, RuntimeIdentity, Supervisor};
+use myproxy::theme_ext;
 use myproxy::updates::{self, UpdateChannel};
 
 use crate::appearance::Appearance;
@@ -110,6 +111,8 @@ const REGION_PRESETS: &[(&str, &[&str])] = &[
     ("TW", &["tw", "台"]),
 ];
 
+const MAX_MIXED_PORT: u16 = 65_428;
+
 struct GroupEditor {
     parent: Entity<AppView>,
     edit_id: Option<String>,
@@ -125,6 +128,7 @@ struct GroupEditor {
     selected: String,
     member_query: Entity<InputState>,
     member_limit: usize,
+    advanced_expanded: bool,
 }
 
 impl GroupEditor {
@@ -173,6 +177,11 @@ impl GroupEditor {
             .as_ref()
             .map(|g| g.selected.clone())
             .unwrap_or_default();
+        let advanced_expanded = existing.as_ref().is_some_and(|group| {
+            !group.sources.is_empty()
+                || !group.name_contains.is_empty()
+                || !group.name_excludes.is_empty()
+        });
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("组名")
@@ -205,6 +214,7 @@ impl GroupEditor {
         Self {
             member_query,
             member_limit: 80,
+            advanced_expanded,
             parent,
             edit_id,
             notice: String::new(),
@@ -417,7 +427,7 @@ impl Render for GroupEditor {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.warning)
+                        .text_color(theme_ext::warning_text(&theme))
                         .child(self.notice.clone()),
                 )
             })
@@ -433,7 +443,7 @@ impl Render for GroupEditor {
                             .child(
                                 Button::new("group-mode-match")
                                     .small()
-                                    .label("条件")
+                                    .label("按筛选")
                                     .selected(!self.all_nodes),
                             )
                             .child(
@@ -453,6 +463,23 @@ impl Render for GroupEditor {
                         })
                     }),
             )
+            .child({
+                let entity = entity.clone();
+                Button::new("toggle-group-filters")
+                    .small()
+                    .secondary()
+                    .label(if self.advanced_expanded {
+                        "收起筛选条件"
+                    } else {
+                        "更多筛选条件"
+                    })
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.advanced_expanded = !this.advanced_expanded;
+                            cx.notify();
+                        });
+                    })
+            })
             .child(
                 h_flex()
                     .gap_1()
@@ -496,7 +523,7 @@ impl Render for GroupEditor {
                         })
                     }),
             )
-            .child(
+            .when(self.advanced_expanded, |this| this.child(
                 h_flex()
                     .gap_1()
                     .items_center()
@@ -530,8 +557,8 @@ impl Render for GroupEditor {
                                 });
                             })
                     })),
-            )
-            .child(
+            ))
+            .when(self.advanced_expanded, |this| this.child(
                 h_flex()
                     .gap_2()
                     .items_center()
@@ -551,8 +578,8 @@ impl Render for GroupEditor {
                                 });
                             })
                     })),
-            )
-            .when(!contains.is_empty(), |this| {
+            ))
+            .when(self.advanced_expanded && !contains.is_empty(), |this| {
                 this.child(chip_row(
                     entity.clone(),
                     "contains",
@@ -560,8 +587,8 @@ impl Render for GroupEditor {
                     &contains,
                 ))
             })
-            .child(v_flex().gap_1().child(div().text_xs().child("名称不含（仅自动匹配）")).child(Input::new(&self.excludes)))
-            .when(!excludes.is_empty(), |this| {
+            .when(self.advanced_expanded, |this| this.child(v_flex().gap_1().child(div().text_xs().child("名称不含（仅自动匹配）")).child(Input::new(&self.excludes))))
+            .when(self.advanced_expanded && !excludes.is_empty(), |this| {
                 this.child(chip_row(
                     entity.clone(),
                     "excludes",
@@ -609,6 +636,7 @@ struct RuleSetEditor {
     matchers: Vec<Matcher>,
     draft_kind: RuleDraftKind,
     match_input: Entity<InputState>,
+    via_query: Entity<InputState>,
 }
 
 impl RuleSetEditor {
@@ -640,11 +668,13 @@ impl RuleSetEditor {
             .unwrap_or(RuleDraftKind::Suffix);
         let name = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("项目名，例如 Cursor")
+                .placeholder("规则名，例如 Cursor")
                 .default_value(name)
         });
         let match_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(draft_kind.placeholder()));
+        let via_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索出口…"));
+        cx.observe(&via_query, |_, _, cx| cx.notify()).detach();
         Self {
             parent,
             edit_id: existing.as_ref().map(|s| s.id.clone()),
@@ -655,6 +685,7 @@ impl RuleSetEditor {
             matchers,
             draft_kind,
             match_input,
+            via_query,
         }
     }
 
@@ -707,7 +738,7 @@ impl RuleSetEditor {
         }
         let mut next = self.draft(cx);
         if next.name.is_empty() {
-            self.notice = "需要项目名。".into();
+            self.notice = "需要规则名。".into();
             self.name.read(cx).focus_handle(cx).focus(window, cx);
             cx.notify();
             return false;
@@ -718,7 +749,7 @@ impl RuleSetEditor {
             return false;
         }
         if next.via.is_empty() {
-            self.notice = "选走向：直连、拒绝、节点组、GFWList，或一个节点。".into();
+            self.notice = "请选择出口：直连、拒绝、节点组、受限网站，或一个节点。".into();
             cx.notify();
             return false;
         }
@@ -773,7 +804,15 @@ impl Render for RuleSetEditor {
         let theme = cx.theme().clone();
         let muted_fg = theme.muted_foreground;
         let via = self.via.clone();
-        let choices = via_choices(&parent.strategy, &parent.catalog, Some(&via));
+        let via_query = self.via_query.read(cx).value().trim().to_lowercase();
+        let choices: Vec<_> = via_choices(&parent.strategy, &parent.catalog, Some(&via))
+            .into_iter()
+            .filter(|choice| {
+                via_query.is_empty()
+                    || choice.label.to_lowercase().contains(&via_query)
+                    || choice.value.to_lowercase().contains(&via_query)
+            })
+            .collect();
         let dns_matcher_available = self
             .matchers
             .iter()
@@ -786,7 +825,7 @@ impl Render for RuleSetEditor {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.warning)
+                        .text_color(theme_ext::warning_text(&theme))
                         .child(self.notice.clone()),
                 )
             })
@@ -795,13 +834,21 @@ impl Render for RuleSetEditor {
                     .gap_2()
                     .items_center()
                     .child(v_flex().flex_1().gap_1().child(div().text_xs().child("规则名称")).child(Input::new(&self.name)))
+                    .child(
+                        v_flex()
+                            .w(px(240.))
+                            .gap_1()
+                            .child(div().text_xs().child("出口"))
+                            .child(
+                                h_flex()
+                                    .gap_1()
                     .child({
                         let entity = entity.clone();
                         Button::new("rule-via")
                             .small()
                             .label(via_label(&via))
                             .icon(IconName::ChevronDown)
-                            .min_w(px(160.))
+                                            .flex_1()
                             .dropdown_menu({
                                 let entity = entity.clone();
                                 move |menu, _, _| {
@@ -814,20 +861,20 @@ impl Render for RuleSetEditor {
                                     })
                                 }
                             })
-                    }),
+                                    })
+                                    .child(Input::new(&self.via_query)),
+                            ),
+                    ),
             )
-            .child({
+            .when(dns_ipv4_available || self.dns_ipv4_only, |this| {
+                this.child({
                 let entity = entity.clone();
                 Switch::new("rule-dns-ipv4-only")
                     .small()
-                    .label(if self.dns_ipv4_only {
-                        "DNS 仅 IPv4"
-                    } else {
-                        "DNS 双栈（仅直连规则）"
-                    })
+                    .label("网站解析仅用 IPv4")
                     .checked(self.dns_ipv4_only)
                     .disabled(!dns_ipv4_available && !self.dns_ipv4_only)
-                    .accessibility_label("直连规则的 DNS 仅使用 IPv4")
+                    .accessibility_label("这条直连规则的网站解析仅用 IPv4")
                     .on_click(move |_, _, app| {
                         entity.update(app, |this, cx| {
                             this.dns_ipv4_only = !this.dns_ipv4_only;
@@ -839,8 +886,9 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("仅对直连规则的域名或后缀生效，不改变规则走向。"),
+                    .child("仅对这条直连规则中的域名生效；其他规则不受影响。"),
             )
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -891,7 +939,7 @@ impl Render for RuleSetEditor {
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("逗号分隔批量加入；同一规则内任一匹配命中即生效。gfw: 由 mihomo 评 GFWList（命中走该组，未命中直连）；系统接管只把进程送到对应入口。"),
+                    .child("逗号分隔可一次加入多个条件；同一规则内任一条件命中即生效。受限网站仅在选择对应出口时参与判断。"),
             )
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
@@ -1010,7 +1058,7 @@ impl Render for SubscriptionEditor {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.warning)
+                        .text_color(theme_ext::warning_text(&theme))
                         .child(self.notice.clone()),
                 )
             })
@@ -1023,7 +1071,7 @@ impl Render for SubscriptionEditor {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_xs().child("订阅 URL"))
+                    .child(div().text_xs().child("订阅地址"))
                     .child(Input::new(&self.url)),
             )
             .child(
@@ -1048,12 +1096,74 @@ fn default_via(strategy: &Strategy) -> String {
 fn via_label(via: &str) -> String {
     let via = via.trim();
     if let Some(group) = myproxy::gfw::gfw_group(via) {
-        return format!("GFWList → {}", via_label(group));
+        return format!("受限网站 → {}", via_label(group));
     }
     match via.to_ascii_lowercase().as_str() {
         "direct" => "直连".into(),
         "reject" => "拒绝".into(),
         _ => via.strip_prefix("node:").unwrap_or(via).to_string(),
+    }
+}
+
+fn inbound_mode_label(mode: InboundMode) -> &'static str {
+    match mode {
+        InboundMode::Rule => "按规则",
+        InboundMode::Proxy => "默认出口",
+        InboundMode::Global => "全局出口",
+        InboundMode::Direct => "直连",
+    }
+}
+
+fn routing_profile_label(profile: RoutingProfile) -> &'static str {
+    match profile {
+        RoutingProfile::Allowlist => "未命中直连",
+        RoutingProfile::Gfwlist => "受限网站",
+        RoutingProfile::Group => "指定出口",
+        RoutingProfile::Chinadirect => "国内直连",
+    }
+}
+
+pub(crate) fn automatic_proxy_status(status: &RuntimeStatus, enabled: bool) -> &'static str {
+    if !enabled {
+        return "未开启";
+    }
+    if !status.observed {
+        return "等待确认";
+    }
+    if status.desired_revision > 0 && status.is_running_for(status.desired_revision) {
+        return "已开启";
+    }
+    match status.phase {
+        Phase::Running => match status.dns_phase {
+            network_extension::DnsPhase::Waiting
+            | network_extension::DnsPhase::Unknown
+            | network_extension::DnsPhase::Stopping => "等待确认",
+            network_extension::DnsPhase::Failed => "需要处理",
+            network_extension::DnsPhase::Running if !status.capture_enabled => "需要处理",
+            network_extension::DnsPhase::Running => "配置未生效",
+            network_extension::DnsPhase::Disabled => "需要处理",
+        },
+        Phase::WaitingApproval => "需要允许",
+        Phase::Requesting => "正在开启",
+        Phase::Stopping => "正在关闭",
+        Phase::RequiresReboot => "需要重启",
+        Phase::Failed => "需要处理",
+        Phase::Unsupported | Phase::Unbundled => "暂不可用",
+        Phase::Disabled => "未开启",
+    }
+}
+
+fn dns_status_label(status: &RuntimeStatus, enabled: bool) -> &'static str {
+    if !enabled || !status.observed {
+        return if enabled { "等待确认" } else { "未开启" };
+    }
+    match status.dns_phase {
+        network_extension::DnsPhase::Running => "已就绪",
+        network_extension::DnsPhase::Waiting => "正在检查",
+        network_extension::DnsPhase::Stopping => "正在关闭",
+        network_extension::DnsPhase::Failed => "需要处理",
+        network_extension::DnsPhase::Unknown => "等待确认",
+        network_extension::DnsPhase::Disabled => "未开启",
     }
 }
 
@@ -1090,7 +1200,7 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
         }
         out.push(ViaChoice {
             value,
-            label: format!("GFWList → {}", group.name),
+            label: format!("受限网站 → {}", group.name),
             section: 2,
         });
     }
@@ -1224,6 +1334,10 @@ pub struct AppView {
     member_query: Entity<InputState>,
     member_limits: HashMap<String, usize>,
     global_limit: usize,
+    global_expanded: bool,
+    advanced_settings_expanded: bool,
+    system_options_expanded: bool,
+    routing_expanded: bool,
 }
 
 impl AppView {
@@ -1447,7 +1561,7 @@ impl AppView {
             });
         });
         let rule_query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选规则…"));
-        let global_query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选 GLOBAL…"));
+        let global_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索出口…"));
         let member_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索所有组的节点…"));
         cx.observe(&rule_query, |_, _, cx| cx.notify()).detach();
@@ -1524,6 +1638,10 @@ impl AppView {
             member_query,
             member_limits: HashMap::new(),
             global_limit: 36,
+            global_expanded: false,
+            advanced_settings_expanded: false,
+            system_options_expanded: false,
+            routing_expanded: false,
         };
         this
     }
@@ -1564,6 +1682,10 @@ impl AppView {
         self.busy || self.supervisor.is_busy()
     }
 
+    fn show_status(&self) -> bool {
+        self.is_busy() || self.external_change_pending || !self.status.starts_with("策略已加载")
+    }
+
     fn operation_label(&self) -> &str {
         match self.supervisor.operation_state() {
             OperationState::Connecting => "正在连接…",
@@ -1577,8 +1699,8 @@ impl AppView {
     fn mixed_endpoint(&self) -> String {
         self.runtime
             .map(|runtime| {
-                if self.applied.mixed_lan {
-                    format!("所有网络接口:{}", runtime.mixed_port)
+                if runtime.mixed_lan {
+                    format!("局域网地址:{}", runtime.mixed_port)
                 } else {
                     format!("127.0.0.1:{}", runtime.mixed_port)
                 }
@@ -1609,11 +1731,11 @@ impl AppView {
             match self.extension_status.phase {
                 Phase::WaitingApproval => {
                     self.status =
-                        "系统接管等待授权。请在系统设置 › 通用 › 登录项与扩展中允许 myproxy。"
+                        "自动代理等待授权。请在系统设置 › 通用 › 登录项与扩展中允许 myproxy。"
                             .into();
                 }
                 Phase::RequiresReboot => {
-                    self.status = "系统接管需要重启后才能生效。".into();
+                    self.status = "自动代理需要重启后才能生效。".into();
                 }
                 _ => {}
             }
@@ -1729,7 +1851,7 @@ impl AppView {
                         }
                         this.sync_runtime();
                         this.status = format!(
-                            "策略已应用 · {} 个节点 · Mixed {}。",
+                            "配置已应用 · {} 个节点 · 手动代理 {}。",
                             this.catalog.nodes.len(),
                             this.mixed_endpoint()
                         );
@@ -1814,7 +1936,7 @@ impl AppView {
                 dirty = true;
             }
             None if became_ready => {
-                self.status = format!("Mixed 已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
+                self.status = format!("代理已就绪 · {}（HTTP + SOCKS5）", self.mixed_endpoint());
                 dirty = true;
             }
             _ => {}
@@ -1826,49 +1948,9 @@ impl AppView {
         if self.connected {
             "已连接"
         } else if self.wanted {
-            "核心异常"
+            "连接异常"
         } else {
             "未连接"
-        }
-    }
-
-    fn core_status_label(&self) -> &'static str {
-        match self.operation {
-            OperationState::Connecting => "启动中",
-            OperationState::Disconnecting => "停止中",
-            _ if self.connected => "已就绪",
-            _ if self.wanted || self.operation == OperationState::Error => "异常",
-            _ => "未连接",
-        }
-    }
-
-    fn extension_status_label(&self) -> &'static str {
-        let status = &self.extension_status;
-        if !self.applied.system_extension
-            && status.observed
-            && matches!(
-                status.phase,
-                Phase::Disabled | Phase::Unsupported | Phase::Unbundled
-            )
-        {
-            "关闭"
-        } else {
-            status.phase_label()
-        }
-    }
-
-    fn dns_status_label(&self) -> &'static str {
-        let status = &self.extension_status;
-        if !self.applied.system_extension
-            && status.observed
-            && matches!(
-                status.dns_phase,
-                network_extension::DnsPhase::Disabled | network_extension::DnsPhase::Unknown
-            )
-        {
-            "关闭"
-        } else {
-            status.dns_label()
         }
     }
 
@@ -2135,7 +2217,7 @@ impl AppView {
             }
             Err(err) => {
                 log::debug("ui", format!("connections poll failed: {err}"));
-                let msg = "暂时读不到核心连接，列表为上次读取结果。";
+                let msg = "暂时读不到代理连接，列表为上次读取结果。";
                 let changed = self.traffic_error.as_deref() != Some(msg);
                 self.traffic_error = Some(msg.into());
                 self.traffic_has_rate = false;
@@ -2162,7 +2244,7 @@ impl AppView {
             }
             Err(err) => {
                 log::debug("ui", format!("connections poll failed: {err}"));
-                let msg = "暂时读不到核心连接，列表为上次读取结果。";
+                let msg = "暂时读不到代理连接，列表为上次读取结果。";
                 let changed = self.traffic_error.as_deref() != Some(msg);
                 self.traffic_error = Some(msg.into());
                 self.traffic_has_rate = false;
@@ -2226,17 +2308,11 @@ impl AppView {
                     .when(compact, |this| this.justify_center())
                     .when(!compact, |this| this.justify_start())
                     .when(!compact, |this| {
-                        this.child(
-                            div()
-                                .w(px(3.))
-                                .h(px(20.))
-                                .rounded_full()
-                                .bg(if selected {
+                        this.child(div().w(px(3.)).h(px(20.)).rounded_full().bg(if selected {
                                     brand_accent(theme)
                                 } else {
                                     theme.sidebar.opacity(0.)
-                                }),
-                        )
+                        }))
                     })
                     .child(Icon::new(icon).size_4().flex_shrink_0())
                     .when(!compact, |this| {
@@ -2266,14 +2342,22 @@ impl AppView {
                     return;
                 }
                 let Ok(port) = this.port_input.read(cx).value().trim().parse::<u16>() else {
-                    this.status = "端口无效。".into();
+                    this.status = format!("端口须为 1 到 {}。", MAX_MIXED_PORT);
                     cx.notify();
                     return;
                 };
+                if !(1..=MAX_MIXED_PORT).contains(&port) {
+                    this.status = format!("端口须为 1 到 {}。", MAX_MIXED_PORT);
+                    cx.notify();
+                    return;
+                }
+                let previous = this.strategy.clone();
                 this.strategy.mixed_port = port;
                 this.strategy.exclude_filter = this.filter_input.read(cx).value().to_string();
                 if this.persist_with_override(this.external_change_pending) {
                     this.start_apply(cx);
+                } else {
+                    this.strategy = previous;
                 }
                 cx.notify();
             });
@@ -2342,13 +2426,11 @@ impl AppView {
                         }
                         this.apply_health(this.supervisor.last_health());
                         if this.connected {
-                            this.status = format!(
-                                "Mixed 已就绪 · {}（HTTP + SOCKS5）",
-                                this.mixed_endpoint()
-                            );
+                            this.status =
+                                format!("代理已就绪 · {}（HTTP + SOCKS5）", this.mixed_endpoint());
                             this.refresh_live(cx);
                         } else if this.status.starts_with("正在连接") {
-                            this.status = "核心已启动，正在确认是否可用…".into();
+                            this.status = "代理正在启动，请稍候确认是否可用…".into();
                         }
                     }
                     Ok(None) => {
@@ -2392,9 +2474,9 @@ impl AppView {
             return;
         }
         if let Some(existing) = self.strategy.rule_sets.iter().find(|set| {
-            set.matchers.iter().any(|item| {
-                item.kind == "app" && item.value.eq_ignore_ascii_case(matcher)
-            })
+            set.matchers
+                .iter()
+                .any(|item| item.kind == "app" && item.value.eq_ignore_ascii_case(matcher))
         }) {
             self.open_rule_dialog(Some(&existing.id.clone()), window, cx);
             return;
@@ -2428,9 +2510,9 @@ impl AppView {
             return;
         }
         if let Some(set) = self.strategy.rule_sets.iter_mut().find(|set| {
-            set.matchers.iter().any(|item| {
-                item.kind == "app" && item.value.eq_ignore_ascii_case(matcher)
-            })
+            set.matchers
+                .iter()
+                .any(|item| item.kind == "app" && item.value.eq_ignore_ascii_case(matcher))
         }) {
             set.via = via.to_string();
         } else {
@@ -2473,7 +2555,7 @@ impl AppView {
         let editing = self.rule_edit_id.is_some();
         let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
         window.open_dialog(cx, move |dialog, window, _| {
-            let ok_label = if editing { "保存" } else { "添加" };
+            let ok_label = if editing { "保存并应用" } else { "添加并应用" };
             dialog
                 .title(if editing {
                     "编辑规则"
@@ -2557,7 +2639,7 @@ impl AppView {
         let editing = id.is_some();
         let initial_focus = editor.read(cx).name.read(cx).focus_handle(cx);
         window.open_dialog(cx, move |dialog, window, _| {
-            let ok_label = if editing { "保存" } else { "添加" };
+            let ok_label = if editing { "保存并应用" } else { "添加并应用" };
             dialog
                 .title(if editing {
                     "编辑节点组"
@@ -2898,21 +2980,17 @@ impl AppView {
                 .footer(
                     DialogFooter::new()
                         .child(
-                            Button::new("danger-confirm-cancel")
-                                .label("取消")
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(Cancel), cx)
-                                }),
+                            Button::new("danger-confirm-cancel").label("取消").on_click(
+                                |_, window, cx| window.dispatch_action(Box::new(Cancel), cx),
+                            ),
                         )
                         .child(
                             Button::new("danger-confirm-ok")
                                 .danger()
                                 .label(confirm_label)
                                 .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(Confirm { secondary: false }),
-                                        cx,
-                                    )
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
                                 }),
                         ),
                 )
@@ -2930,7 +3008,7 @@ impl AppView {
             return match self.live_group(group) {
                 Some(live) if live.members.is_empty() => "不可用",
                 Some(live) if !live.now.is_empty() => &live.now,
-                _ => "等待核心状态",
+                _ => "等待代理就绪",
             };
         }
         if catalog::resolve_group_members(group, &self.catalog).is_empty() {
@@ -3056,7 +3134,7 @@ impl AppView {
         self.status = if id.is_some() {
             "正在关闭连接…"
         } else {
-            "正在关闭核心的全部连接（包含筛选外连接）…"
+            "正在关闭所有连接（包含筛选外的连接）…"
         }
         .into();
         let supervisor = self.supervisor.clone();
@@ -3086,7 +3164,7 @@ impl AppView {
                             this.status = if id.is_some() {
                                 "连接已关闭。"
                             } else {
-                                "核心的全部连接已关闭。"
+                                "所有连接已关闭。"
                             }
                             .into();
                         }
@@ -3105,7 +3183,7 @@ impl AppView {
 
     fn start_group_delay(&mut self, group_name: &str, cx: &mut Context<Self>) {
         if !self.connected || self.is_busy() {
-            self.status = "核心空闲且连接后再测延迟。".into();
+            self.status = "连接代理后才能测试延迟。".into();
             cx.notify();
             return;
         }
@@ -3134,7 +3212,7 @@ impl AppView {
                 }
                 match result {
                     Ok(_) => {
-                        this.status = format!("{name} 探测完成，正在读取核心最新探测记录。");
+                        this.status = format!("{name} 测试完成，正在读取最新结果。");
                         this.refresh_live(cx);
                     }
                     Err(err) => {
@@ -3210,55 +3288,24 @@ impl Render for AppView {
 impl AppView {
     fn title_bar(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let busy = self.is_busy();
-        let core_label = self.core_status_label();
-        let extension_label = self.extension_status_label();
-        let dns_label = self.dns_status_label();
-        let core_color = match core_label {
-            "已就绪" => theme.success,
-            "异常" => theme.warning,
-            "启动中" | "停止中" => theme.accent,
-            _ => theme.muted_foreground,
-        };
-        let extension_color = if !self.extension_status.observed {
-            theme.warning
-        } else if extension_label == "关闭"
-            || matches!(
-                self.extension_status.phase,
-                Phase::Disabled | Phase::Unsupported | Phase::Unbundled
-            ) {
-            theme.muted_foreground
-        } else if matches!(
-            self.extension_status.phase,
-            Phase::Failed | Phase::WaitingApproval | Phase::RequiresReboot
-        ) {
-            theme.warning
-        } else if matches!(self.extension_status.phase, Phase::Running) {
-            theme.success
+        let connection_label = if busy {
+            self.operation_label()
         } else {
-            theme.accent
+            self.connected_label()
         };
-        let dns_color = if !self.extension_status.observed {
-            theme.warning
-        } else if dns_label == "关闭"
-            || matches!(
-                self.extension_status.dns_phase,
-                network_extension::DnsPhase::Disabled
-            ) {
-            theme.muted_foreground
-        } else if matches!(
-            self.extension_status.dns_phase,
-            network_extension::DnsPhase::Failed
-                | network_extension::DnsPhase::Waiting
-                | network_extension::DnsPhase::Unknown
-        ) {
-            theme.warning
-        } else if matches!(
-            self.extension_status.dns_phase,
-            network_extension::DnsPhase::Running
-        ) {
+        let connection_color = if self.connected {
             theme.success
+        } else if self.wanted {
+            theme_ext::warning_text(theme)
         } else {
-            theme.accent
+            theme.muted_foreground
+        };
+        let automatic_label =
+            automatic_proxy_status(&self.extension_status, self.applied.system_extension);
+        let automatic_color = match automatic_label {
+            "已开启" => theme.success,
+            "未开启" => theme.muted_foreground,
+            _ => theme_ext::warning_text(theme),
         };
         TitleBar::new()
             .border_b_1()
@@ -3279,28 +3326,41 @@ impl AppView {
                             .items_center()
                             .child(div().text_sm().font_semibold().child("MyProxy"))
                             .children(
-                                updates::build_badge().map(|label| pill(theme, label, theme.warning)),
+                                updates::build_badge().map(|label| {
+                                    pill(theme, label, theme_ext::warning_text(theme))
+                                }),
                             ),
                     )
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(status_pill(theme, "核心", core_label, core_color))
                             .child(status_pill(
                                 theme,
-                                "系统接管",
-                                extension_label,
-                                extension_color,
+                                "状态",
+                                connection_label,
+                                connection_color,
                             ))
-                            .child(status_pill(theme, "DNS", dns_label, dns_color))
+                            .when(
+                                self.strategy.system_extension || self.applied.system_extension,
+                                |this| {
+                                    this.child(status_pill(
+                                        theme,
+                                        "自动代理",
+                                        automatic_label,
+                                        automatic_color,
+                                    ))
+                                },
+                            )
                             .when(self.connected && self.traffic_has_rate, |this| {
                                 this.child(
-                                    div().text_xs().text_color(theme.muted_foreground).child(format!(
+                                    div().text_xs().text_color(theme.muted_foreground).child(
+                                        format!(
                                         "↑{} · ↓{}",
                                         controller::format_rate(self.traffic_up),
                                         controller::format_rate(self.traffic_down)
-                                    )),
+                                        ),
+                                    ),
                                 )
                             })
                             .when(self.is_dirty() || self.external_change_pending, |this| {
@@ -3346,35 +3406,11 @@ impl AppView {
                         "总览",
                         IconName::LayoutDashboard,
                     ))
-                    .child(self.nav_item(
-                        cx,
-                        theme,
-                        Page::Connections,
-                        "连接",
-                        IconName::Network,
-                    ))
-                    .child(self.nav_item(
-                        cx,
-                        theme,
-                        Page::Subscriptions,
-                        "订阅",
-                        IconName::Inbox,
-                    ))
-                    .child(self.nav_item(
-                        cx,
-                        theme,
-                        Page::Groups,
-                        "节点组",
-                        IconName::Folder,
-                    ))
+                    .child(self.nav_item(cx, theme, Page::Connections, "连接", IconName::Network))
+                    .child(self.nav_item(cx, theme, Page::Subscriptions, "订阅", IconName::Inbox))
+                    .child(self.nav_item(cx, theme, Page::Groups, "节点组", IconName::Folder))
                     .child(self.nav_item(cx, theme, Page::Rules, "规则", IconName::Map))
-                    .child(self.nav_item(
-                        cx,
-                        theme,
-                        Page::Settings,
-                        "设置",
-                        IconName::Settings,
-                    )),
+                    .child(self.nav_item(cx, theme, Page::Settings, "设置", IconName::Settings)),
             )
     }
 
@@ -3388,8 +3424,16 @@ impl AppView {
             } else {
                 IconName::PanelLeft
             })
-            .tooltip(if compact { "展开侧栏" } else { "收起侧栏" })
-            .accessibility_label(if compact { "展开侧栏" } else { "收起侧栏" })
+            .tooltip(if compact {
+                "展开侧栏"
+            } else {
+                "收起侧栏"
+            })
+            .accessibility_label(if compact {
+                "展开侧栏"
+            } else {
+                "收起侧栏"
+            })
             .on_click({
                 let entity = cx.entity();
                 move |_, _, app| {
@@ -3411,7 +3455,7 @@ impl AppView {
                         .text_xs()
                         .font_medium()
                         .text_color(theme.muted_foreground)
-                        .child("WORKSPACE"),
+                        .child("导航"),
                 )
             })
             .child(toggle)
@@ -3428,7 +3472,8 @@ impl AppView {
             .py_6()
             .gap_3()
             .bg(theme.background)
-            .child(
+            .when(self.show_status(), |this| {
+                this.child(
                 div()
                     .id("status")
                     .w_full()
@@ -3439,18 +3484,26 @@ impl AppView {
                     .border_color(theme.border.opacity(0.54))
                     .bg(theme.muted.opacity(0.16))
                     .text_xs()
+                        .role(
+                            if self.status.contains("失败") || self.status.contains("错误") {
+                                Role::Alert
+                            } else {
+                                Role::Status
+                            },
+                        )
                     .text_color(
                         if self.status.contains("失败")
                             || self.status.contains("异常")
                             || self.status.contains("无响应")
                         {
-                            theme.warning
+                                theme_ext::warning_text(theme)
                         } else {
                             theme.muted_foreground
                         },
                     )
                     .child(self.status.clone()),
             )
+            })
             .child(match self.page {
                 Page::Rules => self.rules(cx, theme).into_any_element(),
                 Page::Connections => self.connections(cx, theme).into_any_element(),
@@ -3484,7 +3537,7 @@ impl AppView {
         connect = if busy {
             connect.label(self.operation_label().to_string())
         } else if self.wanted {
-            connect.danger().label("断开")
+            connect.label("断开")
         } else if primary {
             connect.primary().label("连接")
         } else {
@@ -3555,11 +3608,7 @@ impl AppView {
         let has_sub = !self.strategy.subscriptions.is_empty();
         let has_nodes = !self.catalog.nodes.is_empty();
         let muted = theme.muted_foreground;
-        let inbound = format!(
-            "规则只处理进入代理的流量。\nMixed 把客户端代理设为 {}（HTTP + SOCKS5）。\n系统接管在设置里打开，并到 {} 允许 myproxy。\nTUN 与接管互斥，首次要管理员密码。",
-            self.mixed_endpoint(),
-            setup::login_items_path_label()
-        );
+        let inbound = "需要让其他应用自动使用代理时，可在设置开启「自动代理」。";
         surface(theme)
             .flex_1()
             .min_w(px(300.))
@@ -3570,8 +3619,8 @@ impl AppView {
                     .min_w_0()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().font_semibold().child("配置"))
-                    .child(pill(theme, "SETUP", brand_accent(theme))),
+                    .child(div().text_sm().font_semibold().child("配置步骤"))
+                    .child(pill(theme, "3 步", brand_accent(theme))),
             )
             .child(
                 div()
@@ -3579,9 +3628,9 @@ impl AppView {
                     .text_xs()
                     .text_color(muted)
                     .child(if has_sub {
-                        "1. 添加订阅 — 已完成"
+                        "1. 添加订阅 · 已完成"
                     } else {
-                        "1. 添加订阅 — 下一步"
+                        "1. 添加订阅 · 下一步"
                     }),
             )
             .child(
@@ -3590,9 +3639,9 @@ impl AppView {
                     .text_xs()
                     .text_color(muted)
                     .child(if has_nodes {
-                        "2. 刷新得到节点 — 已完成"
+                        "2. 刷新节点 · 已完成"
                     } else {
-                        "2. 刷新得到节点 — 有订阅后点「刷新订阅并应用」"
+                        "2. 刷新节点 · 有订阅后点击「刷新订阅并应用」"
                     }),
             )
             .child(
@@ -3601,18 +3650,12 @@ impl AppView {
                     .text_xs()
                     .text_color(muted)
                     .child(if self.connected {
-                        "3. 连接核心 — 已连接"
+                        "3. 连接代理 · 已连接"
                     } else {
-                        "3. 连接核心 — 有节点后再连。空组出口不可用，不会直连。"
+                        "3. 连接代理 · 有节点后再连。空组不会自动直连。"
                     }),
             )
-            .child(
-                div()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(inbound),
-            )
+            .child(div().min_w_0().text_xs().text_color(muted).child(inbound))
             .when(next == SetupNext::AddSubscription, |this| {
                 this.child(
                     Button::new("setup-add-subscription")
@@ -3648,52 +3691,58 @@ impl AppView {
         } else {
             "—".into()
         };
-        let now = self.overview_proxy_label();
-        let mixed = self.mixed_endpoint();
-        let runtime_status = if connected { "LIVE" } else { "IDLE" };
-        let runtime_color = if connected {
-            theme.success
+        let status_badge = if connected {
+            "可用"
+        } else if wanted {
+            "正在恢复"
         } else {
-            theme.muted_foreground
+            "未连接"
+        };
+        let automatic_label = automatic_proxy_status(
+            &self.extension_status,
+            self.applied.system_extension,
+        );
+        let status_detail = if connected {
+            format!(
+                "手动代理 {} · 自动代理 {}{}",
+                self.mixed_endpoint(),
+                automatic_label,
+                if self.applied.tun {
+                    " · 全局网络接管已开启"
+                } else {
+                    ""
+                }
+            )
+        } else if wanted {
+            "代理正在启动或恢复，请查看上方状态和操作提示。".into()
+        } else {
+            "连接后即可使用已配置的出口。需要让其他应用自动使用代理时，请在设置开启「自动代理」。".into()
         };
         v_flex()
-            .gap_5()
+            .gap_4()
             .child(page_title(
                 theme,
                 "总览",
-                &self.inbound_modes_subtitle(),
+                "连接代理、查看状态，并完成订阅和出口配置。",
             ))
             .child(
                 h_flex()
                     .w_full()
-                    .gap_4()
+                    .gap_3()
                     .flex_wrap()
                     .items_stretch()
                     .child(
-                        v_flex()
+                        surface(theme)
                             .flex_1()
-                            .min_w(px(420.))
-                            .max_w_full()
-                            .p_6()
-                            .gap_4()
-                            .rounded(theme.radius_lg)
-                            .border_1()
-                            .border_color(brand_accent(theme).opacity(0.42))
-                            .bg(theme.background.mix_oklab(brand_accent(theme), 0.92))
-                            .shadow_md()
+                            .min_w(px(360.))
+                            .p_5()
+                            .gap_3()
                             .child(
                                 h_flex()
-                                    .min_w_0()
                                     .items_center()
                                     .justify_between()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(brand_accent(theme))
-                                            .child("RUNTIME STATUS"),
-                                    )
-                                    .child(pill(theme, runtime_status, runtime_color)),
+                                    .child(div().text_sm().font_semibold().child("当前状态"))
+                                    .child(pill(theme, status_badge, brand_accent(theme))),
                             )
                             .child(
                                 h_flex()
@@ -3701,115 +3750,44 @@ impl AppView {
                                     .items_center()
                                     .child(status_dot(theme, connected))
                                     .child(
-                                        div()
-                                            .text_2xl()
-                                            .font_bold()
-                                            .child(self.connected_label()),
+                                        div().text_2xl().font_bold().child(self.connected_label()),
                                     ),
                             )
                             .child(
                                 div()
-                                    .min_w_0()
-                                    .max_w(px(680.))
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
-                                    .child(if connected {
-                                        format!(
-                                            "Mixed {} · 系统接管 {} · DNS {}{}",
-                                            mixed,
-                                            self.extension_status.phase_label(),
-                                            self.extension_status.dns_label(),
-                                            if self.applied.tun {
-                                                " · TUN 按策略规则运行"
-                                            } else {
-                                                ""
-                                            }
-                                        )
-                                    } else if wanted {
-                                        "核心尚未就绪，请查看操作状态。".into()
-                                    } else {
-                                        format!(
-                                            "连接后 Mixed {} 可供显式代理客户端使用。系统接管和 TUN 在设置里分别打开；规则只处理进入这三条入站的流量。",
-                                            mixed
-                                        )
-                                    }),
+                                    .child(status_detail),
                             )
-                            .child(self.overview_hero(cx))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .child(pill(theme, &format!("MIXED {}", mixed), brand_accent(theme)))
-                                    .child(pill(
-                                        theme,
-                                        &format!("SYSTEM {}", self.extension_status.phase_label()),
-                                        if matches!(self.extension_status.phase, Phase::Running) {
-                                            theme.success
-                                        } else {
-                                            theme.muted_foreground
-                                        },
-                                    ))
-                                    .child(pill(
-                                        theme,
-                                        &format!("DNS {}", self.extension_status.dns_label()),
-                                        if matches!(
-                                            self.extension_status.dns_phase,
-                                            network_extension::DnsPhase::Running
-                                        ) {
-                                            theme.success
-                                        } else {
-                                            theme.muted_foreground
-                                        },
-                                    )),
-                            ),
+                            .child(self.overview_hero(cx)),
                     )
                     .child(self.overview_setup_card(cx, theme)),
             )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(section_heading(theme, "LIVE PULSE"))
+            .child(section_heading(theme, "实时概览"))
                     .child(
                         h_flex()
                             .gap_3()
                             .flex_wrap()
-                            .child(metric(theme, "状态", self.connected_label()))
                             .child(metric(theme, "上传", &up))
                             .child(metric(theme, "下载", &down))
                             .child(metric(theme, "连接数", &conns)),
-                    ),
             )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(section_heading(theme, "ROUTING SNAPSHOT"))
+            .child(section_heading(theme, "当前路由"))
                     .child(
                         h_flex()
                             .gap_3()
                             .flex_wrap()
-                            .child(metric(theme, "PROXY", &now))
+                    .child(metric(theme, "默认出口", &self.overview_proxy_label()))
                             .child(metric(
                                 theme,
-                                "GLOBAL",
+                        "全局出口",
                                 &global_selection_label(&self.global_now(), self.connected),
                             ))
                             .child(metric(
                                 theme,
-                                "系统接管",
-                                self.extension_status.phase_label(),
-                            ))
-                            .child(metric(theme, "Mixed", &mixed))
-                            .child(metric(
-                                theme,
-                                "节点",
-                                &format!(
-                                    "{} kept / 过滤 {} / 拉取失败 {}",
-                                    self.catalog.nodes.len(),
-                                    self.catalog.filter_excluded_count(),
-                                    self.catalog.fetch_failure_count()
-                                ),
+                        "可用节点",
+                        &format!("{} 个可用", self.catalog.nodes.len()),
                             )),
-                    ),
             )
             .when(
                 self.traffic_error.is_some() || self.proxy_error.is_some(),
@@ -3817,7 +3795,7 @@ impl AppView {
                     this.child(
                         div()
                             .text_xs()
-                            .text_color(theme.warning)
+                            .text_color(theme_ext::warning_text(theme))
                             .child(
                                 self.traffic_error
                                     .clone()
@@ -3847,28 +3825,21 @@ impl AppView {
         } else {
             "—".into()
         };
-        let count = if connected && self.traffic_error.is_some() {
-            "读不到".into()
-        } else if connected {
-            self.traffic.connection_count.to_string()
-        } else {
-            "—".into()
-        };
-        let mixed = self.mixed_endpoint();
+        let total_count = self.traffic.connection_count;
+        let loaded_count = self.traffic.connections.len();
         let filtered =
             controller::filter_connections(&self.traffic.connections, &self.connection_filters);
-        let filter_note = if !connected || self.traffic.connections.is_empty() {
-            String::new()
-        } else if filtered.len() == self.traffic.connections.len()
-            && self.connection_filters.show_direct
-            && !self.connection_filters.has_column_filter()
-        {
-            String::new()
+        let filtered_count = filtered.len();
+        let summary = if !connected {
+            "连接代理后，这里会显示进入 myproxy 的流量。".into()
+        } else if let Some(error) = &self.traffic_error {
+            error.clone()
+        } else if total_count == 0 && loaded_count == 0 {
+            "当前没有活动连接。只有进入手动代理或自动代理的流量会出现在这里。".into()
         } else {
             format!(
-                "当前筛选 {} / 已加载 {} 条",
-                filtered.len(),
-                self.traffic.connections.len()
+                "已载入 {} 条 · 当前显示 {} 条",
+                loaded_count, filtered_count
             )
         };
         v_flex()
@@ -3882,54 +3853,57 @@ impl AppView {
             .child(page_title(
                 theme,
                 "连接",
-                if self.strategy.system_extension {
-                    "经过 Mihomo 的连接。系统接管中继后会尽量显示真实进程；扩展直接放行或拒绝的活动不在此表。"
-                } else {
-                    "经过 Mihomo 的连接。当前只看到主动指定 Mixed 的客户端。打开系统接管后，未填代理的应用也会出现。"
-                },
+                "查看进入代理的流量；自动放行或拒绝的活动不会出现在这里。",
             ))
             .child(
                 h_flex()
                     .gap_3()
                     .flex_wrap()
-                    .items_stretch()
-                    .child(
-                        metric(theme, "状态", self.connected_label())
-                            .min_w(px(100.))
-                            .p_3(),
-                    )
-                    .child(metric(theme, "Mixed 端口", &mixed).min_w(px(100.)).p_3())
-                    .child(metric(theme, "上传", &up).min_w(px(100.)).p_3())
-                    .child(metric(theme, "下载", &down).min_w(px(100.)).p_3())
-                    .child(metric(theme, "连接数", &count).min_w(px(100.)).p_3()),
+                    .child(metric(
+                        theme,
+                        "状态",
+                        self.connected_label(),
+                    ))
+                    .child(metric(theme, "上传", &up))
+                    .child(metric(theme, "下载", &down))
+                    .child(metric(theme, "活动连接", &total_count.to_string())),
             )
-            .when(
-                self.traffic_error.is_some() || (connected && !self.traffic.connections.is_empty()),
-                |this| {
+            .when(connected, |this| {
                     this.child(
                         h_flex()
                             .items_center()
                             .justify_between()
                             .gap_2()
+                        .flex_wrap()
                             .child(
                                 div()
+                                .flex_1()
+                                .min_w(px(240.))
                                     .text_xs()
                                     .text_color(if self.traffic_error.is_some() {
-                                        theme.warning
+                                    theme_ext::warning_text(theme)
                                     } else {
                                         muted_fg
                                     })
-                                    .child(
-                                        self.traffic_error
-                                            .clone()
-                                            .unwrap_or(filter_note),
-                                    ),
+                                .child(summary.clone()),
                             )
-                            .when(connected && !self.traffic.connections.is_empty(), |this| {
-                                this.child(
+                        .child(
                                     h_flex()
                                         .gap_2()
                                         .items_center()
+                                .child({
+                                    let entity = entity.clone();
+                                    Button::new("refresh-connections")
+                                        .small()
+                                        .label("重新读取")
+                                        .disabled(self.is_busy())
+                                        .on_click(move |_, _, app| {
+                                            entity.update(app, |this, cx| {
+                                                this.refresh_live(cx);
+                                                cx.notify();
+                                            });
+                                        })
+                                })
                                         .child({
                                             let entity = entity.clone();
                                             Toggle::new("show-direct-connections")
@@ -3946,50 +3920,44 @@ impl AppView {
                                                     });
                                                 })
                                         })
-                                        .when(
-                                            self.connection_filters.has_column_filter(),
-                                            |this| {
-                                                this.child({
+                                .when(self.connection_filters.has_column_filter(), |this| {
                                                     let entity = entity.clone();
+                                    this.child(
                                                     Button::new("clear-connection-filters")
                                                         .small()
                                                         .ghost()
                                                         .label("清除筛选")
                                                         .on_click(move |_, _, app| {
                                                             entity.update(app, |this, cx| {
-                                                                this.connection_filters
-                                                                    .clear_columns();
+                                                    this.connection_filters.clear_columns();
                                                                 cx.notify();
                                                             });
-                                                        })
-                                                })
-                                            },
+                                            }),
                                         )
-                                        .child({
+                                })
+                                .when(loaded_count > 0, |this| {
                                             let entity = entity.clone();
+                                    this.child(
                                             Button::new("close-all-connections")
                                                 .small()
                                                 .danger()
-                                                .label("关闭核心全部连接")
+                                            .label("关闭所有连接")
                                                 .disabled(self.is_busy())
-                                                .tooltip("关闭 Mihomo 全部连接，包含当前筛选外的连接")
+                                            .tooltip("关闭所有连接，包含当前筛选外的连接")
                                                 .on_click(move |_, window, app| {
                                                     entity.update(app, |this, cx| {
-                                                        this.confirm_close_all_connections(
-                                                            window, cx,
-                                                        );
+                                                    this.confirm_close_all_connections(window, cx);
                                                     });
-                                                })
                                         }),
                                 )
                             }),
+                        ),
                     )
-                },
-            )
+            })
             .when(!connected && !self.wanted, |this| {
                 this.child(empty_hint_action(
                     theme,
-                    "核心未连接。到总览连接后，这里显示经过 Mihomo 的连接。",
+                    "代理尚未连接。先回到总览连接代理。",
                     Button::new("connections-go-overview")
                         .primary()
                         .label("去总览连接")
@@ -3997,35 +3965,31 @@ impl AppView {
                 ))
             })
             .when(!connected && self.wanted, |this| {
-                this.child(empty_hint(
-                    theme,
-                    "核心未就绪。恢复后显示经过 Mihomo 的连接。",
-                ))
+                this.child(empty_hint(theme, "代理正在恢复，连接列表会在就绪后出现。"))
             })
-            .when(
-                connected && self.traffic.connections.is_empty() && self.traffic_error.is_none(),
-                |this| {
-                    this.child(empty_hint(
+            .when(connected && total_count == 0 && loaded_count == 0 && self.traffic_error.is_none(), |this| {
+                this.child(empty_hint(theme, "暂无经过代理的连接。打开浏览器或其他客户端后，活动会出现在这里。"))
+            })
+            .when(connected && total_count > 0 && loaded_count == 0, |this| {
+                this.child(empty_hint_action(
                         theme,
-                        if self.strategy.system_extension {
-                            "核心目前未记录连接。系统接管已打开时，被中继进 Mihomo 的应用会列在这里。"
-                        } else {
-                            "核心目前未记录连接。只有进入 Mixed 或被系统接管中继的流量会出现在这里。"
-                        },
+                    "代理服务报告有连接，但暂时没有可显示的连接行。请重新读取。",
+                    Button::new("refresh-connections-empty")
+                        .primary()
+                        .label("重新读取")
+                        .disabled(self.is_busy())
+                        .on_click({
+                            let entity = entity.clone();
+                            move |_, _, app| {
+                                entity.update(app, |this, cx| {
+                                    this.refresh_live(cx);
+                                    cx.notify();
+                                });
+                            }
+                        }),
                     ))
-                },
-            )
-            .when(
-                connected && self.traffic.connections.is_empty() && self.traffic_error.is_some(),
-                |this| {
-                    this.child(empty_hint(
-                        theme,
-                        "核心在跑，但读不到连接列表。不是没有流量，是控制器没响应。",
-                    ))
-                },
-            )
-            .when(connected && !self.traffic.connections.is_empty(), |this| {
-                let row_count = filtered.len();
+            })
+            .when(connected && loaded_count > 0, |this| {
                 this.child(
                     h_flex()
                         .id("connection-list")
@@ -4036,10 +4000,9 @@ impl AppView {
                         .overflow_x_scrollbar()
                         .child(
                             v_flex()
-                                .min_w(px(920.))
+                                .min_w(px(560.))
                                 .w_full()
                                 .flex_1()
-                                .flex_shrink_0()
                                 .min_h_0()
                                 .gap_1()
                                 .child(connection_header_row(
@@ -4048,68 +4011,55 @@ impl AppView {
                                     &self.traffic.connections,
                                     &self.connection_filters,
                                 ))
-                                .when(row_count == 0, |this| {
+                                .when(filtered_count == 0, |this| {
                                     this.child(
                                         div()
                                             .px_3()
                                             .py_2()
                                             .text_xs()
                                             .text_color(muted_fg)
-                                            .child(if self.connection_filters.show_direct {
-                                                "没有符合筛选的连接。"
-                                            } else {
-                                                "没有符合筛选的连接。打开「显示直连」可查看直连。"
-                                            }),
+                                            .child("没有符合当前筛选的连接。"),
                                     )
                                 })
-                                .when(row_count > 0, |this| {
+                                .when(filtered_count > 0, |this| {
                                     this.child(
                                         uniform_list(
                                             "connection-rows",
-                                            row_count,
+                                            filtered_count,
                                             cx.processor(|this, range: Range<usize>, _window, cx| {
                                                 let filtered = controller::filter_connections(
                                                     &this.traffic.connections,
                                                     &this.connection_filters,
                                                 );
                                                 let theme = cx.theme().clone();
-                                                let choices =
-                                                    via_choices(&this.strategy, &this.catalog, None);
+                                                let choices = via_choices(&this.strategy, &this.catalog, None);
                                                 let busy = this.is_busy();
                                                 let entity = cx.entity();
-                                                range
-                                                    .filter_map(|ix| {
-                                                        filtered.get(ix).map(|conn| {
-                                                            render_connection_row(
-                                                                entity.clone(),
-                                                                &theme,
-                                                                conn,
-                                                                choices.clone(),
-                                                                busy,
-                                                            )
-                                                        })
+                                                range.filter_map(|ix| {
+                                                    filtered.get(ix).map(|conn| {
+                                                        render_connection_row(
+                                                            entity.clone(), &theme, conn,
+                                                            choices.clone(), busy,
+                                                        )
                                                     })
-                                                    .collect::<Vec<_>>()
+                                                }).collect::<Vec<_>>()
                                             }),
                                         )
                                         .flex_1()
+                                        .min_h(px(160.))
                                         .w_full(),
                                     )
                                 })
-                                .when(
-                                    self.traffic.connection_count > self.traffic.connections.len(),
-                                    |this| {
+                                .when(total_count > loaded_count, |this| {
                                         this.child(
                                             div().px_3().py_2().text_xs().text_color(muted_fg).child(
                                                 format!(
-                                                    "当前仅加载流量最高的 {} 条，核心共 {} 条；筛选只作用于已加载列表。",
-                                                    self.traffic.connections.len(),
-                                                    self.traffic.connection_count
+                                                "已加载流量最高的 {} 条，共 {} 条；筛选只作用于已加载列表。",
+                                                loaded_count, total_count
                                                 ),
                                             ),
                                         )
-                                    },
-                                ),
+                                }),
                         ),
                 )
             })
@@ -4122,7 +4072,7 @@ impl AppView {
             .child(page_title(
                 theme,
                 "订阅",
-                "添加或删除后需应用。规则和模式变更使用匹配的缓存；刷新按钮会重新获取订阅。",
+                "添加订阅并刷新节点，之后就能在节点组里选择出口。",
             ))
             .child(
                 Button::new("refresh-subscriptions")
@@ -4157,7 +4107,7 @@ impl AppView {
                             .gap_1()
                             .flex_1()
                             .min_w(px(180.))
-                            .child(div().text_xs().child("订阅 URL"))
+                            .child(div().text_xs().child("订阅地址"))
                             .child(Input::new(&self.url_input)),
                     )
                     .child(
@@ -4177,7 +4127,7 @@ impl AppView {
                                         let url =
                                             this.url_input.read(cx).value().trim().to_string();
                                         if name.is_empty() || url.is_empty() {
-                                            this.status = "填写订阅名和订阅 URL。".into();
+                                            this.status = "填写订阅名和订阅地址。".into();
                                         } else {
                                             let previous = this.strategy.clone();
                                             this.strategy.add_subscription(name, url);
@@ -4231,7 +4181,10 @@ impl AppView {
                                         .text_xs()
                                         .font_family(theme.mono_font_family.clone())
                                         .text_color(theme.muted_foreground)
-                                        .child(sub.url.clone()),
+                                        .child(format!(
+                                            "已配置 · {}",
+                                            subscription_display_url(&sub.url)
+                                        )),
                                 )
                                 .child(
                                     h_flex()
@@ -4239,20 +4192,22 @@ impl AppView {
                                         .child({
                                             let entity = entity.clone();
                                             let id = id.clone();
-                                            Button::new(SharedString::from(format!("edit-sub-{id}")))
+                                            Button::new(SharedString::from(format!(
+                                                "edit-sub-{id}"
+                                            )))
                                                 .small()
                                                 .label("编辑")
                                                 .disabled(self.is_busy())
                                                 .on_click(move |_, window, app| {
                                                     entity.update(app, |this, cx| {
-                                                        this.open_subscription_dialog(
-                                                            &id, window, cx,
-                                                        );
+                                                    this.open_subscription_dialog(&id, window, cx);
                                                     });
                                                 })
                                         })
                                         .child(
-                                            Button::new(SharedString::from(format!("del-sub-{id}")))
+                                            Button::new(SharedString::from(format!(
+                                                "del-sub-{id}"
+                                            )))
                                                 .small()
                                                 .danger()
                                                 .label("删除")
@@ -4271,7 +4226,12 @@ impl AppView {
                                 ),
                         )
                         .when_some(warning, |this, warning| {
-                            this.child(div().text_xs().text_color(theme.warning).child(warning))
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme_ext::warning_text(theme))
+                                    .child(warning),
+                            )
                         }),
                 )
             }))
@@ -4279,28 +4239,43 @@ impl AppView {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
+                    .child(format!("当前有 {} 个可用节点。", self.catalog.nodes.len())),
+            )
+            .when(self.catalog.filter_excluded_count() > 0, |this| {
+                this.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
                     .child(format!(
-                        "当前目录 {} 个节点，过滤排除 {}，拉取失败 {}。",
-                        self.catalog.nodes.len(),
-                        self.catalog.filter_excluded_count(),
+                            "已按过滤词隐藏 {} 个节点。",
+                            self.catalog.filter_excluded_count()
+                        )),
+                )
+            })
+            .when(self.catalog.fetch_failure_count() > 0, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme_ext::warning_text(theme))
+                        .child(format!(
+                            "{} 个订阅暂时未刷新成功，请稍后重试。",
                         self.catalog.fetch_failure_count()
                     )),
             )
+            })
     }
 
     fn groups(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
-        let accent = brand_accent(theme);
         let query = self.member_query.read(cx).value().trim().to_lowercase();
         v_flex()
             .gap_4()
             .child(page_title(
                 theme,
                 "节点组",
-                "手动组可选节点，自动组展示核心当前成员；点击「编辑」调整条件，卡片边框仅表示编辑中。来源约束名称匹配，钉住优先，精确排除最终生效。",
+                "管理出口，并选择当前使用的节点。",
             ))
-            .child(
-                h_flex().child({
+            .child(h_flex().child({
                     let entity = entity.clone();
                     Button::new("add-group")
                         .primary()
@@ -4311,15 +4286,13 @@ impl AppView {
                                 cx.notify();
                             });
                         })
-                }),
-            )
+            }))
             .child({
                 let now = self.global_now();
                 let members = self.global_members(cx);
                 render_global_card(
                     entity.clone(),
                     theme,
-                    accent,
                     &now,
                     &members,
                     self.delaying.contains(GLOBAL_GROUP),
@@ -4327,14 +4300,20 @@ impl AppView {
                     self.strategy.uses_global(),
                     &self.global_query,
                     self.global_limit,
+                    self.global_expanded,
                     self.is_busy(),
                 )
             })
-            .child(v_flex().gap_1().child(div().text_xs().child("搜索节点组成员")).child(Input::new(&self.member_query)))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_xs().child("搜索所有节点"))
+                    .child(Input::new(&self.member_query)),
+            )
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint_action(
                     theme,
-                    "还没有节点组。添加一个组，或导入带默认 PROXY 的配置。",
+                    "还没有节点组。添加一个组开始选择出口。",
                     Button::new("groups-add-empty")
                         .primary()
                         .label("添加节点组")
@@ -4353,7 +4332,7 @@ impl AppView {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(theme.warning)
+                        .text_color(theme_ext::warning_text(theme))
                         .child(self.proxy_error.clone().unwrap_or_default()),
                 )
             })
@@ -4380,13 +4359,12 @@ impl AppView {
                     group,
                     count,
                     selected,
-                    accent,
                     &now,
                     &members,
                     group.kind == "select",
                     self.delaying.contains(&group.name),
                     self.connected,
-                    *self.member_limits.get(&group.id).unwrap_or(&36),
+                    *self.member_limits.get(&group.id).unwrap_or(&8),
                     self.is_busy(),
                 )
             }))
@@ -4417,9 +4395,9 @@ impl AppView {
             .child(page_title(
                 theme,
                 "规则",
-                "按下表自上而下首条命中；同一规则内任一条件命中，GFWList 预设独立装卸。",
+                "按顺序匹配应用或网站，并设置它们的去向。",
             ))
-            .child(self.routing_panel(cx, theme))
+            .child(self.routing_panel(cx, theme, self.routing_expanded))
             .child(
                 h_flex()
                     .gap_2()
@@ -4437,17 +4415,32 @@ impl AppView {
                             })
                     })
                     .child(div().flex_1().child(Input::new(&self.rule_query)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(if query.trim().is_empty() {
+                    .when(!query.trim().is_empty(), |this| {
+                        let entity = entity.clone();
+                        this.child(
+                            Button::new("clear-rule-filter")
+                                .small()
+                                .ghost()
+                                .label("清除")
+                                .on_click(move |_, window, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.rule_query.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    })
+                    .child(div().text_xs().text_color(muted_fg).child(
+                        if query.trim().is_empty() {
                                 format!("{total} 项")
                             } else {
                                 format!("{visible_len} / {total} 项")
-                            }),
-                    ),
+                        },
+                    )),
             )
+            .when(visible_len > 0, |this| this.child(rule_table_header(theme)))
             .when(self.strategy.rule_sets.is_empty(), |this| {
                 this.child(empty_hint_action(
                     theme,
@@ -4494,35 +4487,46 @@ impl AppView {
 
     fn settings(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
+        let endpoint_note = if self.runtime.is_some() {
+            let pending = self.strategy.mixed_port != self.applied.mixed_port
+                || self.strategy.mixed_lan != self.applied.mixed_lan;
+            if pending {
+                format!(
+                    "当前运行地址：{}。保存的端口或局域网设置尚未应用。",
+                    self.mixed_endpoint()
+                )
+            } else {
+                format!("当前手动代理地址：{}。", self.mixed_endpoint())
+            }
+        } else {
+            let endpoint = if self.strategy.mixed_lan {
+                format!("本机或局域网地址:{}", self.strategy.mixed_port)
+            } else {
+                format!("127.0.0.1:{}", self.strategy.mixed_port)
+            };
+            format!("连接后手动代理地址：{}。", endpoint)
+        };
         v_flex()
             .gap_4()
             .child(page_title(
                 theme,
                 "设置",
                 &format!(
-                    "系统接管让应用不用自己填代理。第一次请到 {} 允许 myproxy。Mixed 给显式客户端；TUN 与接管互斥。",
+                    "管理自动代理、手动代理和外观。首次开启自动代理时，请到 {} 允许 myproxy。",
                     setup::login_items_path_label()
                 ),
             ))
             .child(self.system_extension_panel(cx, theme))
             .child(panel(
                 theme,
-                "外观",
-                v_flex().gap_3().child(self.appearance_row(cx, theme)),
-            ))
-            .child(panel(
-                theme,
-                "显式代理（Mixed）",
+                "手动代理",
                 v_flex()
                     .gap_3()
                     .child(
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "把客户端 HTTP 或 SOCKS5 代理设为 {}。系统接管按捕获规则转入核心；原生放行和拒绝不进连接列表。",
-                                self.mixed_endpoint()
-                            )),
+                            .child(endpoint_note),
                     )
                     .child(
                         h_flex()
@@ -4533,24 +4537,24 @@ impl AppView {
                             .child(
                                 v_flex()
                                     .gap(px(2.))
-                                    .child(div().text_sm().child("对局域网开放"))
+                                    .child(div().text_sm().child("允许局域网设备使用"))
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
-                                            .child("同一局域网的设备使用本机 IP 和 Mixed 端口连接；IP 可在系统设置 → 网络查看。"),
+                                            .child("同一局域网的设备可使用本机 IP 和这个端口连接；IP 可在系统设置 → 网络查看。"),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(theme.warning)
-                                            .child("Mixed 无入站密码，并监听所有网络接口。VPN、热点或防火墙规则可能让其他网络也能访问。"),
+                                            .text_color(theme_ext::warning_text(theme))
+                                            .child("开放后没有额外入站密码；VPN、热点或防火墙规则可能让其他网络也能访问。"),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
-                                            .child("控制器、DNS 和系统接管入口仍只在本机。"),
+                                            .child("控制器、网站解析和自动代理入口仍只在本机。"),
                                     ),
                             )
                             .child({
@@ -4560,7 +4564,7 @@ impl AppView {
                                     .small()
                                     .label(if lan_on { "开启" } else { "关闭" })
                                     .checked(lan_on)
-                                    .accessibility_label("对局域网开放（所有网络接口）")
+                                    .accessibility_label("允许局域网设备使用手动代理")
                                     .disabled(self.is_busy())
                                     .on_click(move |_, _, app| {
                                         entity.update(app, |this, cx| {
@@ -4568,9 +4572,9 @@ impl AppView {
                                             this.persist_inbound_mode(
                                                 cx,
                                                 if this.strategy.mixed_lan {
-                                                    "Mixed 将对局域网开放（所有网络接口）。".into()
+                                                    "手动代理将对局域网开放。".into()
                                                 } else {
-                                                    "Mixed 将只监听本机。".into()
+                                                    "手动代理将只允许本机使用。".into()
                                                 },
                                             );
                                             cx.notify();
@@ -4584,31 +4588,54 @@ impl AppView {
                             .items_center()
                             .flex_wrap()
                             .child(div().text_sm().child(if self.applied.mixed_lan {
-                                "所有网络接口"
+                                "局域网可用"
                             } else {
                                 "127.0.0.1"
                             }))
-                            .child(div().w(px(100.)).child(Input::new(&self.port_input)))
+                            .child(
+                                div()
+                                    .w(px(88.))
+                                    .child(Input::new(&self.port_input).aria_label("手动代理端口")),
+                            )
                             .child({
                                 let entity = entity.clone();
                                 Button::new("save-port")
                                     .disabled(self.is_busy())
                                     .label("保存端口")
-                                    .on_click(
-                                    move |_, _, app| {
+                                    .on_click(move |_, _, app| {
                                         entity.update(app, |this, cx| {
-                                            if let Ok(port) =
-                                                this.port_input.read(cx).value().parse::<u16>()
+                                            let previous = this.strategy.mixed_port;
+                                            if let Ok(port) = this
+                                                .port_input
+                                                .read(cx)
+                                                .value()
+                                                .parse::<u16>()
                                             {
+                                                if !(1..=MAX_MIXED_PORT).contains(&port) {
+                                                    this.status = format!(
+                                                        "端口须为 1 到 {}。",
+                                                        MAX_MIXED_PORT
+                                                    );
+                                                } else {
                                                 this.strategy.mixed_port = port;
-                                                this.persist();
+                                                    if this.persist() {
+                                                        this.status = format!(
+                                                            "手动代理端口已保存为 {}，下次应用后生效。",
+                                                            port
+                                                        );
                                             } else {
-                                                this.status = "端口须为 1 到 65535。".into();
+                                                        this.strategy.mixed_port = previous;
+                                                    }
+                                                }
+                                            } else {
+                                                this.status = format!(
+                                                    "端口须为 1 到 {}。",
+                                                    MAX_MIXED_PORT
+                                                );
                                             }
                                             cx.notify();
                                         });
-                                    },
-                                )
+                                    })
                             })
                             .child(self.inbound_mode_buttons(
                                 cx,
@@ -4624,42 +4651,89 @@ impl AppView {
                         "mixed",
                     )),
             ))
-            .child(self.updates_panel(cx, theme))
             .child(panel(
                 theme,
-                "排除过滤器",
+                "外观",
+                v_flex().gap_3().child(self.appearance_row(cx, theme)),
+            ))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .gap(px(2.))
+                                    .child(div().text_sm().font_semibold().child("高级设置"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("启动、更新、订阅过滤、配置备份和诊断工具。"),
+                                    ),
+                            )
+                            .child({
+                                let entity = entity.clone();
+                                Button::new("toggle-advanced-settings")
+                                    .small()
+                                    .secondary()
+                                    .label(if self.advanced_settings_expanded {
+                                        "收起高级设置"
+                                    } else {
+                                        "显示高级设置"
+                                    })
+                                    .on_click(move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            this.advanced_settings_expanded =
+                                                !this.advanced_settings_expanded;
+                                            cx.notify();
+                                        });
+                                    })
+                            }),
+                    )
+                    .when(self.advanced_settings_expanded, |this| {
+                        this.child(self.updates_panel(cx, theme))
+                            .child(panel(
+                                theme,
+                                "订阅过滤",
                 v_flex()
                     .gap_2()
                     .child(
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("从订阅节点名里排除流量、剩余、到期这类字样。不影响已保存的组。"),
+                                            .child("从订阅节点名中排除流量、剩余、到期等提示词，不影响已保存的节点组。"),
                     )
-                    .child(Input::new(&self.filter_input))
+                                    .child(Input::new(&self.filter_input).aria_label("订阅过滤词"))
                     .child({
                         let entity = entity.clone();
                         Button::new("save-filter")
                             .disabled(self.is_busy())
                             .primary()
                             .label("保存过滤器")
-                            .on_click(
-                            move |_, _, app| {
+                                            .on_click(move |_, _, app| {
                                 entity.update(app, |this, cx| {
                                     this.strategy.exclude_filter =
                                         this.filter_input.read(cx).value().to_string();
-                                    this.persist();
+                                                    if this.persist() {
+                                                        this.status = "订阅过滤器已保存，下次刷新订阅时生效。".into();
+                                                    }
                                     cx.notify();
                                 });
-                            },
-                        )
+                                            })
                     }),
             ))
             .child(self.startup_panel(cx, theme))
             .child(self.cli_install_panel(cx, theme))
             .child(self.strategy_backup_panel(cx, theme))
-            .child(self.logs_panel(theme))
             .child(self.developer_panel(cx, theme))
+            .child(self.logs_panel(theme))
+                    }),
+            )
     }
 
     fn strategy_backup_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
@@ -4822,8 +4896,14 @@ impl AppView {
             .and_then(|name| name.to_str())
             .unwrap_or("配置")
             .to_string();
+        let apply_note = if self.wanted {
+            "导入后立即应用。"
+        } else {
+            "下次连接或应用时生效。"
+        };
+        let import_label = if self.wanted { "导入并应用" } else { "导入" };
         let message = format!(
-            "将用「{file_name}」整份替换当前策略（{} 个订阅、{} 个节点组、{} 条规则）。导入前会留下备份。",
+            "将用「{file_name}」整份替换当前策略（{} 个订阅、{} 个节点组、{} 条规则）。导入前会留下备份。{apply_note}",
             preview.subscriptions.len(),
             preview.groups.len(),
             preview.rule_sets.len()
@@ -4858,7 +4938,7 @@ impl AppView {
                         .child(
                             Button::new("import-strategy-ok")
                                 .primary()
-                                .label("导入")
+                                .label(import_label)
                                 .on_click(|_, window, cx| {
                                     window
                                         .dispatch_action(Box::new(Confirm { secondary: false }), cx)
@@ -4965,9 +5045,8 @@ impl AppView {
                                                     );
                                                 }
                                                 Err(error) => {
-                                                    this.status = format!(
-                                                        "命令行工具安装失败：{error:#}"
-                                                    );
+                                                    this.status =
+                                                        format!("命令行工具安装失败：{error:#}");
                                                 }
                                             }
                                             cx.notify();
@@ -5044,12 +5123,6 @@ impl AppView {
         )
     }
 
-    fn inbound_modes_subtitle(&self) -> String {
-        format!("已保存模式：Mixed {} · 系统接管 {}。规则模式先绕过本机/私网再匹配策略；代理、全局、直连绕过用户规则。TUN 固定按策略规则。{}",
-            self.strategy.mixed_mode.label(), self.strategy.extension_mode.label(),
-            if self.is_dirty() { " 当前有待应用修改。" } else { "" })
-    }
-
     fn global_mode_row(
         &self,
         cx: &mut Context<Self>,
@@ -5061,28 +5134,31 @@ impl AppView {
         let now_label = global_selection_label(&now, self.connected);
         let entity = cx.entity();
         let muted_fg = theme.muted_foreground;
-        let mut shortcuts: Vec<String> = vec!["DIRECT".into(), "REJECT".into()];
+        let mut shortcuts: Vec<(String, String)> = vec![
+            ("DIRECT".into(), "直连".into()),
+            ("REJECT".into(), "拒绝".into()),
+        ];
         for group in &self.strategy.groups {
-            if !shortcuts.iter().any(|name| name == &group.name) {
-                shortcuts.push(group.name.clone());
+            if !shortcuts.iter().any(|(name, _)| name == &group.name) {
+                shortcuts.push((group.name.clone(), group.name.clone()));
             }
         }
         v_flex()
             .gap_1()
             .child(div().text_xs().text_color(muted_fg).child(if active {
-                format!("GLOBAL 当前 {now_label} · 点下方组或到节点组选节点")
+                format!("全局出口当前为 {now_label} · 可在节点组中选择具体出口")
             } else {
-                format!("内置 GLOBAL 当前 {now_label} · 仅「全局」模式整段走它")
+                format!("全局出口当前为 {now_label} · 只有选择全局模式时整段使用它")
             }))
             .when(active, |this| {
                 this.child(h_flex().w_full().flex_wrap().gap_1().children(
-                    shortcuts.into_iter().map(|name| {
+                    shortcuts.into_iter().map(|(name, label)| {
                         let entity = entity.clone();
                         let pick = name.clone();
                         let mut button =
                             Button::new(SharedString::from(format!("{id_prefix}-global-{name}")))
                                 .small()
-                                .label(name.clone());
+                                .label(label);
                         if name == now {
                             button = button.primary();
                         }
@@ -5113,9 +5189,9 @@ impl AppView {
                     Button::new(SharedString::from(format!("{id_prefix}-{}", mode.as_str())))
                         .small();
                 btn = if current == mode {
-                    btn.primary().label(mode.label())
+                    btn.primary().label(inbound_mode_label(mode))
                 } else {
-                    btn.label(mode.label())
+                    btn.label(inbound_mode_label(mode))
                 };
                 btn.disabled(self.is_busy()).on_click(move |_, _, app| {
                     entity.update(app, |this, cx| {
@@ -5134,7 +5210,10 @@ impl AppView {
         if mode == InboundMode::Global {
             self.strategy.ensure_global_selected();
         }
-        self.persist_inbound_mode(cx, format!("Mixed 已保存为{}。", mode.label()));
+        self.persist_inbound_mode(
+            cx,
+            format!("手动代理已保存为{}。", inbound_mode_label(mode)),
+        );
     }
 
     fn set_extension_mode(&mut self, mode: InboundMode, cx: &mut Context<Self>) {
@@ -5145,7 +5224,10 @@ impl AppView {
         if mode == InboundMode::Global {
             self.strategy.ensure_global_selected();
         }
-        self.persist_inbound_mode(cx, format!("系统接管已保存为{}。", mode.label()));
+        self.persist_inbound_mode(
+            cx,
+            format!("自动代理已保存为{}。", inbound_mode_label(mode)),
+        );
     }
 
     fn persist_inbound_mode(&mut self, cx: &mut Context<Self>, note: String) {
@@ -5171,11 +5253,11 @@ impl AppView {
         } else if self.persist() {
             self.status = if on {
                 format!(
-                    "已记录。下次连接会请求系统扩展，请到 {} 允许 myproxy。",
+                    "已记录。下次连接会请求自动代理，请到 {} 允许 myproxy。",
                     setup::login_items_path_label()
                 )
             } else {
-                "已保存关闭系统接管的意图。".into()
+                "已保存关闭自动代理的意图。".into()
             };
         }
     }
@@ -5192,105 +5274,140 @@ impl AppView {
             self.persist_and_apply(cx);
         } else if self.persist() {
             self.status = if on {
-                "已记录。下次连接走 TUN；首次会要管理员密码。".into()
+                "已记录。下次连接开启全局网络接管；首次会要管理员密码。".into()
             } else {
-                "已保存关闭 TUN 的意图。".into()
+                "已保存关闭全局网络接管的意图。".into()
             };
         }
     }
 
-    fn routing_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+    fn routing_panel(
+        &self,
+        cx: &mut Context<Self>,
+        theme: &Theme,
+        expanded: bool,
+    ) -> impl IntoElement {
         let entity = cx.entity();
         let current = self.strategy.routing_profile;
         let unmatched = myproxy::compile::unmatched_target(&self.strategy);
+        let summary = match current {
+            RoutingProfile::Allowlist => "未命中直连",
+            RoutingProfile::Gfwlist => "受限网站命中走默认出口",
+            RoutingProfile::Group => "未命中走指定出口",
+            RoutingProfile::Chinadirect => "国内直连，其他走指定出口",
+        };
         panel(
             theme,
-            "分流",
+            "未命中流量",
             v_flex()
                 .gap_2()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(div().text_sm().child(summary))
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("toggle-routing-profile")
+                                .small()
+                                .secondary()
+                                .label(if expanded {
+                                    "收起选项"
+                                } else {
+                                    "调整分流"
+                                })
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.routing_expanded = !this.routing_expanded;
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                )
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("入口绕过本机与私网；再按规则、GFWList、国内直连或未命中走向处理。"),
+                        .child("只有未被上方规则匹配的流量会使用这里的设置。"),
                 )
-                .child(
-                    h_flex().gap_1().flex_wrap().children(RoutingProfile::ALL.into_iter().map(
-                        |profile| {
+                .when(expanded, |this| {
+                    this.child(h_flex().gap_1().flex_wrap().children(
+                        RoutingProfile::ALL.into_iter().map(|profile| {
                             let entity = entity.clone();
-                            let mut btn = Button::new(SharedString::from(format!(
+                            let mut button = Button::new(SharedString::from(format!(
                                 "routing-{}",
                                 profile.as_str()
                             )))
                             .small();
-                            btn = if current == profile {
-                                btn.primary().label(profile.label())
+                            button = if current == profile {
+                                button.primary().label(routing_profile_label(profile))
                             } else {
-                                btn.label(profile.label())
+                                button.label(routing_profile_label(profile))
                             };
-                            btn.disabled(self.is_busy()).on_click(move |_, _, app| {
+                            button.disabled(self.is_busy()).on_click(move |_, _, app| {
                                 entity.update(app, |this, cx| {
                                     this.set_routing_profile(profile, cx);
                                     cx.notify();
                                 });
                             })
-                        },
-                    )),
-                )
+                        }),
+                    ))
                 .when(
                     matches!(current, RoutingProfile::Group | RoutingProfile::Chinadirect),
                     |this| {
-                    this.child(
-                        h_flex().gap_1().flex_wrap().children(
+                            this.child(h_flex().gap_1().flex_wrap().children(
                             self.strategy.groups.iter().map(|group| {
                                 let name = group.name.clone();
                                 let selected = unmatched == name;
                                 let entity = entity.clone();
-                                let mut btn = Button::new(SharedString::from(format!(
+                                    let mut button = Button::new(SharedString::from(format!(
                                     "routing-via-{name}"
                                 )))
                                 .small();
-                                btn = if selected {
-                                    btn.primary().label(name.clone())
+                                    button = if selected {
+                                        button.primary().label(name.clone())
                                 } else {
-                                    btn.label(name.clone())
+                                        button.label(name.clone())
                                 };
-                                btn.disabled(self.is_busy()).on_click(move |_, _, app| {
+                                    button.disabled(self.is_busy()).on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
                                         this.strategy.unmatched_via = name.clone();
                                         this.persist_inbound_mode(
                                             cx,
-                                            format!("未匹配走 {name}。"),
+                                                format!("未匹配走 {}。", name),
                                         );
                                         cx.notify();
                                     });
                                 })
                             }),
-                        ),
+                            ))
+                        },
                     )
-                })
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(match current {
                             RoutingProfile::Allowlist => {
-                                "未命中直连。Telegram 和其他自己的规则仍按各自走向。".to_string()
+                                    "未命中直连；你添加的规则仍然优先。".to_string()
                             }
                             RoutingProfile::Gfwlist => {
-                                "已装 Loyalsoldier GFWList，列表内走默认组，其余直连。换回未命中直连即卸下。".to_string()
+                                    "受限网站命中走默认出口，其他直连。".to_string()
                             }
                             RoutingProfile::Group => {
-                                format!("未命中走 {unmatched}。连接或应用后生效。")
+                                    format!(
+                                        "未命中走 {}，连接或应用后生效。",
+                                        via_label(&unmatched)
+                                    )
                             }
                             RoutingProfile::Chinadirect => {
-                                format!("中国大陆 IP 直连（GEOIP,CN）。其余走 {unmatched}。未单独命中的接管流量在 Mihomo 里做 GEOIP。")
+                                    format!("国内地址直连，其他走 {}。", via_label(&unmatched))
                             }
                         }),
-                ),
         )
-        .p_3()
-        .gap_2()
+                }),
+        )
     }
 
     fn set_routing_profile(&mut self, profile: RoutingProfile, cx: &mut Context<Self>) {
@@ -5298,16 +5415,26 @@ impl AppView {
             return;
         }
         self.strategy.set_routing_profile(profile);
-        self.persist_inbound_mode(cx, format!("分流已保存为{}。", profile.label()));
+        self.persist_inbound_mode(
+            cx,
+            format!("未命中流量已保存为{}。", routing_profile_label(profile)),
+        );
     }
 
     fn system_extension_panel(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
         let on = self.strategy.system_extension;
         let tun_on = self.strategy.tun;
+        let automatic_label =
+            automatic_proxy_status(&self.extension_status, self.applied.system_extension);
+        let dns_label = dns_status_label(&self.extension_status, self.applied.system_extension);
+        let waiting = matches!(
+            self.extension_status.phase,
+            Phase::WaitingApproval | Phase::Requesting
+        );
         panel(
             theme,
-            "系统接管",
+            "自动代理",
             v_flex()
                 .gap_3()
                 .child(
@@ -5319,12 +5446,12 @@ impl AppView {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(div().text_sm().child("拦截本机应用"))
+                                .child(div().text_sm().child("让应用自动按规则联网"))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("按规则接管未自己填写代理的应用，不必再给每个客户端设端口。"),
+                                        .child("不必逐个填写代理；手动代理客户端仍可单独使用。"),
                                 ),
                         )
                         .child({
@@ -5332,7 +5459,7 @@ impl AppView {
                                 .small()
                                 .label(if on { "开启" } else { "关闭" })
                                 .checked(on)
-                                .accessibility_label("系统接管")
+                                .accessibility_label("自动代理")
                                 .disabled(self.is_busy())
                                 .on_click({
                                     let entity = entity.clone();
@@ -5352,27 +5479,23 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(if on {
+                        .child(if on && waiting {
                             format!(
-                                "已保存启用意图；实际状态见下方。请到 {} 允许 myproxy。",
+                                "状态：{}。请到 {} 允许 myproxy。",
+                                automatic_label,
                                 setup::login_items_path_label()
                             )
                         } else {
-                            "关闭系统接管后，显式代理客户端仍可使用 Mixed；TUN 单独控制。".into()
+                            format!("状态：{} · 网站解析：{}", automatic_label, dns_label)
                         }),
                 )
-                .child({
+                .when(waiting, |this| {
+                    this.child({
                     let entity = entity.clone();
-                    let waiting = matches!(
-                        self.extension_status.phase,
-                        Phase::WaitingApproval | Phase::Requesting
-                    );
                     let mut button = Button::new("open-login-items")
                         .small()
                         .label("打开系统设置");
-                    if waiting {
                         button = button.primary();
-                    }
                     button.on_click(move |_, _, app| {
                         entity.update(app, |this, cx| {
                             match network_extension::open_login_items_settings() {
@@ -5393,29 +5516,7 @@ impl AppView {
                         });
                     })
                 })
-                .child(div().text_xs().child(format!("系统接管：{} · DNS：{}", self.extension_status.phase_label(), self.extension_status.dns_label())))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!(
-                            "捕获 {} · 失败开放 {}",
-                            if self.extension_status.capture_enabled { "开" } else { "关" },
-                            if self.extension_status.fail_open { "开" } else { "关" }
-                        )),
-                )
-                .when_some(self.extension_status.message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(message)))
-                .when_some(self.extension_status.dns_message.clone(), |this, message| this.child(div().text_xs().text_color(theme.warning).child(format!("DNS：{message}"))))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(if self.strategy.lan_capture {
-                            "内置旁路：本机组件、回环、链路本地、.local。局域网地址会进规则。"
-                        } else {
-                            "内置旁路：本机组件、回环、私网、链路本地、.local。这些项不能删除。"
-                        }),
-                )
+                })
                 .child(
                     h_flex()
                         .w_full()
@@ -5425,81 +5526,35 @@ impl AppView {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(div().text_sm().child("局域网也进规则"))
+                                .child(div().text_sm().font_semibold().child("更多接管设置"))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("关闭私网旁路。回环和本机组件仍直连。"),
+                                        .child("入口模式、浏览器代理、局域网和全局网络接管"),
                                 ),
                         )
                         .child({
                             let entity = entity.clone();
-                            let lan_on = self.strategy.lan_capture;
-                            Switch::new("lan-capture-toggle")
+                            Button::new("toggle-system-options")
                                 .small()
-                                .label(if lan_on { "开启" } else { "关闭" })
-                                .checked(lan_on)
-                                .accessibility_label("局域网也进规则")
-                                .disabled(self.is_busy())
+                                .secondary()
+                                .label(if self.system_options_expanded {
+                                    "收起设置"
+                                            } else {
+                                    "显示设置"
+                                })
                                 .on_click(move |_, _, app| {
                                     entity.update(app, |this, cx| {
-                                        this.strategy.lan_capture = !this.strategy.lan_capture;
-                                        this.persist_inbound_mode(
-                                            cx,
-                                            if this.strategy.lan_capture {
-                                                "局域网将进入规则。".into()
-                                            } else {
-                                                "局域网恢复内置旁路。".into()
-                                            },
-                                        );
+                                        this.system_options_expanded =
+                                            !this.system_options_expanded;
                                         cx.notify();
                                     });
                                 })
                         }),
                 )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .child(
-                            v_flex()
-                                .gap(px(2.))
-                                .child(div().text_sm().child("系统代理"))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("把系统 HTTP/HTTPS/SOCKS 指到 Mixed。未开接管、未开此项时浏览器需手填端口。与系统接管、TUN 三选一即可。断开或退出会恢复。"),
-                                ),
-                        )
-                        .child({
-                            let entity = entity.clone();
-                            let proxy_on = self.strategy.system_proxy;
-                            Switch::new("system-proxy-toggle")
-                                .small()
-                                .label(if proxy_on { "开启" } else { "关闭" })
-                                .checked(proxy_on)
-                                .accessibility_label("系统代理")
-                                .disabled(self.is_busy())
-                                .on_click(move |_, _, app| {
-                                    entity.update(app, |this, cx| {
-                                        this.strategy.system_proxy = !this.strategy.system_proxy;
-                                        this.persist_inbound_mode(
-                                            cx,
-                                            if this.strategy.system_proxy {
-                                                "系统代理将指向 Mixed。".into()
-                                            } else {
-                                                "将恢复原先的系统代理。".into()
-                                            },
-                                        );
-                                        cx.notify();
-                                    });
-                                })
-                        }),
-                )
+                .when(self.system_options_expanded, |this| {
+                    this.child(div().text_xs().font_semibold().child("接管方式"))
                 .child(self.inbound_mode_buttons(
                     cx,
                     "extension-mode",
@@ -5512,39 +5567,95 @@ impl AppView {
                     self.strategy.extension_mode == InboundMode::Global,
                     "extension",
                 ))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .child(
-                            v_flex()
-                                .gap(px(2.))
-                                .child(div().text_sm().child("TUN"))
+                        .child(toggle_setting_row(
+                            entity.clone(),
+                            theme,
+                            "system-proxy-toggle",
+                            "系统代理（浏览器）",
+                            "把系统 HTTP/HTTPS/SOCKS 指向手动代理，断开时恢复原设置。",
+                            self.strategy.system_proxy,
+                            self.is_busy(),
+                            move |this, cx| {
+                                this.strategy.system_proxy = !this.strategy.system_proxy;
+                                this.persist_inbound_mode(
+                                    cx,
+                                    if this.strategy.system_proxy {
+                                        "系统代理将指向手动代理。".into()
+                                    } else {
+                                        "将恢复原先的系统代理。".into()
+                                    },
+                                );
+                            },
+                        ))
+                        .child(toggle_setting_row(
+                            entity.clone(),
+                            theme,
+                            "lan-capture-toggle",
+                            "局域网地址也按规则",
+                            "关闭局域网旁路；回环和本机组件仍保持直连。",
+                            self.strategy.lan_capture,
+                            self.is_busy(),
+                            move |this, cx| {
+                                this.strategy.lan_capture = !this.strategy.lan_capture;
+                                this.persist_inbound_mode(
+                                    cx,
+                                    if this.strategy.lan_capture {
+                                        "局域网地址将按规则处理。".into()
+                                    } else {
+                                        "局域网地址恢复直连旁路。".into()
+                                    },
+                                );
+                            },
+                        ))
+                        .child(toggle_setting_row(
+                            entity,
+                            theme,
+                            "tun-toggle",
+                            "全局网络接管",
+                            "接管整台 Mac 的网络并按规则运行，与自动代理互斥。",
+                            tun_on,
+                            self.is_busy(),
+                            move |this, cx| this.set_tun(!this.strategy.tun, cx),
+                        ))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("TUN 与系统接管互斥，固定按策略规则运行，不使用 Mixed 或接管的模式按钮。"),
-                                ),
+                                .child(format!(
+                                    "诊断：捕获 {} · 失败开放 {} · 网站解析 {}",
+                                    if self.extension_status.capture_enabled {
+                                        "开启"
+                                    } else {
+                                        "关闭"
+                                    },
+                                    if self.extension_status.fail_open {
+                                        "开启"
+                                    } else {
+                                        "关闭"
+                                    },
+                                    dns_label
+                                )),
                         )
-                        .child({
-                            let entity = entity.clone();
-                            Switch::new("tun-toggle")
-                                .small()
-                                .label(if tun_on { "开启" } else { "关闭" })
-                                .checked(tun_on)
-                                .accessibility_label("TUN")
-                                .disabled(self.is_busy())
-                                .on_click(move |_, _, app| {
-                                    entity.update(app, |this, cx| {
-                                        this.set_tun(!this.strategy.tun, cx);
-                                        cx.notify();
-                                    });
+                        .when_some(self.extension_status.message.clone(), |this, message| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme_ext::warning_text(theme))
+                                    .child(message),
+                        )
                                 })
+                        .when_some(
+                            self.extension_status.dns_message.clone(),
+                            |this, message| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme_ext::warning_text(theme))
+                                        .child(format!("网站解析：{message}")),
+                                )
+                            },
+                        )
                         }),
-                ),
         )
     }
 
@@ -5605,7 +5716,7 @@ impl AppView {
                     theme,
                     "lite-mode",
                     "轻量模式",
-                    "不加载主界面，仅运行核心与菜单栏。点菜单栏图标可打开窗口。",
+                    "不加载主界面，仅运行代理服务与菜单栏。点菜单栏图标可打开窗口。",
                     self.strategy.lite_mode,
                     |this, cx| {
                         let previous = this.strategy.lite_mode;
@@ -5797,7 +5908,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("已连接时，检查更新与下载走 Mixed；未连接则直连。"),
+                        .child("已连接时，检查更新与下载走手动代理；未连接则直连。"),
                 )
                 .when(!crate::sparkle::available(), |this| {
                     this.child(
@@ -5840,7 +5951,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("Info、Warning、Error 始终写入同一文件。Debug / Trace 仅开发者模式或 MYPROXY_DEV=1。不记录订阅 URL。"),
+                        .child("查看运行记录，订阅链接不会写入日志。开启开发者模式可记录更多诊断细节。"),
                 )
                 .child(
                     h_flex()
@@ -5882,7 +5993,7 @@ impl AppView {
                         .children(self.log_lines.iter().map(|line| {
                             let color = match log::Level::from_line(line) {
                                 Some(log::Level::Error) | Some(log::Level::Warn) => {
-                                    Some(theme.warning)
+                                    Some(theme_ext::warning_text(theme))
                                 }
                                 Some(log::Level::Debug) | Some(log::Level::Trace) => {
                                     Some(theme.muted_foreground)
@@ -5911,7 +6022,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("打开后，Debug / Trace 也会写入上方日志。MYPROXY_DEV=1 同样生效。"),
+                        .child("打开后会记录更详细的诊断日志。MYPROXY_DEV=1 同样生效。"),
                 )
                 .child({
                     let entity = entity.clone();
@@ -5932,6 +6043,53 @@ impl AppView {
                 }),
         )
     }
+}
+
+fn toggle_setting_row<F>(
+    entity: Entity<AppView>,
+    theme: &Theme,
+    id: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    on: bool,
+    disabled: bool,
+    apply: F,
+) -> impl IntoElement
+where
+    F: Fn(&mut AppView, &mut Context<AppView>) + 'static,
+{
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(
+            v_flex()
+                .gap(px(2.))
+                .child(div().text_sm().child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(hint),
+                ),
+        )
+        .child({
+            Switch::new(id)
+                .small()
+                .label(if on { "开启" } else { "关闭" })
+                .checked(on)
+                .accessibility_label(title)
+                .disabled(disabled)
+                .on_click(move |_, _, app| {
+                    entity.update(app, |this, cx| {
+                        if !this.is_busy() {
+                            apply(this, cx);
+                            cx.notify();
+                        }
+                    });
+                })
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -6100,7 +6258,7 @@ fn render_member_row(
 fn global_selection_label(now: &str, connected: bool) -> String {
     if now.is_empty() {
         if connected {
-            "等待核心状态"
+            "等待代理就绪"
         } else {
             "未指定"
         }
@@ -6127,7 +6285,6 @@ fn render_group_card(
     group: &Group,
     count: Option<usize>,
     selected: bool,
-    accent: Hsla,
     now: &str,
     members: &[(String, Option<u32>)],
     can_select: bool,
@@ -6139,7 +6296,8 @@ fn render_group_card(
     let id = group.id.clone();
     let del_id = group.id.clone();
     let group_name = group.name.clone();
-    let muted = theme.muted;
+    let hover = theme_ext::row_hover(theme);
+    let selected_border = theme_ext::selection_border(theme);
     let muted_fg = theme.muted_foreground;
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     surface(theme)
@@ -6147,13 +6305,13 @@ fn render_group_card(
         .p_5()
         .gap_3()
         .border_color(if selected {
-            accent
+            selected_border
         } else {
-            theme.border.opacity(0.68)
+            theme.border
         })
         .cursor_pointer()
-        .when(selected, |this| this.bg(accent.opacity(0.14)))
-        .hover(move |style| style.bg(muted))
+        .when(selected, |this| this.bg(selected_border.opacity(0.10)))
+        .hover(move |style| style.bg(hover))
         .on_click({
             let entity = entity.clone();
             let id = id.clone();
@@ -6185,7 +6343,7 @@ fn render_group_card(
                             group.kind_label(),
                             count
                                 .map(|count| format!("{count} 个节点"))
-                                .unwrap_or_else(|| "等待核心状态".into())
+                                .unwrap_or_else(|| "尚未连接".into())
                         )),
                 )
                 .child(
@@ -6244,7 +6402,7 @@ fn render_group_card(
         .child(div().text_xs().text_color(muted_fg).child(format!(
             "{} {}  ·  {}",
             if connected {
-                "核心当前"
+                "当前选择"
             } else {
                 "已保存选择"
             },
@@ -6314,11 +6472,11 @@ fn render_group_card(
             this.child(
                 Button::new(SharedString::from(format!("more-{id}")))
                     .small()
-                    .label(format!("继续显示（{} / {}）", limit, members.len()))
+                    .label(format!("显示更多（{} / {}）", limit, members.len()))
                     .on_click(move |_, _, app| {
                         app.stop_propagation();
                         entity.update(app, |this, cx| {
-                            *this.member_limits.entry(id.clone()).or_insert(36) += 36;
+                            *this.member_limits.entry(id.clone()).or_insert(8) += 8;
                             cx.notify();
                         });
                     }),
@@ -6329,7 +6487,6 @@ fn render_group_card(
 fn render_global_card(
     entity: Entity<AppView>,
     theme: &Theme,
-    accent: Hsla,
     now: &str,
     members: &[(String, Option<u32>)],
     delaying: bool,
@@ -6337,41 +6494,58 @@ fn render_global_card(
     inbound_global: bool,
     query: &Entity<InputState>,
     limit: usize,
+    expanded: bool,
     busy: bool,
 ) -> impl IntoElement {
     let now_label = global_selection_label(now, connected);
-    let muted = theme.muted;
     let muted_fg = theme.muted_foreground;
+    let hover = theme_ext::row_hover(theme);
+    let selected_border = theme_ext::selection_border(theme);
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     let shown_empty = shown.is_empty();
     surface(theme)
         .id("group-card-GLOBAL")
-        .p_5()
-        .gap_3()
+        .p_4()
+        .gap_2()
         .border_color(if inbound_global {
-            accent.opacity(0.72)
+            selected_border
         } else {
-            theme.border.opacity(0.68)
+            theme.border
         })
-        .when(inbound_global, |this| this.bg(accent.opacity(0.10)))
-        .hover(move |style| style.bg(muted))
+        .hover(move |style| style.bg(hover))
         .child(
             h_flex()
                 .w_full()
                 .min_w_0()
                 .items_center()
                 .justify_between()
+                .gap_2()
                 .child(
-                    div()
-                        .flex_1()
+                    h_flex()
                         .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_sm()
-                        .font_semibold()
-                        .child(format!("GLOBAL  ·  内置选择  ·  {} 个成员", members.len())),
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_sm().font_semibold().child("全局出口")),
                 )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child({
+                            let entity = entity.clone();
+                            Button::new("toggle-global-members")
+                                .small()
+                                .label(if expanded {
+                                    "收起选择"
+                                } else {
+                                    "选择出口"
+                                })
+                                .on_click(move |_, _, app| {
+                                    entity.update(app, |this, cx| {
+                                        this.global_expanded = !this.global_expanded;
+                                        cx.notify();
+                                    });
+                                })
+                        })
                 .child({
                     let entity = entity.clone();
                     Button::new("delay-group-GLOBAL")
@@ -6388,25 +6562,31 @@ fn render_global_card(
                             });
                         })
                 }),
+                ),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(muted_fg)
                 .child(if inbound_global {
-                    format!("当前 {now_label}  ·  Mixed 或接管为全局时整段走这里")
+                    format!("当前 {now_label} · 手动代理或自动代理设为全局时，所有流量使用这里")
                 } else {
-                    format!("当前 {now_label}  ·  未开全局时只作备用，规则仍按组走")
+                    format!("当前 {now_label} · 未启用全局时只作备用，规则仍按组走")
                 }),
         )
-        .child(div().w_full().child(Input::new(query)))
-        .when(!shown_empty, |this| {
+        .when(!expanded, |this| {
             this.child(
-                h_flex()
-                    .w_full()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(shown.into_iter().map(|(name, delay)| {
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(format!("{} 个成员可选 · 当前出口保持在上方", members.len())),
+            )
+        })
+        .when(expanded, |this| {
+            this.child(div().w_full().child(Input::new(query)))
+                .when(!shown_empty, |this| {
+                    this.child(h_flex().w_full().flex_wrap().gap_1().children(
+                        shown.into_iter().map(|(name, delay)| {
                         let delay_text = format_delay(delay);
                         let label = if delay_text.is_empty() {
                             name.clone()
@@ -6432,15 +6612,15 @@ fn render_global_card(
                                 this.select_global_member(&name, cx);
                             });
                         })
-                    })),
-            )
+                        }),
+                    ))
         })
         .when(shown_empty, |this| {
             this.child(
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("没有匹配的成员。"),
+                            .child("没有匹配的出口。"),
             )
         })
         .when(members.len() > limit, |this| {
@@ -6457,6 +6637,7 @@ fn render_global_card(
                     }),
             )
         })
+        })
 }
 
 fn file_stamp(path: &Path) -> Option<SystemTime> {
@@ -6466,7 +6647,11 @@ fn file_stamp(path: &Path) -> Option<SystemTime> {
 }
 
 fn empty_hint_box(theme: &Theme) -> Div {
-    surface(theme).p_5()
+    div()
+        .p_4()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
 }
 
 fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
@@ -6476,11 +6661,7 @@ fn empty_hint(theme: &Theme, text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn empty_hint_action(
-    theme: &Theme,
-    text: &str,
-    action: impl IntoElement,
-) -> impl IntoElement {
+fn empty_hint_action(theme: &Theme, text: &str, action: impl IntoElement) -> impl IntoElement {
     empty_hint_box(theme).child(
         v_flex()
             .gap_3()
@@ -6500,7 +6681,6 @@ fn connection_header_row(
     connections: &[controller::LiveConnection],
     filters: &ConnectionFilters,
 ) -> impl IntoElement {
-    let muted_fg = theme.muted_foreground;
     h_flex()
         .w_full()
         .items_center()
@@ -6511,7 +6691,7 @@ fn connection_header_row(
             entity.clone(),
             theme,
             "conn-filter-process",
-            Some(px(108.)),
+            Some(px(116.)),
             ConnectionColumn::Process,
             "进程",
             controller::connection_column_values(connections, filters, ConnectionColumn::Process),
@@ -6537,7 +6717,7 @@ fn connection_header_row(
             "conn-filter-network",
             Some(px(64.)),
             ConnectionColumn::Network,
-            "协议",
+            "网络",
             controller::connection_column_values(connections, filters, ConnectionColumn::Network),
             filters.network.clone(),
         ))
@@ -6545,16 +6725,12 @@ fn connection_header_row(
             entity,
             theme,
             "conn-filter-chain",
-            Some(px(168.)),
+            Some(px(144.)),
             ConnectionColumn::Chain,
             "走向",
             controller::connection_column_values(connections, filters, ConnectionColumn::Chain),
             filters.chain.clone(),
         ))
-        .child(connection_col(px(72.), "上传", muted_fg, None))
-        .child(connection_col(px(72.), "下载", muted_fg, None))
-        .child(connection_col(px(80.), "时长", muted_fg, None))
-        .child(div().w(px(56.)))
 }
 
 fn connection_filter_header(
@@ -6574,7 +6750,7 @@ fn connection_filter_header(
     }
     let active = current.is_some();
     let color = if active {
-        theme.accent
+        theme.primary
     } else {
         theme.muted_foreground
     };
@@ -6678,24 +6854,87 @@ fn render_connection_row(
     let id = conn.id.clone();
     let process = conn.process.clone();
     let app_matcher = conn.app_matcher.clone();
-    let muted = theme.muted;
+    let context_choices = via_choices.clone();
+    let hover = theme_ext::row_hover(theme);
     let muted_fg = theme.muted_foreground;
     let fg = theme.foreground;
     let mono = theme.mono_font_family.clone();
     let up = controller::format_bytes(conn.upload);
     let down = controller::format_bytes(conn.download);
-    h_flex()
+    let action_row = {
+        let entity = entity.clone();
+        let process = process.clone();
+        let app_matcher = app_matcher.clone();
+        let choices = via_choices.clone();
+        h_flex()
+            .w(px(192.))
+            .min_w(px(192.))
+            .flex_shrink_0()
+            .justify_end()
+            .gap_1()
+            .child({
+                let entity = entity.clone();
+                let process = process.clone();
+                let app_matcher = app_matcher.clone();
+                Button::new(SharedString::from(format!("rule-conn-{id}")))
+                    .small()
+                    .label("建规则")
+                    .accessibility_label(format!("为 {} 创建规则", conn.process))
+                    .on_click(move |_, window, app| {
+                        app.stop_propagation();
+                        entity.update(app, |this, cx| {
+                            this.open_rule_dialog_for_process(&process, &app_matcher, window, cx);
+                            cx.notify();
+                        });
+                    })
+            })
+            .child({
+                let entity = entity.clone();
+                let process = process.clone();
+                let app_matcher = app_matcher.clone();
+                Button::new(SharedString::from(format!("route-conn-{id}")))
+                    .small()
+                    .label("改走向")
+                    .dropdown_menu(move |menu, _, _| {
+                        let entity = entity.clone();
+                        let process = process.clone();
+                        let app_matcher = app_matcher.clone();
+                        via_menu(menu, &choices, "", move |app, value| {
+                            entity.update(app, |this, cx| {
+                                this.set_connection_process_via(&process, &app_matcher, &value, cx);
+                                cx.notify();
+                            });
+                        })
+                    })
+            })
+            .child({
+                let entity = entity.clone();
+                let close_id = id.clone();
+                Button::new(SharedString::from(format!("close-conn-{id}")))
+                    .small()
+                    .danger()
+                    .label("关闭")
+                    .disabled(busy)
+                    .accessibility_label(format!("关闭 {} 的连接", conn.destination))
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.close_connections(Some(close_id.clone()), cx)
+                        });
+                    })
+            })
+    };
+    v_flex()
         .id(SharedString::from(format!("conn-{id}")))
         .w_full()
-        .items_center()
+        .min_w(px(560.))
         .px_3()
         .py_2()
-        .gap_2()
-        .rounded(theme.radius_lg)
+        .gap_1()
+        .rounded(theme.radius)
         .border_1()
-        .border_color(theme.border.opacity(0.58))
-        .bg(theme.group_box.opacity(0.68))
-        .hover(move |style| style.bg(muted))
+        .border_color(theme.border)
+        .bg(theme.group_box)
+        .hover(move |style| style.bg(hover))
         .context_menu({
             let entity = entity.clone();
             let process = process.clone();
@@ -6705,8 +6944,8 @@ fn render_connection_row(
                 let create_process = process.clone();
                 let create_matcher = app_matcher.clone();
                 menu.min_w(px(168.))
-                    .item(
-                        PopupMenuItem::new("对此进程建规则").on_click(move |_, window, app| {
+                    .item(PopupMenuItem::new("对此进程建规则").on_click(
+                        move |_, window, app| {
                             create_entity.update(app, |this, cx| {
                                 this.open_rule_dialog_for_process(
                                     &create_process,
@@ -6716,13 +6955,13 @@ fn render_connection_row(
                                 );
                                 cx.notify();
                             });
-                        }),
-                    )
+                        },
+                    ))
                     .submenu("改为走向", window, cx, {
                         let entity = entity.clone();
                         let process = process.clone();
                         let app_matcher = app_matcher.clone();
-                        let choices = via_choices.clone();
+                        let choices = context_choices.clone();
                         move |menu, _, _| {
                             let entity = entity.clone();
                             let process = process.clone();
@@ -6742,39 +6981,34 @@ fn render_connection_row(
                     })
             }
         })
-        .child(connection_col(px(108.), conn.process.clone(), fg, None))
-        .child(connection_col_flex(
-            conn.destination.clone(),
-            muted_fg,
-            Some(mono.clone()),
-        ))
-        .child(connection_col(
-            px(64.),
-            conn.network.clone(),
-            muted_fg,
-            None,
-        ))
-        .child(connection_col(px(168.), conn.chain.clone(), fg, None))
-        .child(connection_col(px(72.), up, muted_fg, Some(mono.clone())))
-        .child(connection_col(px(72.), down, muted_fg, Some(mono)))
-        .child(connection_col(
-            px(80.),
-            conn.duration.clone(),
-            muted_fg,
-            None,
-        ))
-        .child({
-            let entity = entity.clone();
-            Button::new(SharedString::from(format!("close-conn-{id}")))
-                .small()
-                .danger()
-                .label("关闭")
-                .disabled(busy)
-                .accessibility_label(format!("关闭 {} 的连接", conn.destination))
-                .on_click(move |_, _, app| {
-                    entity.update(app, |this, cx| this.close_connections(Some(id.clone()), cx));
-                })
-        })
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(connection_col(px(116.), conn.process.clone(), fg, None))
+                .child(connection_col_flex(
+                    conn.destination.clone(),
+                    muted_fg,
+                    Some(mono.clone()),
+                ))
+                .child(connection_col(px(64.), conn.network.clone(), muted_fg, None))
+                .child(connection_col(px(144.), conn.chain.clone(), fg, None)),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(connection_col(
+                    px(192.),
+                    format!("↑{up} ↓{down} · {}", conn.duration),
+                    muted_fg,
+                    Some(mono),
+                ))
+                .child(action_row),
+        )
 }
 
 fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {
@@ -6787,6 +7021,20 @@ fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {
         .text_xs()
         .text_color(theme.muted_foreground)
         .child(text.to_string())
+}
+
+fn rule_table_header(theme: &Theme) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(div().w(px(28.)).child("#"))
+        .child(div().flex_1().min_w_0().child("匹配条件"))
+        .child(div().w(px(150.)).child("出口"))
+        .child(div().w(px(260.)).child("操作"))
 }
 
 fn render_rule_set_card(
@@ -6803,8 +7051,10 @@ fn render_rule_set_card(
     let via = set.via.clone();
     let can_up = index > 0;
     let can_down = index + 1 < total;
-    let muted = theme.muted;
+    let hover = theme_ext::row_hover(theme);
+    let selected_border = theme_ext::selection_border(theme);
     let muted_fg = theme.muted_foreground;
+    let context_choices = via_choices.clone();
     const CHIP_LIMIT: usize = 10;
     let extra = set.matchers.len().saturating_sub(CHIP_LIMIT);
     surface(theme)
@@ -6812,13 +7062,13 @@ fn render_rule_set_card(
         .p_5()
         .gap_3()
         .border_color(if selected {
-            accent
+            selected_border
         } else {
-            theme.border.opacity(0.68)
+            theme.border
         })
         .cursor_pointer()
-        .when(selected, |this| this.bg(accent.opacity(0.14)))
-        .hover(move |style| style.bg(muted))
+        .when(selected, |this| this.bg(selected_border.opacity(0.10)))
+        .hover(move |style| style.bg(hover))
         .on_click({
             let entity = entity.clone();
             let id = id.clone();
@@ -6871,7 +7121,7 @@ fn render_rule_set_card(
                         let entity = entity.clone();
                         let id = id.clone();
                         let via_current = via.clone();
-                        let choices = via_choices.clone();
+                        let choices = context_choices.clone();
                         move |menu, _, _| {
                             let entity = entity.clone();
                             let id = id.clone();
@@ -6920,9 +7170,13 @@ fn render_rule_set_card(
                                 .font_semibold()
                                 .child(set.name.clone()),
                         )
-                        .child(pill(theme, &via_label(&via), accent))
+                        .child(div().w(px(150.)).min_w(px(120.)).child(pill(
+                            theme,
+                            &via_label(&via),
+                            accent,
+                        )))
                         .when(set.dns_ipv4_only, |this| {
-                            this.child(pill(theme, "DNS 仅 IPv4", theme.info))
+                            this.child(pill(theme, "解析仅用 IPv4", theme.info))
                         }),
                 )
                 .child({
@@ -6963,6 +7217,80 @@ fn render_rule_set_card(
                     this.child(div().text_xs().text_color(muted_fg).child("没有匹配项"))
                 }),
         )
+        .child(
+            h_flex()
+                .gap_1()
+                .flex_wrap()
+                .child({
+                    let entity = entity.clone();
+                    let edit_id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("edit-rule-{edit_id}")))
+                        .small()
+                        .label("编辑")
+                        .accessibility_label(format!("编辑规则 {name}"))
+                        .on_click(move |_, window, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.open_rule_dialog(Some(&edit_id), window, cx);
+                                cx.notify();
+                            });
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    let move_id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("up-rule-{move_id}")))
+                        .small()
+                        .label("上移")
+                        .accessibility_label(format!("上移规则 {name}"))
+                        .disabled(!can_up)
+                        .on_click(move |_, _, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.move_selected_rule(&move_id, -1, cx);
+                                cx.notify();
+                            });
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    let move_id = id.clone();
+                    let name = set.name.clone();
+                    Button::new(SharedString::from(format!("down-rule-{move_id}")))
+                        .small()
+                        .label("下移")
+                        .accessibility_label(format!("下移规则 {name}"))
+                        .disabled(!can_down)
+                        .on_click(move |_, _, app| {
+                            app.stop_propagation();
+                            entity.update(app, |this, cx| {
+                                this.move_selected_rule(&move_id, 1, cx);
+                                cx.notify();
+                            });
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    let via_id = id.clone();
+                    let via_current = via.clone();
+                    let choices = via_choices.clone();
+                    Button::new(SharedString::from(format!("via-rule-{via_id}")))
+                        .small()
+                        .label("改走向")
+                        .dropdown_menu(move |menu, _, _| {
+                            let entity = entity.clone();
+                            let via_id = via_id.clone();
+                            via_menu(menu, &choices, &via_current, move |app, value| {
+                                entity.update(app, |this, cx| {
+                                    this.set_selected_rule_via(&via_id, &value, cx);
+                                    cx.notify();
+                                });
+                            })
+                        })
+                }),
+        )
 }
 
 fn surface(theme: &Theme) -> Div {
@@ -6971,6 +7299,25 @@ fn surface(theme: &Theme) -> Div {
         .border_1()
         .border_color(theme.border.opacity(0.68))
         .bg(theme.group_box.opacity(0.78))
+}
+
+fn subscription_display_url(url: &str) -> String {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if host.is_empty() {
+        "地址未设置".into()
+    } else {
+        host.to_string()
+    }
 }
 
 fn brand_accent(theme: &Theme) -> Hsla {
@@ -7000,25 +7347,6 @@ fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
     v_flex()
         .gap_2()
         .pb_1()
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .w(px(24.))
-                        .h(px(3.))
-                        .rounded_full()
-                        .bg(brand_accent(theme)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(brand_accent(theme))
-                        .child("MYPROXY / CONTROL"),
-                ),
-        )
         .child(div().text_2xl().font_bold().child(title.to_string()))
         .child(
             div()
@@ -7054,15 +7382,15 @@ fn panel(theme: &Theme, title: &str, body: impl IntoElement) -> Div {
         .child(body)
 }
 
-fn pill(_theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
+fn pill(theme: &Theme, text: &str, color: Hsla) -> impl IntoElement {
     div()
         .px_2()
         .py(px(3.))
         .rounded(px(999.))
-        .bg(color.opacity(0.16))
+        .bg(theme_ext::chip_bg(theme))
         .border_1()
         .border_color(color.opacity(0.24))
-        .text_color(color)
+        .text_color(theme_ext::chip_fg(theme))
         .text_xs()
         .font_medium()
         .child(text.to_string())
@@ -7089,7 +7417,7 @@ fn status_pill(theme: &Theme, label: &str, value: &str, color: Hsla) -> impl Int
             div()
                 .text_xs()
                 .font_semibold()
-                .text_color(color)
+                .text_color(theme.foreground)
                 .child(value.to_string()),
         )
 }
@@ -7100,4 +7428,54 @@ fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
     } else {
         theme.muted_foreground
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        automatic_proxy_status, network_extension, subscription_display_url, Phase, RuntimeStatus,
+    };
+
+    fn running_status() -> RuntimeStatus {
+        RuntimeStatus {
+            phase: Phase::Running,
+            dns_phase: network_extension::DnsPhase::Running,
+            observed: true,
+            desired_revision: 7,
+            applied_revision: Some(7),
+            message: None,
+            dns_message: None,
+            capture_enabled: true,
+            fail_open: true,
+        }
+    }
+
+    #[test]
+    fn automatic_proxy_label_requires_capture_dns_and_revision() {
+        let mut status = running_status();
+        assert_eq!(automatic_proxy_status(&status, true), "已开启");
+
+        status.capture_enabled = false;
+        assert_eq!(automatic_proxy_status(&status, true), "需要处理");
+
+        status.capture_enabled = true;
+        status.dns_phase = network_extension::DnsPhase::Failed;
+        assert_eq!(automatic_proxy_status(&status, true), "需要处理");
+
+        status.dns_phase = network_extension::DnsPhase::Running;
+        status.applied_revision = None;
+        assert_eq!(automatic_proxy_status(&status, true), "配置未生效");
+    }
+
+    #[test]
+    fn subscription_summary_omits_credentials_and_query() {
+        assert_eq!(
+            subscription_display_url("https://user:secret@example.invalid?token=secret"),
+            "example.invalid"
+        );
+        assert_eq!(
+            subscription_display_url("https://example.invalid/path#secret"),
+            "example.invalid"
+        );
+    }
 }
