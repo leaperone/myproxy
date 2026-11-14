@@ -6341,16 +6341,6 @@ fn render_group_card(
     let selected_border = theme_ext::selection_border(theme);
     let muted_fg = theme.muted_foreground;
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
-    let card_label = format!(
-        "编辑节点组 {}，{}，{}",
-        group.name,
-        group.kind_label(),
-        if connected {
-            format!("当前选择 {}", now)
-        } else {
-            format!("已保存选择 {}", now)
-        }
-    );
     surface(theme)
         .id(SharedString::from(format!("group-card-{id}")))
         .p_5()
@@ -6360,37 +6350,8 @@ fn render_group_card(
         } else {
             theme.border
         })
-        .cursor_pointer()
-        .role(Role::Button)
-        .aria_label(card_label)
-        .tab_index(0)
-        .focus_visible(|style| style.border_color(selected_border))
-        .on_key_down({
-            let entity = entity.clone();
-            let id = id.clone();
-            move |event, window, app| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    window.prevent_default();
-                    app.stop_propagation();
-                    entity.update(app, |this, cx| {
-                        this.open_group_dialog(Some(&id), window, cx);
-                        cx.notify();
-                    });
-                }
-            }
-        })
         .when(selected, |this| this.bg(selected_border.opacity(0.10)))
         .hover(move |style| style.bg(hover))
-        .on_click({
-            let entity = entity.clone();
-            let id = id.clone();
-            move |_, window, app| {
-                entity.update(app, |this, cx| {
-                    this.open_group_dialog(Some(&id), window, cx);
-                    cx.notify();
-                });
-            }
-        })
         .child(
             h_flex()
                 .w_full()
@@ -7128,7 +7089,6 @@ fn render_rule_set_card(
     let selected_border = theme_ext::selection_border(theme);
     let muted_fg = theme.muted_foreground;
     let context_choices = via_choices.clone();
-    let card_label = format!("编辑规则 {}，走向 {}", set.name, via_label(&via));
     const CHIP_LIMIT: usize = 10;
     let extra = set.matchers.len().saturating_sub(CHIP_LIMIT);
     surface(theme)
@@ -7140,37 +7100,8 @@ fn render_rule_set_card(
         } else {
             theme.border
         })
-        .cursor_pointer()
-        .role(Role::Button)
-        .aria_label(card_label)
-        .tab_index(0)
-        .focus_visible(|style| style.border_color(selected_border))
-        .on_key_down({
-            let entity = entity.clone();
-            let id = id.clone();
-            move |event, window, app| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    window.prevent_default();
-                    app.stop_propagation();
-                    entity.update(app, |this, cx| {
-                        this.open_rule_dialog(Some(&id), window, cx);
-                        cx.notify();
-                    });
-                }
-            }
-        })
         .when(selected, |this| this.bg(selected_border.opacity(0.10)))
         .hover(move |style| style.bg(hover))
-        .on_click({
-            let entity = entity.clone();
-            let id = id.clone();
-            move |_, window, app| {
-                entity.update(app, |this, cx| {
-                    this.open_rule_dialog(Some(&id), window, cx);
-                    cx.notify();
-                });
-            }
-        })
         .context_menu({
             let entity = entity.clone();
             let id = id.clone();
