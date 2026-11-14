@@ -3718,14 +3718,22 @@ impl AppView {
             &self.extension_status,
             self.applied.system_extension,
         );
+        let dns_label = dns_status_label(&self.extension_status, self.applied.system_extension);
+        let automatic_pending = self.strategy.system_extension != self.applied.system_extension;
         let automatic_problem = self.connected
-            && self.applied.system_extension
-            && automatic_label != "已开启";
+            && (automatic_pending
+                || (self.applied.system_extension && automatic_label != "已开启"));
+        let overview_automatic_label = if automatic_pending {
+            "待应用"
+        } else {
+            automatic_label
+        };
         let status_detail = if connected {
             format!(
-                "手动代理 {} · 自动代理 {}{}",
+                "手动代理 {} · 自动代理 {} · DNS {}{}",
                 self.mixed_endpoint(),
-                automatic_label,
+                overview_automatic_label,
+                dns_label,
                 if self.applied.tun {
                     " · 全局网络接管已开启"
                 } else {
@@ -3862,6 +3870,13 @@ impl AppView {
             "—".into()
         };
         let total_count = self.traffic.connection_count;
+        let reported_count = if !connected {
+            "—".to_string()
+        } else if self.traffic_error.is_some() {
+            "读不到".to_string()
+        } else {
+            total_count.to_string()
+        };
         let loaded_count = self.traffic.connections.len();
         let filtered =
             controller::filter_connections(&self.traffic.connections, &self.connection_filters);
@@ -3902,7 +3917,7 @@ impl AppView {
                     ))
                     .child(metric(theme, "上传", &up))
                     .child(metric(theme, "下载", &down))
-                    .child(metric(theme, "核心报告", &total_count.to_string())),
+                    .child(metric(theme, "核心报告", &reported_count)),
             )
             .when(connected, |this| {
                     this.child(
@@ -4340,12 +4355,12 @@ impl AppView {
                     self.is_busy(),
                 )
             })
-            .child(section_heading(theme, "节点组"))
+            .child(section_heading(theme, "已配置节点组"))
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_xs().child("筛选节点预览"))
-                    .child(Input::new(&self.member_query).aria_label("筛选节点预览")),
+                    .child(div().text_xs().child("筛选各组成员"))
+                    .child(Input::new(&self.member_query).aria_label("筛选各组成员")),
             )
             .when(self.strategy.groups.is_empty(), |this| {
                 this.child(empty_hint_action(
@@ -7293,11 +7308,13 @@ fn render_rule_set_card(
                 .child({
                     let entity = entity.clone();
                     let via_id = id.clone();
+                    let name = set.name.clone();
                     let via_current = via.clone();
                     let choices = via_choices.clone();
                     Button::new(SharedString::from(format!("via-rule-{via_id}")))
                         .small()
                         .label("改走向")
+                        .accessibility_label(format!("修改规则 {name} 的走向"))
                         .dropdown_menu(move |menu, _, _| {
                             let entity = entity.clone();
                             let via_id = via_id.clone();
