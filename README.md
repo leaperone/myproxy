@@ -58,11 +58,11 @@ Chrome/Edge use a PAC script and Firefox uses the WebExtension proxy listener.
 Safari has no WebExtension proxy API, so its packaged resources use the native
 messaging protocol documented in [`browser-extension/safari/native-bridge.md`](browser-extension/safari/native-bridge.md).
 
-Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy.log`; 设置 → 日志 shows the tail. Subscription URLs are never written.
+Rust 1.98+ (`rust-toolchain.toml`). Info / Warning / Error always go to `myproxy.log`; 设置 → 高级设置 → 日志 shows the tail. Subscription URLs are never written.
 
 ## CLI
 
-`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. Open **设置 → 命令行工具** to create or update the `~/.cargo/bin/myproxyctl` PATH link. **复制 Agent skill** copies the official instructions from `.agents/skills/agent/SKILL.md`. **安装说明** opens the optional installation dialog. The MacBook Air install script creates the same PATH link automatically.
+`myproxyctl` is included in `myproxy.app/Contents/MacOS/` and updated with the app. Open **设置 → 高级设置 → 命令行工具** to create or update the `~/.cargo/bin/myproxyctl` PATH link. **复制 Agent skill** copies the official instructions from `.agents/skills/agent/SKILL.md`. **安装说明** opens the optional installation dialog. The MacBook Air install script creates the same PATH link automatically.
 
 The in-app installer refuses to replace an existing regular file. If a terminal cannot find `myproxyctl`, add `~/.cargo/bin` to `PATH`. You can still invoke `/Applications/myproxy.app/Contents/MacOS/myproxyctl` directly.
 

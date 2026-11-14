@@ -174,37 +174,7 @@ fn menu_face() -> MenuFace {
         OperationState::Disconnecting => "正在断开…".into(),
         _ if busy => "正在处理操作…".into(),
         _ if health.ready && runtime.is_some() => {
-            let automatic = if !automatic_enabled {
-                "自动代理未开启"
-            } else if extension.observed
-                && extension.desired_revision > 0
-                && extension.is_running_for(extension.desired_revision)
-            {
-                "自动代理已开启"
-            } else {
-                match extension.phase {
-                    network_extension::Phase::Running
-                        if matches!(extension.dns_phase, network_extension::DnsPhase::Failed)
-                            || !extension.capture_enabled =>
-                    {
-                        "自动代理需要处理"
-                    }
-                    network_extension::Phase::Running
-                        if matches!(
-                            extension.dns_phase,
-                            network_extension::DnsPhase::Unknown
-                                | network_extension::DnsPhase::Waiting
-                                | network_extension::DnsPhase::Stopping
-                        ) =>
-                    {
-                        "自动代理等待确认"
-                    }
-                    network_extension::Phase::Running => "自动代理配置未生效",
-                    network_extension::Phase::WaitingApproval => "自动代理等待授权",
-                    network_extension::Phase::Failed => "自动代理需要处理",
-                    _ => "自动代理未开启",
-                }
-            };
+            let automatic = crate::ui::automatic_proxy_status(&extension, automatic_enabled);
             let scope = runtime
                 .map(|identity| {
                     if identity.mixed_lan {
@@ -214,7 +184,7 @@ fn menu_face() -> MenuFace {
                     }
                 })
                 .unwrap_or("仅本机可用");
-            format!("已连接 · 手动代理可用 · {automatic} · {scope}")
+            format!("已连接 · 手动代理可用 · 自动代理{automatic} · {scope}")
         }
         _ if supervisor.wanted() => health.note.clone().unwrap_or_else(|| "代理正在恢复".into()),
         _ => health.note.clone().unwrap_or_else(|| "未连接".into()),

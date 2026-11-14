@@ -1037,7 +1037,7 @@ impl Render for SubscriptionEditor {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_xs().child("订阅 URL"))
+                    .child(div().text_xs().child("订阅地址"))
                     .child(Input::new(&self.url)),
             )
             .child(
@@ -1062,7 +1062,7 @@ fn default_via(strategy: &Strategy) -> String {
 fn via_label(via: &str) -> String {
     let via = via.trim();
     if let Some(group) = myproxy::gfw::gfw_group(via) {
-        return format!("受限列表 → {}", via_label(group));
+        return format!("受限网站 → {}", via_label(group));
     }
     match via.to_ascii_lowercase().as_str() {
         "direct" => "直连".into(),
@@ -1089,7 +1089,7 @@ fn routing_profile_label(profile: RoutingProfile) -> &'static str {
     }
 }
 
-fn automatic_proxy_status(status: &RuntimeStatus, enabled: bool) -> &'static str {
+pub(crate) fn automatic_proxy_status(status: &RuntimeStatus, enabled: bool) -> &'static str {
     if !enabled {
         return "未开启";
     }
@@ -1166,7 +1166,7 @@ fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> V
         }
         out.push(ViaChoice {
             value,
-            label: format!("受限列表 → {}", group.name),
+            label: format!("受限网站 → {}", group.name),
             section: 2,
         });
     }
@@ -1665,7 +1665,7 @@ impl AppView {
     fn mixed_endpoint(&self) -> String {
         self.runtime
             .map(|runtime| {
-                if self.applied.mixed_lan {
+                if runtime.mixed_lan {
                     format!("局域网地址:{}", runtime.mixed_port)
                 } else {
                     format!("127.0.0.1:{}", runtime.mixed_port)
@@ -3572,10 +3572,7 @@ impl AppView {
         let has_sub = !self.strategy.subscriptions.is_empty();
         let has_nodes = !self.catalog.nodes.is_empty();
         let muted = theme.muted_foreground;
-        let inbound = format!(
-            "手动代理地址：{}。普通应用需要在设置开启自动代理；首次使用时，系统会请求允许 myproxy。",
-            self.mixed_endpoint(),
-        );
+        let inbound = "需要让其他应用自动使用代理时，可在设置开启「自动代理」。";
         surface(theme)
             .flex_1()
             .min_w(px(300.))
@@ -3690,10 +3687,7 @@ impl AppView {
         } else if wanted {
             "代理正在启动或恢复，请查看上方状态和操作提示。".into()
         } else {
-            format!(
-                "连接后可让手动代理客户端使用 {}；普通应用可在设置开启自动代理。",
-                self.mixed_endpoint()
-            )
+            "连接后即可使用已配置的出口。需要让其他应用自动使用代理时，请在设置开启「自动代理」。".into()
         };
         v_flex()
             .gap_4()
@@ -3987,7 +3981,7 @@ impl AppView {
                         .overflow_x_scrollbar()
                         .child(
                             v_flex()
-                                .min_w(px(640.))
+                                .min_w(px(860.))
                                 .w_full()
                                 .flex_1()
                                 .min_h_0()
@@ -4037,7 +4031,8 @@ impl AppView {
                                                     .collect::<Vec<_>>()
                                             }),
                                     ))
-                                        .flex_1()
+                                    .flex_1()
+                                    .min_h(px(160.))
                                     .w_full()
                                 })
                                 .when(total_count > loaded_count, |this| {
@@ -4097,7 +4092,7 @@ impl AppView {
                             .gap_1()
                             .flex_1()
                             .min_w(px(180.))
-                            .child(div().text_xs().child("订阅 URL"))
+                            .child(div().text_xs().child("订阅地址"))
                             .child(Input::new(&self.url_input)),
                     )
                     .child(
@@ -4117,7 +4112,7 @@ impl AppView {
                                         let url =
                                             this.url_input.read(cx).value().trim().to_string();
                                         if name.is_empty() || url.is_empty() {
-                                            this.status = "填写订阅名和订阅 URL。".into();
+                                            this.status = "填写订阅名和订阅地址。".into();
                                         } else {
                                             let previous = this.strategy.clone();
                                             this.strategy.add_subscription(name, url);
@@ -5935,7 +5930,7 @@ impl AppView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("Info、Warning、Error 始终写入同一文件。Debug / Trace 仅开发者模式或 MYPROXY_DEV=1。不记录订阅 URL。"),
+                        .child("Info、Warning、Error 始终写入同一文件。Debug / Trace 仅开发者模式或 MYPROXY_DEV=1。不记录订阅地址。"),
                 )
                 .child(
                     h_flex()
@@ -6069,6 +6064,7 @@ where
                     entity.update(app, |this, cx| {
                         if !this.is_busy() {
                             apply(this, cx);
+                            cx.notify();
                         }
                     });
                 })
@@ -6715,8 +6711,7 @@ fn connection_header_row(
             controller::connection_column_values(connections, filters, ConnectionColumn::Chain),
             filters.chain.clone(),
         ))
-        .child(connection_col(px(128.), "流量", muted_fg, None))
-        .child(div().w(px(56.)))
+        .child(connection_col(px(192.), "流量与操作", muted_fg, None))
 }
 
 fn connection_filter_header(
@@ -6847,13 +6842,75 @@ fn render_connection_row(
     let mono = theme.mono_font_family.clone();
     let up = controller::format_bytes(conn.upload);
     let down = controller::format_bytes(conn.download);
-    h_flex()
+    let action_row = {
+        let entity = entity.clone();
+        let process = process.clone();
+        let app_matcher = app_matcher.clone();
+        let choices = via_choices.clone();
+        h_flex()
+            .w(px(192.))
+            .min_w(px(192.))
+            .flex_shrink_0()
+            .justify_end()
+            .gap_1()
+            .child({
+                let entity = entity.clone();
+                let process = process.clone();
+                let app_matcher = app_matcher.clone();
+                Button::new(SharedString::from(format!("rule-conn-{id}")))
+                    .small()
+                    .label("建规则")
+                    .accessibility_label(format!("为 {} 创建规则", conn.process))
+                    .on_click(move |_, window, app| {
+                        app.stop_propagation();
+                        entity.update(app, |this, cx| {
+                            this.open_rule_dialog_for_process(&process, &app_matcher, window, cx);
+                            cx.notify();
+                        });
+                    })
+            })
+            .child({
+                let entity = entity.clone();
+                let process = process.clone();
+                let app_matcher = app_matcher.clone();
+                Button::new(SharedString::from(format!("route-conn-{id}")))
+                    .small()
+                    .label("改走向")
+                    .dropdown_menu(move |menu, _, _| {
+                        let entity = entity.clone();
+                        let process = process.clone();
+                        let app_matcher = app_matcher.clone();
+                        via_menu(menu, &choices, "", move |app, value| {
+                            entity.update(app, |this, cx| {
+                                this.set_connection_process_via(&process, &app_matcher, &value, cx);
+                                cx.notify();
+                            });
+                        })
+                    })
+            })
+            .child({
+                let entity = entity.clone();
+                let close_id = id.clone();
+                Button::new(SharedString::from(format!("close-conn-{id}")))
+                    .small()
+                    .danger()
+                    .label("关闭")
+                    .disabled(busy)
+                    .accessibility_label(format!("关闭 {} 的连接", conn.destination))
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.close_connections(Some(close_id.clone()), cx)
+                        });
+                    })
+            })
+    };
+    v_flex()
         .id(SharedString::from(format!("conn-{id}")))
         .w_full()
-        .items_center()
+        .min_w(px(860.))
         .px_3()
         .py_2()
-        .gap_2()
+        .gap_1()
         .rounded(theme.radius)
         .border_1()
         .border_color(theme.border)
@@ -6868,8 +6925,8 @@ fn render_connection_row(
                 let create_process = process.clone();
                 let create_matcher = app_matcher.clone();
                 menu.min_w(px(168.))
-                    .item(
-                        PopupMenuItem::new("对此进程建规则").on_click(move |_, window, app| {
+                    .item(PopupMenuItem::new("对此进程建规则").on_click(
+                        move |_, window, app| {
                             create_entity.update(app, |this, cx| {
                                 this.open_rule_dialog_for_process(
                                     &create_process,
@@ -6879,8 +6936,8 @@ fn render_connection_row(
                                 );
                                 cx.notify();
                             });
-                        }),
-                    )
+                        },
+                    ))
                     .submenu("改为走向", window, cx, {
                         let entity = entity.clone();
                         let process = process.clone();
@@ -6905,73 +6962,34 @@ fn render_connection_row(
                     })
             }
         })
-        .child(connection_col(px(116.), conn.process.clone(), fg, None))
-        .child(connection_col_flex(
-            conn.destination.clone(),
-            muted_fg,
-            Some(mono.clone()),
-        ))
-        .child(connection_col(
-            px(64.),
-            conn.network.clone(),
-            muted_fg,
-            None,
-        ))
-        .child(connection_col(px(144.), conn.chain.clone(), fg, None))
-        .child(connection_col(
-            px(128.),
-            format!("↑{up} ↓{down} · {}", conn.duration),
-            muted_fg,
-            Some(mono),
-        ))
-        .child({
-            let entity = entity.clone();
-            let process = process.clone();
-            let app_matcher = app_matcher.clone();
-            Button::new(SharedString::from(format!("rule-conn-{id}")))
-                .small()
-                .label("建规则")
-                .accessibility_label(format!("为 {} 创建规则", conn.process))
-                .on_click(move |_, window, app| {
-                    app.stop_propagation();
-                    entity.update(app, |this, cx| {
-                        this.open_rule_dialog_for_process(&process, &app_matcher, window, cx);
-                        cx.notify();
-                    });
-                })
-        })
-        .child({
-            let entity = entity.clone();
-            let process = process.clone();
-            let app_matcher = app_matcher.clone();
-            let choices = via_choices.clone();
-            Button::new(SharedString::from(format!("route-conn-{id}")))
-                .small()
-                .label("改走向")
-                .dropdown_menu(move |menu, _, _| {
-                    let entity = entity.clone();
-                    let process = process.clone();
-                    let app_matcher = app_matcher.clone();
-                    via_menu(menu, &choices, "", move |app, value| {
-                        entity.update(app, |this, cx| {
-                            this.set_connection_process_via(&process, &app_matcher, &value, cx);
-                            cx.notify();
-                        });
-                    })
-                })
-        })
-        .child({
-            let entity = entity.clone();
-            Button::new(SharedString::from(format!("close-conn-{id}")))
-                .small()
-                .danger()
-                .label("关闭")
-                .disabled(busy)
-                .accessibility_label(format!("关闭 {} 的连接", conn.destination))
-                .on_click(move |_, _, app| {
-                    entity.update(app, |this, cx| this.close_connections(Some(id.clone()), cx));
-                })
-        })
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(connection_col(px(116.), conn.process.clone(), fg, None))
+                .child(connection_col_flex(
+                    conn.destination.clone(),
+                    muted_fg,
+                    Some(mono.clone()),
+                ))
+                .child(connection_col(px(64.), conn.network.clone(), muted_fg, None))
+                .child(connection_col(px(144.), conn.chain.clone(), fg, None)),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(connection_col(
+                    px(192.),
+                    format!("↑{up} ↓{down} · {}", conn.duration),
+                    muted_fg,
+                    Some(mono),
+                ))
+                .child(action_row),
+        )
 }
 
 fn outline_pill(theme: &Theme, text: &str) -> impl IntoElement {
@@ -7266,7 +7284,13 @@ fn subscription_display_url(url: &str) -> String {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
-    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
     if host.is_empty() {
         "地址未设置".into()
     } else {
@@ -7371,7 +7395,7 @@ fn status_pill(theme: &Theme, label: &str, value: &str, color: Hsla) -> impl Int
             div()
                 .text_xs()
                 .font_semibold()
-                .text_color(color)
+                .text_color(theme.foreground)
                 .child(value.to_string()),
         )
 }
@@ -7386,7 +7410,9 @@ fn status_dot(theme: &Theme, on: bool) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{automatic_proxy_status, network_extension, Phase, RuntimeStatus};
+    use super::{
+        automatic_proxy_status, network_extension, subscription_display_url, Phase, RuntimeStatus,
+    };
 
     fn running_status() -> RuntimeStatus {
         RuntimeStatus {
@@ -7417,5 +7443,17 @@ mod tests {
         status.dns_phase = network_extension::DnsPhase::Running;
         status.applied_revision = None;
         assert_eq!(automatic_proxy_status(&status, true), "配置未生效");
+    }
+
+    #[test]
+    fn subscription_summary_omits_credentials_and_query() {
+        assert_eq!(
+            subscription_display_url("https://user:secret@example.invalid?token=secret"),
+            "example.invalid"
+        );
+        assert_eq!(
+            subscription_display_url("https://example.invalid/path#secret"),
+            "example.invalid"
+        );
     }
 }
