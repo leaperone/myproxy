@@ -7270,8 +7270,7 @@ fn render_rule_set_card(
                         .when(set.dns_ipv4_only, |this| {
                             this.child(pill(theme, "解析仅用 IPv4", theme.info))
                         }),
-                )
-                .child(div().w(px(12.))),
+                ),
         )
         .child(
             h_flex()
