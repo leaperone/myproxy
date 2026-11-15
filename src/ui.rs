@@ -637,6 +637,7 @@ struct RuleSetEditor {
     draft_kind: RuleDraftKind,
     match_input: Entity<InputState>,
     via_query: Entity<InputState>,
+    help_expanded: bool,
 }
 
 impl RuleSetEditor {
@@ -686,6 +687,7 @@ impl RuleSetEditor {
             draft_kind,
             match_input,
             via_query,
+            help_expanded: false,
         }
     }
 
@@ -935,12 +937,22 @@ impl Render for RuleSetEditor {
                         )
                     }),
             )
-            .child(
+            .child({
+                let entity = entity.clone();
+                explanation_button("rule-help", "填写说明", self.help_expanded)
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.help_expanded = !this.help_expanded;
+                            cx.notify();
+                        });
+                    })
+            })
+            .when(self.help_expanded, |this| this.child(
                 div()
                     .text_xs()
                     .text_color(muted_fg)
                     .child("逗号分隔可一次加入多个条件；同一规则内任一条件命中即生效。受限网站仅在选择对应出口时参与判断。"),
-            )
+            ))
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
             })
@@ -980,6 +992,7 @@ struct SubscriptionEditor {
     name: Entity<InputState>,
     url: Entity<InputState>,
     notice: String,
+    help_expanded: bool,
 }
 
 impl SubscriptionEditor {
@@ -1005,6 +1018,7 @@ impl SubscriptionEditor {
             name,
             url,
             notice: String::new(),
+            help_expanded: false,
         }
     }
 
@@ -1051,6 +1065,7 @@ impl SubscriptionEditor {
 
 impl Render for SubscriptionEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
         let theme = cx.theme().clone();
         v_flex()
             .gap_3()
@@ -1075,11 +1090,20 @@ impl Render for SubscriptionEditor {
                     .child(Input::new(&self.url)),
             )
             .child(
+                explanation_button("subscription-help", "编辑说明", self.help_expanded)
+                    .on_click(move |_, _, app| {
+                        entity.update(app, |this, cx| {
+                            this.help_expanded = !this.help_expanded;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .when(self.help_expanded, |this| this.child(
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child("改名会同步节点组来源与钉住节点；保存后需刷新订阅并应用。"),
-            )
+            ))
     }
 }
 
@@ -1281,7 +1305,7 @@ enum LivePageJob {
     Snapshot(RuntimeIdentity, u64, LiveNeed),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Page {
     Overview,
     Connections,
@@ -1304,6 +1328,8 @@ fn initial_page() -> Page {
 
 pub struct AppView {
     page: Page,
+    expanded_page_help: HashSet<Page>,
+    overview_seen: bool,
     sidebar_compact: bool,
     strategy: Strategy,
     saved: Strategy,
@@ -1600,6 +1626,8 @@ impl AppView {
             .unwrap_or_else(|| strategy.clone());
         let this = Self {
             page: initial_page(),
+            expanded_page_help: HashSet::new(),
+            overview_seen: crate::onboard::overview_seen(),
             sidebar_compact: false,
             health_note: None,
             status: if catalog.nodes.is_empty() {
@@ -3272,6 +3300,11 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page == Page::Overview && !self.overview_seen {
+            self.overview_seen = true;
+            self.expanded_page_help.insert(Page::Overview);
+            crate::onboard::mark_overview_seen();
+        }
         let active = window.is_window_active();
         if active && !self.window_active && self.connected {
             self.window_active = true;
@@ -3590,6 +3623,54 @@ impl AppView {
             })
     }
 
+    fn page_help_expanded(&self) -> bool {
+        self.expanded_page_help.contains(&self.page)
+    }
+
+    fn page_title(
+        &self,
+        cx: &mut Context<Self>,
+        theme: &Theme,
+        title: &str,
+        subtitle: &str,
+    ) -> impl IntoElement {
+        let page = self.page;
+        let expanded = self.page_help_expanded();
+        let entity = cx.entity();
+        v_flex()
+            .gap_2()
+            .pb_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_2xl().font_bold().child(title.to_string()))
+                    .child(
+                        explanation_button(
+                            "toggle-page-help",
+                            if page == Page::Overview { "入门指南" } else { "功能说明" },
+                            expanded,
+                        )
+                        .on_click(move |_, _, app| {
+                            entity.update(app, |this, cx| {
+                                if !this.expanded_page_help.remove(&page) {
+                                    this.expanded_page_help.insert(page);
+                                }
+                                cx.notify();
+                            });
+                        }),
+                    ),
+            )
+            .when(expanded, |this| this.child(
+                div()
+                    .max_w(px(780.))
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(subtitle.to_string()),
+            ))
+    }
+
     fn setup_next(&self) -> SetupNext {
         setup::next_setup_action(
             self.strategy.subscriptions.len(),
@@ -3800,11 +3881,13 @@ impl AppView {
                 "代理正在启动或恢复。自动代理 {} · DNS {}{}。请查看上方状态和操作提示。",
                 overview_automatic_label, dns_label, tun_detail
             )
-        } else {
+        } else if self.page_help_expanded() {
             format!(
                 "连接后即可使用已配置的出口。自动代理 {} · DNS {}{}。需要让其他应用自动使用代理时，请在设置开启「自动代理」。",
                 overview_automatic_label, dns_label, tun_detail
             )
+        } else {
+            format!("自动代理 {} · DNS {}{}", overview_automatic_label, dns_label, tun_detail)
         };
         let status_label = if automatic_problem {
             "部分可用"
@@ -3813,7 +3896,8 @@ impl AppView {
         };
         v_flex()
             .gap_4()
-            .child(page_title(
+            .child(self.page_title(
+                cx,
                 theme,
                 "总览",
                 "连接代理、查看状态，并完成订阅和出口配置。",
@@ -3866,7 +3950,9 @@ impl AppView {
                             )
                             .child(self.overview_hero(cx)),
                     )
-                    .child(self.overview_setup_card(cx, theme)),
+                    .when(self.page_help_expanded(), |this| {
+                        this.child(self.overview_setup_card(cx, theme))
+                    }),
             )
             .child(section_heading(theme, "实时概览"))
                     .child(
@@ -3962,7 +4048,8 @@ impl AppView {
             .overflow_y_scroll()
             .overflow_x_hidden()
             .gap_4()
-            .child(page_title(
+            .child(self.page_title(
+                cx,
                 theme,
                 "连接",
                 "查看进入代理的流量；自动放行或拒绝的活动不会出现在这里。",
@@ -4181,7 +4268,8 @@ impl AppView {
         let entity = cx.entity();
         v_flex()
             .gap_4()
-            .child(page_title(
+            .child(self.page_title(
+                cx,
                 theme,
                 "订阅",
                 "添加订阅并刷新节点，之后就能在节点组里选择出口。",
@@ -4382,7 +4470,8 @@ impl AppView {
         let query = self.member_query.read(cx).value().trim().to_lowercase();
         v_flex()
             .gap_4()
-            .child(page_title(
+            .child(self.page_title(
+                cx,
                 theme,
                 "节点组",
                 "管理出口，并选择当前使用的节点。",
@@ -4413,6 +4502,7 @@ impl AppView {
                     &self.global_query,
                     self.global_limit,
                     self.global_expanded,
+                    self.page_help_expanded(),
                     self.is_busy(),
                 )
             })
@@ -4505,7 +4595,8 @@ impl AppView {
             .overflow_y_scroll()
             .overflow_x_hidden()
             .gap_2()
-            .child(page_title(
+            .child(self.page_title(
+                cx,
                 theme,
                 "规则",
                 "按顺序匹配应用或网站，并设置它们的去向。",
@@ -4624,7 +4715,8 @@ impl AppView {
         };
         v_flex()
             .gap_4()
-            .child(page_title(
+            .child(self.page_title(
+                cx,
                 theme,
                 "设置",
                 &format!(
@@ -4654,24 +4746,24 @@ impl AppView {
                                 v_flex()
                                     .gap(px(2.))
                                     .child(div().text_sm().child("允许局域网设备使用"))
-                                    .child(
+                                    .when(self.page_help_expanded(), |this| this.child(
                                         div()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
                                             .child("同一局域网的设备可使用本机 IP 和这个端口连接；IP 可在系统设置 → 网络查看。"),
-                                    )
+                                    ))
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(theme_ext::warning_text(theme))
                                             .child("开放后没有额外入站密码；VPN、热点或防火墙规则可能让其他网络也能访问。"),
                                     )
-                                    .child(
+                                    .when(self.page_help_expanded(), |this| this.child(
                                         div()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
                                             .child("控制器、网站解析和自动代理入口仍只在本机。"),
-                                    ),
+                                    )),
                             )
                             .child({
                                 let entity = entity.clone();
@@ -4785,12 +4877,12 @@ impl AppView {
                                 v_flex()
                                     .gap(px(2.))
                                     .child(div().text_sm().font_semibold().child("高级设置"))
-                                    .child(
+                                    .when(self.page_help_expanded(), |this| this.child(
                                         div()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
                                             .child("启动、更新、订阅过滤、配置备份和诊断工具。"),
-                                    ),
+                                    )),
                             )
                             .child({
                                 let entity = entity.clone();
@@ -4818,12 +4910,12 @@ impl AppView {
                                 "订阅过滤",
                 v_flex()
                     .gap_2()
-                    .child(
+                    .when(self.page_help_expanded(), |this| this.child(
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
                                             .child("从订阅节点名中排除流量、剩余、到期等提示词，不影响已保存的节点组。"),
-                    )
+                    ))
                                     .child(Input::new(&self.filter_input).aria_label("订阅过滤词"))
                     .child({
                         let entity = entity.clone();
@@ -5132,12 +5224,12 @@ impl AppView {
                             v_flex()
                                 .gap(px(2.))
                                 .child(div().text_sm().child("安装 myproxyctl"))
-                                .child(
+                                .when(self.page_help_expanded(), |this| this.child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
                                         .child("让 Agent 或终端直接使用 myproxyctl 配置代理。"),
-                                ),
+                                )),
                         )
                         .child(
                             h_flex()
@@ -5216,12 +5308,12 @@ impl AppView {
                         .items_center()
                         .justify_between()
                         .gap_4()
-                        .child(
+                        .when(self.page_help_expanded(), |this| this.child(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child("官方 Agent skill，复制后交给 Cursor / Codex。"),
-                        )
+                        ))
                         .child({
                             let entity = entity.clone();
                             Button::new("copy-cli-skill")
@@ -5261,7 +5353,9 @@ impl AppView {
         }
         v_flex()
             .gap_1()
-            .child(div().text_xs().text_color(muted_fg).child(if active {
+            .child(div().text_xs().text_color(muted_fg).child(if !self.page_help_expanded() {
+                format!("全局出口当前为 {now_label}")
+            } else if active {
                 format!("全局出口当前为 {now_label} · 可在节点组中选择具体出口")
             } else {
                 format!("全局出口当前为 {now_label} · 只有选择全局模式时整段使用它")
@@ -5441,12 +5535,12 @@ impl AppView {
                                 })
                         }),
                 )
-                .child(
+                .when(self.page_help_expanded(), |this| this.child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child("只有未被上方规则匹配的流量会使用这里的设置。"),
-                )
+                ))
                 .when(expanded, |this| {
                     this.child(h_flex().gap_1().flex_wrap().children(
                         RoutingProfile::ALL.into_iter().map(|profile| {
@@ -5563,12 +5657,12 @@ impl AppView {
                             v_flex()
                                 .gap(px(2.))
                                 .child(div().text_sm().child("让应用自动按规则联网"))
-                                .child(
+                                .when(self.page_help_expanded(), |this| this.child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
                                         .child("不必逐个填写代理；手动代理客户端仍可单独使用。"),
-                                ),
+                                )),
                         )
                         .child({
                             Switch::new("se-toggle")
@@ -5643,12 +5737,12 @@ impl AppView {
                             v_flex()
                                 .gap(px(2.))
                                 .child(div().text_sm().font_semibold().child("更多接管设置"))
-                                .child(
+                                .when(self.page_help_expanded(), |this| this.child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
                                         .child("入口模式、浏览器代理、局域网和全局网络接管"),
-                                ),
+                                )),
                         )
                         .child({
                             let entity = entity.clone();
@@ -5689,6 +5783,7 @@ impl AppView {
                             "system-proxy-toggle",
                             "系统代理（浏览器）",
                             "把系统 HTTP/HTTPS/SOCKS 指向手动代理，断开时恢复原设置。",
+                            self.page_help_expanded(),
                             self.strategy.system_proxy,
                             self.is_busy(),
                             move |this, cx| {
@@ -5709,6 +5804,7 @@ impl AppView {
                             "lan-capture-toggle",
                             "局域网地址也按规则",
                             "关闭局域网旁路；回环和本机组件仍保持直连。",
+                            self.page_help_expanded(),
                             self.strategy.lan_capture,
                             self.is_busy(),
                             move |this, cx| {
@@ -5729,6 +5825,7 @@ impl AppView {
                             "tun-toggle",
                             "全局网络接管",
                             "接管整台 Mac 的网络并按规则运行，与自动代理互斥。",
+                            true,
                             tun_on,
                             self.is_busy(),
                             move |this, cx| this.set_tun(!this.strategy.tun, cx),
@@ -5884,12 +5981,12 @@ impl AppView {
                 v_flex()
                     .gap(px(2.))
                     .child(div().text_sm().child(title))
-                    .child(
+                    .when(self.page_help_expanded(), |this| this.child(
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(hint),
-                    ),
+                    )),
             )
             .child({
                 Switch::new(id)
@@ -6014,18 +6111,18 @@ impl AppView {
                                 })
                         }),
                 )
-                .child(
+                .when(self.page_help_expanded() || channel == UpdateChannel::Nightly, |this| this.child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(hint),
-                )
-                .child(
+                ))
+                .when(self.page_help_expanded(), |this| this.child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child("已连接时，检查更新与下载走手动代理；未连接则直连。"),
-                )
+                ))
                 .when(!crate::sparkle::available(), |this| {
                     this.child(
                         div()
@@ -6063,12 +6160,12 @@ impl AppView {
             "日志",
             v_flex()
                 .gap_2()
-                .child(
+                .when(self.page_help_expanded(), |this| this.child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child("查看运行记录，订阅链接不会写入日志。开启开发者模式可记录更多诊断细节。"),
-                )
+                ))
                 .child(
                     h_flex()
                         .gap_2()
@@ -6134,12 +6231,12 @@ impl AppView {
             "开发者",
             v_flex()
                 .gap_2()
-                .child(
+                .when(self.page_help_expanded(), |this| this.child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child("打开后会记录更详细的诊断日志。MYPROXY_DEV=1 同样生效。"),
-                )
+                ))
                 .child({
                     let entity = entity.clone();
                     let mut toggle = Button::new("dev-mode").small();
@@ -6167,6 +6264,7 @@ fn toggle_setting_row<F>(
     id: &'static str,
     title: &'static str,
     hint: &'static str,
+    show_hint: bool,
     on: bool,
     disabled: bool,
     apply: F,
@@ -6183,12 +6281,12 @@ where
             v_flex()
                 .gap(px(2.))
                 .child(div().text_sm().child(title))
-                .child(
+                .when(show_hint, |this| this.child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(hint),
-                ),
+                )),
         )
         .child({
             Switch::new(id)
@@ -6600,6 +6698,7 @@ fn render_global_card(
     query: &Entity<InputState>,
     limit: usize,
     expanded: bool,
+    show_help: bool,
     busy: bool,
 ) -> impl IntoElement {
     let now_label = global_selection_label(now, connected);
@@ -6673,7 +6772,9 @@ fn render_global_card(
             div()
                 .text_xs()
                 .text_color(muted_fg)
-                .child(if inbound_global {
+                .child(if !show_help {
+                    format!("当前 {now_label}")
+                } else if inbound_global {
                     format!("当前 {now_label} · 手动代理或自动代理设为全局时，所有流量使用这里")
                 } else {
                     format!("当前 {now_label} · 未启用全局时只作备用，规则仍按组走")
@@ -7442,18 +7543,18 @@ fn section_heading(theme: &Theme, title: &str) -> impl IntoElement {
         .child(div().h(px(1.)).flex_1().bg(theme.border.opacity(0.58)))
 }
 
-fn page_title(theme: &Theme, title: &str, subtitle: &str) -> impl IntoElement {
-    v_flex()
-        .gap_2()
-        .pb_1()
-        .child(div().text_2xl().font_bold().child(title.to_string()))
-        .child(
-            div()
-                .max_w(px(780.))
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(subtitle.to_string()),
-        )
+fn explanation_button(id: &'static str, title: &str, expanded: bool) -> Button {
+    let label = if expanded {
+        format!("收起{title}")
+    } else {
+        title.to_string()
+    };
+    Button::new(id)
+        .small()
+        .ghost()
+        .icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+        .label(label.clone())
+        .accessibility_label(label)
 }
 
 fn metric(theme: &Theme, label: &str, value: &str) -> Div {

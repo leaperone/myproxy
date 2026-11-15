@@ -4,6 +4,8 @@ macOS menu-bar controller ([GPUI](https://github.com/zed-industries/zed)) for a 
 
 Strategy JSON under `~/Library/Application Support/myproxy/` is the source of truth: subscriptions, node groups, rules, and Mixed port (HTTP + SOCKS5, loopback unless **设置** opens it to the LAN). The UI is Chinese: **总览**, **连接**, **订阅**, **节点组**, **规则**, **设置**.
 
+**总览 → 入门指南** expands on the first visit and starts collapsed in later windows. Reopen it at any time; **功能说明** on the other pages reveals optional explanations. Runtime status, permission prompts, and safety warnings remain visible with the controls they describe.
+
 ## Install
 
 Download `myproxy-*.sparkle.zip` from [Releases](https://github.com/leaperone/myproxy/releases), unzip, and move `myproxy.app` into Applications.
