@@ -19,6 +19,8 @@ pub fn copy_agent_skill(cx: &App) {
 struct OnboardState {
     #[serde(default)]
     cli_done: bool,
+    #[serde(default)]
+    overview_seen: bool,
 }
 
 fn load() -> OnboardState {
@@ -46,6 +48,19 @@ pub fn mark_cli_done() {
         return;
     }
     state.cli_done = true;
+    save(&state);
+}
+
+pub fn overview_seen() -> bool {
+    load().overview_seen
+}
+
+pub fn mark_overview_seen() {
+    let mut state = load();
+    if state.overview_seen {
+        return;
+    }
+    state.overview_seen = true;
     save(&state);
 }
 
@@ -197,4 +212,32 @@ pub fn open(
             )
             .child(view.clone())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OnboardState;
+
+    #[test]
+    fn legacy_cli_state_keeps_overview_unseen() {
+        let state: OnboardState = serde_json::from_str(r#"{"cli_done":true}"#).unwrap();
+        assert!(state.cli_done);
+        assert!(!state.overview_seen);
+
+        let empty: OnboardState = serde_json::from_str("{}").unwrap();
+        assert!(!empty.cli_done);
+        assert!(!empty.overview_seen);
+    }
+
+    #[test]
+    fn overview_state_roundtrips_independently_of_cli() {
+        let state = OnboardState {
+            cli_done: false,
+            overview_seen: true,
+        };
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored: OnboardState = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.cli_done);
+        assert!(restored.overview_seen);
+    }
 }
