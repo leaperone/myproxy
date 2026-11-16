@@ -57,7 +57,7 @@ final class DirectUDPFlowRelay: @unchecked Sendable {
     let id = UUID()
 
     private enum Limits {
-        static let idleTimeout: DispatchTimeInterval = .seconds(120)
+        static let idleTimeoutSeconds = 120
         static let maximumDestinations = 32
         static let maximumQueuedResponses = 256
         static let maximumQueuedResponseBytes = 4 * 1_024 * 1_024
@@ -79,8 +79,12 @@ final class DirectUDPFlowRelay: @unchecked Sendable {
         maximumBytes: Limits.maximumQueuedResponseBytes
     )
     private var flowWriteInFlight = false
-    private var idleTimeout: DispatchWorkItem?
-    private var idleGeneration: UInt64 = 0
+    private lazy var idleTimer = RelayIdleTimer(
+        queue: queue,
+        timeoutSeconds: Limits.idleTimeoutSeconds
+    ) { [weak self] in
+        self?.finish(error: DirectUDPFlowRelayError.idleTimedOut)
+    }
     private var openedFlow = false
     private var finished = false
     private var byteLedger = UDPRelayByteLedger()
@@ -368,22 +372,13 @@ final class DirectUDPFlowRelay: @unchecked Sendable {
     }
 
     private func resetIdleTimeout() {
-        idleTimeout?.cancel()
-        idleGeneration &+= 1
-        let generation = idleGeneration
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.idleGeneration == generation else { return }
-            self.finish(error: DirectUDPFlowRelayError.idleTimedOut)
-        }
-        idleTimeout = work
-        queue.asyncAfter(deadline: .now() + Limits.idleTimeout, execute: work)
+        idleTimer.touch()
     }
 
     private func finish(error: Error?) {
         guard !finished else { return }
         finished = true
-        idleTimeout?.cancel()
-        idleTimeout = nil
+        idleTimer.cancel()
         for connection in connections.values {
             connection.stateUpdateHandler = nil
             connection.cancel()

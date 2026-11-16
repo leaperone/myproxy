@@ -26,6 +26,8 @@ public struct ApplicationSourceMatcher: Codable, Hashable, Sendable {
 
 public struct ApplicationIdentifierPatternMatcher: Codable, Hashable, Sendable {
     public let pattern: String
+    private let patternCharacters: [Character]
+    private let hasWildcard: Bool
 
     public init(pattern: String) throws {
         let normalized = pattern.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -40,14 +42,24 @@ public struct ApplicationIdentifierPatternMatcher: Codable, Hashable, Sendable {
             )
         }
         self.pattern = normalized
+        patternCharacters = Array(normalized)
+        hasWildcard = normalized.contains("*") || normalized.contains("?")
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.pattern == rhs.pattern
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(pattern)
     }
 
     public func matches(_ candidate: String) -> Bool {
         let candidate = candidate.lowercased()
-        guard pattern.contains("*") || pattern.contains("?") else {
+        guard hasWildcard else {
             return pattern.elementsEqual(candidate)
         }
-        return Self.wildcardMatch(pattern: Array(pattern), candidate: Array(candidate))
+        return Self.wildcardMatch(pattern: patternCharacters, candidate: Array(candidate))
     }
 
     private static func wildcardMatch(pattern: [Character], candidate: [Character]) -> Bool {
@@ -237,6 +249,7 @@ public struct HostMatcher: Codable, Hashable, Sendable {
 /// while imported masks such as `*github*` retain their wildcard behavior.
 public struct HostPatternMatcher: Codable, Hashable, Sendable {
     public let pattern: String
+    private let patternCharacters: [Character]
 
     public init(pattern: String) throws {
         let normalized = pattern.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -251,6 +264,15 @@ public struct HostPatternMatcher: Codable, Hashable, Sendable {
             throw NetworkRuleValidationError.invalidDomain(pattern)
         }
         self.pattern = normalized
+        patternCharacters = Array(normalized)
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.pattern == rhs.pattern
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(pattern)
     }
 
     public func matches(_ hostname: String) -> Bool {
@@ -258,7 +280,7 @@ public struct HostPatternMatcher: Codable, Hashable, Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        return Self.wildcardMatch(pattern: Array(pattern), candidate: Array(candidate))
+        return Self.wildcardMatch(pattern: patternCharacters, candidate: Array(candidate))
     }
 
     /// Returns the literal suffix for the common `*example.com` form. The

@@ -30,7 +30,7 @@
 
   function setStateLabel(text, error = false) {
     stateLabel.textContent = text;
-    stateLabel.style.color = error ? "#ff3b30" : "";
+    stateLabel.classList.toggle("error", error);
   }
 
   function render() {
@@ -57,9 +57,8 @@
     }
     if (!current.rules.length) {
       const empty = document.createElement("li");
-      empty.className = "rule";
+      empty.className = "rule empty";
       empty.textContent = "还没有网站规则";
-      empty.style.color = "#6e6e73";
       rules.append(empty);
     }
   }

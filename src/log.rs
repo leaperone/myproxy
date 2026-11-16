@@ -96,9 +96,18 @@ impl State {
             return;
         };
         let Ok(meta) = std::fs::metadata(path) else {
+            // Another process rotated the file away; start the new one.
+            self.file = OpenOptions::new().create(true).append(true).open(path).ok();
             return;
         };
         if meta.len() < MAX_FILE_BYTES {
+            use std::os::unix::fs::MetadataExt;
+            let stale = self.file.as_ref().and_then(|file| file.metadata().ok()).is_none_or(
+                |open| open.ino() != meta.ino() || open.dev() != meta.dev(),
+            );
+            if stale {
+                self.file = OpenOptions::new().create(true).append(true).open(path).ok();
+            }
             return;
         }
         self.file = None;

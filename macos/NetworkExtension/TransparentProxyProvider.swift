@@ -554,16 +554,16 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                     "App Routing reached its active UDP flow safety limit"
             ]
         )
-        guard var activity = activities.activity(for: original.flowIdentifier) else { return }
-        activity.relayState = .failed
-        activity.relayError = error.localizedDescription
-        activity.endedAt = Date()
-        activities.upsert(activity)
         AppProxyFlowCompatibility.open(flow) { completionError in
             let terminalError = completionError ?? error
             flow.closeReadWithError(terminalError)
             flow.closeWriteWithError(terminalError)
         }
+        guard var activity = activities.activity(for: original.flowIdentifier) else { return }
+        activity.relayState = .failed
+        activity.relayError = error.localizedDescription
+        activity.endedAt = Date()
+        activities.upsert(activity)
     }
 
     private func recordDirectRelayUnavailable(_ original: AppRoutingActivity) {
@@ -682,11 +682,12 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         _ activities: AppRoutingActivityRing,
         lifecycle: AppRoutingRelayState
     ) {
+        guard AppLog.isDebugEnabled else { return }
         let distribution = activities.activeSourceCounts()
             .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: ",")
-        AppLog.info(
+        AppLog.debug(
             "NetworkExtension.Relays",
             "lifecycle=\(lifecycle.rawValue) active=\(activities.activeCount) by_app=\(distribution.isEmpty ? "none" : distribution)"
         )

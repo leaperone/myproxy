@@ -42,7 +42,7 @@ pub fn apply(mixed_port: u16) -> Result<()> {
         if mixed_port == 0 {
             bail!("mixed port is required");
         }
-        let services = list_enabled_services()?;
+        let services = list_services(false)?;
         if !restore_path()?.exists() {
             let snapshot = RestoreFile {
                 services: services
@@ -79,10 +79,28 @@ pub fn restore() -> Result<bool> {
         let data = fs::read_to_string(&path).context("read system proxy restore file")?;
         let snapshot: RestoreFile =
             serde_json::from_str(&data).context("parse system proxy restore file")?;
-        for service in snapshot.services {
-            restore_proxy(&service.name, "web", &service.http)?;
-            restore_proxy(&service.name, "secureweb", &service.https)?;
-            restore_proxy(&service.name, "socksfirewall", &service.socks)?;
+        let current = list_services(true)?;
+        let mut failures = Vec::new();
+        // A service removed or renamed since the snapshot cannot be restored
+        // and must not keep every later disconnect failing.
+        for service in snapshot
+            .services
+            .into_iter()
+            .filter(|service| current.contains(&service.name))
+        {
+            for (kind, state) in [
+                ("web", &service.http),
+                ("secureweb", &service.https),
+                ("socksfirewall", &service.socks),
+            ] {
+                if let Err(err) = restore_proxy(&service.name, kind, state) {
+                    failures.push(format!("{err:#}"));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            // Keep the snapshot so the next disconnect can retry the restore.
+            bail!("system proxy restore incomplete: {}", failures.join("; "));
         }
         let _ = fs::remove_file(&path);
         log::info("system-proxy", "restored previous system proxy");
@@ -105,7 +123,8 @@ pub fn sync(enabled: bool, mixed_port: u16) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn list_enabled_services() -> Result<Vec<String>> {
+/// `include_disabled` keeps services macOS marks with `*`, without the marker.
+fn list_services(include_disabled: bool) -> Result<Vec<String>> {
     let output = Command::new("networksetup")
         .arg("-listallnetworkservices")
         .output()
@@ -120,8 +139,8 @@ fn list_enabled_services() -> Result<Vec<String>> {
         .lines()
         .skip(1)
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('*'))
-        .map(str::to_string)
+        .filter(|line| !line.is_empty() && (include_disabled || !line.starts_with('*')))
+        .map(|line| line.trim_start_matches('*').to_string())
         .collect())
 }
 
@@ -201,11 +220,15 @@ fn restore_proxy(service: &str, kind: &str, state: &ProxyState) -> Result<()> {
     if state.enabled && !state.server.is_empty() && state.port > 0 {
         set_proxy(service, kind, &state.server, state.port)?;
     } else {
-        let _ = Command::new("networksetup")
+        let status = Command::new("networksetup")
             .arg(format!("-set{kind}proxystate"))
             .arg(service)
             .arg("off")
-            .status();
+            .status()
+            .with_context(|| format!("networksetup -set{kind}proxystate"))?;
+        if !status.success() {
+            bail!("disable {kind} proxy failed for {service}");
+        }
     }
     Ok(())
 }
