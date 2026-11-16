@@ -79,8 +79,12 @@ final class TCPFlowRelay: @unchecked Sendable {
 
     private var connection: NWConnection?
     private var handshakeTimeout: DispatchWorkItem?
-    private var idleTimeout: DispatchWorkItem?
-    private var idleGeneration: UInt64 = 0
+    private lazy var idleTimer = RelayIdleTimer(
+        queue: queue,
+        timeoutSeconds: NetworkRelayLimits.tcpIdleTimeoutSeconds
+    ) { [weak self] in
+        self?.finish(error: TCPFlowRelayError.idleTimedOut)
+    }
     private var methodDecoder = SOCKS5MethodSelectionDecoder()
     private var authenticationDecoder = SOCKS5UsernamePasswordResponseDecoder()
     private var commandDecoder = SOCKS5CommandReplyDecoder()
@@ -148,6 +152,10 @@ final class TCPFlowRelay: @unchecked Sendable {
             handshakeStarted = true
             relayLocalPort = Self.localPort(of: connection)
             beginSOCKSHandshake()
+        case let .waiting(error):
+            // The SOCKS endpoint is always loopback, so waiting means the
+            // listener is gone; no path change will make it ready.
+            finish(error: TCPFlowRelayError.upstreamFailed(error.localizedDescription))
         case let .failed(error):
             finish(error: TCPFlowRelayError.upstreamFailed(error.localizedDescription))
         case .cancelled:
@@ -485,8 +493,7 @@ final class TCPFlowRelay: @unchecked Sendable {
         finished = true
         handshakeTimeout?.cancel()
         handshakeTimeout = nil
-        idleTimeout?.cancel()
-        idleTimeout = nil
+        idleTimer.cancel()
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
@@ -509,8 +516,7 @@ final class TCPFlowRelay: @unchecked Sendable {
         finished = true
         handshakeTimeout?.cancel()
         handshakeTimeout = nil
-        idleTimeout?.cancel()
-        idleTimeout = nil
+        idleTimer.cancel()
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
@@ -518,18 +524,7 @@ final class TCPFlowRelay: @unchecked Sendable {
     }
 
     private func resetIdleTimeout() {
-        idleTimeout?.cancel()
-        idleGeneration &+= 1
-        let generation = idleGeneration
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.idleGeneration == generation else { return }
-            self.finish(error: TCPFlowRelayError.idleTimedOut)
-        }
-        idleTimeout = work
-        queue.asyncAfter(
-            deadline: .now() + NetworkRelayLimits.tcpIdleTimeout,
-            execute: work
-        )
+        idleTimer.touch()
     }
 
     private func report(_ state: AppRoutingRelayState, error: String? = nil) {

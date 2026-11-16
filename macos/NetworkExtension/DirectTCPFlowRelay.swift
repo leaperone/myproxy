@@ -52,8 +52,12 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
 
     private var connection: NWConnection?
     private var connectionTimeout: DispatchWorkItem?
-    private var idleTimeout: DispatchWorkItem?
-    private var idleGeneration: UInt64 = 0
+    private lazy var idleTimer = RelayIdleTimer(
+        queue: queue,
+        timeoutSeconds: NetworkRelayLimits.tcpIdleTimeoutSeconds
+    ) { [weak self] in
+        self?.finish(error: DirectTCPFlowRelayError.idleTimedOut)
+    }
     private var openedFlow = false
     private var openingFlow = false
     private var halfCloseState = TCPRelayHalfCloseState()
@@ -314,8 +318,7 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
         finished = true
         connectionTimeout?.cancel()
         connectionTimeout = nil
-        idleTimeout?.cancel()
-        idleTimeout = nil
+        idleTimer.cancel()
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
@@ -335,18 +338,7 @@ final class DirectTCPFlowRelay: @unchecked Sendable {
     }
 
     private func resetIdleTimeout() {
-        idleTimeout?.cancel()
-        idleGeneration &+= 1
-        let generation = idleGeneration
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.idleGeneration == generation else { return }
-            self.finish(error: DirectTCPFlowRelayError.idleTimedOut)
-        }
-        idleTimeout = work
-        queue.asyncAfter(
-            deadline: .now() + NetworkRelayLimits.tcpIdleTimeout,
-            execute: work
-        )
+        idleTimer.touch()
     }
 
     private func report(_ state: AppRoutingRelayState, error: String? = nil) {
