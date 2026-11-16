@@ -1038,17 +1038,21 @@ public func myproxy_ne_activity_batch(
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         do {
-            boxed.value = try await HostController.shared.activityBatch(
+            boxed.store(try await HostController.shared.activityBatch(
                 cursor: cursor,
                 limit: max(1, min(Int(limit), 500))
-            )
+            ))
         } catch {
-            boxed.value = HostActivityProcessBatch(nil)
+            boxed.store(HostActivityProcessBatch(nil))
         }
         semaphore.signal()
     }
-    _ = semaphore.wait(timeout: .now() + 0.8)
-    guard let batch = boxed.value,
+    let waited = semaphore.wait(timeout: .now() + 0.8)
+    // The task may still finish after a timeout; closing the box makes that
+    // late store a no-op instead of a race with this read.
+    let value = boxed.close()
+    guard waited == .success,
+          let batch = value,
           let data = try? JSONEncoder().encode(batch),
           let json = String(data: data, encoding: .utf8) else {
         return duplicateString("{\"entries\":[],\"nextCursor\":0,\"hasMore\":false}")
@@ -1057,7 +1061,22 @@ public func myproxy_ne_activity_batch(
 }
 
 private final class ActivityBatchBox: @unchecked Sendable {
-    var value: HostActivityProcessBatch?
+    private let lock = NSLock()
+    private var value: HostActivityProcessBatch?
+    private var closed = false
+
+    func store(_ batch: HostActivityProcessBatch) {
+        lock.lock()
+        defer { lock.unlock() }
+        if !closed { value = batch }
+    }
+
+    func close() -> HostActivityProcessBatch? {
+        lock.lock()
+        defer { lock.unlock() }
+        closed = true
+        return value
+    }
 }
 
 @_cdecl("myproxy_ne_status")
