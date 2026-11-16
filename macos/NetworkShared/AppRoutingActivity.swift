@@ -283,15 +283,13 @@ public final class BoundedAppRoutingActivityRing: @unchecked Sendable {
     /// Returns the current live-flow distribution using the least sensitive
     /// stable process label available to the provider.
     public func activeSourceCounts() -> [String: Int] {
-        withLock {
-            active.values.reduce(into: [:]) { counts, activity in
-                let source = activity.source
-                let label = source.bundleIdentifier
-                    ?? source.signingIdentifier
-                    ?? source.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent }
-                    ?? "unknown"
-                counts[label, default: 0] += 1
-            }
+        let sources = withLock { active.values.map(\.source) }
+        return sources.reduce(into: [:]) { counts, source in
+            let label = source.bundleIdentifier
+                ?? source.signingIdentifier
+                ?? source.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? "unknown"
+            counts[label, default: 0] += 1
         }
     }
 

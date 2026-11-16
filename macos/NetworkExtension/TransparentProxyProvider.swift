@@ -682,11 +682,12 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         _ activities: AppRoutingActivityRing,
         lifecycle: AppRoutingRelayState
     ) {
+        guard AppLog.isDebugEnabled else { return }
         let distribution = activities.activeSourceCounts()
             .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: ",")
-        AppLog.info(
+        AppLog.debug(
             "NetworkExtension.Relays",
             "lifecycle=\(lifecycle.rawValue) active=\(activities.activeCount) by_app=\(distribution.isEmpty ? "none" : distribution)"
         )
