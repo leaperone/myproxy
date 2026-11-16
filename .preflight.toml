@@ -15,6 +15,11 @@ build = "scripts/build-network-extension.sh"
 ci_check = "build"
 
 [[scope]]
+name = "Browser extension"
+prefix = "browser-extension/"
+check = "node --check browser-extension/background.js && node --check browser-extension/popup.js"
+
+[[scope]]
 name = "Preflight configuration"
 prefix = ".preflight.toml"
 # Parsed as part of preflight Phase 0; this file has no build artifact.
