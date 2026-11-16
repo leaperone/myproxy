@@ -452,8 +452,11 @@ impl Supervisor {
         }
         let mut health = watch.last.clone();
         health.wanted = true;
-        if health.note.is_none() {
-            health.note = watch.system_proxy_error.clone();
+        if let Some(error) = &watch.system_proxy_error {
+            health.note = Some(match health.note.take() {
+                Some(note) => format!("{note}；{error}"),
+                None => error.clone(),
+            });
         }
         health
     }
@@ -1042,8 +1045,15 @@ impl Supervisor {
         }
     }
 
+    /// Keeps `system_proxy_error`: only the next sync may clear it, and it is
+    /// hidden while disconnected.
     fn reset_health(&self) {
-        *self.health.lock().expect("supervisor health lock") = HealthWatch::default();
+        let mut watch = self.health.lock().expect("supervisor health lock");
+        let system_proxy_error = watch.system_proxy_error.take();
+        *watch = HealthWatch {
+            system_proxy_error,
+            ..HealthWatch::default()
+        };
     }
 
     fn note_failure(&self, runtime: RuntimeConfig, now: Instant, reason: &str) -> CoreHealth {
