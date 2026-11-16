@@ -9,8 +9,6 @@ enum UDPFlowSessionError: Error, LocalizedError, Sendable {
     case flowOpenFailed(String)
     case flowReadFailed(String)
     case flowWriteFailed(String)
-    case datagramTooLarge(limit: Int, actual: Int)
-    case outboundQueueFull(maximumDatagrams: Int, maximumBytes: Int)
     case responseQueueFull(maximumDatagrams: Int, maximumBytes: Int)
     case tooManyConversations(limit: Int)
     case globalConversationLimit(limit: Int)
@@ -33,10 +31,6 @@ enum UDPFlowSessionError: Error, LocalizedError, Sendable {
             "Reading the intercepted UDP flow failed: \(message)"
         case let .flowWriteFailed(message):
             "Writing the intercepted UDP flow failed: \(message)"
-        case let .datagramTooLarge(limit, actual):
-            "The intercepted UDP datagram is \(actual) bytes; limit is \(limit)."
-        case let .outboundQueueFull(datagrams, bytes):
-            "The UDP outbound queue reached its safety limit of \(datagrams) datagrams or \(bytes) bytes."
         case let .responseQueueFull(datagrams, bytes):
             "The UDP response queue reached its safety limit of \(datagrams) datagrams or \(bytes) bytes."
         case let .tooManyConversations(limit):
@@ -75,6 +69,7 @@ private protocol UDPConversation: AnyObject, Sendable {
         completion: @escaping @Sendable (Error?) -> Void
     )
     func responseDelivered(bytes: Int)
+    func recordDropped()
     func resumeReceiving()
     func stop(error: Error?, reportTerminal: Bool)
 }
@@ -91,6 +86,8 @@ final class UDPFlowSession: @unchecked Sendable {
         static let maximumQueuedOutboundBytes = 4 * 1_024 * 1_024
         static let maximumQueuedResponseDatagrams = 128
         static let maximumQueuedResponseBytes = 4 * 1_024 * 1_024
+        static let idleTimeoutNanoseconds =
+            UInt64(NetworkRelayLimits.udpIdleTimeoutSeconds) * 1_000_000_000
     }
 
     private struct ConversationKey: Hashable, Sendable {
@@ -103,8 +100,9 @@ final class UDPFlowSession: @unchecked Sendable {
         let key: ConversationKey
         let plan: UDPFlowInterceptionPlan
         var conversation: (any UDPConversation)?
-        var idleTimeout: DispatchWorkItem?
-        var idleGeneration: UInt64 = 0
+        var lastActivity: UInt64 = 0
+        var rejection: String?
+        var droppedDatagrams: UInt64 = 0
         var pendingPayloads: ArraySlice<Data?> = []
         var ready = false
         var sendInFlight = false
@@ -152,6 +150,10 @@ final class UDPFlowSession: @unchecked Sendable {
     private var writeInFlight = false
     private var opened = false
     private var finished = false
+    private var idleTimer: DispatchSourceTimer?
+    private var emptySince: UInt64?
+    private var parentState: AppRoutingRelayState = .connecting
+    private var parentDroppedDatagrams: UInt64 = 0
 
     init(
         id: UUID,
@@ -195,6 +197,8 @@ final class UDPFlowSession: @unchecked Sendable {
                         return
                     }
                     self.opened = true
+                    self.emptySince = DispatchTime.now().uptimeNanoseconds
+                    self.ensureIdleTimer()
                     self.readFromFlowIfPossible()
                 }
             }
@@ -225,7 +229,9 @@ final class UDPFlowSession: @unchecked Sendable {
               outboundBudget.byteCount
                 < Limits.maximumQueuedOutboundBytes * 3 / 4 else { return }
         readInFlight = true
-        UDPAppProxyFlowCompatibility.read(from: flow) { [weak self] datagrams, error in
+        UDPAppProxyFlowCompatibility.readSkippingUnsupported(
+            from: flow
+        ) { [weak self] datagrams, skipped, error in
             guard let self else { return }
             self.queue.async {
                 self.readInFlight = false
@@ -235,48 +241,90 @@ final class UDPFlowSession: @unchecked Sendable {
                     ))
                     return
                 }
-                guard let datagrams, !datagrams.isEmpty else {
+                guard let datagrams, !datagrams.isEmpty || skipped > 0 else {
                     self.finish(error: nil)
                     return
                 }
-                do {
-                    for datagram in datagrams {
-                        try self.enqueue(datagram)
-                    }
-                    self.readFromFlowIfPossible()
-                } catch {
-                    self.finish(error: error)
+                for _ in 0..<skipped {
+                    self.recordSessionDrop()
                 }
+                for datagram in datagrams where !self.finished {
+                    self.enqueue(datagram)
+                }
+                self.readFromFlowIfPossible()
             }
         }
     }
 
-    private func enqueue(_ datagram: UDPFlowDatagram) throws {
-        guard datagram.payload.count <= SOCKS5Limits.maximumUDPDatagramBytes else {
-            throw UDPFlowSessionError.datagramTooLarge(
-                limit: SOCKS5Limits.maximumUDPDatagramBytes,
-                actual: datagram.payload.count
-            )
-        }
-        guard outboundBudget.reserve(bytes: datagram.payload.count) else {
-            throw UDPFlowSessionError.outboundQueueFull(
-                maximumDatagrams: Limits.maximumQueuedOutboundDatagrams,
-                maximumBytes: Limits.maximumQueuedOutboundBytes
-            )
+    /// A datagram this session cannot route is dropped on its own; the other
+    /// destinations on the same socket keep relaying.
+    private func enqueue(_ datagram: UDPFlowDatagram) {
+        guard datagram.payload.count <= SOCKS5Limits.maximumUDPDatagramBytes,
+              outboundBudget.reserve(bytes: datagram.payload.count)
+        else {
+            recordSessionDrop()
+            return
         }
 
+        let record: ConversationRecord
         do {
-            let record = try conversationRecord(
+            record = try conversationRecord(
                 for: datagram.endpoint,
                 queryScope: queryScope(datagram.payload)
             )
-            record.pendingPayloads.append(datagram.payload)
-            drain(record)
         } catch {
             outboundBudget.release(bytes: datagram.payload.count)
-            readFromFlowIfPossible()
-            throw error
+            recordSessionDrop()
+            return
         }
+        if let rejection = record.rejection {
+            outboundBudget.release(bytes: datagram.payload.count)
+            record.droppedDatagrams = Self.increment(record.droppedDatagrams)
+            record.lastActivity = DispatchTime.now().uptimeNanoseconds
+            publishRejection(record, reason: rejection)
+            // A socket that only reaches rejected destinations ends as before,
+            // so it does not hold a session slot until the idle timeout.
+            if !records.values.contains(where: { $0.conversation != nil }) {
+                finish(error: UDPFlowSessionError.rejected(rejection))
+            }
+            return
+        }
+        record.pendingPayloads.append(datagram.payload)
+        drain(record)
+    }
+
+    /// Counts a drop that has no conversation of its own against the flow's
+    /// parent activity.
+    private func recordSessionDrop() {
+        let parentIdentifier = initialPlan.activity.flowIdentifier
+        if let owner = records.values.first(where: {
+            $0.plan.activity.flowIdentifier == parentIdentifier
+        }) {
+            if let conversation = owner.conversation {
+                conversation.recordDropped()
+                return
+            }
+            if let rejection = owner.rejection {
+                owner.droppedDatagrams = Self.increment(owner.droppedDatagrams)
+                publishRejection(owner, reason: rejection)
+                return
+            }
+        }
+        parentDroppedDatagrams = Self.increment(parentDroppedDatagrams)
+        observerFactory(parentIdentifier)(
+            AppRoutingRelaySnapshot(
+                state: parentState,
+                uploadBytes: 0,
+                downloadBytes: 0,
+                error: nil,
+                localPort: nil,
+                droppedDatagrams: parentDroppedDatagrams
+            )
+        )
+    }
+
+    private static func increment(_ value: UInt64) -> UInt64 {
+        value == .max ? .max : value + 1
     }
 
     private func conversationRecord(
@@ -311,6 +359,7 @@ final class UDPFlowSession: @unchecked Sendable {
             } else {
                 // The payload refined the route, so the activity published at
                 // start never gets a conversation of its own.
+                parentState = .completed
                 observerFactory(initialPlan.activity.flowIdentifier)(
                     AppRoutingRelaySnapshot(
                         state: .completed,
@@ -329,6 +378,7 @@ final class UDPFlowSession: @unchecked Sendable {
         let record = ConversationRecord(key: key, plan: plan)
         record.admissionHeld = true
         records[key] = record
+        emptySince = nil
         do {
             try configure(record)
             resetIdleTimeout(for: record)
@@ -358,9 +408,9 @@ final class UDPFlowSession: @unchecked Sendable {
                 note: "The UDP flow was already owned when fail-open was requested; myproxy relayed this destination directly and measured it instead of silently losing the packet."
             )
         case .reject:
-            publishRejection(record, reason: "A matching App Routing rule rejected this UDP destination.")
-            throw UDPFlowSessionError.rejected(
-                "UDP destination \(Self.description(record.key.destination)) was rejected by App Routing."
+            holdRejection(
+                record,
+                reason: "A matching App Routing rule rejected this UDP destination."
             )
         case .mihomo:
             guard let proxy = record.plan.proxy else {
@@ -376,12 +426,9 @@ final class UDPFlowSession: @unchecked Sendable {
                         note: "The requested Mihomo UDP group listener was unavailable; this destination used the original path because profile-rules could not be selected here."
                     )
                 case .reject:
-                    publishRejection(
+                    holdRejection(
                         record,
                         reason: "The requested Mihomo UDP route was unavailable and this rule rejects fallback."
-                    )
-                    throw UDPFlowSessionError.rejected(
-                        "The requested Mihomo UDP route was unavailable and fallback is Reject."
                     )
                 }
                 return
@@ -485,7 +532,7 @@ final class UDPFlowSession: @unchecked Sendable {
                       self.records[record.key] === record else { return }
                 record.sendInFlight = false
                 if let error {
-                    self.finish(error: error)
+                    self.remove(record, error: error, reportTerminal: true)
                     return
                 }
                 if record.conversation is MihomoUDPConversation {
@@ -564,8 +611,6 @@ final class UDPFlowSession: @unchecked Sendable {
             record.conversation = nil
             record.ready = false
             record.sendInFlight = false
-            record.idleTimeout?.cancel()
-            record.idleTimeout = nil
             configureDirect(
                 record,
                 note: "Mihomo SOCKS5 UDP setup failed before payload forwarding; this destination used the rule's Direct fallback. \(error.localizedDescription)"
@@ -573,7 +618,17 @@ final class UDPFlowSession: @unchecked Sendable {
             resetIdleTimeout(for: record)
             return
         }
-        finish(error: error)
+        remove(record, error: error, reportTerminal: true)
+    }
+
+    /// Keeps the rejected destination as a record without an upstream so later
+    /// datagrams to it are counted as drops instead of being re-planned.
+    private func holdRejection(_ record: ConversationRecord, reason: String) {
+        record.rejection = reason
+        if record.admissionHeld {
+            record.admissionHeld = false
+            releaseConversationAdmission()
+        }
     }
 
     private func publishRejection(
@@ -590,7 +645,7 @@ final class UDPFlowSession: @unchecked Sendable {
                 effectiveAction: .reject,
                 uploadDatagrams: 0,
                 downloadDatagrams: 0,
-                droppedDatagrams: 1,
+                droppedDatagrams: record.droppedDatagrams,
                 lastPayloadAt: Date()
             )
         )
@@ -602,19 +657,48 @@ final class UDPFlowSession: @unchecked Sendable {
     }
 
     private func resetIdleTimeout(for record: ConversationRecord) {
-        record.idleTimeout?.cancel()
-        record.idleGeneration &+= 1
-        let generation = record.idleGeneration
-        let key = record.key
-        let work = DispatchWorkItem { [weak self] in
-            guard let self,
-                  let current = self.records[key],
-                  current.idleGeneration == generation
-            else { return }
-            self.expire(record: current)
+        record.lastActivity = DispatchTime.now().uptimeNanoseconds
+        ensureIdleTimer()
+    }
+
+    private func ensureIdleTimer() {
+        guard !finished, idleTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.setEventHandler { [weak self] in
+            self?.sweepIdle()
         }
-        record.idleTimeout = work
-        queue.asyncAfter(deadline: .now() + NetworkRelayLimits.udpIdleTimeout, execute: work)
+        timer.schedule(deadline: .now() + .nanoseconds(Int(Limits.idleTimeoutNanoseconds)))
+        idleTimer = timer
+        timer.resume()
+    }
+
+    /// Expires idle destinations, then ends the whole session once it has had
+    /// no destination for a full idle interval so its admission slot returns.
+    private func sweepIdle() {
+        guard !finished, let idleTimer else { return }
+        let timeout = Limits.idleTimeoutNanoseconds
+        let now = DispatchTime.now().uptimeNanoseconds
+        var next = timeout
+        for record in Array(records.values) {
+            let elapsed = now &- record.lastActivity
+            if elapsed >= timeout {
+                expire(record: record)
+            } else {
+                next = min(next, timeout - elapsed)
+            }
+        }
+        guard !finished else { return }
+        if records.isEmpty {
+            let since = emptySince ?? now
+            emptySince = since
+            let elapsed = now &- since
+            if elapsed >= timeout {
+                finish(error: nil)
+                return
+            }
+            next = min(next, timeout - elapsed)
+        }
+        idleTimer.schedule(deadline: .now() + .nanoseconds(Int(next)))
     }
 
     private func expire(record: ConversationRecord) {
@@ -632,8 +716,6 @@ final class UDPFlowSession: @unchecked Sendable {
         error: Error? = nil,
         reportTerminal: Bool = false
     ) {
-        record.idleTimeout?.cancel()
-        record.idleTimeout = nil
         if let conversation = record.conversation {
             let conversationIdentifier = conversation.id
             recordKeyByConversationID.removeValue(forKey: conversationIdentifier)
@@ -657,6 +739,9 @@ final class UDPFlowSession: @unchecked Sendable {
         }
         record.pendingPayloads.removeAll()
         records.removeValue(forKey: record.key)
+        if records.isEmpty {
+            emptySince = DispatchTime.now().uptimeNanoseconds
+        }
         if record.admissionHeld {
             record.admissionHeld = false
             releaseConversationAdmission()
@@ -667,13 +752,13 @@ final class UDPFlowSession: @unchecked Sendable {
     private func finish(error: Error?) {
         guard !finished else { return }
         finished = true
+        idleTimer?.cancel()
+        idleTimer = nil
         let parentFlowIdentifier = initialPlan.activity.flowIdentifier
         let parentIsReportedByConversation = records.values.contains {
             $0.plan.activity.flowIdentifier == parentFlowIdentifier
         }
         for record in records.values {
-            record.idleTimeout?.cancel()
-            record.idleTimeout = nil
             record.conversation?.stop(error: error, reportTerminal: true)
             if record.admissionHeld {
                 record.admissionHeld = false
@@ -708,13 +793,6 @@ final class UDPFlowSession: @unchecked Sendable {
         guard case .mihomoUnavailable = plan.decision.reason else { return nil }
         return "Mihomo was unavailable when this destination was decided, so the rule's Direct fallback was used."
     }
-
-    private static func description(_ endpoint: SOCKS5Endpoint) -> String {
-        let host = endpoint.address.ipAddress?.presentation
-            ?? endpoint.address.domain
-            ?? "unknown"
-        return "\(host):\(endpoint.port)"
-    }
 }
 
 /// A single destination on an owned UDP flow, connected directly while
@@ -739,6 +817,7 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
     private var byteLedger = UDPRelayByteLedger()
     private var uploadDatagrams: UInt64 = 0
     private var downloadDatagrams: UInt64 = 0
+    private var droppedDatagrams: UInt64 = 0
     private var localPort: UInt16?
     private var lastPayloadAt: Date?
 
@@ -833,6 +912,12 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
         report(.relaying)
     }
 
+    func recordDropped() {
+        guard !finished else { return }
+        droppedDatagrams = Self.increment(droppedDatagrams)
+        report(ready ? .relaying : .connecting)
+    }
+
     func resumeReceiving() {
         receiveNext()
     }
@@ -918,7 +1003,7 @@ private final class DirectUDPConversation: UDPConversation, @unchecked Sendable 
             effectiveAction: .direct,
             uploadDatagrams: uploadDatagrams,
             downloadDatagrams: downloadDatagrams,
-            droppedDatagrams: 0,
+            droppedDatagrams: droppedDatagrams,
             lastPayloadAt: lastPayloadAt
         ))
     }
@@ -963,6 +1048,7 @@ private final class MihomoUDPConversation: UDPConversation, @unchecked Sendable 
     private var byteLedger = UDPRelayByteLedger()
     private var uploadDatagrams: UInt64 = 0
     private var downloadDatagrams: UInt64 = 0
+    private var droppedDatagrams: UInt64 = 0
     private var localPort: UInt16?
     private var lastPayloadAt: Date?
 
@@ -1055,6 +1141,12 @@ private final class MihomoUDPConversation: UDPConversation, @unchecked Sendable 
         downloadDatagrams = Self.increment(downloadDatagrams)
         lastPayloadAt = Date()
         report(.relaying)
+    }
+
+    func recordDropped() {
+        guard !finished else { return }
+        droppedDatagrams = Self.increment(droppedDatagrams)
+        report(ready ? .relaying : .connecting)
     }
 
     func resumeReceiving() {
@@ -1382,7 +1474,7 @@ private final class MihomoUDPConversation: UDPConversation, @unchecked Sendable 
             localPort: localPort,
             uploadDatagrams: uploadDatagrams,
             downloadDatagrams: downloadDatagrams,
-            droppedDatagrams: 0,
+            droppedDatagrams: droppedDatagrams,
             lastPayloadAt: lastPayloadAt
         ))
     }

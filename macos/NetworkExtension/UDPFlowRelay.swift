@@ -73,9 +73,25 @@ struct UDPFlowDatagram: Sendable {
 /// `Network.NWEndpoint` API without allowing deprecated endpoint wrappers to
 /// escape the compatibility boundary.
 enum UDPAppProxyFlowCompatibility {
+    /// Fails the whole batch when any endpoint cannot be converted.
     static func read(
         from flow: NEAppProxyUDPFlow,
         completion: @escaping @Sendable ([UDPFlowDatagram]?, Error?) -> Void
+    ) {
+        readSkippingUnsupported(from: flow) { datagrams, skipped, error in
+            if skipped > 0 {
+                completion(nil, UDPFlowRelayError.unsupportedEndpoint)
+            } else {
+                completion(datagrams, error)
+            }
+        }
+    }
+
+    /// Drops only the datagrams whose endpoint cannot be converted and reports
+    /// how many were skipped. An empty batch with `skipped > 0` is not EOF.
+    static func readSkippingUnsupported(
+        from flow: NEAppProxyUDPFlow,
+        completion: @escaping @Sendable ([UDPFlowDatagram]?, Int, Error?) -> Void
     ) {
         if #available(macOS 15.0, *) {
             readModern(from: flow, completion: completion)
@@ -99,24 +115,19 @@ enum UDPAppProxyFlowCompatibility {
     @available(macOS 15.0, *)
     private static func readModern(
         from flow: NEAppProxyUDPFlow,
-        completion: @escaping @Sendable ([UDPFlowDatagram]?, Error?) -> Void
+        completion: @escaping @Sendable ([UDPFlowDatagram]?, Int, Error?) -> Void
     ) {
         flow.readDatagrams { values, error in
             guard let values else {
-                completion(nil, error)
+                completion(nil, 0, error)
                 return
             }
-            do {
-                let converted = try values.map { payload, endpoint in
-                    UDPFlowDatagram(
-                        payload: payload,
-                        endpoint: try socksEndpoint(endpoint)
-                    )
+            let converted = values.compactMap { payload, endpoint in
+                (try? socksEndpoint(endpoint)).map {
+                    UDPFlowDatagram(payload: payload, endpoint: $0)
                 }
-                completion(converted, error)
-            } catch let conversionError {
-                completion(nil, conversionError)
             }
+            completion(converted, values.count - converted.count, error)
         }
     }
 
@@ -140,16 +151,17 @@ enum UDPAppProxyFlowCompatibility {
     @available(macOS, introduced: 14.0, obsoleted: 15.0)
     private static func readLegacy(
         from flow: NEAppProxyUDPFlow,
-        completion: @escaping @Sendable ([UDPFlowDatagram]?, Error?) -> Void
+        completion: @escaping @Sendable ([UDPFlowDatagram]?, Int, Error?) -> Void
     ) {
         flow.__readDatagrams { datagrams, endpoints, error in
             guard let datagrams, let endpoints else {
-                completion(nil, error)
+                completion(nil, 0, error)
                 return
             }
             guard datagrams.count == endpoints.count else {
                 completion(
                     nil,
+                    0,
                     UDPFlowRelayError.invalidDatagramBatch(
                         datagrams: datagrams.count,
                         endpoints: endpoints.count
@@ -157,17 +169,12 @@ enum UDPAppProxyFlowCompatibility {
                 )
                 return
             }
-            do {
-                let converted = try zip(datagrams, endpoints).map { payload, endpoint in
-                    UDPFlowDatagram(
-                        payload: payload,
-                        endpoint: try socksEndpoint(endpoint)
-                    )
+            let converted = zip(datagrams, endpoints).compactMap { payload, endpoint in
+                (try? socksEndpoint(endpoint)).map {
+                    UDPFlowDatagram(payload: payload, endpoint: $0)
                 }
-                completion(converted, error)
-            } catch {
-                completion(nil, error)
             }
+            completion(converted, datagrams.count - converted.count, error)
         }
     }
 
