@@ -480,6 +480,8 @@ impl Supervisor {
                 bail!("连接操作已取消");
             }
             self.reset_health();
+            // A new session reports only its own sync result.
+            self.health.lock().expect("supervisor health lock").system_proxy_error = None;
             self.activate(candidate, true)
         })();
         let result = self.finish_cancelled(result);
@@ -845,6 +847,9 @@ impl Supervisor {
             log::warn("system-proxy", format!("restore failed: {err:#}"));
             format!("系统代理未能恢复，请在系统设置中关闭网页代理和 SOCKS 代理：{err:#}")
         });
+        if proxy_note.is_none() {
+            self.health.lock().expect("supervisor health lock").system_proxy_error = None;
+        }
         crate::network_extension::disable_async()
             .and_then(|()| crate::network_extension::wait_disabled(Duration::from_secs(30)))
             .context(CaptureStopUnconfirmed)?;
