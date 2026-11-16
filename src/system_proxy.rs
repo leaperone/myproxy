@@ -79,10 +79,21 @@ pub fn restore() -> Result<bool> {
         let data = fs::read_to_string(&path).context("read system proxy restore file")?;
         let snapshot: RestoreFile =
             serde_json::from_str(&data).context("parse system proxy restore file")?;
+        let mut failures = Vec::new();
         for service in snapshot.services {
-            restore_proxy(&service.name, "web", &service.http)?;
-            restore_proxy(&service.name, "secureweb", &service.https)?;
-            restore_proxy(&service.name, "socksfirewall", &service.socks)?;
+            for (kind, state) in [
+                ("web", &service.http),
+                ("secureweb", &service.https),
+                ("socksfirewall", &service.socks),
+            ] {
+                if let Err(err) = restore_proxy(&service.name, kind, state) {
+                    failures.push(format!("{err:#}"));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            // Keep the snapshot so the next disconnect can retry the restore.
+            bail!("system proxy restore incomplete: {}", failures.join("; "));
         }
         let _ = fs::remove_file(&path);
         log::info("system-proxy", "restored previous system proxy");
@@ -201,11 +212,15 @@ fn restore_proxy(service: &str, kind: &str, state: &ProxyState) -> Result<()> {
     if state.enabled && !state.server.is_empty() && state.port > 0 {
         set_proxy(service, kind, &state.server, state.port)?;
     } else {
-        let _ = Command::new("networksetup")
+        let status = Command::new("networksetup")
             .arg(format!("-set{kind}proxystate"))
             .arg(service)
             .arg("off")
-            .status();
+            .status()
+            .with_context(|| format!("networksetup -set{kind}proxystate"))?;
+        if !status.success() {
+            bail!("disable {kind} proxy failed for {service}");
+        }
     }
     Ok(())
 }

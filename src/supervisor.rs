@@ -85,6 +85,7 @@ struct HealthWatch {
     recovery_committed: bool,
     pending_since: Option<Instant>,
     released: Option<String>,
+    system_proxy_error: Option<String>,
 }
 
 impl Default for HealthWatch {
@@ -99,6 +100,7 @@ impl Default for HealthWatch {
             recovery_committed: false,
             pending_since: None,
             released: None,
+            system_proxy_error: None,
         }
     }
 }
@@ -281,6 +283,12 @@ fn acquire_operation_with_timeout(timeout: Duration) -> Result<OperationGuard> {
     let state = loop {
         match OPERATION.try_lock() {
             Ok(state) => break state,
+            // A panic inside an earlier operation must not block every later
+            // connect or disconnect until restart.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                OPERATION.clear_poison();
+                break poisoned.into_inner();
+            }
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => bail!("另一个核心操作正在进行中，请稍后重试"),
         }
@@ -444,6 +452,9 @@ impl Supervisor {
         }
         let mut health = watch.last.clone();
         health.wanted = true;
+        if health.note.is_none() {
+            health.note = watch.system_proxy_error.clone();
+        }
         health
     }
 
@@ -595,12 +606,17 @@ impl Supervisor {
             candidate.activation_generation = candidate.generation;
             candidate.save()?;
             if should_run {
-                if let Err(err) = crate::system_proxy::sync(
+                let proxy_error = crate::system_proxy::sync(
                     candidate.strategy.system_proxy,
                     candidate.strategy.mixed_port,
-                ) {
+                )
+                .err()
+                .map(|err| {
                     log::warn("system-proxy", format!("sync failed: {err:#}"));
-                }
+                    format!("系统代理设置未生效：{err:#}")
+                });
+                self.health.lock().expect("supervisor health lock").system_proxy_error =
+                    proxy_error;
             }
             if let Some(health) = health {
                 self.reset_health();
@@ -675,10 +691,13 @@ impl Supervisor {
         if !is_wanted() {
             bail!("连接操作已取消");
         }
-        reclaim_owned_mihomo(Some(strategy.mixed_port), None);
+        reclaim_owned_mihomo(Some(strategy.mixed_port), None)?;
         wait_for_owned_ports_free(strategy.mixed_port);
         let bin = paths::bundled_mihomo();
-        let log_file = File::create(paths::mihomo_log_path()?).context("mihomo.log")?;
+        let log_path = paths::mihomo_log_path()?;
+        // Keep the previous core's output; it explains why a recovery restart happened.
+        let _ = fs::rename(&log_path, log_path.with_extension("log.1"));
+        let log_file = File::create(&log_path).context("mihomo.log")?;
         let mut child = mihomo_command(&bin)?
             .arg("-f")
             .arg(paths::runtime_yaml_path()?)
@@ -818,9 +837,10 @@ impl Supervisor {
     }
 
     fn disconnect_inner(&self, mixed_port: Option<u16>) -> Result<()> {
-        if let Err(err) = crate::system_proxy::restore() {
+        let proxy_note = crate::system_proxy::restore().err().map(|err| {
             log::warn("system-proxy", format!("restore failed: {err:#}"));
-        }
+            format!("系统代理未能恢复，请在系统设置中关闭网页代理和 SOCKS 代理：{err:#}")
+        });
         crate::network_extension::disable_async()
             .and_then(|()| crate::network_extension::wait_disabled(Duration::from_secs(30)))
             .context(CaptureStopUnconfirmed)?;
@@ -838,7 +858,7 @@ impl Supervisor {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let stopped = reclaim_owned_mihomo(port, child_pid);
+        let stopped = reclaim_owned_mihomo(port, child_pid)?;
         if let Ok(path) = paths::pid_path() {
             let _ = fs::remove_file(path);
         }
@@ -847,6 +867,9 @@ impl Supervisor {
         self.remember_mixed_port(None);
         if stopped || child_pid.is_some() {
             log::info("supervisor", "disconnect");
+        }
+        if let Some(note) = proxy_note {
+            self.health.lock().expect("supervisor health lock").released = Some(note);
         }
         Ok(())
     }
@@ -961,7 +984,7 @@ impl Supervisor {
         controller::probe(strategy.mixed_port, target)
     }
 
-    pub fn observe(&self, _draft: &Strategy) -> CoreHealth {
+    pub fn observe(&self) -> CoreHealth {
         if !is_wanted() {
             return self.last_health();
         }
@@ -1062,8 +1085,11 @@ impl Supervisor {
         let result = self.disconnect_inner(None).and_then(|()| set_wanted(false));
         match result {
             Ok(()) => {
-                let note = format!("运行状态多次恢复失败，已自动断开并恢复系统网络设置：{reason}");
                 let mut watch = self.health.lock().expect("supervisor health lock");
+                let note = match watch.released.take() {
+                    None => format!("运行状态多次恢复失败，已自动断开并恢复系统网络设置：{reason}"),
+                    Some(proxy) => format!("运行状态多次恢复失败，已自动断开：{reason}。{proxy}"),
+                };
                 *watch = HealthWatch::default();
                 watch.released = Some(note.clone());
                 CoreHealth {
@@ -1434,7 +1460,7 @@ fn owned_listen_ports(mixed_port: u16) -> [u16; 4] {
     ]
 }
 
-fn reclaim_owned_mihomo(mixed_port: Option<u16>, already_stopped: Option<i32>) -> bool {
+fn reclaim_owned_mihomo(mixed_port: Option<u16>, already_stopped: Option<i32>) -> Result<bool> {
     let mut pids = BTreeSet::new();
     if let Some(pid) = read_pid_file() {
         pids.insert(pid);
@@ -1449,18 +1475,24 @@ fn reclaim_owned_mihomo(mixed_port: Option<u16>, already_stopped: Option<i32>) -
         }
     }
     let mut stopped = already_stopped.is_some();
+    let mut survivors = Vec::new();
     for pid in pids {
         if already_stopped == Some(pid) || !is_leftover_mihomo_pid(pid) {
             continue;
         }
         log::info("supervisor", format!("stopping leftover mihomo pid {pid}"));
-        terminate_pid(pid);
+        if !terminate_pid(pid) {
+            survivors.push(pid);
+        }
         stopped = true;
+    }
+    if !survivors.is_empty() {
+        bail!("遗留的 mihomo 进程未能退出（pid {survivors:?}），端口仍被占用");
     }
     if let Some(port) = mixed_port {
         wait_for_port_free(port);
     }
-    stopped
+    Ok(stopped)
 }
 
 fn read_pid_file() -> Option<i32> {
@@ -1468,17 +1500,24 @@ fn read_pid_file() -> Option<i32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn terminate_pid(pid: i32) {
+/// Returns whether the process is gone.
+fn terminate_pid(pid: i32) -> bool {
+    let alive = || unsafe {
+        // Reap it first if it is our own exited child; a zombie still answers kill(0).
+        libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+        libc::kill(pid, 0) == 0
+    };
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
     wait_for_pid_exit(pid);
-    if unsafe { libc::kill(pid, 0) } == 0 {
+    if alive() {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
         wait_for_pid_exit(pid);
     }
+    !alive()
 }
 
 fn wait_for_port_free(port: u16) {
