@@ -427,7 +427,8 @@ public struct CaptureRuleEngine: Sendable {
             self.generalHostPatterns = generalHostPatterns
         }
 
-        func match(_ destination: FlowDestination) -> RuleDestinationMatchEvidence? {
+        func match(_ flow: PreparedFlow) -> RuleDestinationMatchEvidence? {
+            let destination = flow.context.destination
             var best: IndexedDestination?
 
             func consider(_ candidate: IndexedDestination?) {
@@ -446,19 +447,19 @@ public struct CaptureRuleEngine: Sendable {
                 }
             }
 
-            if let hostname = destination.hostname {
-                let normalized = Self.normalizedHostname(hostname)
+            if let normalized = flow.normalizedHostname {
                 consider(exactHosts[normalized])
 
-                let labels = normalized.split(separator: ".", omittingEmptySubsequences: true)
-                for index in labels.indices {
-                    let suffix = labels[index...].joined(separator: ".")
-                    consider(domainSuffixes[suffix])
+                if !domainSuffixes.isEmpty {
+                    for suffix in flow.labelSuffixes {
+                        consider(domainSuffixes[suffix])
+                    }
                 }
 
-                let characters = Array(normalized)
-                for index in characters.indices {
-                    consider(looseSuffixes[String(characters[index...])])
+                if !looseSuffixes.isEmpty {
+                    for suffix in flow.characterSuffixes {
+                        consider(looseSuffixes[suffix])
+                    }
                 }
 
                 for indexed in generalHostPatterns {
@@ -471,12 +472,37 @@ public struct CaptureRuleEngine: Sendable {
             guard let best else { return nil }
             return CaptureRuleEngine.destinationEvidence(for: best.matcher)
         }
+    }
 
-        private static func normalizedHostname(_ hostname: String) -> String {
-            var result = hostname.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            while result.last == "." { result.removeLast() }
-            return result
+    /// Values derived from one flow that every rule would otherwise recompute.
+    /// Lazy members are only built when some rule needs them.
+    private final class PreparedFlow {
+        let context: FlowContext
+        let normalizedHostname: String?
+
+        init(_ context: FlowContext) {
+            self.context = context
+            normalizedHostname = context.destination.hostname.map { hostname in
+                var result = hostname.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                while result.last == "." { result.removeLast() }
+                return result
+            }
         }
+
+        lazy var executableName: String? = context.source.executablePath.map {
+            URL(fileURLWithPath: $0).lastPathComponent
+        }
+
+        lazy var labelSuffixes: [String] = {
+            guard let normalizedHostname else { return [] }
+            let labels = normalizedHostname.split(separator: ".", omittingEmptySubsequences: true)
+            return labels.indices.map { labels[$0...].joined(separator: ".") }
+        }()
+
+        lazy var characterSuffixes: [String] = {
+            guard let normalizedHostname else { return [] }
+            return normalizedHostname.indices.map { String(normalizedHostname[$0...]) }
+        }()
     }
 
     private struct OrderedRule: Sendable {
@@ -549,12 +575,13 @@ public struct CaptureRuleEngine: Sendable {
             )
         }
 
+        let flow = PreparedFlow(context)
         for orderedRule in orderedRules where orderedRule.rule.enabled {
             let rule = orderedRule.rule
             if let evidence = Self.matchEvidence(
                 for: rule,
                 compiledDestinations: orderedRule.destinations,
-                context: context,
+                flow: flow,
                 sourceEvaluationMode: sourceEvaluationMode
             ) {
                 return RuleDecision(
@@ -576,9 +603,10 @@ public struct CaptureRuleEngine: Sendable {
     private static func matchEvidence(
         for rule: CaptureRule,
         compiledDestinations: CompiledDestinations,
-        context: FlowContext,
+        flow: PreparedFlow,
         sourceEvaluationMode: SourceEvaluationMode
     ) -> CaptureRuleDecisionEvidence? {
+        let context = flow.context
         // Protocol matching is bounded and rejects many rules. Run it before
         // source identity, wildcard, network, and hostname matching so every
         // new flow pays the expensive work only for viable candidates.
@@ -598,7 +626,7 @@ public struct CaptureRuleEngine: Sendable {
         } else if let evidence = rule.sources.lazy.compactMap({ matcher in
             matchEvidence(
                 for: matcher,
-                source: context.source,
+                flow: flow,
                 sourceEvaluationMode: sourceEvaluationMode
             )
         }).first {
@@ -610,7 +638,7 @@ public struct CaptureRuleEngine: Sendable {
         let destinationEvidence: RuleDestinationMatchEvidence
         if rule.destinations.isEmpty {
             destinationEvidence = .unconstrained
-        } else if let evidence = compiledDestinations.match(context.destination) {
+        } else if let evidence = compiledDestinations.match(flow) {
             destinationEvidence = evidence
         } else {
             return nil
@@ -636,9 +664,10 @@ public struct CaptureRuleEngine: Sendable {
 
     private static func matchEvidence(
         for matcher: SourceMatcher,
-        source: FlowSource,
+        flow: PreparedFlow,
         sourceEvaluationMode: SourceEvaluationMode
     ) -> RuleSourceMatchEvidence? {
+        let source = flow.context.source
         switch sourceEvaluationMode {
         case .verified:
             break
@@ -696,7 +725,7 @@ public struct CaptureRuleEngine: Sendable {
             let candidates: [(String?, RuleApplicationIdentifierField)] = [
                 (source.bundleIdentifier, .bundleIdentifier),
                 (source.signingIdentifier, .signingIdentifier),
-                (source.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent }, .executableName),
+                (flow.executableName, .executableName),
             ]
             guard let matchedField = candidates.first(where: { candidate, _ in
                 candidate.map(application.matches) == true

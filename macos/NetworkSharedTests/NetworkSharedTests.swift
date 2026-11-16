@@ -345,6 +345,37 @@ struct NetworkSharedTests {
             try expectEqual(miss.cause, .defaultDirect, "bundle miss")
         }
 
+        run.test("capture_host_patterns_loose_and_general") {
+            let loose = try CaptureRule(
+                id: "loose",
+                priority: 10,
+                destinations: [.hostPattern(try HostPatternMatcher(pattern: "*GitHub.com"))],
+                action: .reject
+            )
+            let general = try CaptureRule(
+                id: "general",
+                priority: 20,
+                destinations: [.hostPattern(try HostPatternMatcher(pattern: "api.*.example?com"))],
+                action: .reject
+            )
+            let engine = try engine(rules: [loose, general])
+            func cause(_ host: String) throws -> RuleDecisionCause {
+                engine.evaluate(context(
+                    source: flowSource(),
+                    destination: try FlowDestination(hostname: host, port: 443)
+                )).cause
+            }
+            try expectEqual(try cause("Raw.GITHUB.com."), .matchedRule("loose"), "loose suffix")
+            try expectEqual(try cause("notgithub.com"), .matchedRule("loose"), "loose is not label-bound")
+            try expectEqual(try cause("api.v2.example-com"), .matchedRule("general"), "general wildcard")
+            try expectEqual(try cause("github.org"), .defaultDirect, "pattern miss")
+            try expectEqual(
+                try HostPatternMatcher(pattern: "*a.com"),
+                try HostPatternMatcher(pattern: " *A.COM "),
+                "pattern equality follows normalized text"
+            )
+        }
+
         run.test("capture_domain_exact_vs_suffix") {
             let exact = try CaptureRule(
                 id: "exact-host",
