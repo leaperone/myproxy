@@ -152,6 +152,12 @@ fn try_compile_root(
 
     let mut groups = Vec::new();
     for group in &strategy.groups {
+        for pin in catalog::missing_pins(group, catalog) {
+            log::warn(
+                "catalog",
+                format!("group {} skip missing pin {}", group.name, pin),
+            );
+        }
         let mut members = catalog::resolve_group_members(group, catalog);
         if members.is_empty() {
             log::warn(

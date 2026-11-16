@@ -1212,65 +1212,40 @@ fn runtime_dns_label(
 }
 
 fn via_choices(strategy: &Strategy, catalog: &Catalog, extra: Option<&str>) -> Vec<ViaChoice> {
-    let mut out = vec![
-        ViaChoice {
-            value: "DIRECT".into(),
-            label: "直连".into(),
-            section: 0,
-        },
-        ViaChoice {
-            value: "REJECT".into(),
-            label: "拒绝".into(),
-            section: 0,
-        },
-    ];
-    for group in &strategy.groups {
-        if out
-            .iter()
-            .any(|c| c.value.eq_ignore_ascii_case(&group.name))
-        {
-            continue;
+    let mut out: Vec<ViaChoice> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |value: String, label: String, section: u8| {
+        if seen.insert(value.to_ascii_lowercase()) {
+            out.push(ViaChoice {
+                value,
+                label,
+                section,
+            });
         }
-        out.push(ViaChoice {
-            value: group.name.clone(),
-            label: group.name.clone(),
-            section: 1,
-        });
+    };
+    push("DIRECT".into(), "直连".into(), 0);
+    push("REJECT".into(), "拒绝".into(), 0);
+    for group in &strategy.groups {
+        push(group.name.clone(), group.name.clone(), 1);
     }
     for group in &strategy.groups {
-        let value = format!("gfw:{}", group.name);
-        if out.iter().any(|c| c.value.eq_ignore_ascii_case(&value)) {
-            continue;
-        }
-        out.push(ViaChoice {
-            value,
-            label: format!("受限网站 → {}", group.name),
-            section: 2,
-        });
+        push(
+            format!("gfw:{}", group.name),
+            format!("受限网站 → {}", group.name),
+            2,
+        );
     }
+    let group_names: HashSet<&str> = strategy.groups.iter().map(|g| g.name.as_str()).collect();
     for node in &catalog.nodes {
-        let value = if strategy.groups.iter().any(|g| g.name == node.name) {
+        let value = if group_names.contains(node.name.as_str()) {
             format!("node:{}", node.name)
         } else {
             node.name.clone()
         };
-        if out.iter().any(|c| c.value.eq_ignore_ascii_case(&value)) {
-            continue;
-        }
-        out.push(ViaChoice {
-            value,
-            label: node.name.clone(),
-            section: 3,
-        });
+        push(value, node.name.clone(), 3);
     }
     if let Some(via) = extra.map(str::trim).filter(|s| !s.is_empty()) {
-        if !out.iter().any(|c| c.value.eq_ignore_ascii_case(via)) {
-            out.push(ViaChoice {
-                value: via.to_string(),
-                label: via_label(via),
-                section: 3,
-            });
-        }
+        push(via.to_string(), via_label(via), 3);
     }
     out
 }
@@ -1430,15 +1405,15 @@ impl AppView {
                         if this.is_busy() {
                             None
                         } else {
-                            Some((this.supervisor.clone(), this.applied.clone(), this.live_revision))
+                            Some((this.supervisor.clone(), this.live_revision))
                         }
                     })
                     .ok()
                     .flatten();
-                if let Some((supervisor, strategy, revision)) = health_strategy {
+                if let Some((supervisor, revision)) = health_strategy {
                     let _health = cx
                         .background_executor()
-                        .spawn(async move { supervisor.observe(&strategy) })
+                        .spawn(async move { supervisor.observe() })
                         .await;
                     if this
                         .update(cx, |this, cx| {
@@ -1521,9 +1496,17 @@ impl AppView {
                         if !this.is_busy() {
                             if let Some(path) = strategy_path.as_deref() {
                                 let stamp = file_stamp(path);
-                                if stamp != this.strategy_stamp {
-                                    if let Ok(strategy) = Strategy::load() {
-                                        this.strategy_stamp = stamp;
+                                // A missing file is not reloaded: Strategy::load would
+                                // recreate defaults and replace the user's configuration.
+                                if stamp != this.strategy_stamp && stamp.is_some() {
+                                    let loaded = Strategy::load();
+                                    this.strategy_stamp = stamp;
+                                    if let Err(err) = &loaded {
+                                        log::warn("ui", format!("reload strategy.json failed: {err:#}"));
+                                        this.status = format!("外部策略文件无法读取，界面保留当前配置：{err:#}");
+                                        dirty = true;
+                                    }
+                                    if let Ok(strategy) = loaded {
                                         log::set_developer(strategy.developer_mode);
                                         let local_inputs_dirty = this.port_input.read(cx).value().trim()
                                             != this.strategy.mixed_port.to_string()
@@ -1556,8 +1539,12 @@ impl AppView {
                             if let Some(path) = catalog_path.as_deref() {
                                 let stamp = file_stamp(path);
                                 if stamp != catalog_stamp {
-                                    if let Ok(catalog) = Catalog::load() {
-                                        catalog_stamp = stamp;
+                                    catalog_stamp = stamp;
+                                    let loaded = Catalog::load();
+                                    if let Err(err) = &loaded {
+                                        log::warn("ui", format!("reload catalog.json failed: {err:#}"));
+                                    }
+                                    if let Ok(catalog) = loaded {
                                         log::debug(
                                             "ui",
                                             format!(
@@ -2143,22 +2130,20 @@ impl AppView {
                 .map(|member| member.name.clone())
                 .collect()
         } else {
-            let mut names = vec!["DIRECT".into(), "REJECT".into()];
-            for group in &self.strategy.groups {
-                if !names.iter().any(|name| name == &group.name) {
-                    names.push(group.name.clone());
-                }
-            }
-            for node in &self.catalog.nodes {
-                if !names.iter().any(|name| name == &node.name) {
-                    names.push(node.name.clone());
-                }
-            }
-            names
+            let mut seen = HashSet::new();
+            ["DIRECT", "REJECT"]
+                .into_iter()
+                .chain(self.strategy.groups.iter().map(|group| group.name.as_str()))
+                .chain(self.catalog.nodes.iter().map(|node| node.name.as_str()))
+                .filter(|name| seen.insert(*name))
+                .map(str::to_string)
+                .collect()
         };
         if !query.is_empty() {
             names.retain(|name| name.to_lowercase().contains(&query));
         }
+        let group_names: HashSet<&str> =
+            self.strategy.groups.iter().map(|group| group.name.as_str()).collect();
         names.sort_by(|a, b| {
             let rank = |name: &str| {
                 if name == now {
@@ -2167,7 +2152,7 @@ impl AppView {
                     1
                 } else if name.eq_ignore_ascii_case("REJECT") {
                     2
-                } else if self.strategy.groups.iter().any(|group| group.name == name) {
+                } else if group_names.contains(name) {
                     3
                 } else {
                     4
@@ -2175,10 +2160,11 @@ impl AppView {
             };
             rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
         });
+        let delays = self.member_delays();
         names
             .into_iter()
             .map(|name| {
-                let delay = self.member_delay(&name);
+                let delay = delays.get(name.as_str()).copied().flatten();
                 (name, delay)
             })
             .collect()
@@ -3074,7 +3060,7 @@ impl AppView {
             .find(|live| live.name == group.name)
     }
 
-    fn group_now<'a>(&'a self, group: &'a Group) -> &'a str {
+    fn group_now<'a>(&'a self, group: &'a Group, members_empty: bool) -> &'a str {
         if self.connected {
             return match self.live_group(group) {
                 Some(live) if live.members.is_empty() => "不可用",
@@ -3082,7 +3068,7 @@ impl AppView {
                 _ => "等待代理就绪",
             };
         }
-        if catalog::resolve_group_members(group, &self.catalog).is_empty() {
+        if members_empty {
             "不可用"
         } else if group.selected.is_empty() {
             "—"
@@ -3106,12 +3092,13 @@ impl AppView {
         catalog::resolve_group_members(group, &self.catalog)
     }
 
-    fn member_delay(&self, name: &str) -> Option<u32> {
-        self.proxy_groups
-            .iter()
-            .flat_map(|group| group.members.iter())
-            .find(|member| member.name == name)
-            .and_then(|member| member.delay)
+    /// First live record per member name, so lookups stay O(1) per row.
+    fn member_delays(&self) -> HashMap<&str, Option<u32>> {
+        let mut delays = HashMap::new();
+        for member in self.proxy_groups.iter().flat_map(|group| group.members.iter()) {
+            delays.entry(member.name.as_str()).or_insert(member.delay);
+        }
+        delays
     }
 
     fn select_global_member(&mut self, node: &str, cx: &mut Context<Self>) {
@@ -4231,14 +4218,12 @@ impl AppView {
                                                     &this.connection_filters,
                                                 );
                                                 let theme = cx.theme().clone();
-                                                let choices = via_choices(&this.strategy, &this.catalog, None);
                                                 let busy = this.is_busy();
                                                 let entity = cx.entity();
                                                 range.filter_map(|ix| {
                                                     filtered.get(ix).map(|conn| {
                                                         render_connection_row(
-                                                            entity.clone(), &theme, conn,
-                                                            choices.clone(), busy,
+                                                            entity.clone(), &theme, conn, busy,
                                                         )
                                                     })
                                                 }).collect::<Vec<_>>()
@@ -4468,6 +4453,7 @@ impl AppView {
     fn groups(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
         let entity = cx.entity();
         let query = self.member_query.read(cx).value().trim().to_lowercase();
+        let delays = self.member_delays();
         v_flex()
             .gap_4()
             .child(self.page_title(
@@ -4547,12 +4533,12 @@ impl AppView {
                     Some(member_names.len())
                 };
                 let selected = self.group_edit_id.as_deref() == Some(group.id.as_str());
-                let now = self.group_now(group).to_string();
+                let now = self.group_now(group, member_names.is_empty()).to_string();
                 let members: Vec<(String, Option<u32>)> = member_names
                     .into_iter()
                     .filter(|name| name.to_lowercase().contains(&query))
                     .map(|name| {
-                        let delay = self.member_delay(&name);
+                        let delay = delays.get(name.as_str()).copied().flatten();
                         (name, delay)
                     })
                     .collect();
@@ -4577,11 +4563,10 @@ impl AppView {
         let entity = cx.entity();
         let query = self.rule_query.read(cx).value().to_string();
         let total = self.strategy.rule_sets.len();
-        let visible: Vec<(usize, RuleSet)> = self
+        let visible: Vec<(usize, &RuleSet)> = self
             .strategy
             .rule_sets
             .iter()
-            .cloned()
             .enumerate()
             .filter(|(_, set)| set.matches_query(&query))
             .collect();
@@ -4684,8 +4669,7 @@ impl AppView {
                             index,
                             total,
                             self.rule_edit_id.as_deref() == Some(set.id.as_str()),
-                            &set,
-                            via_choices(&self.strategy, &self.catalog, Some(&set.via)),
+                            set,
                             accent,
                         )
                     })),
@@ -7058,13 +7042,11 @@ fn render_connection_row(
     entity: Entity<AppView>,
     theme: &Theme,
     conn: &controller::LiveConnection,
-    via_choices: Vec<ViaChoice>,
     busy: bool,
 ) -> impl IntoElement {
     let id = conn.id.clone();
     let process = conn.process.clone();
     let app_matcher = conn.app_matcher.clone();
-    let context_choices = via_choices.clone();
     let hover = theme_ext::row_hover(theme);
     let muted_fg = theme.muted_foreground;
     let fg = theme.foreground;
@@ -7075,7 +7057,6 @@ fn render_connection_row(
         let entity = entity.clone();
         let process = process.clone();
         let app_matcher = app_matcher.clone();
-        let choices = via_choices.clone();
         h_flex()
             .w(px(192.))
             .min_w(px(192.))
@@ -7105,7 +7086,11 @@ fn render_connection_row(
                 Button::new(SharedString::from(format!("route-conn-{id}")))
                     .small()
                     .label("改走向")
-                    .dropdown_menu(move |menu, _, _| {
+                    .dropdown_menu(move |menu, _, cx| {
+                        let choices = {
+                            let this = entity.read(cx);
+                            via_choices(&this.strategy, &this.catalog, None)
+                        };
                         let entity = entity.clone();
                         let process = process.clone();
                         let app_matcher = app_matcher.clone();
@@ -7171,8 +7156,11 @@ fn render_connection_row(
                         let entity = entity.clone();
                         let process = process.clone();
                         let app_matcher = app_matcher.clone();
-                        let choices = context_choices.clone();
-                        move |menu, _, _| {
+                        move |menu, _, cx| {
+                            let choices = {
+                                let this = entity.read(cx);
+                                via_choices(&this.strategy, &this.catalog, None)
+                            };
                             let entity = entity.clone();
                             let process = process.clone();
                             let app_matcher = app_matcher.clone();
@@ -7240,7 +7228,6 @@ fn render_rule_set_card(
     total: usize,
     selected: bool,
     set: &RuleSet,
-    via_choices: Vec<ViaChoice>,
     accent: Hsla,
 ) -> impl IntoElement {
     let id = set.id.clone();
@@ -7250,7 +7237,6 @@ fn render_rule_set_card(
     let hover = theme_ext::row_hover(theme);
     let selected_border = theme_ext::selection_border(theme);
     let muted_fg = theme.muted_foreground;
-    let context_choices = via_choices.clone();
     const CHIP_LIMIT: usize = 10;
     let extra = set.matchers.len().saturating_sub(CHIP_LIMIT);
     surface(theme)
@@ -7306,8 +7292,11 @@ fn render_rule_set_card(
                         let entity = entity.clone();
                         let id = id.clone();
                         let via_current = via.clone();
-                        let choices = context_choices.clone();
-                        move |menu, _, _| {
+                        move |menu, _, cx| {
+                            let choices = {
+                                let this = entity.read(cx);
+                                via_choices(&this.strategy, &this.catalog, Some(&via_current))
+                            };
                             let entity = entity.clone();
                             let id = id.clone();
                             via_menu(menu, &choices, &via_current, move |app, value| {
@@ -7457,12 +7446,15 @@ fn render_rule_set_card(
                     let via_id = id.clone();
                     let name = set.name.clone();
                     let via_current = via.clone();
-                    let choices = via_choices.clone();
                     Button::new(SharedString::from(format!("via-rule-{via_id}")))
                         .small()
                         .label("改走向")
                         .accessibility_label(format!("修改规则 {name} 的走向"))
-                        .dropdown_menu(move |menu, _, _| {
+                        .dropdown_menu(move |menu, _, cx| {
+                            let choices = {
+                                let this = entity.read(cx);
+                                via_choices(&this.strategy, &this.catalog, Some(&via_current))
+                            };
                             let entity = entity.clone();
                             let via_id = via_id.clone();
                             via_menu(menu, &choices, &via_current, move |app, value| {

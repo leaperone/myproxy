@@ -49,9 +49,7 @@ pub fn install(cx: &mut App) {
         cx.background_executor()
             .spawn(async move {
                 if !Supervisor::shared().is_busy() {
-                    if let Ok(strategy) = Strategy::load() {
-                        Supervisor::shared().observe(&strategy);
-                    }
+                    Supervisor::shared().observe();
                 }
                 *health_face.lock().expect("tray observed face") = menu_face();
             })

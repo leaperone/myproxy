@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::process::Command;
 
@@ -408,34 +408,58 @@ pub fn resolve_group_members(group: &crate::strategy::Group, catalog: &Catalog) 
     // Pin order is fallback/select priority. Do not alpha-sort: flag-prefixed
     // names would otherwise become the implicit first member.
     let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let known: HashSet<&str> = catalog.nodes.iter().map(|node| node.name.as_str()).collect();
     for pin in &group.include {
-        if !catalog.nodes.iter().any(|node| node.name == *pin) {
-            log::warn(
-                "catalog",
-                format!("group {} skip missing pin {}", group.name, pin),
-            );
+        if !known.contains(pin.as_str()) || group.exclude.iter().any(|excluded| excluded == pin) {
             continue;
         }
-        if group.exclude.iter().any(|excluded| excluded == pin) {
-            continue;
-        }
-        if !names.iter().any(|n| n == pin) {
+        if seen.insert(pin.as_str()) {
             names.push(pin.clone());
         }
     }
+    let name_contains = lowered_patterns(&group.name_contains);
+    let name_excludes = lowered_patterns(&group.name_excludes);
     for node in &catalog.nodes {
-        if group_accepts(group, node) && !names.iter().any(|n| n == &node.name) {
+        if !seen.contains(node.name.as_str())
+            && group_accepts(group, node, &name_contains, &name_excludes)
+        {
+            seen.insert(&node.name);
             names.push(node.name.clone());
         }
     }
     names
 }
 
+/// Pins whose node no longer exists in the catalog; resolution skips them.
+pub fn missing_pins<'a>(group: &'a crate::strategy::Group, catalog: &Catalog) -> Vec<&'a str> {
+    let known: HashSet<&str> = catalog.nodes.iter().map(|node| node.name.as_str()).collect();
+    group
+        .include
+        .iter()
+        .map(String::as_str)
+        .filter(|pin| !known.contains(pin))
+        .collect()
+}
+
+fn lowered_patterns(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|pattern| pattern.trim().to_lowercase())
+        .filter(|pattern| !pattern.is_empty())
+        .collect()
+}
+
 pub fn count_group_members(group: &crate::strategy::Group, catalog: &Catalog) -> usize {
     resolve_group_members(group, catalog).len()
 }
 
-fn group_accepts(group: &crate::strategy::Group, node: &Node) -> bool {
+fn group_accepts(
+    group: &crate::strategy::Group,
+    node: &Node,
+    name_contains: &[String],
+    name_excludes: &[String],
+) -> bool {
     if group.exclude.iter().any(|n| n == &node.name) {
         return false;
     }
@@ -445,34 +469,25 @@ fn group_accepts(group: &crate::strategy::Group, node: &Node) -> bool {
     if !source_matches(group, node) {
         return false;
     }
-    if group
-        .name_excludes
+    let text = node.name.to_lowercase();
+    if name_excludes
         .iter()
-        .any(|pattern| name_matches_pattern(&node.name, pattern))
+        .any(|pattern| name_matches_pattern(&text, pattern))
     {
         return false;
     }
     if group.all_nodes {
         return true;
     }
-    if group.name_contains.is_empty() {
-        return false;
-    }
-    group
-        .name_contains
+    name_contains
         .iter()
-        .any(|pattern| name_matches_pattern(&node.name, pattern))
+        .any(|pattern| name_matches_pattern(&text, pattern))
 }
 
+/// `text` and `pattern` are already lowercased; `pattern` is trimmed and non-empty.
 fn name_matches_pattern(text: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern.is_empty() {
-        return false;
-    }
-    let text = text.to_lowercase();
-    let pattern = pattern.to_lowercase();
     if !pattern.contains('*') && !pattern.contains('?') {
-        return text.contains(&pattern);
+        return text.contains(pattern);
     }
     wildcard_match(
         &pattern.chars().collect::<Vec<_>>(),
@@ -582,5 +597,32 @@ mod tests {
         assert_eq!(strip_node_display_prefix("HK · X · n", "HK"), Some("X · n"));
         assert_eq!(strip_node_display_prefix("A · X · n", "A · X"), Some("n"));
         assert_eq!(strip_node_display_prefix("other", "HK"), None);
+    }
+
+    #[test]
+    fn group_members_keep_pin_order_and_pattern_semantics() {
+        let node = |name: &str| Node {
+            name: name.into(),
+            subscription: "sub".into(),
+            raw: serde_yaml::Value::Null,
+        };
+        let catalog = Catalog {
+            nodes: ["HK 01", "hk test", "JP-2", "Z pin", "US 1"]
+                .into_iter()
+                .map(node)
+                .collect(),
+            ..Catalog::default()
+        };
+        let mut group = crate::strategy::Group::all_nodes("G".into(), "select".into());
+        group.all_nodes = false;
+        group.name_contains = vec![" HK* ".into(), "jp".into(), "  ".into()];
+        group.name_excludes = vec!["*TEST*".into()];
+        group.include = vec!["Z pin".into(), "missing".into(), "US 1".into()];
+        group.exclude = vec!["US 1".into()];
+        assert_eq!(
+            resolve_group_members(&group, &catalog),
+            ["Z pin", "HK 01", "JP-2"]
+        );
+        assert_eq!(missing_pins(&group, &catalog), ["missing"]);
     }
 }
