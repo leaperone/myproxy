@@ -154,6 +154,7 @@ final class UDPFlowSession: @unchecked Sendable {
     private var emptySince: UInt64?
     private var parentState: AppRoutingRelayState = .connecting
     private var parentDroppedDatagrams: UInt64 = 0
+    private var parentHadConversation = false
 
     init(
         id: UUID,
@@ -310,6 +311,9 @@ final class UDPFlowSession: @unchecked Sendable {
                 return
             }
         }
+        // Once the parent's own conversation has reported, its activity holds
+        // real state and bytes; a bare snapshot here would overwrite them.
+        guard !parentHadConversation else { return }
         parentDroppedDatagrams = Self.increment(parentDroppedDatagrams)
         observerFactory(parentIdentifier)(
             AppRoutingRelaySnapshot(
@@ -376,6 +380,9 @@ final class UDPFlowSession: @unchecked Sendable {
         }
 
         let record = ConversationRecord(key: key, plan: plan)
+        if plan.activity.flowIdentifier == initialPlan.activity.flowIdentifier {
+            parentHadConversation = true
+        }
         record.admissionHeld = true
         records[key] = record
         emptySince = nil

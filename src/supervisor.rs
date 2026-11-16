@@ -605,22 +605,12 @@ impl Supervisor {
             }
             candidate.activation_generation = candidate.generation;
             candidate.save()?;
-            if should_run {
-                let proxy_error = crate::system_proxy::sync(
-                    candidate.strategy.system_proxy,
-                    candidate.strategy.mixed_port,
-                )
-                .err()
-                .map(|err| {
-                    log::warn("system-proxy", format!("sync failed: {err:#}"));
-                    format!("系统代理设置未生效：{err:#}")
-                });
-                self.health.lock().expect("supervisor health lock").system_proxy_error =
-                    proxy_error;
-            }
             if let Some(health) = health {
                 self.reset_health();
                 self.store_health(health);
+            }
+            if should_run {
+                self.sync_system_proxy(&candidate.strategy);
             }
             Ok(())
         })();
@@ -836,6 +826,17 @@ impl Supervisor {
         result
     }
 
+    /// Runs after any health reset so the failure stays visible in `last_health`.
+    fn sync_system_proxy(&self, strategy: &Strategy) {
+        let error = crate::system_proxy::sync(strategy.system_proxy, strategy.mixed_port)
+            .err()
+            .map(|err| {
+                log::warn("system-proxy", format!("sync failed: {err:#}"));
+                format!("系统代理设置未生效：{err:#}")
+            });
+        self.health.lock().expect("supervisor health lock").system_proxy_error = error;
+    }
+
     fn disconnect_inner(&self, mixed_port: Option<u16>) -> Result<()> {
         let proxy_note = crate::system_proxy::restore().err().map(|err| {
             log::warn("system-proxy", format!("restore failed: {err:#}"));
@@ -858,18 +859,22 @@ impl Supervisor {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let stopped = reclaim_owned_mihomo(port, child_pid)?;
-        if let Ok(path) = paths::pid_path() {
-            let _ = fs::remove_file(path);
+        let reclaimed = reclaim_owned_mihomo(port, child_pid);
+        // A surviving leftover keeps the pid file so the next attempt still finds it.
+        if reclaimed.is_ok() {
+            if let Ok(path) = paths::pid_path() {
+                let _ = fs::remove_file(path);
+            }
         }
         *self.running_tun.lock().expect("supervisor lock") = false;
         *self.running_se.lock().expect("supervisor lock") = false;
         self.remember_mixed_port(None);
-        if stopped || child_pid.is_some() {
-            log::info("supervisor", "disconnect");
-        }
         if let Some(note) = proxy_note {
             self.health.lock().expect("supervisor health lock").released = Some(note);
+        }
+        let stopped = reclaimed?;
+        if stopped || child_pid.is_some() {
+            log::info("supervisor", "disconnect");
         }
         Ok(())
     }
@@ -1155,11 +1160,7 @@ impl Supervisor {
             if !is_wanted() {
                 bail!("连接操作已取消");
             }
-            if let Err(err) =
-                crate::system_proxy::sync(runtime.strategy.system_proxy, runtime.strategy.mixed_port)
-            {
-                log::warn("system-proxy", format!("sync failed: {err:#}"));
-            }
+            self.sync_system_proxy(&runtime.strategy);
             self.health
                 .lock()
                 .expect("supervisor health lock")

@@ -79,8 +79,15 @@ pub fn restore() -> Result<bool> {
         let data = fs::read_to_string(&path).context("read system proxy restore file")?;
         let snapshot: RestoreFile =
             serde_json::from_str(&data).context("parse system proxy restore file")?;
+        let current = list_enabled_services()?;
         let mut failures = Vec::new();
-        for service in snapshot.services {
+        // A service removed or renamed since the snapshot cannot be restored
+        // and must not keep every later disconnect failing.
+        for service in snapshot
+            .services
+            .into_iter()
+            .filter(|service| current.contains(&service.name))
+        {
             for (kind, state) in [
                 ("web", &service.http),
                 ("secureweb", &service.https),
