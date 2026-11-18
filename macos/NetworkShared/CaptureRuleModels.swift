@@ -568,6 +568,29 @@ public struct CaptureRule: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// Destinations used by Bilibili's live player are direct by default. Keeping
+/// this in the capture layer makes the policy survive app-level proxy pins.
+public enum BuiltInDirectCaptureRules {
+    public static let bilibiliLiveCDNSuffixes = [
+        "bilivideo.com",
+        "bilivideo.cn",
+        "bilivideo.net",
+    ]
+
+    public static func bilibiliLiveCDN(priority: Int = 0) throws -> CaptureRule {
+        let destinations = try bilibiliLiveCDNSuffixes.map {
+            DestinationMatcher.host(try HostMatcher(kind: .suffix, value: $0))
+        }
+        return try CaptureRule(
+            id: "builtin-bilibili-live-cdn-direct",
+            priority: priority,
+            destinations: destinations,
+            action: .direct,
+            unavailableFallback: .direct
+        )
+    }
+}
+
 public struct FlowSource: Codable, Hashable, Sendable {
     public let processIdentifier: Int32
     public let auditToken: Data

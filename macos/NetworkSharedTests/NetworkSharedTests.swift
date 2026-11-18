@@ -280,6 +280,27 @@ struct NetworkSharedTests {
             try expectEqual(missed.cause, .defaultDirect, "exact app miss")
         }
 
+        run.test("bilibili_live_cdn_direct_precedes_application_proxy") {
+            let bilibili = try BuiltInDirectCaptureRules.bilibiliLiveCDN()
+            let appProxy = try CaptureRule(
+                id: "dia-default",
+                priority: 1,
+                sources: [
+                    .applicationIdentifierPattern(
+                        try ApplicationIdentifierPatternMatcher(pattern: "company.thebrowser.dia")
+                    )
+                ],
+                action: .mihomo(.group("Default")),
+                unavailableFallback: .profileRules
+            )
+            let source = flowSource(bundleIdentifier: "company.thebrowser.dia")
+            let cdn = try FlowDestination(hostname: "d1--ov-gotcha207b.bilivideo.com", port: 443)
+            let other = try FlowDestination(hostname: "example.com", port: 443)
+            let capture = try engine(rules: [bilibili, appProxy])
+            try expectEqual(capture.evaluate(context(source: source, destination: cdn)).action, .direct, "Bilibili CDN route")
+            try expectEqual(capture.evaluate(context(source: source, destination: other)).action, .mihomo(.group("Default")), "other Dia route")
+        }
+
         run.test("capture_name_wildcard_matches_electron_helper") {
             let rule = try CaptureRule(
                 id: "t3-helper",

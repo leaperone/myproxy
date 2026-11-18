@@ -672,6 +672,10 @@ private func captureSnapshot(
         ))
     }
 
+    // Bilibili live CDN traffic must remain direct even when the browser has
+    // an application-level proxy rule; this is a built-in destination policy.
+    rules.append(try BuiltInDirectCaptureRules.bilibiliLiveCDN(priority: rules.count))
+
     enum OrderedInput {
         case process(Int, HostEnableRequest.ProcessRule)
         case destination(Int, HostEnableRequest.DestRule)
