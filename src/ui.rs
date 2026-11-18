@@ -6712,7 +6712,7 @@ fn render_global_card(
         if inbound_global {
             format!("当前 {now_label} · 手动代理或自动代理设为全局时，所有流量使用这里")
         } else {
-            format!("当前 {now_label} · 未启用全局时只作备用，规则仍按组走")
+            format!("当前 {now_label} · 未启用全局时只作备用，流量按当前入口模式处理。")
         }
     } else if inbound_global {
         format!("当前 {now_label} · 全局模式会使用这里")
