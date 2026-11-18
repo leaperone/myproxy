@@ -1125,6 +1125,19 @@ enum Page {
     Settings,
 }
 
+impl Page {
+    fn motion_key(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Connections => "connections",
+            Self::Subscriptions => "subscriptions",
+            Self::Groups => "groups",
+            Self::Rules => "rules",
+            Self::Settings => "settings",
+        }
+    }
+}
+
 fn initial_page() -> Page {
     match std::env::var("MYPROXY_PAGE").unwrap_or_default().as_str() {
         "connections" | "traffic" | "conn" => Page::Connections,
@@ -3374,6 +3387,8 @@ impl AppView {
     }
 
     fn page_view(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
+        let page = self.page;
+        let motion_key = page.motion_key();
         v_flex()
             .id("page")
             .flex_1()
@@ -3407,9 +3422,29 @@ impl AppView {
                     )
                     .child(self.status.clone()),
             )
-            .child(match self.page {
-                Page::Rules => self.rules(cx, theme).into_any_element(),
-                Page::Connections => self.connections(cx, theme).into_any_element(),
+            .child(match page {
+                Page::Rules => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.rules(cx, theme))
+                    .with_animation(
+                        format!("page-enter-{motion_key}"),
+                        Animation::new(Duration::from_millis(220))
+                            .with_easing(|t| 1.0 - (1.0 - t).powi(3)),
+                        |this, delta| this.opacity(delta).top(px(6. * (1. - delta))),
+                    )
+                    .into_any_element(),
+                Page::Connections => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.connections(cx, theme))
+                    .with_animation(
+                        format!("page-enter-{motion_key}"),
+                        Animation::new(Duration::from_millis(220))
+                            .with_easing(|t| 1.0 - (1.0 - t).powi(3)),
+                        |this, delta| this.opacity(delta).top(px(6. * (1. - delta))),
+                    )
+                    .into_any_element(),
                 page => div()
                     .id("page-scroll")
                     .flex_1()
@@ -3422,6 +3457,12 @@ impl AppView {
                         Page::Settings => self.settings(cx, theme).into_any_element(),
                         Page::Rules | Page::Connections => unreachable!(),
                     })
+                    .with_animation(
+                        format!("page-enter-{motion_key}"),
+                        Animation::new(Duration::from_millis(220))
+                            .with_easing(|t| 1.0 - (1.0 - t).powi(3)),
+                        |this, delta| this.opacity(delta).top(px(6. * (1. - delta))),
+                    )
                     .into_any_element(),
             })
     }
