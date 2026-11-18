@@ -19,8 +19,8 @@ pub fn copy_agent_skill(cx: &App) {
 struct OnboardState {
     #[serde(default)]
     cli_done: bool,
-    #[serde(default)]
-    overview_seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overview_seen: Option<bool>,
 }
 
 fn load() -> OnboardState {
@@ -51,16 +51,26 @@ pub fn mark_cli_done() {
     save(&state);
 }
 
-pub fn overview_seen() -> bool {
-    load().overview_seen
+fn infer_overview_seen(stored_seen: Option<bool>, subscriptions: usize, nodes: usize) -> bool {
+    stored_seen.unwrap_or(subscriptions > 0 || nodes > 0)
+}
+
+pub fn overview_seen_for(subscriptions: usize, nodes: usize) -> bool {
+    let mut state = load();
+    let seen = infer_overview_seen(state.overview_seen, subscriptions, nodes);
+    if state.overview_seen.is_none() && seen {
+        state.overview_seen = Some(true);
+        save(&state);
+    }
+    seen
 }
 
 pub fn mark_overview_seen() {
     let mut state = load();
-    if state.overview_seen {
+    if state.overview_seen == Some(true) {
         return;
     }
-    state.overview_seen = true;
+    state.overview_seen = Some(true);
     save(&state);
 }
 
@@ -216,28 +226,37 @@ pub fn open(
 
 #[cfg(test)]
 mod tests {
-    use super::OnboardState;
+    use super::{infer_overview_seen, OnboardState};
 
     #[test]
     fn legacy_cli_state_keeps_overview_unseen() {
         let state: OnboardState = serde_json::from_str(r#"{"cli_done":true}"#).unwrap();
         assert!(state.cli_done);
-        assert!(!state.overview_seen);
+        assert_eq!(state.overview_seen, None);
 
         let empty: OnboardState = serde_json::from_str("{}").unwrap();
         assert!(!empty.cli_done);
-        assert!(!empty.overview_seen);
+        assert_eq!(empty.overview_seen, None);
     }
 
     #[test]
     fn overview_state_roundtrips_independently_of_cli() {
         let state = OnboardState {
             cli_done: false,
-            overview_seen: true,
+            overview_seen: Some(true),
         };
         let saved = serde_json::to_string(&state).unwrap();
         let restored: OnboardState = serde_json::from_str(&saved).unwrap();
         assert!(!restored.cli_done);
-        assert!(restored.overview_seen);
+        assert_eq!(restored.overview_seen, Some(true));
+    }
+
+    #[test]
+    fn configured_legacy_users_are_seen_but_empty_installs_are_not() {
+        assert!(!infer_overview_seen(None, 0, 0));
+        assert!(infer_overview_seen(None, 1, 0));
+        assert!(infer_overview_seen(None, 0, 1));
+        assert!(!infer_overview_seen(Some(false), 1, 1));
+        assert!(infer_overview_seen(Some(true), 0, 0));
     }
 }

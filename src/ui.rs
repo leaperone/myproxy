@@ -1620,7 +1620,10 @@ impl AppView {
         let this = Self {
             page: initial_page(),
             expanded_page_help: HashSet::new(),
-            overview_seen: crate::onboard::overview_seen(),
+            overview_seen: crate::onboard::overview_seen_for(
+                strategy.subscriptions.len(),
+                catalog.nodes.len(),
+            ),
             sidebar_compact: false,
             health_note: None,
             status: if catalog.nodes.is_empty() {
@@ -4021,12 +4024,22 @@ impl AppView {
         let filtered =
             controller::filter_connections(&self.traffic.connections, &self.connection_filters);
         let filtered_count = filtered.len();
+        let connection_scope = "仅列出进入 myproxy 代理核心的连接";
         let summary = if !connected {
             "连接代理后，这里会显示进入 myproxy 的流量。".into()
         } else if let Some(error) = &self.traffic_error {
-            error.clone()
+            if loaded_count > 0 {
+                format!("{error}；{connection_scope}。")
+            } else {
+                error.clone()
+            }
         } else if total_count == 0 && loaded_count == 0 {
             "当前没有活动连接。只有进入手动代理或自动代理的流量会出现在这里。".into()
+        } else if loaded_count > 0 {
+            format!(
+                "{connection_scope}；核心报告 {} 条 · 已载入 {} 条 · 当前显示 {} 条",
+                total_count, loaded_count, filtered_count
+            )
         } else {
             format!(
                 "核心报告 {} 条 · 已载入 {} 条 · 当前显示 {} 条",
@@ -6695,6 +6708,17 @@ fn render_global_card(
     let muted_fg = theme.muted_foreground;
     let hover = theme_ext::row_hover(theme);
     let selected_border = theme_ext::selection_border(theme);
+    let routing_status = if show_help {
+        if inbound_global {
+            format!("当前 {now_label} · 手动代理或自动代理设为全局时，所有流量使用这里")
+        } else {
+            format!("当前 {now_label} · 未启用全局时只作备用，规则仍按组走")
+        }
+    } else if inbound_global {
+        format!("当前 {now_label} · 全局模式会使用这里")
+    } else {
+        format!("当前 {now_label} · 入站模式不是全局，当前成员仅作备用")
+    };
     let shown: Vec<_> = members.iter().take(limit).cloned().collect();
     let shown_empty = shown.is_empty();
     surface(theme)
@@ -6762,13 +6786,7 @@ fn render_global_card(
             div()
                 .text_xs()
                 .text_color(muted_fg)
-                .child(if !show_help {
-                    format!("当前 {now_label}")
-                } else if inbound_global {
-                    format!("当前 {now_label} · 手动代理或自动代理设为全局时，所有流量使用这里")
-                } else {
-                    format!("当前 {now_label} · 未启用全局时只作备用，规则仍按组走")
-                }),
+                .child(routing_status),
         )
         .when(!expanded, |this| {
             this.child(
