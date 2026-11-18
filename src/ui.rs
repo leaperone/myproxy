@@ -947,11 +947,17 @@ impl Render for RuleSetEditor {
                         });
                     })
             })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child("匹配条件按 OR 处理：任一条件命中即生效。"),
+            )
             .when(self.help_expanded, |this| this.child(
                 div()
                     .text_xs()
                     .text_color(muted_fg)
-                    .child("逗号分隔可一次加入多个条件；同一规则内任一条件命中即生效。受限网站仅在选择对应出口时参与判断。"),
+                    .child("逗号分隔可一次加入多个条件；受限网站仅在选择对应出口时参与判断。"),
             ))
             .when(self.matchers.is_empty(), |this| {
                 this.child(div().text_xs().text_color(muted_fg).child("还没有匹配项。"))
