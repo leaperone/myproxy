@@ -32,6 +32,12 @@ const DEFAULT_DIRECT_RULES: &[&str] = &[
     "IP-CIDR6,ff00::/8,DIRECT,no-resolve",
 ];
 
+const BUILTIN_BILIBILI_LIVE_CDN_RULES: &[&str] = &[
+    "DOMAIN-SUFFIX,bilivideo.com,DIRECT",
+    "DOMAIN-SUFFIX,bilivideo.cn,DIRECT",
+    "DOMAIN-SUFFIX,bilivideo.net,DIRECT",
+];
+
 /// Mirrored by `DNSProxyUpstreamResolver.mihomoDNS`, where the Network
 /// Extension DNS provider relays public system lookups.
 pub const DNS_LISTEN_PORT: u16 = 1053;
@@ -173,6 +179,11 @@ fn try_compile_root(
 
     let mut rules = Vec::new();
     append_default_direct_rules(&mut rules);
+    rules.extend(
+        BUILTIN_BILIBILI_LIVE_CDN_RULES
+            .iter()
+            .map(|rule| (*rule).to_string()),
+    );
     append_gfw_inlet_rules(&mut rules, strategy, request);
     for set in &strategy.rule_sets {
         for matcher in &set.matchers {
@@ -773,11 +784,39 @@ mod tests {
         let root = compiled(&strategy);
         assert!(!root.contains_key("rule-providers"));
         let rules = rule_strings(&root);
+        assert!(rules.contains(&"DOMAIN-SUFFIX,bilivideo.com,DIRECT"));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,bilivideo.cn,DIRECT"));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,bilivideo.net,DIRECT"));
         assert!(rules
             .iter()
             .any(|rule| rule.starts_with("DOMAIN-SUFFIX,telegram.org,")));
         assert!(!rules.iter().any(|rule| rule.starts_with("RULE-SET,")));
         assert_eq!(rules.last().copied(), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn builtin_bilibili_direct_precedes_user_proxy_rule() {
+        let mut strategy = Strategy::default();
+        strategy.rule_sets.push(crate::strategy::RuleSet {
+            id: "bilibili-proxy".into(),
+            name: "Bilibili proxy override".into(),
+            via: "PROXY".into(),
+            matchers: vec![crate::strategy::Matcher {
+                kind: "suffix".into(),
+                value: "bilivideo.com".into(),
+            }],
+        });
+        let root = compiled(&strategy);
+        let rules = rule_strings(&root);
+        let builtin = rules
+            .iter()
+            .position(|rule| *rule == "DOMAIN-SUFFIX,bilivideo.com,DIRECT")
+            .expect("builtin Bilibili direct rule");
+        let proxy = rules
+            .iter()
+            .position(|rule| *rule == "DOMAIN-SUFFIX,bilivideo.com,PROXY")
+            .expect("user Bilibili proxy rule");
+        assert!(builtin < proxy, "builtin={builtin} proxy={proxy}");
     }
 
     #[test]
