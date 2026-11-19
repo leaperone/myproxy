@@ -4051,7 +4051,7 @@ impl AppView {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_hidden()
             .overflow_x_hidden()
             .gap_4()
             .child(self.page_title(
@@ -4202,6 +4202,7 @@ impl AppView {
                         .min_h_0()
                         .min_w_0()
                         .w_full()
+                        .overflow_y_scroll()
                         .overflow_x_scrollbar()
                         .child(
                             v_flex()
