@@ -575,6 +575,20 @@ public struct CaptureRuleEngine: Sendable {
             )
         }
 
+        // A bare Mihomo fake-IP has no usable hostname at the NE boundary.
+        // Keep it on profile-rules so Mihomo can restore the name before
+        // application-level pins (such as Dia -> Default) are considered.
+        if let address = context.destination.ipAddress,
+           context.destination.hostname?.isEmpty != false,
+           DNSProxyUpstreamResolver.mihomoFakeIPNetwork.contains(address) {
+            return RuleDecision(
+                action: .mihomo(.profileRules),
+                unavailableFallback: .direct,
+                cause: .matchedRule("builtin-fake-ip-profile-rules"),
+                evidence: CaptureRuleDecisionEvidence(outcome: .matchedRule)
+            )
+        }
+
         let flow = PreparedFlow(context)
         for orderedRule in orderedRules where orderedRule.rule.enabled {
             let rule = orderedRule.rule

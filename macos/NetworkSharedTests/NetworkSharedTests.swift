@@ -648,6 +648,49 @@ struct NetworkSharedTests {
             try expectEqual(real.action, .direct, "real address stays direct")
         }
 
+        run.test("bare_fake_ip_precedes_application_proxy") {
+            let appProxy = try CaptureRule(
+                id: "dia-default",
+                priority: 0,
+                sources: [
+                    .applicationIdentifierPattern(
+                        try ApplicationIdentifierPatternMatcher(pattern: "company.thebrowser.dia")
+                    )
+                ],
+                action: .mihomo(.group("Default")),
+                unavailableFallback: .profileRules
+            )
+            let decision = try engine(rules: [appProxy]).evaluate(
+                context(
+                    source: flowSource(bundleIdentifier: "company.thebrowser.dia"),
+                    destination: try FlowDestination(
+                        ipAddress: try IPAddress("198.18.0.4"),
+                        port: 443
+                    )
+                )
+            )
+            try expectEqual(decision.action, .mihomo(.profileRules), "bare fake-ip route")
+            try expectEqual(decision.cause, .matchedRule("builtin-fake-ip-profile-rules"), "bare fake-ip cause")
+        }
+
+        run.test("trusted_component_bypasses_bare_fake_ip") {
+            let decision = try engine(rules: []).evaluate(
+                context(
+                    source: flowSource(isTrustedMyproxyComponent: true),
+                    destination: try FlowDestination(
+                        ipAddress: try IPAddress("198.18.0.4"),
+                        port: 53
+                    )
+                )
+            )
+            try expectEqual(decision.action, .direct, "trusted fake-ip route")
+            try expectEqual(
+                decision.cause,
+                .builtInBypass(.trustedmyproxyComponent),
+                "trusted fake-ip cause"
+            )
+        }
+
         func dnsQuery(_ labels: [String]) -> Data {
             var bytes: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
             for label in labels {
