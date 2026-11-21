@@ -907,6 +907,7 @@ mod tests {
             id: "bilibili-proxy".into(),
             name: "Bilibili proxy override".into(),
             via: "PROXY".into(),
+            dns_ipv4_only: false,
             matchers: vec![crate::strategy::Matcher {
                 kind: "suffix".into(),
                 value: "bilivideo.com".into(),

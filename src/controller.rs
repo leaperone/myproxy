@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,11 +38,104 @@ pub struct LiveConnection {
     pub process: String,
     pub app_matcher: String,
     pub destination: String,
+    pub destination_host: String,
+    pub destination_ip: String,
     pub network: String,
     pub chain: String,
     pub upload: u64,
     pub download: u64,
     pub duration: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomesticCandidate {
+    pub key: String,
+    pub destination: String,
+    pub host: String,
+    pub ip: String,
+    pub bytes: u64,
+    pub connections: usize,
+    pub reason: String,
+}
+
+/// Returns high-confidence candidates only. A country IP database is owned by
+/// Mihomo, so raw IPs without a hostname are deliberately left unclassified.
+pub fn domestic_candidates(connections: &[LiveConnection]) -> Vec<DomesticCandidate> {
+    let mut grouped: HashMap<String, DomesticCandidate> = HashMap::new();
+    for connection in connections {
+        if connection.is_direct() {
+            continue;
+        }
+        let Some((key, reason)) = domestic_evidence(connection) else {
+            continue;
+        };
+        let entry = grouped.entry(key.clone()).or_insert_with(|| DomesticCandidate {
+            key,
+            destination: connection.destination.clone(),
+            host: connection.destination_host.clone(),
+            ip: connection.destination_ip.clone(),
+            bytes: 0,
+            connections: 0,
+            reason,
+        });
+        entry.bytes = entry
+            .bytes
+            .saturating_add(connection.upload.saturating_add(connection.download));
+        entry.connections += 1;
+    }
+    let mut result: Vec<_> = grouped.into_values().collect();
+    result.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key)));
+    result
+}
+
+/// Bare IP flows cannot be assigned a country from the controller payload
+/// alone. Keep them visible as investigation candidates without calling them
+/// domestic traffic.
+pub fn unresolved_ip_candidates(connections: &[LiveConnection]) -> Vec<DomesticCandidate> {
+    let mut grouped: HashMap<String, DomesticCandidate> = HashMap::new();
+    for connection in connections {
+        if connection.is_direct()
+            || !connection.destination_host.trim().is_empty()
+            || connection.destination_ip.parse::<IpAddr>().is_err()
+        {
+            continue;
+        }
+        let key = connection.destination_ip.clone();
+        let entry = grouped.entry(key.clone()).or_insert_with(|| DomesticCandidate {
+            key,
+            destination: connection.destination.clone(),
+            host: String::new(),
+            ip: connection.destination_ip.clone(),
+            bytes: 0,
+            connections: 0,
+            reason: "裸 IP，需 GeoIP 证据".into(),
+        });
+        entry.bytes = entry
+            .bytes
+            .saturating_add(connection.upload.saturating_add(connection.download));
+        entry.connections += 1;
+    }
+    let mut result: Vec<_> = grouped.into_values().collect();
+    result.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key)));
+    result
+}
+
+fn domestic_evidence(connection: &LiveConnection) -> Option<(String, String)> {
+    let host = connection.destination_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    // shortcut: curated high-confidence domains, upgrade when a local GeoIP/geosite reader exists.
+    const DOMAINS: &[&str] = &[
+        "baidu.com", "bilibili.com", "bilivideo.com", "hdslb.com", "qq.com",
+        "wechat.com", "weixin.qq.com", "taobao.com", "tmall.com", "jd.com",
+        "aliyun.com", "tencent.com", "douyin.com", "douban.com", "weibo.com",
+        "zhihu.com", "xiaohongshu.com", "163.com", "126.com", "mi.com",
+    ];
+    if DOMAINS.iter().any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}"))) {
+        return Some((host.clone(), "已知中国大陆服务域名".into()));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -779,6 +873,8 @@ impl LiveConnection {
             process,
             app_matcher,
             destination,
+            destination_host: raw.metadata.host.trim().to_string(),
+            destination_ip: raw.metadata.destination_ip.trim().to_string(),
             network: if raw.metadata.network.is_empty() {
                 "—".into()
             } else {
@@ -945,6 +1041,8 @@ mod tests {
             process: process.into(),
             app_matcher: process.into(),
             destination: destination.into(),
+            destination_host: destination.into(),
+            destination_ip: String::new(),
             network: network.into(),
             chain: chain.into(),
             upload: 0,
@@ -960,6 +1058,37 @@ mod tests {
         assert!(chain_has_direct("PROXY → DIRECT"));
         assert!(!chain_has_direct("PROXY → HK"));
         assert!(!chain_has_direct("—"));
+    }
+
+    #[test]
+    fn domestic_candidates_group_proxy_bytes_and_ignore_direct() {
+        let mut bilibili = conn("Safari", "live.bilibili.com", "TCP", "PROXY");
+        bilibili.upload = 10;
+        bilibili.download = 90;
+        let mut direct = conn("Safari", "www.baidu.com", "TCP", "DIRECT");
+        direct.download = 10_000;
+        let candidates = domestic_candidates(&[bilibili.clone(), bilibili]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].key, "live.bilibili.com");
+        assert_eq!(candidates[0].bytes, 200);
+        assert!(domestic_candidates(&[direct]).is_empty());
+    }
+
+    #[test]
+    fn unresolved_ip_candidates_are_not_called_domestic() {
+        let mut row = conn("Player", "203.0.113.8:443", "TCP", "PROXY");
+        row.destination_host.clear();
+        row.destination_ip = "203.0.113.8".into();
+        row.download = 42;
+        let candidates = unresolved_ip_candidates(&[row]);
+        assert_eq!(candidates[0].reason, "裸 IP，需 GeoIP 证据");
+        assert!(domestic_candidates(&[]).is_empty());
+    }
+
+    #[test]
+    fn country_code_suffix_is_not_enough_evidence() {
+        let row = conn("Browser", "example.cn", "TCP", "PROXY");
+        assert!(domestic_candidates(&[row]).is_empty());
     }
 
     #[test]

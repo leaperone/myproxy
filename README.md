@@ -142,6 +142,11 @@ application support directory.
 - The connections page shows connections recorded by Mihomo. System Extension
   traffic passed directly to macOS or rejected before Mihomo is outside that list;
   **显示直连** reveals only DIRECT connections recorded by the core.
+- The connections page also groups high-confidence proxy traffic for mainland
+  service domains and shows the transferred bytes. Users can open a DIRECT
+  suffix rule or enable the existing **国内直连** profile. Bare IP flows are
+  shown separately as unresolved because the controller payload does not prove
+  their country; myproxy does not guess or add broad IP ranges automatically.
 - System Extension DNS interception stays coupled to the core: disconnect waits
   until capture and DNS are down before stopping Mihomo. If NEDNSProxy cannot be
   disabled, the core is kept so system resolution is not blackholed.
