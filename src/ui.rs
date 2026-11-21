@@ -2560,6 +2560,40 @@ impl AppView {
         );
     }
 
+    fn open_rule_dialog_for_destination(
+        &mut self,
+        host: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            self.status = "这条连接没有可用的域名。".into();
+            return;
+        }
+        if let Some(existing) = self.strategy.rule_sets.iter().find(|set| {
+            set.via.eq_ignore_ascii_case("DIRECT")
+                && set.matchers.iter().any(|item| {
+                    matches!(item.kind.as_str(), "domain" | "suffix")
+                        && item.value.eq_ignore_ascii_case(&host)
+                })
+        }) {
+            self.open_rule_dialog(Some(&existing.id.clone()), window, cx);
+            return;
+        }
+        self.present_rule_dialog(
+            Some(RuleSet {
+                id: String::new(),
+                name: format!("国内直连 · {host}"),
+                via: "DIRECT".into(),
+                dns_ipv4_only: false,
+                matchers: vec![Matcher::suffix(host)],
+            }),
+            window,
+            cx,
+        );
+    }
+
     fn set_connection_process_via(
         &mut self,
         process: &str,
@@ -4159,6 +4193,9 @@ impl AppView {
                         ),
                     )
             })
+            .when(connected && loaded_count > 0, |this| {
+                this.child(self.domestic_diagnostics(entity.clone(), theme))
+            })
             .when(!connected && !self.wanted, |this| {
                 this.child(empty_hint_action(
                     theme,
@@ -4264,6 +4301,130 @@ impl AppView {
                                         )
                                 }),
                         ),
+                )
+            })
+    }
+
+    fn domestic_diagnostics(
+        &self,
+        entity: Entity<AppView>,
+        theme: &Theme,
+    ) -> impl IntoElement {
+        let candidates = controller::domestic_candidates(&self.traffic.connections);
+        let ip_candidates = controller::unresolved_ip_candidates(&self.traffic.connections);
+        let current = self.strategy.routing_profile;
+        surface(theme)
+            .id("domestic-traffic-diagnostics")
+            .p_4()
+            .gap_2()
+            .when(candidates.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("当前未发现有明确域名证据的代理流量。裸 IP 连接需要 Mihomo GeoIP 运行证据，应用不会猜测。"),
+                )
+            })
+            .when(!candidates.is_empty(), |this| {
+                this.child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().font_semibold().child("疑似大陆流量"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("这些连接经过代理，并匹配大陆域名证据。请确认后再添加直连规则。"),
+                                ),
+                        )
+                        .when(current != RoutingProfile::Chinadirect, |this| {
+                            let entity = entity.clone();
+                            this.child(
+                                Button::new("enable-chinadirect")
+                                    .small()
+                                    .primary()
+                                    .label("启用国内直连")
+                                    .on_click(move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            this.set_routing_profile(RoutingProfile::Chinadirect, cx);
+                                        });
+                                    }),
+                            )
+                        }),
+                )
+                .children(candidates.into_iter().take(8).map(|candidate| {
+                    let host = candidate.host.clone();
+                    let entity = entity.clone();
+                    h_flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .text_ellipsis()
+                                        .child(candidate.destination.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!(
+                                            "{} · {} · {} 条连接",
+                                            candidate.reason,
+                                            controller::format_bytes(candidate.bytes),
+                                            candidate.connections
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "domestic-rule-{}",
+                                candidate.key
+                            )))
+                            .small()
+                            .label("添加直连规则")
+                            .on_click(move |_, window, app| {
+                                entity.update(app, |this, cx| {
+                                    this.open_rule_dialog_for_destination(&host, window, cx);
+                                });
+                            }),
+                        )
+                }))
+            })
+            .when(!ip_candidates.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .pt_2()
+                        .child(div().text_sm().font_semibold().child("待确认的裸 IP 流量"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("当前连接没有 hostname，不能安全判断是否属于中国大陆。先检查系统接管的 hostname/fake-IP 恢复，再决定是否启用国内直连。"),
+                        )
+                        .children(ip_candidates.into_iter().take(5).map(|candidate| {
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().text_xs().child(candidate.destination))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(controller::format_bytes(candidate.bytes)),
+                                )
+                        })),
                 )
             })
     }
