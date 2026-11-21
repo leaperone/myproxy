@@ -2572,11 +2572,14 @@ impl AppView {
             return;
         }
         if let Some(existing) = self.strategy.rule_sets.iter().find(|set| {
-            set.via.eq_ignore_ascii_case("DIRECT")
-                && set.matchers.iter().any(|item| {
-                    matches!(item.kind.as_str(), "domain" | "suffix")
-                        && item.value.eq_ignore_ascii_case(&host)
-                })
+            set.matchers.iter().any(|item| match item.kind.as_str() {
+                "domain" => item.value.eq_ignore_ascii_case(&host),
+                "suffix" => {
+                    let suffix = item.value.trim().trim_start_matches('.').to_ascii_lowercase();
+                    host == suffix || host.ends_with(&format!(".{suffix}"))
+                }
+                _ => false,
+            })
         }) {
             self.open_rule_dialog(Some(&existing.id.clone()), window, cx);
             return;

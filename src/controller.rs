@@ -125,9 +125,6 @@ fn domestic_evidence(connection: &LiveConnection) -> Option<(String, String)> {
     if host.is_empty() {
         return None;
     }
-    if host == "cn" || host.ends_with(".cn") || host.ends_with(".中国") || host.ends_with(".公司") {
-        return Some((host.clone(), "中国大陆域名后缀".into()));
-    }
     // shortcut: curated high-confidence domains, upgrade when a local GeoIP/geosite reader exists.
     const DOMAINS: &[&str] = &[
         "baidu.com", "bilibili.com", "bilivideo.com", "hdslb.com", "qq.com",
@@ -1086,6 +1083,12 @@ mod tests {
         let candidates = unresolved_ip_candidates(&[row]);
         assert_eq!(candidates[0].reason, "裸 IP，需 GeoIP 证据");
         assert!(domestic_candidates(&[]).is_empty());
+    }
+
+    #[test]
+    fn country_code_suffix_is_not_enough_evidence() {
+        let row = conn("Browser", "example.cn", "TCP", "PROXY");
+        assert!(domestic_candidates(&[row]).is_empty());
     }
 
     #[test]
