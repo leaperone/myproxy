@@ -1283,7 +1283,7 @@ fn via_menu(
 
 enum LivePageJob {
     Rows(RuntimeIdentity, u64, bool),
-    Snapshot(RuntimeIdentity, u64, LiveNeed),
+    Snapshot(RuntimeIdentity, u64, LiveNeed, bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1354,6 +1354,7 @@ pub struct AppView {
     log_lines: Vec<String>,
     file_dialog_pending: bool,
     connection_filters: ConnectionFilters,
+    ignored_domestic: HashSet<String>,
     runtime: Option<RuntimeIdentity>,
     operation: OperationState,
     extension_status: RuntimeStatus,
@@ -1466,11 +1467,11 @@ impl AppView {
                             break;
                         }
                     }
-                    Some(LivePageJob::Snapshot(identity, revision, need)) => {
+                    Some(LivePageJob::Snapshot(identity, revision, need, system_extension)) => {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
-                                controller::fetch_live(identity.mixed_port, need, false)
+                                controller::fetch_live(identity.mixed_port, need, system_extension)
                                     .map_err(|err| err.to_string())
                             })
                             .await;
@@ -1675,6 +1676,7 @@ impl AppView {
             pending_port_input: None,
             pending_filter_input: None,
             connection_filters: ConnectionFilters::default(),
+            ignored_domestic: HashSet::new(),
             runtime: None,
             operation: OperationState::Idle,
             extension_status: network_extension::status(),
@@ -2056,15 +2058,23 @@ impl AppView {
                 self.live_revision,
                 self.strategy.system_extension,
             )),
-            Page::Overview | Page::Groups => Some(LivePageJob::Snapshot(
+            Page::Overview => Some(LivePageJob::Snapshot(
+                runtime,
+                self.live_revision,
+                LiveNeed::Rows,
+                self.strategy.system_extension,
+            )),
+            Page::Groups => Some(LivePageJob::Snapshot(
                 runtime,
                 self.live_revision,
                 LiveNeed::Totals,
+                false,
             )),
             Page::Settings if self.strategy.uses_global() => Some(LivePageJob::Snapshot(
                 runtime,
                 self.live_revision,
                 LiveNeed::Totals,
+                false,
             )),
             _ => None,
         }
@@ -2232,11 +2242,11 @@ impl AppView {
                 })
                 .ok();
             }
-            LivePageJob::Snapshot(identity, revision, need) => {
+            LivePageJob::Snapshot(identity, revision, need, system_extension) => {
                 let snap = cx
                     .background_executor()
                     .spawn(async move {
-                        controller::fetch_live(identity.mixed_port, need, false)
+                        controller::fetch_live(identity.mixed_port, need, system_extension)
                             .map_err(|err| err.to_string())
                     })
                     .await;
@@ -3996,6 +4006,9 @@ impl AppView {
                             .child(metric(theme, "下载", &down))
                             .child(metric(theme, "连接数", &conns)),
             )
+            .when(connected, |this| {
+                this.child(self.domestic_traffic_notice(cx, theme))
+            })
             .child(section_heading(theme, "当前路由"))
                     .child(
                         h_flex()
@@ -4029,6 +4042,92 @@ impl AppView {
                     )
                 },
             )
+    }
+
+    fn domestic_traffic_notice(
+        &self,
+        cx: &mut Context<Self>,
+        theme: &Theme,
+    ) -> impl IntoElement {
+        let candidates = controller::domestic_candidates(&self.traffic.connections)
+            .into_iter()
+            .filter(|candidate| !self.ignored_domestic.contains(&candidate.key))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return div().into_any_element();
+        }
+        let total = candidates
+            .iter()
+            .fold(0_u64, |sum, candidate| sum.saturating_add(candidate.bytes));
+        let top = candidates[0].clone();
+        let entity = cx.entity();
+        surface(theme)
+            .p_4()
+            .gap_2()
+            .border_color(theme.warning.opacity(0.45))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().font_semibold().child("发现疑似大陆流量走代理"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "{} 个域名 · 约 {} · 最大来源 {}（{}）",
+                                        candidates.len(),
+                                        controller::format_bytes(total),
+                                        top.destination,
+                                        top.process
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new("overview-domestic-details")
+                            .small()
+                            .primary()
+                            .label("查看并处理")
+                            .on_click(self.select_page(cx, Page::Connections)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .children(candidates.into_iter().take(3).map(|candidate| {
+                        let key = candidate.key.clone();
+                        let entity = entity.clone();
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(outline_pill(
+                                theme,
+                                &format!(
+                                    "{} {}",
+                                    candidate.destination,
+                                    controller::format_bytes(candidate.bytes)
+                                ),
+                            ))
+                            .child(
+                                Button::new(SharedString::from(format!("ignore-domestic-{key}")))
+                                    .small()
+                                    .ghost()
+                                    .label("忽略")
+                                    .on_click(move |_, _, app| {
+                                        entity.update(app, |this, cx| {
+                                            this.ignored_domestic.insert(key.clone());
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                    })),
+            )
+            .into_any_element()
     }
 
     fn connections(&self, cx: &mut Context<Self>, theme: &Theme) -> impl IntoElement {
