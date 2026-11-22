@@ -147,6 +147,9 @@ application support directory.
   suffix rule or enable the existing **国内直连** profile. Bare IP flows are
   shown separately as unresolved because the controller payload does not prove
   their country; myproxy does not guess or add broad IP ranges automatically.
+- When connected, **总览** surfaces the same candidates with their aggregate
+  bytes and links directly to the detailed handling view. Dismissing a domain
+  hides it for the current app session only; it does not change saved rules.
 - System Extension DNS interception stays coupled to the core: disconnect waits
   until capture and DNS are down before stopping Mihomo. If NEDNSProxy cannot be
   disabled, the core is kept so system resolution is not blackholed.

@@ -53,6 +53,7 @@ pub struct DomesticCandidate {
     pub destination: String,
     pub host: String,
     pub ip: String,
+    pub process: String,
     pub bytes: u64,
     pub connections: usize,
     pub reason: String,
@@ -74,6 +75,7 @@ pub fn domestic_candidates(connections: &[LiveConnection]) -> Vec<DomesticCandid
             destination: connection.destination.clone(),
             host: connection.destination_host.clone(),
             ip: connection.destination_ip.clone(),
+            process: connection.process.clone(),
             bytes: 0,
             connections: 0,
             reason,
@@ -82,6 +84,9 @@ pub fn domestic_candidates(connections: &[LiveConnection]) -> Vec<DomesticCandid
             .bytes
             .saturating_add(connection.upload.saturating_add(connection.download));
         entry.connections += 1;
+        if entry.process != connection.process && !connection.process.is_empty() {
+            entry.process = "多个应用".into();
+        }
     }
     let mut result: Vec<_> = grouped.into_values().collect();
     result.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key)));
@@ -106,6 +111,7 @@ pub fn unresolved_ip_candidates(connections: &[LiveConnection]) -> Vec<DomesticC
             destination: connection.destination.clone(),
             host: String::new(),
             ip: connection.destination_ip.clone(),
+                process: connection.process.clone(),
             bytes: 0,
             connections: 0,
             reason: "裸 IP，需 GeoIP 证据".into(),
@@ -311,6 +317,7 @@ pub struct LiveSnapshot {
     pub traffic: TrafficSnapshot,
     pub groups: Vec<LiveGroup>,
     pub fetched_rows: bool,
+    pub traffic_error: Option<String>,
 }
 
 static LAST_GROUPS: Mutex<Vec<LiveGroup>> = Mutex::new(Vec::new());
@@ -546,8 +553,11 @@ pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
 }
 
 pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Result<LiveSnapshot> {
-    let (traffic, fetched_rows) = match need {
-        LiveNeed::Rows => (fetch(mixed_port, system_extension)?, true),
+    let (traffic, fetched_rows, traffic_error) = match need {
+        LiveNeed::Rows => match fetch(mixed_port, system_extension) {
+            Ok(traffic) => (traffic, true, None),
+            Err(error) => (TrafficSnapshot::default(), false, Some(error.to_string())),
+        },
         LiveNeed::Totals => {
             let totals = fetch_totals(mixed_port)?;
             (
@@ -558,6 +568,7 @@ pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Re
                     download_total: totals.download_total,
                 },
                 false,
+                None,
             )
         }
     };
@@ -566,6 +577,7 @@ pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Re
         traffic,
         groups,
         fetched_rows,
+        traffic_error,
     })
 }
 
