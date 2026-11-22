@@ -2085,6 +2085,8 @@ impl AppView {
             Ok(snap) => {
                 let traffic_changed = if snap.fetched_rows {
                     self.apply_traffic(Ok(snap.traffic))
+                } else if let Some(error) = snap.traffic_error {
+                    self.apply_totals(Err(error))
                 } else {
                     self.apply_totals(Ok(TrafficTotals {
                         upload_total: snap.traffic.upload_total,
@@ -4006,7 +4008,7 @@ impl AppView {
                             .child(metric(theme, "下载", &down))
                             .child(metric(theme, "连接数", &conns)),
             )
-            .when(connected, |this| {
+            .when(connected && self.traffic_error.is_none(), |this| {
                 this.child(self.domestic_traffic_notice(cx, theme))
             })
             .child(section_heading(theme, "当前路由"))

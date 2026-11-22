@@ -317,6 +317,7 @@ pub struct LiveSnapshot {
     pub traffic: TrafficSnapshot,
     pub groups: Vec<LiveGroup>,
     pub fetched_rows: bool,
+    pub traffic_error: Option<String>,
 }
 
 static LAST_GROUPS: Mutex<Vec<LiveGroup>> = Mutex::new(Vec::new());
@@ -552,8 +553,11 @@ pub fn fetch_proxies(mixed_port: u16) -> Result<Vec<LiveGroup>> {
 }
 
 pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Result<LiveSnapshot> {
-    let (traffic, fetched_rows) = match need {
-        LiveNeed::Rows => (fetch(mixed_port, system_extension)?, true),
+    let (traffic, fetched_rows, traffic_error) = match need {
+        LiveNeed::Rows => match fetch(mixed_port, system_extension) {
+            Ok(traffic) => (traffic, true, None),
+            Err(error) => (TrafficSnapshot::default(), false, Some(error.to_string())),
+        },
         LiveNeed::Totals => {
             let totals = fetch_totals(mixed_port)?;
             (
@@ -564,6 +568,7 @@ pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Re
                     download_total: totals.download_total,
                 },
                 false,
+                None,
             )
         }
     };
@@ -572,6 +577,7 @@ pub fn fetch_live(mixed_port: u16, need: LiveNeed, system_extension: bool) -> Re
         traffic,
         groups,
         fetched_rows,
+        traffic_error,
     })
 }
 
