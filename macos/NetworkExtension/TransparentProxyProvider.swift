@@ -351,22 +351,32 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
                 response = runtime.apply(request)
             case .prepareDNS:
                 let snapshot = runtime.apply(request)
-                guard snapshot.accepted,
-                      snapshot.running,
-                      let revision = request.revision,
-                      revision == snapshot.revision,
-                      let activationIdentifier = request.activationIdentifier,
-                      let payload = request.dnsProxyBootstrap,
-                      let bootstrap = try? DNSProxyBootstrapConfiguration.decode(payload),
-                      bootstrap.revision == revision,
-                      bootstrap.activationIdentifier == activationIdentifier,
-                      DNSProxyRuntimeRegistry.shared.prepare(bootstrap)
-                else {
-                    response = Self.response(
-                        from: snapshot,
-                        accepted: false,
-                        message: "DNS activation preparation requires the active revision and an activation identifier"
-                    )
+                guard snapshot.accepted else {
+                    response = snapshot
+                    break
+                }
+                let rejection: String?
+                if !snapshot.running {
+                    rejection = "Transparent proxy is not running"
+                } else if request.revision != snapshot.revision {
+                    rejection = "DNS preparation revision does not match the active capture revision"
+                } else if request.activationIdentifier == nil {
+                    rejection = "DNS preparation is missing its activation identifier"
+                } else if let payload = request.dnsProxyBootstrap,
+                          let bootstrap = try? DNSProxyBootstrapConfiguration.decode(payload) {
+                    if bootstrap.revision != snapshot.revision ||
+                        bootstrap.activationIdentifier != request.activationIdentifier {
+                        rejection = "DNS bootstrap identity does not match the preparation request"
+                    } else if !DNSProxyRuntimeRegistry.shared.prepare(bootstrap) {
+                        rejection = "DNS provider rejected the live bootstrap update"
+                    } else {
+                        rejection = nil
+                    }
+                } else {
+                    rejection = "DNS preparation bootstrap is missing or invalid"
+                }
+                if let rejection {
+                    response = Self.response(from: snapshot, accepted: false, message: rejection)
                     break
                 }
                 response = snapshot
