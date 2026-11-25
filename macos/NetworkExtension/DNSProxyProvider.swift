@@ -190,6 +190,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             if let error {
                 self.activeBackendProbe = nil
                 self.pendingStartCompletion = nil
+                self.unregisterLiveUpdaterLocked()
                 self.reporter = nil
                 self.proxy = nil
                 self.upstreamResolvers = []
@@ -216,6 +217,7 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
             } catch {
                 self.activeBackendProbe = nil
                 self.pendingStartCompletion = nil
+                self.unregisterLiveUpdaterLocked()
                 self.reporter = nil
                 self.proxy = nil
                 self.upstreamResolvers = []
@@ -258,6 +260,12 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         backendProbeLock.unlock()
     }
 
+    private func unregisterLiveUpdaterLocked() {
+        guard let token = liveUpdaterToken else { return }
+        DNSProxyRuntimeRegistry.shared.unregisterLiveUpdater(token)
+        liveUpdaterToken = nil
+    }
+
     override func stopProxy(
         with reason: NEProviderStopReason,
         completionHandler: @escaping () -> Void
@@ -278,14 +286,10 @@ final class DNSProxyProvider: NEDNSProxyProvider, @unchecked Sendable {
         self.pendingStartCompletion = nil
         let reporter = reporter
         self.reporter = nil
-        let liveUpdaterToken = liveUpdaterToken
-        self.liveUpdaterToken = nil
+        unregisterLiveUpdaterLocked()
         proxy = nil
         upstreamResolvers = []
         flowDecisionCoordinator.quiesce()
-        if let liveUpdaterToken {
-            DNSProxyRuntimeRegistry.shared.unregisterLiveUpdater(liveUpdaterToken)
-        }
         backendProbeLock.unlock()
         timer?.setEventHandler {}
         timer?.cancel()
