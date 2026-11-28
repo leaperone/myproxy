@@ -131,9 +131,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         _ flow: NEAppProxyUDPFlow,
         initialRemoteEndpoint remoteEndpoint: NetworkExtension.__NWEndpoint
     ) -> Bool {
-        guard InitialFlowOwnershipPolicy.shouldEvaluate(
-            metadataSigningIdentifier: flow.metaData.sourceAppSigningIdentifier
-        ) else { return false }
+        guard InitialFlowOwnershipPolicy.shouldEvaluateUDP(flow.metaData) else { return false }
 
         let parentFlowIdentifier = UUID()
         let plan = flowDecisionCoordinator.planLegacyUDPFlow(
@@ -733,9 +731,7 @@ extension TransparentProxyProvider: NEAppProxyUDPFlowHandling {
         _ flow: NEAppProxyUDPFlow,
         initialRemoteFlowEndpoint remoteEndpoint: Network.NWEndpoint
     ) -> Bool {
-        guard InitialFlowOwnershipPolicy.shouldEvaluate(
-            metadataSigningIdentifier: flow.metaData.sourceAppSigningIdentifier
-        ) else { return false }
+        guard InitialFlowOwnershipPolicy.shouldEvaluateUDP(flow.metaData) else { return false }
 
         let parentFlowIdentifier = UUID()
         let plan = flowDecisionCoordinator.planUDPFlow(
