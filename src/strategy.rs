@@ -455,6 +455,66 @@ impl Default for Strategy {
     }
 }
 
+pub fn via_target(via: &str, strategy: &Strategy) -> String {
+    let via = via.trim();
+    if let Some(group) = crate::gfw::gfw_group(via) {
+        return via_target(group, strategy);
+    }
+    match via.to_ascii_lowercase().as_str() {
+        "direct" => "DIRECT".into(),
+        "reject" => "REJECT".into(),
+        _ => {
+            if let Some(name) = via.strip_prefix("node:") {
+                name.to_string()
+            } else if let Some(name) = via.strip_prefix("group:") {
+                resolve_group_target(name, strategy)
+            } else {
+                resolve_group_target(via, strategy)
+            }
+        }
+    }
+}
+
+fn resolve_group_target(via: &str, strategy: &Strategy) -> String {
+    if let Some(group) = strategy.resolve_group_reference(via) {
+        return group.name.clone();
+    }
+    if default_group_alias(via) {
+        return strategy.default_group_name().to_string();
+    }
+    via.to_string()
+}
+
+pub fn unmatched_target(strategy: &Strategy) -> String {
+    match strategy.routing_profile {
+        RoutingProfile::Allowlist | RoutingProfile::Gfwlist => "DIRECT".into(),
+        RoutingProfile::Group | RoutingProfile::Chinadirect => {
+            let via = strategy.unmatched_via.trim();
+            if via.is_empty() || via.eq_ignore_ascii_case("direct") {
+                if strategy.routing_profile == RoutingProfile::Chinadirect {
+                    default_group(strategy).to_string()
+                } else {
+                    "DIRECT".into()
+                }
+            } else {
+                via_target(via, strategy)
+            }
+        }
+    }
+}
+
+pub fn unmatched_is_direct(strategy: &Strategy) -> bool {
+    unmatched_target(strategy).eq_ignore_ascii_case("DIRECT")
+}
+
+pub fn default_group(strategy: &Strategy) -> &str {
+    strategy.default_group_name()
+}
+
+fn default_group_alias(name: &str) -> bool {
+    name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("proxy")
+}
+
 impl Strategy {
     pub fn load() -> Result<Self> {
         let path = paths::strategy_path()?;
@@ -817,7 +877,7 @@ impl Strategy {
             .iter()
             .find(|group| group.name.eq_ignore_ascii_case(name))
             .or_else(|| {
-                if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("proxy") {
+                if default_group_alias(name) {
                     self.groups
                         .iter()
                         .find(|group| group.name == self.default_group_name())

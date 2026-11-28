@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::compile;
+use crate::strategy::via_target;
 use crate::gfw;
 use crate::log;
 use crate::login_item;
@@ -448,9 +448,9 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
                 continue;
             }
             let capture_via = if let Some(group) = gfw::gfw_group(via) {
-                format!("gfw:{}", compile::via_target(group, strategy))
+                format!("gfw:{}", via_target(group, strategy))
             } else {
-                compile::via_target(via, strategy)
+                via_target(via, strategy)
             };
             let mut pins_inlet = false;
             for matcher in &set.matchers {
@@ -604,7 +604,7 @@ fn push_app_patterns(process_rules: &mut Vec<ProcessRule>, order: u64, value: &s
 }
 
 fn pin_group(via: &str, strategy: &Strategy) -> Option<String> {
-    let target = compile::via_target(via, strategy);
+    let target = via_target(via, strategy);
     if matches!(target.as_str(), "DIRECT" | "REJECT") {
         None
     } else {

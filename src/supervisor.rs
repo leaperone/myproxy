@@ -992,7 +992,7 @@ impl Supervisor {
         let target = match strategy.mixed_mode {
             InboundMode::Direct => "DIRECT",
             InboundMode::Global => GLOBAL_GROUP,
-            _ => compile::default_group(strategy),
+            _ => strategy.default_group_name(),
         };
         controller::probe(strategy.mixed_port, target)
     }

@@ -8,6 +8,7 @@ pub use crate::endpoints::{
 use crate::gfw;
 use crate::log;
 use crate::paths;
+pub use crate::strategy::{default_group, unmatched_is_direct, unmatched_target, via_target};
 use crate::strategy::{InboundMode, RoutingProfile, Strategy};
 
 /// Addresses and names that must stay on the local network. These rules are
@@ -190,7 +191,7 @@ fn try_compile_root(
                 continue;
             };
             let routed = wrap_gfw_condition(&condition, &set.via, matcher.kind.as_str());
-            let target = rule_via_target(&set.via, strategy);
+            let target = via_target(&set.via, strategy);
             let se_app = matcher.kind == "app" && strategy.system_extension;
             let inlet_names = se_app.then(|| network_extension_inlet_names(request));
             if se_app {
@@ -301,27 +302,12 @@ fn wrap_gfw_condition(condition: &str, via: &str, kind: &str) -> String {
     }
 }
 
-fn rule_via_target(via: &str, strategy: &Strategy) -> String {
-    if let Some(group) = gfw::gfw_group(via) {
-        return via_target(group, strategy);
-    }
-    via_target(via, strategy)
-}
-
 fn gfw_socks_prefix(port: u16) -> String {
     format!("myproxy-network-extension-socks-gfw-{port}")
 }
 
 fn gfw_sub_rule_name(port: u16) -> String {
     format!("gfw-{port}")
-}
-
-fn gfw_inlet_group(name: &str, strategy: &Strategy) -> String {
-    if let Some(group) = gfw::gfw_group(name) {
-        via_target(group, strategy)
-    } else {
-        via_target(name, strategy)
-    }
 }
 
 fn network_extension_inlet_names(
@@ -352,7 +338,7 @@ fn append_gfw_inlet_rules(
     for port in &plan.gfw_ports {
         let prefix = gfw_socks_prefix(port.port);
         let names = format!("{prefix}-ipv4/{prefix}-ipv6");
-        let group = gfw_inlet_group(&port.name, strategy);
+        let group = via_target(&port.name, strategy);
         rules.push(format!(
             "AND,((IN-NAME,{names}),(RULE-SET,{})),{group}",
             gfw::PROVIDER
@@ -374,7 +360,7 @@ fn insert_gfw_sub_rules(
     }
     let mut sub = serde_yaml::Mapping::new();
     for port in &plan.gfw_ports {
-        let group = gfw_inlet_group(&port.name, strategy);
+        let group = via_target(&port.name, strategy);
         let items = vec![
             serde_yaml::Value::String(format!("RULE-SET,{},{group}", gfw::PROVIDER)),
             serde_yaml::Value::String("MATCH,DIRECT".into()),
@@ -719,66 +705,6 @@ fn push_socks_pair(
         );
         listeners.push(serde_yaml::Value::Mapping(item));
     }
-}
-
-pub fn via_target(via: &str, strategy: &Strategy) -> String {
-    let via = via.trim();
-    if let Some(group) = gfw::gfw_group(via) {
-        return via_target(group, strategy);
-    }
-    match via.to_ascii_lowercase().as_str() {
-        "direct" => "DIRECT".into(),
-        "reject" => "REJECT".into(),
-        _ => {
-            if let Some(name) = via.strip_prefix("node:") {
-                name.to_string()
-            } else if let Some(name) = via.strip_prefix("group:") {
-                resolve_group_target(name, strategy)
-            } else {
-                resolve_group_target(via, strategy)
-            }
-        }
-    }
-}
-
-fn resolve_group_target(via: &str, strategy: &Strategy) -> String {
-    if let Some(group) = strategy
-        .groups
-        .iter()
-        .find(|group| group.name.eq_ignore_ascii_case(via))
-    {
-        return group.name.clone();
-    }
-    if via.eq_ignore_ascii_case("default") || via.eq_ignore_ascii_case("proxy") {
-        return default_group(strategy).to_string();
-    }
-    via.to_string()
-}
-
-pub fn unmatched_target(strategy: &Strategy) -> String {
-    match strategy.routing_profile {
-        RoutingProfile::Allowlist | RoutingProfile::Gfwlist => "DIRECT".into(),
-        RoutingProfile::Group | RoutingProfile::Chinadirect => {
-            let via = strategy.unmatched_via.trim();
-            if via.is_empty() || via.eq_ignore_ascii_case("direct") {
-                if strategy.routing_profile == RoutingProfile::Chinadirect {
-                    default_group(strategy).to_string()
-                } else {
-                    "DIRECT".into()
-                }
-            } else {
-                via_target(via, strategy)
-            }
-        }
-    }
-}
-
-pub fn unmatched_is_direct(strategy: &Strategy) -> bool {
-    unmatched_target(strategy).eq_ignore_ascii_case("DIRECT")
-}
-
-pub fn default_group(strategy: &Strategy) -> &str {
-    strategy.default_group_name()
 }
 
 #[cfg(test)]
