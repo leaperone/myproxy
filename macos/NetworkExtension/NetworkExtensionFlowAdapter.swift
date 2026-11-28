@@ -2,30 +2,12 @@ import Foundation
 import MyproxyNetworkShared
 import Network
 import NetworkExtension
-import Security
 
 enum InitialFlowOwnershipPolicy {
     static func shouldEvaluate(metadataSigningIdentifier: String) -> Bool {
         !TrustedMyproxyComponentPolicy().contains(
             metadataSigningIdentifier: metadataSigningIdentifier
         )
-    }
-
-    static func shouldEvaluateUDP(_ metadata: NEFlowMetaData) -> Bool {
-        let identifier = metadata.sourceAppSigningIdentifier
-        guard shouldEvaluate(metadataSigningIdentifier: identifier) else { return false }
-        guard identifier == "io.tailscale.ipn.macsys.network-extension",
-              let audit = metadata.sourceAppAuditToken else { return true }
-        let attributes = [kSecGuestAttributeAudit: audit as CFData] as CFDictionary
-        var code: SecCode?
-        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
-              let code else { return true }
-        let expression = #"anchor apple generic and identifier "io.tailscale.ipn.macsys.network-extension" and certificate leaf[subject.OU] = "W5364U7YZB""#
-        var requirement: SecRequirement?
-        guard SecRequirementCreateWithString(expression as CFString, [], &requirement) == errSecSuccess,
-              let requirement else { return true }
-        // Keep the tunnel's shared discovery and relay socket native in every routing mode.
-        return SecCodeCheckValidity(code, [], requirement) != errSecSuccess
     }
 
     /// Returning `false` from an NE transparent provider preserves the original
