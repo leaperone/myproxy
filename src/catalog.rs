@@ -14,20 +14,7 @@ use crate::strategy::Strategy;
 const SUBSCRIPTION_CURL_MAX_TIME: &str = "8";
 const SUBSCRIPTION_CURL_CONNECT_TIMEOUT: &str = "3";
 
-pub const NODE_DISPLAY_SEP: &str = " · ";
-
-/// Catalog / pin display name: `"{subscription} · {original}"`.
-pub fn node_display_name(subscription: &str, original: &str) -> String {
-    format!("{subscription}{NODE_DISPLAY_SEP}{original}")
-}
-
-pub fn node_display_prefix(subscription: &str) -> String {
-    format!("{subscription}{NODE_DISPLAY_SEP}")
-}
-
-pub fn strip_node_display_prefix<'a>(raw: &'a str, subscription: &str) -> Option<&'a str> {
-    raw.strip_prefix(&node_display_prefix(subscription))
-}
+pub use crate::strategy::{node_display_name, node_display_prefix, strip_node_display_prefix, NODE_DISPLAY_SEP};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
@@ -51,6 +38,38 @@ pub struct Excluded {
     pub name: String,
     pub subscription: String,
     pub reason: String,
+}
+
+impl Strategy {
+    /// Candidate validation uses the catalog that will actually be applied.
+    /// Saved intent may refer to nodes from subscriptions that have not refreshed yet.
+    pub fn validate_catalog(&self, catalog: &Catalog) -> Result<()> {
+        catalog.validate()?;
+        for node in &catalog.nodes {
+            if self
+                .groups
+                .iter()
+                .any(|group| group.name.eq_ignore_ascii_case(&node.name))
+            {
+                anyhow::bail!("node name conflicts with a group: {}", node.name);
+            }
+        }
+        let has_node = |name: &str| catalog.nodes.iter().any(|node| node.name == name);
+        for set in &self.rule_sets {
+            self.validate_target(&set.via, Some(&has_node))
+                .with_context(|| format!("rule {} target", set.name))?;
+        }
+        if matches!(
+            self.routing_profile,
+            crate::strategy::RoutingProfile::Group | crate::strategy::RoutingProfile::Chinadirect
+        ) {
+            self.validate_target(&self.unmatched_via, Some(&has_node))
+                .context("unmatched target")?;
+        }
+        // Historical selector picks are checked against live members when restored;
+        // a removed subscription node must not prevent a safe default from loading.
+        Ok(())
+    }
 }
 
 impl Catalog {

@@ -271,7 +271,7 @@ fn run(cli: Cli) -> Result<()> {
             let runtime = snapshot.runtime;
             let controller_ready = snapshot.controller_ready;
             let extension = snapshot.extension;
-            let unmatched = myproxy::compile::unmatched_target(&strategy);
+            let unmatched = myproxy::strategy::unmatched_target(&strategy);
             emit(json, serde_json::json!({
                 "mixed_port": strategy.mixed_port,
                 "mixed_lan": strategy.mixed_lan,
@@ -567,7 +567,7 @@ fn run(cli: Cli) -> Result<()> {
                             bail!("routing group <via>");
                         }
                         strategy.unmatched_via = if via.eq_ignore_ascii_case("group") {
-                            myproxy::compile::default_group(&strategy).to_string()
+                            strategy.default_group_name().to_string()
                         } else {
                             via.to_string()
                         };
@@ -575,7 +575,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 save_strategy(&strategy)?;
             }
-            let unmatched = myproxy::compile::unmatched_target(&strategy);
+            let unmatched = myproxy::strategy::unmatched_target(&strategy);
             emit(
                 json,
                 serde_json::json!({
@@ -602,7 +602,7 @@ fn run(cli: Cli) -> Result<()> {
                     strategy.unmatched_via = "DIRECT".into();
                 } else if via.eq_ignore_ascii_case("group") {
                     strategy.set_routing_profile(RoutingProfile::Group);
-                    strategy.unmatched_via = myproxy::compile::default_group(&strategy).to_string();
+                    strategy.unmatched_via = strategy.default_group_name().to_string();
                 } else if via.eq_ignore_ascii_case("gfwlist") || via.eq_ignore_ascii_case("gfw") {
                     strategy.set_routing_profile(RoutingProfile::Gfwlist);
                 } else if via.eq_ignore_ascii_case("chinadirect")
@@ -615,14 +615,14 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 save_strategy(&strategy)?;
             }
-            let unmatched = myproxy::compile::unmatched_target(&strategy);
+            let unmatched = myproxy::strategy::unmatched_target(&strategy);
             emit(
                 json,
                 serde_json::json!({
                     "routing": strategy.routing_profile.as_str(),
                     "unmatched": unmatched,
                     "unmatched_via": strategy.unmatched_via,
-                    "direct": myproxy::compile::unmatched_is_direct(&strategy),
+                    "direct": myproxy::strategy::unmatched_is_direct(&strategy),
                 }),
                 format!(
                     "routing {} unmatched {}",

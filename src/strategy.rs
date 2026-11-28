@@ -16,6 +16,21 @@ pub const DEFAULT_MIXED_PORT: u16 = 7890;
 
 pub const STRATEGY_SCHEMA: u32 = 8;
 
+pub const NODE_DISPLAY_SEP: &str = " · ";
+
+/// Catalog / pin display name: `"{subscription} · {original}"`.
+pub fn node_display_name(subscription: &str, original: &str) -> String {
+    format!("{subscription}{NODE_DISPLAY_SEP}{original}")
+}
+
+pub fn node_display_prefix(subscription: &str) -> String {
+    format!("{subscription}{NODE_DISPLAY_SEP}")
+}
+
+pub fn strip_node_display_prefix<'a>(raw: &'a str, subscription: &str) -> Option<&'a str> {
+    raw.strip_prefix(&node_display_prefix(subscription))
+}
+
 pub const TELEGRAM_GROUP: &str = "Telegram";
 
 /// Mihomo's built-in selector. Mixed/SE「全局」pins inbound to this name.
@@ -455,6 +470,66 @@ impl Default for Strategy {
     }
 }
 
+pub fn via_target(via: &str, strategy: &Strategy) -> String {
+    let via = via.trim();
+    if let Some(group) = crate::gfw::gfw_group(via) {
+        return via_target(group, strategy);
+    }
+    match via.to_ascii_lowercase().as_str() {
+        "direct" => "DIRECT".into(),
+        "reject" => "REJECT".into(),
+        _ => {
+            if let Some(name) = via.strip_prefix("node:") {
+                name.to_string()
+            } else if let Some(name) = via.strip_prefix("group:") {
+                resolve_group_target(name, strategy)
+            } else {
+                resolve_group_target(via, strategy)
+            }
+        }
+    }
+}
+
+fn resolve_group_target(via: &str, strategy: &Strategy) -> String {
+    if let Some(group) = strategy.resolve_group_reference(via) {
+        return group.name.clone();
+    }
+    if default_group_alias(via) {
+        return strategy.default_group_name().to_string();
+    }
+    via.to_string()
+}
+
+pub fn unmatched_target(strategy: &Strategy) -> String {
+    match strategy.routing_profile {
+        RoutingProfile::Allowlist | RoutingProfile::Gfwlist => "DIRECT".into(),
+        RoutingProfile::Group | RoutingProfile::Chinadirect => {
+            let via = strategy.unmatched_via.trim();
+            if via.is_empty() || via.eq_ignore_ascii_case("direct") {
+                if strategy.routing_profile == RoutingProfile::Chinadirect {
+                    default_group(strategy).to_string()
+                } else {
+                    "DIRECT".into()
+                }
+            } else {
+                via_target(via, strategy)
+            }
+        }
+    }
+}
+
+pub fn unmatched_is_direct(strategy: &Strategy) -> bool {
+    unmatched_target(strategy).eq_ignore_ascii_case("DIRECT")
+}
+
+pub fn default_group(strategy: &Strategy) -> &str {
+    strategy.default_group_name()
+}
+
+fn default_group_alias(name: &str) -> bool {
+    name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("proxy")
+}
+
 impl Strategy {
     pub fn load() -> Result<Self> {
         let path = paths::strategy_path()?;
@@ -626,19 +701,20 @@ impl Strategy {
 
     /// Validate persisted intent without fetching subscriptions or touching the running core.
     pub fn validate(&self) -> Result<()> {
-        let controller = self
-            .mixed_port
-            .checked_add(107)
-            .filter(|_| self.mixed_port != 0)
-            .context("mixed port must be between 1 and 65428")?;
+        use crate::endpoints::{
+            controller_port, network_extension_socks_port, DNS_LISTEN_PORT, MAX_MIXED_PORT,
+        };
+        if !(1..=MAX_MIXED_PORT).contains(&self.mixed_port) {
+            anyhow::bail!("mixed port must be between 1 and {MAX_MIXED_PORT}");
+        }
         if self.tun && self.system_extension {
             anyhow::bail!("TUN and System Extension cannot both be enabled");
         }
         if self.tun || self.system_extension {
-            let dns = crate::compile::DNS_LISTEN_PORT;
+            let dns = DNS_LISTEN_PORT;
             if self.mixed_port == dns
-                || controller == dns
-                || (self.system_extension && self.mixed_port + 1 == dns)
+                || controller_port(self.mixed_port) == dns
+                || (self.system_extension && network_extension_socks_port(self.mixed_port) == dns)
             {
                 anyhow::bail!(
                     "mixed/controller/System Extension listener conflicts with DNS port {dns}"
@@ -747,36 +823,11 @@ impl Strategy {
         Ok(())
     }
 
-    /// Candidate validation uses the catalog that will actually be applied.
-    /// Saved intent may refer to nodes from subscriptions that have not refreshed yet.
-    pub fn validate_catalog(&self, catalog: &crate::catalog::Catalog) -> Result<()> {
-        catalog.validate()?;
-        for node in &catalog.nodes {
-            if self
-                .groups
-                .iter()
-                .any(|group| group.name.eq_ignore_ascii_case(&node.name))
-            {
-                anyhow::bail!("node name conflicts with a group: {}", node.name);
-            }
-        }
-        for set in &self.rule_sets {
-            self.validate_target(&set.via, Some(catalog))
-                .with_context(|| format!("rule {} target", set.name))?;
-        }
-        if matches!(
-            self.routing_profile,
-            RoutingProfile::Group | RoutingProfile::Chinadirect
-        ) {
-            self.validate_target(&self.unmatched_via, Some(catalog))
-                .context("unmatched target")?;
-        }
-        // Historical selector picks are checked against live members when restored;
-        // a removed subscription node must not prevent a safe default from loading.
-        Ok(())
-    }
-
-    fn validate_target(&self, raw: &str, catalog: Option<&crate::catalog::Catalog>) -> Result<()> {
+    pub(crate) fn validate_target(
+        &self,
+        raw: &str,
+        has_node: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<()> {
         validate_name("target", raw)?;
         let gfw = crate::gfw::gfw_group(raw);
         let target = gfw.unwrap_or(raw);
@@ -801,8 +852,8 @@ impl Strategy {
                 return Ok(());
             }
         }
-        if let Some(catalog) = catalog {
-            if !catalog.nodes.iter().any(|node| node.name == target) {
+        if let Some(has_node) = has_node {
+            if !has_node(target) {
                 anyhow::bail!("target does not exist: {target}");
             }
         } else if target.eq_ignore_ascii_case(GLOBAL_GROUP) || target.ends_with(':') {
@@ -816,7 +867,7 @@ impl Strategy {
             .iter()
             .find(|group| group.name.eq_ignore_ascii_case(name))
             .or_else(|| {
-                if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("proxy") {
+                if default_group_alias(name) {
                     self.groups
                         .iter()
                         .find(|group| group.name == self.default_group_name())
@@ -1286,7 +1337,7 @@ fn node_owner_index(subscriptions: &[Subscription], raw: &str) -> Option<usize> 
         .iter()
         .enumerate()
         .filter(|(_, sub)| {
-            crate::catalog::strip_node_display_prefix(raw, &sub.name).is_some()
+            strip_node_display_prefix(raw, &sub.name).is_some()
         })
         .max_by_key(|(_, sub)| sub.name.len())
         .map(|(index, _)| index)
@@ -1316,8 +1367,8 @@ fn rewrite_owned_node_name(
         return None;
     }
     let old = &subscriptions[index].name;
-    let rest = crate::catalog::strip_node_display_prefix(raw, old)?;
-    Some(crate::catalog::node_display_name(new, rest))
+    let rest = strip_node_display_prefix(raw, old)?;
+    Some(node_display_name(new, rest))
 }
 
 fn rewrite_target_ref(
@@ -1886,6 +1937,20 @@ mod tests {
         assert!(strategy.set_global_selected("DIRECT".into()));
         assert_eq!(strategy.global_selected, "DIRECT");
         assert!(!strategy.set_global_selected("  ".into()));
+    }
+
+    #[test]
+    fn mixed_port_must_leave_room_for_private_listeners() {
+        let mut strategy = Strategy::default();
+        for (port, valid) in [(0, false), (1, true), (65428, true), (65429, false)] {
+            strategy.mixed_port = port;
+            assert_eq!(strategy.validate().is_ok(), valid, "port {port}");
+        }
+        strategy.system_extension = true;
+        for port in [946, 1052, 1053] {
+            strategy.mixed_port = port;
+            assert!(strategy.validate().is_err(), "DNS collision at {port}");
+        }
     }
 
     fn temp_json(name: &str) -> PathBuf {

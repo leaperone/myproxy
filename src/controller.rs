@@ -9,7 +9,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::compile::{controller_port, CONTROLLER_SECRET};
+use crate::endpoints::{controller_port, CONTROLLER_SECRET};
 use crate::log;
 use crate::paths;
 use crate::strategy::{Strategy, GLOBAL_GROUP};
@@ -681,7 +681,7 @@ pub fn selection_restores(strategy: &Strategy) -> Vec<(&str, &str)> {
 
 pub fn restore_selections(mixed_port: u16, strategy: &Strategy) -> Result<Vec<String>> {
     let mut restores = selection_restores(strategy);
-    let global_default = crate::compile::default_group(strategy);
+    let global_default = strategy.default_group_name();
     if strategy.global_selected.trim().is_empty()
         && (strategy.mixed_mode == crate::strategy::InboundMode::Global
             || (strategy.system_extension

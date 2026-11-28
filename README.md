@@ -98,6 +98,16 @@ To let devices on the same LAN use this Mac as a proxy, enable **设置 → 手�
 
 Mixed has no inbound password and listens on all network interfaces when enabled. Leave the switch off on untrusted networks. VPN, hotspot, and firewall rules can make the port reachable from other networks. The controller, DNS, and System Extension listeners stay on loopback. Run `myproxyctl mixed-lan off` to close the LAN listener. Apply or reconnect after changing the setting.
 
+## Where to change routing behavior
+
+| Question | Owner | Consumers |
+| --- | --- | --- |
+| What did the user configure? | `src/strategy.rs` defines saved strategy and migrations. | Both the GPUI app and `myproxyctl` use the library model. |
+| Which subscription nodes belong to a group? | `src/catalog.rs` resolves members from pins, filters and fetched nodes. | Group previews and runtime configuration use the resolved membership. |
+| What should the core and extension receive? | `src/compile.rs` emits Mihomo YAML; `src/network_extension.rs` builds the extension request. | `src/supervisor.rs` prepares and activates the candidate. |
+| Which configuration is active? | The supervisor tracks the applied configuration and runtime identity. | Controller operations address that runtime; the saved strategy can differ. |
+| Who can change macOS capture? | The signed Host controls system preferences; the provider handles flows. | The bundled CLI reaches the Host through `src/host_control.rs`. Both Swift targets use `macos/NetworkShared` for shared contracts. |
+
 ## Routing and runtime state
 
 `strategy.json` stores the saved configuration. Saving, applying, Mihomo readiness,

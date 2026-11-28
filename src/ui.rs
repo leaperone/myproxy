@@ -111,7 +111,7 @@ const REGION_PRESETS: &[(&str, &[&str])] = &[
     ("TW", &["tw", "台"]),
 ];
 
-const MAX_MIXED_PORT: u16 = 65_428;
+use myproxy::endpoints::MAX_MIXED_PORT;
 
 struct GroupEditor {
     parent: Entity<AppView>,
@@ -5767,7 +5767,7 @@ impl AppView {
     ) -> impl IntoElement {
         let entity = cx.entity();
         let current = self.strategy.routing_profile;
-        let unmatched = myproxy::compile::unmatched_target(&self.strategy);
+        let unmatched = myproxy::strategy::unmatched_target(&self.strategy);
         let summary = match current {
             RoutingProfile::Allowlist => "未命中直连",
             RoutingProfile::Gfwlist => "受限网站命中走默认出口",

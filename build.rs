@@ -25,6 +25,7 @@ fn main() {
     println!("cargo:rerun-if-changed=macos/NetworkShared");
     println!("cargo:rerun-if-changed=macos/NetworkHost");
     println!("cargo:rerun-if-changed=scripts/build-network-host.sh");
+    println!("cargo:rerun-if-changed=scripts/build-network-shared.sh");
 
     if std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("macos") {
         compile_network_host(&manifest);
