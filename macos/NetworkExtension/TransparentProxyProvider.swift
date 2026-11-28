@@ -131,7 +131,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         _ flow: NEAppProxyUDPFlow,
         initialRemoteEndpoint remoteEndpoint: NetworkExtension.__NWEndpoint
     ) -> Bool {
-        guard InitialFlowOwnershipPolicy.shouldEvaluateUDP(flow.metaData) else { return false }
+        guard InitialFlowOwnershipPolicy.shouldEvaluate(
+            metadataSigningIdentifier: flow.metaData.sourceAppSigningIdentifier
+        ) else { return false }
 
         let parentFlowIdentifier = UUID()
         let plan = flowDecisionCoordinator.planLegacyUDPFlow(
@@ -302,7 +304,35 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             tunnelRemoteAddress: "127.0.0.1"
         )
         settings.includedNetworkRules = [allOutboundNetworkRule()]
+        // Declining Tailscale's shared UDP socket per flow still breaks it
+        // (sendto EPIPE), so macOS must never hand that socket to the provider.
+        settings.excludedNetworkRules = ["0.0.0.0", "::"].map {
+            localUDPPortRule(address: $0, port: tailscaleUDPPort)
+        }
         return settings
+    }
+
+    private static let tailscaleUDPPort: UInt16 = 41641
+
+    private static func localUDPPortRule(address: String, port: UInt16) -> NENetworkRule {
+        if #available(macOS 15.0, *) {
+            return NENetworkRule(
+                remoteNetworkEndpoint: nil,
+                remotePrefix: 0,
+                localNetworkEndpoint: .hostPort(host: .init(address), port: .init(integerLiteral: port)),
+                localPrefix: 0,
+                protocol: .UDP,
+                direction: .outbound
+            )
+        }
+        return NENetworkRule(
+            __remoteNetwork: nil,
+            remotePrefix: 0,
+            localNetwork: __NWHostEndpoint(hostname: address, port: String(port)),
+            localPrefix: 0,
+            protocol: .UDP,
+            direction: .outbound
+        )
     }
 
     private static func allOutboundNetworkRule() -> NENetworkRule {
@@ -731,7 +761,9 @@ extension TransparentProxyProvider: NEAppProxyUDPFlowHandling {
         _ flow: NEAppProxyUDPFlow,
         initialRemoteFlowEndpoint remoteEndpoint: Network.NWEndpoint
     ) -> Bool {
-        guard InitialFlowOwnershipPolicy.shouldEvaluateUDP(flow.metaData) else { return false }
+        guard InitialFlowOwnershipPolicy.shouldEvaluate(
+            metadataSigningIdentifier: flow.metaData.sourceAppSigningIdentifier
+        ) else { return false }
 
         let parentFlowIdentifier = UUID()
         let plan = flowDecisionCoordinator.planUDPFlow(
