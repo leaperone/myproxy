@@ -95,19 +95,11 @@ actor AppleTransparentProxyManager {
         revision: UInt64
     ) async throws {
         let quiesced = try await send(
-            HostProviderControlRequest(
-                command: "quiesce",
+            ProviderControlRequest(
+                command: .quiesce,
                 revision: revision,
-                activationIdentifier: nil,
-                dnsProxyBootstrap: nil,
                 captureEnabled: false,
-                failOpen: true,
-                captureConfigurationSnapshot: nil,
-                mihomoRouteProxyCatalog: nil,
-                mihomoSOCKSHost: nil,
-                mihomoSOCKSPort: nil,
-                mihomoSOCKSUsername: nil,
-                mihomoSOCKSPassword: nil
+                failOpen: true
             )
         )
         guard quiesced.accepted, quiesced.revision == revision else {
@@ -119,23 +111,23 @@ actor AppleTransparentProxyManager {
 
         try Task.checkCancellation()
         let applied = try await send(
-            HostProviderControlRequest(
-                command: "applyConfiguration",
+            ProviderControlRequest(
+                command: .applyConfiguration,
                 revision: revision,
-                activationIdentifier: uuid(configuration["activationIdentifier"]),
-                dnsProxyBootstrap: data(configuration["dnsProxyBootstrap"]),
+                activationIdentifier: uuid(configuration[ProviderConfigurationKey.activationIdentifier]),
+                dnsProxyBootstrap: data(configuration[ProviderConfigurationKey.dnsProxyBootstrap]),
                 captureEnabled: true,
                 failOpen: true,
                 captureConfigurationSnapshot: data(
-                    configuration["captureConfigurationSnapshot"]
+                    configuration[ProviderConfigurationKey.captureConfigurationSnapshot]
                 ),
                 mihomoRouteProxyCatalog: data(
-                    configuration["mihomoRouteProxyCatalog"]
+                    configuration[ProviderConfigurationKey.mihomoRouteProxyCatalog]
                 ),
-                mihomoSOCKSHost: configuration["mihomoSOCKSHost"] as? String,
-                mihomoSOCKSPort: uint16(configuration["mihomoSOCKSPort"]),
-                mihomoSOCKSUsername: configuration["mihomoSOCKSUsername"] as? String,
-                mihomoSOCKSPassword: configuration["mihomoSOCKSPassword"] as? String
+                mihomoSOCKSHost: configuration[ProviderConfigurationKey.mihomoSOCKSHost] as? String,
+                mihomoSOCKSPort: uint16(configuration[ProviderConfigurationKey.mihomoSOCKSPort]),
+                mihomoSOCKSUsername: configuration[ProviderConfigurationKey.mihomoSOCKSUsername] as? String,
+                mihomoSOCKSPassword: configuration[ProviderConfigurationKey.mihomoSOCKSPassword] as? String
             )
         )
         guard applied.accepted, applied.revision == revision, applied.captureEnabled else {
@@ -152,19 +144,11 @@ actor AppleTransparentProxyManager {
         bootstrap: Data
     ) async throws {
         let response = try await send(
-            HostProviderControlRequest(
-                command: "prepareDNS",
+            ProviderControlRequest(
+                command: .prepareDNS,
                 revision: revision,
                 activationIdentifier: activationIdentifier,
-                dnsProxyBootstrap: bootstrap,
-                captureEnabled: nil,
-                failOpen: nil,
-                captureConfigurationSnapshot: nil,
-                mihomoRouteProxyCatalog: nil,
-                mihomoSOCKSHost: nil,
-                mihomoSOCKSPort: nil,
-                mihomoSOCKSUsername: nil,
-                mihomoSOCKSPassword: nil
+                dnsProxyBootstrap: bootstrap
             )
         )
         guard response.accepted, response.revision == revision else {
@@ -176,29 +160,12 @@ actor AppleTransparentProxyManager {
     }
 
     func runtimeStatus() async throws -> HostProviderControlResponse {
-        try await send(HostProviderControlRequest(
-            command: "dnsStatus", revision: nil, activationIdentifier: nil,
-            dnsProxyBootstrap: nil, captureEnabled: nil, failOpen: nil,
-            captureConfigurationSnapshot: nil, mihomoRouteProxyCatalog: nil,
-            mihomoSOCKSHost: nil, mihomoSOCKSPort: nil,
-            mihomoSOCKSUsername: nil, mihomoSOCKSPassword: nil
-        ))
+        try await send(ProviderControlRequest(command: .dnsStatus))
     }
 
     func fetchActivity(cursor: UInt64, limit: Int) async throws -> HostProviderControlResponse {
-        try await send(HostProviderControlRequest(
-            command: "activity",
-            revision: nil,
-            activationIdentifier: nil,
-            dnsProxyBootstrap: nil,
-            captureEnabled: nil,
-            failOpen: nil,
-            captureConfigurationSnapshot: nil,
-            mihomoRouteProxyCatalog: nil,
-            mihomoSOCKSHost: nil,
-            mihomoSOCKSPort: nil,
-            mihomoSOCKSUsername: nil,
-            mihomoSOCKSPassword: nil,
+        try await send(ProviderControlRequest(
+            command: .activity,
             activityCursor: cursor,
             activityLimit: limit
         ))
@@ -358,7 +325,7 @@ actor AppleTransparentProxyManager {
     }
 
     private func send(
-        _ request: HostProviderControlRequest
+        _ request: ProviderControlRequest
     ) async throws -> HostProviderControlResponse {
         try await reload()
         guard let manager else {
@@ -455,24 +422,6 @@ actor AppleTransparentProxyManager {
             nil
         }
     }
-}
-
-private struct HostProviderControlRequest: Encodable, Sendable {
-    let protocolVersion = 3
-    let command: String
-    let revision: UInt64?
-    let activationIdentifier: UUID?
-    let dnsProxyBootstrap: Data?
-    let captureEnabled: Bool?
-    let failOpen: Bool?
-    let captureConfigurationSnapshot: Data?
-    let mihomoRouteProxyCatalog: Data?
-    let mihomoSOCKSHost: String?
-    let mihomoSOCKSPort: UInt16?
-    let mihomoSOCKSUsername: String?
-    let mihomoSOCKSPassword: String?
-    var activityCursor: UInt64? = nil
-    var activityLimit: Int? = nil
 }
 
 struct HostProviderControlResponse: Decodable, Sendable {

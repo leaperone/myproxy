@@ -629,17 +629,17 @@ private func providerConfigurations(
         encodedCaptureSnapshot: encodedSnapshot
     ).encoded()
     let transparent: [String: NSObject] = [
-        "revision": NSNumber(value: request.revision),
-        "activationIdentifier": activationIdentifier.uuidString as NSString,
-        "dnsProxyBootstrap": bootstrap as NSData,
-        "captureEnabled": NSNumber(value: true),
-        "failOpen": NSNumber(value: true),
-        "captureConfigurationSnapshot": encodedSnapshot as NSData,
-        "mihomoRouteProxyCatalog": catalog as NSData,
-        "mihomoSOCKSHost": "127.0.0.1" as NSString,
-        "mihomoSOCKSPort": NSNumber(value: request.socksPort),
-        "mihomoSOCKSUsername": request.username as NSString,
-        "mihomoSOCKSPassword": request.password as NSString,
+        ProviderConfigurationKey.revision: NSNumber(value: request.revision),
+        ProviderConfigurationKey.activationIdentifier: activationIdentifier.uuidString as NSString,
+        ProviderConfigurationKey.dnsProxyBootstrap: bootstrap as NSData,
+        ProviderConfigurationKey.captureEnabled: NSNumber(value: true),
+        ProviderConfigurationKey.failOpen: NSNumber(value: true),
+        ProviderConfigurationKey.captureConfigurationSnapshot: encodedSnapshot as NSData,
+        ProviderConfigurationKey.mihomoRouteProxyCatalog: catalog as NSData,
+        ProviderConfigurationKey.mihomoSOCKSHost: "127.0.0.1" as NSString,
+        ProviderConfigurationKey.mihomoSOCKSPort: NSNumber(value: request.socksPort),
+        ProviderConfigurationKey.mihomoSOCKSUsername: request.username as NSString,
+        ProviderConfigurationKey.mihomoSOCKSPassword: request.password as NSString,
     ]
     return HostProviderConfigurations(transparent: transparent, dnsBootstrap: bootstrap)
 }

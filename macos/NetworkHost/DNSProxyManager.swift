@@ -1,3 +1,4 @@
+import MyproxyNetworkShared
 @preconcurrency import Darwin
 @preconcurrency import Foundation
 @preconcurrency import NetworkExtension
@@ -28,7 +29,7 @@ actor AppleDNSProxyManager {
         let providerProtocol = NEDNSProxyProviderProtocol()
         providerProtocol.providerBundleIdentifier = providerBundleIdentifier
         providerProtocol.providerConfiguration = [
-            "dnsProxyBootstrap": bootstrap
+            ProviderConfigurationKey.dnsProxyBootstrap: bootstrap
         ]
         manager.providerProtocol = providerProtocol
         manager.localizedDescription = MyproxyNetworkExtensionIdentifiers.localizedDescription

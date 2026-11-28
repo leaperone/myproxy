@@ -1,3 +1,4 @@
+import MyproxyNetworkShared
 import Foundation
 
 /// Small, lock-protected lifecycle state shared by provider callbacks.

@@ -112,6 +112,15 @@ private func context(
 struct NetworkSharedTests {
     static func main() {
         var run = TestRun()
+        run.test("provider status request retains its versioned wire shape") {
+            let data = try JSONEncoder().encode(ProviderControlRequest(command: .dnsStatus))
+            let json = try JSONSerialization.jsonObject(with: data) as? NSDictionary
+            try expectEqual(json, ["command": "dnsStatus", "protocolVersion": 3] as NSDictionary, "request")
+            let previous = Data(#"{"command":"activity","protocolVersion":2,"activityLimit":4}"#.utf8)
+            let decoded = try JSONDecoder().decode(ProviderControlRequest.self, from: previous)
+            try expectEqual(decoded.protocolVersion, 2, "preserve sender version for validation")
+            try expectEqual(decoded.activityLimit, 4, "activity limit")
+        }
 
         run.test("socks5_encode_greeting_no_auth") {
             let data = try SOCKS5Codec.encodeGreeting(methods: [.noAuthenticationRequired])
