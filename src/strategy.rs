@@ -626,19 +626,20 @@ impl Strategy {
 
     /// Validate persisted intent without fetching subscriptions or touching the running core.
     pub fn validate(&self) -> Result<()> {
-        let controller = self
-            .mixed_port
-            .checked_add(107)
-            .filter(|_| self.mixed_port != 0)
-            .context("mixed port must be between 1 and 65428")?;
+        use crate::endpoints::{
+            controller_port, network_extension_socks_port, DNS_LISTEN_PORT, MAX_MIXED_PORT,
+        };
+        if !(1..=MAX_MIXED_PORT).contains(&self.mixed_port) {
+            anyhow::bail!("mixed port must be between 1 and {MAX_MIXED_PORT}");
+        }
         if self.tun && self.system_extension {
             anyhow::bail!("TUN and System Extension cannot both be enabled");
         }
         if self.tun || self.system_extension {
-            let dns = crate::compile::DNS_LISTEN_PORT;
+            let dns = DNS_LISTEN_PORT;
             if self.mixed_port == dns
-                || controller == dns
-                || (self.system_extension && self.mixed_port + 1 == dns)
+                || controller_port(self.mixed_port) == dns
+                || (self.system_extension && network_extension_socks_port(self.mixed_port) == dns)
             {
                 anyhow::bail!(
                     "mixed/controller/System Extension listener conflicts with DNS port {dns}"
@@ -1886,6 +1887,20 @@ mod tests {
         assert!(strategy.set_global_selected("DIRECT".into()));
         assert_eq!(strategy.global_selected, "DIRECT");
         assert!(!strategy.set_global_selected("  ".into()));
+    }
+
+    #[test]
+    fn mixed_port_must_leave_room_for_private_listeners() {
+        let mut strategy = Strategy::default();
+        for (port, valid) in [(0, false), (1, true), (65428, true), (65429, false)] {
+            strategy.mixed_port = port;
+            assert_eq!(strategy.validate().is_ok(), valid, "port {port}");
+        }
+        strategy.system_extension = true;
+        for port in [946, 1052, 1053] {
+            strategy.mixed_port = port;
+            assert!(strategy.validate().is_err(), "DNS collision at {port}");
+        }
     }
 
     fn temp_json(name: &str) -> PathBuf {

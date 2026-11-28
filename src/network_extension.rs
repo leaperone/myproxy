@@ -418,8 +418,8 @@ pub fn inbound_plan(strategy: &Strategy) -> EnableRequest {
 }
 
 pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
-    let socks_port = compile::network_extension_socks_port(strategy.mixed_port);
-    let controller = compile::controller_port(strategy.mixed_port);
+    let socks_port = crate::endpoints::network_extension_socks_port(strategy.mixed_port);
+    let controller = crate::endpoints::controller_port(strategy.mixed_port);
     let mut session = SESSION.lock().expect("ne session");
     let session = session.get_or_insert_with(|| Session {
         revision: 0,
@@ -533,7 +533,7 @@ pub fn try_inbound_plan(strategy: &Strategy) -> Result<EnableRequest> {
         gfw_domains: Vec::new(),
         group_ports,
         gfw_ports,
-        dns_resolvers: compile::DNS_NAMESERVERS
+        dns_resolvers: crate::endpoints::DNS_NAMESERVERS
             .iter()
             .map(|resolver| (*resolver).to_string())
             .collect(),
@@ -621,7 +621,7 @@ fn next_listener_port(
 ) -> Result<u16> {
     let mut port = start.max(1024);
     for _ in 1024..=u16::MAX {
-        if ![socks_port, controller, mixed, compile::DNS_LISTEN_PORT].contains(&port)
+        if ![socks_port, controller, mixed, crate::endpoints::DNS_LISTEN_PORT].contains(&port)
             && !used.values().any(|used| *used == port)
         {
             return Ok(port);
@@ -933,7 +933,7 @@ mod tests {
         let plan = inbound_plan(&strategy);
         assert_eq!(
             plan.dns_resolvers,
-            compile::DNS_NAMESERVERS
+            crate::endpoints::DNS_NAMESERVERS
                 .iter()
                 .map(|resolver| resolver.to_string())
                 .collect::<Vec<_>>()

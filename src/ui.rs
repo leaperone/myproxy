@@ -111,7 +111,7 @@ const REGION_PRESETS: &[(&str, &[&str])] = &[
     ("TW", &["tw", "台"]),
 ];
 
-const MAX_MIXED_PORT: u16 = 65_428;
+use myproxy::endpoints::MAX_MIXED_PORT;
 
 struct GroupEditor {
     parent: Entity<AppView>,

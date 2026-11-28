@@ -1470,9 +1470,9 @@ fn mixed_listening(port: u16) -> bool {
 fn owned_listen_ports(mixed_port: u16) -> [u16; 4] {
     [
         mixed_port,
-        compile::network_extension_socks_port(mixed_port),
-        compile::controller_port(mixed_port),
-        compile::DNS_LISTEN_PORT,
+        crate::endpoints::network_extension_socks_port(mixed_port),
+        crate::endpoints::controller_port(mixed_port),
+        crate::endpoints::DNS_LISTEN_PORT,
     ]
 }
 
@@ -1485,7 +1485,7 @@ fn reclaim_owned_mihomo(mixed_port: Option<u16>, already_stopped: Option<i32>) -
     if let Some(port) = mixed_port {
         for owned in owned_listen_ports(port) {
             pids.extend(pids_listening_tcp(owned));
-            if owned == compile::DNS_LISTEN_PORT {
+            if owned == crate::endpoints::DNS_LISTEN_PORT {
                 pids.extend(pids_bound_udp(owned));
             }
         }
@@ -1547,7 +1547,7 @@ fn wait_for_owned_ports_free(mixed_port: u16) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         let busy = owned_listen_ports(mixed_port).iter().any(|port| {
-            if *port == compile::DNS_LISTEN_PORT {
+            if *port == crate::endpoints::DNS_LISTEN_PORT {
                 !pids_listening_tcp(*port).is_empty() || !pids_bound_udp(*port).is_empty()
             } else {
                 !pids_listening_tcp(*port).is_empty()
@@ -1566,8 +1566,8 @@ fn pid_owns_tcp_listen(pid: i32, port: u16) -> bool {
 }
 
 fn pid_owns_dns(pid: i32) -> bool {
-    pid_owns_tcp_listen(pid, compile::DNS_LISTEN_PORT)
-        || pids_bound_udp(compile::DNS_LISTEN_PORT).contains(&pid)
+    pid_owns_tcp_listen(pid, crate::endpoints::DNS_LISTEN_PORT)
+        || pids_bound_udp(crate::endpoints::DNS_LISTEN_PORT).contains(&pid)
 }
 
 fn lsof_bin() -> &'static str {
@@ -2201,9 +2201,9 @@ mod tests {
     fn owned_listen_ports_cover_mixed_controller_ne_and_dns() {
         let ports = owned_listen_ports(7891);
         assert_eq!(ports[0], 7891);
-        assert_eq!(ports[1], compile::network_extension_socks_port(7891));
-        assert_eq!(ports[2], compile::controller_port(7891));
-        assert_eq!(ports[3], compile::DNS_LISTEN_PORT);
+        assert_eq!(ports[1], crate::endpoints::network_extension_socks_port(7891));
+        assert_eq!(ports[2], crate::endpoints::controller_port(7891));
+        assert_eq!(ports[3], crate::endpoints::DNS_LISTEN_PORT);
     }
 
     #[test]

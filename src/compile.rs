@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 use crate::catalog::{self, Catalog};
+pub use crate::endpoints::{
+    controller_port, network_extension_socks_port, CONTROLLER_SECRET, DNS_LISTEN_PORT, DNS_NAMESERVERS,
+};
 use crate::gfw;
 use crate::log;
 use crate::paths;
 use crate::strategy::{InboundMode, RoutingProfile, Strategy};
-
-pub const CONTROLLER_SECRET: &str = "myproxy-local";
 
 /// Addresses and names that must stay on the local network. These rules are
 /// compiled ahead of user rules so a broad user matcher cannot send local
@@ -39,18 +40,6 @@ const BUILTIN_BILIBILI_LIVE_CDN_RULES: &[&str] = &[
     "DOMAIN-SUFFIX,bilivideo.net,DIRECT",
 ];
 
-/// Mirrored by `DNSProxyUpstreamResolver.mihomoDNS`, where the Network
-/// Extension DNS provider relays public system lookups.
-pub const DNS_LISTEN_PORT: u16 = 1053;
-
-/// Resolvers Mihomo uses for its own lookups.
-///
-/// macOS hands the Network Extension DNS provider the *queried name* as the
-/// flow endpoint instead of the resolver address. When a LAN name, or any
-/// name while Mihomo is unavailable, has to be answered directly, the
-/// provider dials this list instead of the endpoint it sees.
-pub const DNS_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
-
 /// The resolver fragment keeps AAAA, SVCB, and HTTPS IPv6 hints out while
 /// leaving global IPv6 enabled for domains without the user rule toggle.
 const DNS_IPV4_ONLY_NAMESERVERS: [&str; 2] = [
@@ -66,10 +55,6 @@ const AUTO_GROUP_PROBE_INTERVAL_SECS: i64 = 30;
 const AUTO_GROUP_PROBE_TIMEOUT_MS: i64 = 3000;
 /// Mark a member down after this many failed probes, then use the next alive one.
 const AUTO_GROUP_MAX_FAILED_TIMES: i64 = 2;
-
-pub fn controller_port(mixed_port: u16) -> u16 {
-    mixed_port.saturating_add(107)
-}
 
 pub fn compile(strategy: &Strategy, catalog: &Catalog) -> Result<String> {
     let request = if strategy.system_extension {
@@ -620,15 +605,6 @@ fn insert_tun_intercept(root: &mut serde_yaml::Mapping, strategy: &Strategy) {
     sniffer.insert("parse-pure-ip".into(), true.into());
     sniffer.insert("sniff".into(), serde_yaml::Value::Mapping(sniff));
     root.insert("sniffer".into(), serde_yaml::Value::Mapping(sniffer));
-}
-
-pub fn network_extension_socks_port(mixed_port: u16) -> u16 {
-    let port = mixed_port.saturating_add(1);
-    if port == controller_port(mixed_port) {
-        port.saturating_add(1)
-    } else {
-        port
-    }
 }
 
 pub fn inbound_proxy(mode: InboundMode, strategy: &Strategy) -> Option<String> {
