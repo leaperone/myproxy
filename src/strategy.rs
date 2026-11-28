@@ -16,6 +16,21 @@ pub const DEFAULT_MIXED_PORT: u16 = 7890;
 
 pub const STRATEGY_SCHEMA: u32 = 8;
 
+pub const NODE_DISPLAY_SEP: &str = " · ";
+
+/// Catalog / pin display name: `"{subscription} · {original}"`.
+pub fn node_display_name(subscription: &str, original: &str) -> String {
+    format!("{subscription}{NODE_DISPLAY_SEP}{original}")
+}
+
+pub fn node_display_prefix(subscription: &str) -> String {
+    format!("{subscription}{NODE_DISPLAY_SEP}")
+}
+
+pub fn strip_node_display_prefix<'a>(raw: &'a str, subscription: &str) -> Option<&'a str> {
+    raw.strip_prefix(&node_display_prefix(subscription))
+}
+
 pub const TELEGRAM_GROUP: &str = "Telegram";
 
 /// Mihomo's built-in selector. Mixed/SE「全局」pins inbound to this name.
@@ -808,36 +823,11 @@ impl Strategy {
         Ok(())
     }
 
-    /// Candidate validation uses the catalog that will actually be applied.
-    /// Saved intent may refer to nodes from subscriptions that have not refreshed yet.
-    pub fn validate_catalog(&self, catalog: &crate::catalog::Catalog) -> Result<()> {
-        catalog.validate()?;
-        for node in &catalog.nodes {
-            if self
-                .groups
-                .iter()
-                .any(|group| group.name.eq_ignore_ascii_case(&node.name))
-            {
-                anyhow::bail!("node name conflicts with a group: {}", node.name);
-            }
-        }
-        for set in &self.rule_sets {
-            self.validate_target(&set.via, Some(catalog))
-                .with_context(|| format!("rule {} target", set.name))?;
-        }
-        if matches!(
-            self.routing_profile,
-            RoutingProfile::Group | RoutingProfile::Chinadirect
-        ) {
-            self.validate_target(&self.unmatched_via, Some(catalog))
-                .context("unmatched target")?;
-        }
-        // Historical selector picks are checked against live members when restored;
-        // a removed subscription node must not prevent a safe default from loading.
-        Ok(())
-    }
-
-    fn validate_target(&self, raw: &str, catalog: Option<&crate::catalog::Catalog>) -> Result<()> {
+    pub(crate) fn validate_target(
+        &self,
+        raw: &str,
+        has_node: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<()> {
         validate_name("target", raw)?;
         let gfw = crate::gfw::gfw_group(raw);
         let target = gfw.unwrap_or(raw);
@@ -862,8 +852,8 @@ impl Strategy {
                 return Ok(());
             }
         }
-        if let Some(catalog) = catalog {
-            if !catalog.nodes.iter().any(|node| node.name == target) {
+        if let Some(has_node) = has_node {
+            if !has_node(target) {
                 anyhow::bail!("target does not exist: {target}");
             }
         } else if target.eq_ignore_ascii_case(GLOBAL_GROUP) || target.ends_with(':') {
@@ -1347,7 +1337,7 @@ fn node_owner_index(subscriptions: &[Subscription], raw: &str) -> Option<usize> 
         .iter()
         .enumerate()
         .filter(|(_, sub)| {
-            crate::catalog::strip_node_display_prefix(raw, &sub.name).is_some()
+            strip_node_display_prefix(raw, &sub.name).is_some()
         })
         .max_by_key(|(_, sub)| sub.name.len())
         .map(|(index, _)| index)
@@ -1377,8 +1367,8 @@ fn rewrite_owned_node_name(
         return None;
     }
     let old = &subscriptions[index].name;
-    let rest = crate::catalog::strip_node_display_prefix(raw, old)?;
-    Some(crate::catalog::node_display_name(new, rest))
+    let rest = strip_node_display_prefix(raw, old)?;
+    Some(node_display_name(new, rest))
 }
 
 fn rewrite_target_ref(
